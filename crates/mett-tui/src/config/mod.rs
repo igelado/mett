@@ -249,11 +249,19 @@ impl Config {
                 // Ignored commands are not expanded, so their backticks
                 // never run.
                 other if NOT_YET_SUPPORTED.contains(&other) => {
-                    self.warn_once(other, format!("{other} is not supported yet; ignored"));
+                    self.warn_once(
+                        "command",
+                        other,
+                        format!("{other} is not supported yet; ignored"),
+                    );
                     Ok(())
                 }
                 other => {
-                    self.warn_once(other, format!("unknown command {other}; ignored"));
+                    self.warn_once(
+                        "command",
+                        other,
+                        format!("unknown command {other}; ignored"),
+                    );
                     Ok(())
                 }
             },
@@ -421,13 +429,18 @@ impl Config {
     /// Unknown variables are reported, but don't stop the configuration
     /// from loading (a shared muttrc sets many mett doesn't use).
     fn unknown_variable(&mut self, name: &str) -> Result<(), String> {
-        self.warn_once(name, format!("unknown variable {name}; ignored"));
+        self.warn_once(
+            "variable",
+            name,
+            format!("unknown variable {name}; ignored"),
+        );
         Ok(())
     }
 
-    /// Queues `warning` about `item` unless `item` was already reported.
-    fn warn_once(&mut self, item: &str, warning: String) {
-        if self.warned.insert(item.to_owned()) {
+    /// Queues `warning` about the `kind` named `item` (a command or a
+    /// variable) unless it was already reported.
+    fn warn_once(&mut self, kind: &str, item: &str, warning: String) {
+        if self.warned.insert(format!("{kind} {item}")) {
             self.pending.push(warning);
         }
     }
@@ -657,6 +670,9 @@ mod tests {
     fn warns_about_each_ignored_item_once() {
         let config = load("bind a b c\nbind d e f\nset imap_user=x\nset imap_user=y\n");
         assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
+        // A variable and a command with the same name are different items.
+        let both = load("set bind=1\nbind a b c\n");
+        assert_eq!(both.warnings.len(), 2, "{:?}", both.warnings);
         assert!(config.warnings[0].starts_with("/conf/mettrc:1:"));
         assert!(config.warnings[1].starts_with("/conf/mettrc:3:"));
     }
