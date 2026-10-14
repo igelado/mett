@@ -112,7 +112,13 @@ fn main() -> ExitCode {
             }
         };
         let page_size = match config.get("msgraph_page_size") {
-            Some(config::Value::Number(n)) if *n > 0 => u32::try_from(*n).unwrap_or(u32::MAX),
+            Some(config::Value::Number(n)) if *n > 0 => match u32::try_from(*n) {
+                Ok(size) => size,
+                Err(_) => {
+                    eprintln!("mett: msgraph_page_size {n} is too large");
+                    return ExitCode::FAILURE;
+                }
+            },
             _ => {
                 eprintln!("mett: msgraph_page_size must be a positive number");
                 return ExitCode::FAILURE;
