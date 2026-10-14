@@ -386,3 +386,43 @@ async fn requests_the_identity_scopes() {
     );
     auth.access_token().await.unwrap();
 }
+
+#[tokio::test]
+async fn ignores_a_matching_email_claim_for_another_principal() {
+    let server = MockServer::start().await;
+    let encode = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+    let id_token = format!(
+        "{}.{}.sig",
+        encode(json!({"alg": "none"})),
+        encode(json!({
+            "preferred_username": "mallory@contoso.com",
+            "email": "alice@contoso.com",
+        }))
+    );
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a-m",
+            "refresh_token": "r-m",
+            "id_token": id_token,
+            "expires_in": 3600,
+        })))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        |_| {},
+    );
+
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    assert_eq!(store.load(&account()).unwrap(), None);
+}

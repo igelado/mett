@@ -36,17 +36,18 @@ pub(crate) struct Tokens {
 }
 
 impl Tokens {
-    /// The user the tokens were issued to, from the ID token's
-    /// `preferred_username` (the UPN for work accounts) or `email` claims.
+    /// The user principal name the tokens were issued to: the ID token's
+    /// `preferred_username` claim, or its `upn` claim if that is missing.
+    /// The `email` claim is ignored: it can name an address that belongs to
+    /// another principal.
     ///
     /// The ID token comes straight from the token endpoint over TLS, so its
     /// claims are read without verifying the signature, as OpenID Connect
     /// allows for this case.
-    pub fn signed_in_as(&self) -> Vec<String> {
+    pub fn signed_in_as(&self) -> Option<String> {
         #[derive(Deserialize)]
         struct Claims {
             preferred_username: Option<String>,
-            email: Option<String>,
             upn: Option<String>,
         }
         let claims = self
@@ -55,14 +56,7 @@ impl Tokens {
             .and_then(|jwt| jwt.split('.').nth(1))
             .and_then(|payload| URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok())
             .and_then(|json| serde_json::from_slice::<Claims>(&json).ok());
-        claims
-            .map(|c| {
-                [c.preferred_username, c.email, c.upn]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-            })
-            .unwrap_or_default()
+        claims.and_then(|c| c.preferred_username.or(c.upn))
     }
 }
 

@@ -94,13 +94,13 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
     /// already checked when it was first issued.
     fn check_identity(&self, tokens: &Tokens, origin: Origin) -> Result<()> {
         let expected = self.settings.account.as_str();
-        let users = tokens.signed_in_as();
-        if users.iter().any(|u| u.eq_ignore_ascii_case(expected))
-            || (users.is_empty() && origin == Origin::Refresh)
-        {
-            return Ok(());
+        let user = tokens.signed_in_as();
+        match &user {
+            Some(user) if user.eq_ignore_ascii_case(expected) => return Ok(()),
+            None if origin == Origin::Refresh => return Ok(()),
+            _ => {}
         }
-        Err(mett_core::Error::Auth(match users.first() {
+        Err(mett_core::Error::Auth(match user {
             Some(user) => format!("signed in as {user}, but the account is {expected}"),
             None => format!("could not confirm that the sign-in was for {expected}"),
         }))
