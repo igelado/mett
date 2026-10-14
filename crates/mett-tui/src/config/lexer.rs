@@ -1,16 +1,37 @@
 //! Splitting a mettrc into commands and words, with mutt's lexical rules
 //! (`docs/MUTTRC.md` §2).
 //!
-//! The source is read one command at a time, because `$variable`
-//! expansion must see the values set by earlier commands.
+//! Words are kept as parts (literal text, `$variables` and backtick
+//! commands) and expanded only when their value is needed. A setting mett
+//! ignores is therefore never expanded, so its backtick command never runs,
+//! and `$variable` expansion sees the values set by earlier commands.
 
 use std::fmt;
 
-/// A command: its words, after quoting and expansion, and where it starts.
+/// A piece of a word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// Literal text, after quoting and escapes. An empty literal records an
+    /// empty quoted string (`""`), which still counts as a value.
+    Literal(String),
+    /// `$name` or `${name}`.
+    Variable(String),
+    /// A backtick command.
+    Command(String),
+}
+
+/// A word, as parts to expand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Word {
+    /// The parts, in order.
+    pub parts: Vec<Part>,
+}
+
+/// A command: its words and where it starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
     /// The words; the first is the command name.
-    pub words: Vec<String>,
+    pub words: Vec<Word>,
     /// The 1-based line the command starts on.
     pub line: usize,
 }
@@ -30,13 +51,95 @@ impl fmt::Display for SyntaxError {
     }
 }
 
-/// What the lexer needs from its surroundings.
+/// What expansion needs from its surroundings.
 pub trait Expander {
     /// The value of `$name`: a configuration variable or, failing that, an
     /// environment variable.
     fn variable(&self, name: &str) -> Option<String>;
     /// The output of a backtick command.
     fn command(&self, command: &str) -> Result<String, String>;
+}
+
+impl Word {
+    fn push_char(&mut self, c: char) {
+        match self.parts.last_mut() {
+            Some(Part::Literal(text)) => text.push(c),
+            _ => self.parts.push(Part::Literal(c.to_string())),
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        match self.parts.last_mut() {
+            Some(Part::Literal(text)) => text.push_str(s),
+            _ => self.parts.push(Part::Literal(s.to_owned())),
+        }
+    }
+
+    /// The word's value: variables are replaced and backtick commands run
+    /// (without their trailing newline).
+    pub fn expand(&self, expander: &dyn Expander) -> Result<String, String> {
+        let mut out = String::new();
+        for part in &self.parts {
+            match part {
+                Part::Literal(text) => out.push_str(text),
+                Part::Variable(name) => {
+                    out.push_str(&expander.variable(name).unwrap_or_default());
+                }
+                Part::Command(command) => {
+                    let output = expander
+                        .command(command)
+                        .map_err(|e| format!("`{command}` failed: {e}"))?;
+                    out.push_str(output.trim_end_matches(['\n', '\r']));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The word's text if it has no variables or commands.
+    pub fn literal(&self) -> Option<String> {
+        let mut out = String::new();
+        for part in &self.parts {
+            match part {
+                Part::Literal(text) => out.push_str(text),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Splits `name=value` at the first literal `=`, if the name before it
+    /// is literal text. The value is `None` for a bare `name=` (nothing
+    /// after the `=`, not even `""`).
+    pub fn split_assignment(&self) -> Option<(String, Option<Word>)> {
+        let (index, offset) = self
+            .parts
+            .iter()
+            .enumerate()
+            .find_map(|(i, part)| match part {
+                Part::Literal(text) => text.find('=').map(|offset| (i, offset)),
+                _ => None,
+            })?;
+        let mut name = String::new();
+        for part in &self.parts[..index] {
+            match part {
+                Part::Literal(text) => name.push_str(text),
+                _ => return None,
+            }
+        }
+        let Part::Literal(text) = &self.parts[index] else {
+            unreachable!("found in a literal");
+        };
+        name.push_str(&text[..offset]);
+        let mut value = Word::default();
+        let rest = &text[offset + 1..];
+        if !rest.is_empty() {
+            value.parts.push(Part::Literal(rest.to_owned()));
+        }
+        value.parts.extend(self.parts[index + 1..].iter().cloned());
+        let value = (!value.parts.is_empty()).then_some(value);
+        Some((name, value))
+    }
 }
 
 /// Reads commands from a mettrc source.
@@ -55,13 +158,10 @@ impl<'a> Lexer<'a> {
     }
 
     /// The next non-empty command, or `None` at the end of the source.
-    pub fn next_command(
-        &mut self,
-        expander: &dyn Expander,
-    ) -> Option<Result<Command, SyntaxError>> {
+    pub fn next_command(&mut self) -> Option<Result<Command, SyntaxError>> {
         loop {
             let line = self.line;
-            match self.read_command(expander) {
+            match self.read_command() {
                 Ok(None) => return None,
                 Ok(Some(words)) if words.is_empty() => continue,
                 Ok(Some(words)) => return Some(Ok(Command { words, line })),
@@ -99,17 +199,12 @@ impl<'a> Lexer<'a> {
 
     /// Reads one command's words, up to a newline or `;`. `Ok(None)` means
     /// the end of the source.
-    fn read_command(
-        &mut self,
-        expander: &dyn Expander,
-    ) -> Result<Option<Vec<String>>, SyntaxError> {
+    fn read_command(&mut self) -> Result<Option<Vec<Word>>, SyntaxError> {
         if self.chars.peek().is_none() {
             return Ok(None);
         }
         let mut words = Vec::new();
-        let mut word = String::new();
-        // Whether `word` has started (a quoted empty string is a word).
-        let mut in_word = false;
+        let mut word = Word::default();
         while let Some(&c) = self.chars.peek() {
             match c {
                 '\n' | ';' => {
@@ -118,9 +213,8 @@ impl<'a> Lexer<'a> {
                 }
                 ' ' | '\t' | '\r' => {
                     self.bump();
-                    if in_word {
+                    if !word.parts.is_empty() {
                         words.push(std::mem::take(&mut word));
-                        in_word = false;
                     }
                 }
                 '#' => {
@@ -134,15 +228,15 @@ impl<'a> Lexer<'a> {
                     match self.bump() {
                         // A trailing backslash continues the command.
                         Some('\n') => {}
-                        Some(c) => {
-                            word.push(escaped(c));
-                            in_word = true;
-                        }
+                        Some(c) => word.push_char(escaped(c)),
                         None => return Err(self.error("backslash at end of file")),
                     }
                 }
                 '\'' => {
                     self.bump();
+                    // A quoted string starts its own part, so that even `''`
+                    // after `=` counts as an (empty) value.
+                    word.parts.push(Part::Literal(String::new()));
                     loop {
                         match self.chars.peek() {
                             Some('\'') => {
@@ -153,44 +247,40 @@ impl<'a> Lexer<'a> {
                             Some('\n') | None => {
                                 return Err(self.error("unterminated single quote"));
                             }
-                            Some(_) => word.extend(self.bump()),
+                            Some(_) => {
+                                let c = self.bump().expect("peeked");
+                                word.push_char(c);
+                            }
                         }
                     }
-                    in_word = true;
                 }
                 '"' => {
                     self.bump();
-                    self.read_double_quoted(&mut word, expander)?;
-                    in_word = true;
+                    word.parts.push(Part::Literal(String::new()));
+                    self.read_double_quoted(&mut word)?;
                 }
                 '`' => {
                     self.bump();
-                    word.push_str(&self.read_backtick(expander)?);
-                    in_word = true;
+                    let command = self.read_backtick()?;
+                    word.parts.push(Part::Command(command));
                 }
                 '$' => {
                     self.bump();
-                    word.push_str(&self.read_variable(expander));
-                    in_word = true;
+                    self.read_variable(&mut word);
                 }
                 _ => {
                     self.bump();
-                    word.push(c);
-                    in_word = true;
+                    word.push_char(c);
                 }
             }
         }
-        if in_word {
+        if !word.parts.is_empty() {
             words.push(word);
         }
         Ok(Some(words))
     }
 
-    fn read_double_quoted(
-        &mut self,
-        word: &mut String,
-        expander: &dyn Expander,
-    ) -> Result<(), SyntaxError> {
+    fn read_double_quoted(&mut self, word: &mut Word) -> Result<(), SyntaxError> {
         loop {
             // As in mutt, a quote ends at the end of its line (a trailing
             // backslash still continues it).
@@ -201,41 +291,38 @@ impl<'a> Lexer<'a> {
                 Some('"') => return Ok(()),
                 Some('\\') => match self.bump() {
                     Some('\n') => {}
-                    Some(c) => word.push(escaped(c)),
+                    Some(c) => word.push_char(escaped(c)),
                     None => return Err(self.error("unterminated double quote")),
                 },
-                Some('`') => word.push_str(&self.read_backtick(expander)?),
-                Some('$') => word.push_str(&self.read_variable(expander)),
-                Some(c) => word.push(c),
+                Some('`') => {
+                    let command = self.read_backtick()?;
+                    word.parts.push(Part::Command(command));
+                }
+                Some('$') => self.read_variable(word),
+                Some(c) => word.push_char(c),
                 None => return Err(self.error("unterminated double quote")),
             }
         }
     }
 
-    /// Reads up to the closing backtick and returns the command's output,
-    /// without its trailing newline.
-    fn read_backtick(&mut self, expander: &dyn Expander) -> Result<String, SyntaxError> {
+    /// Reads up to the closing backtick and returns the command.
+    fn read_backtick(&mut self) -> Result<String, SyntaxError> {
         let mut command = String::new();
         loop {
             match self.chars.peek() {
                 Some('`') => {
                     self.bump();
-                    break;
+                    return Ok(command);
                 }
                 Some('\n') | None => return Err(self.error("unterminated backtick")),
                 Some(_) => command.extend(self.bump()),
             }
         }
-        let output = expander
-            .command(&command)
-            .map_err(|e| self.error(format!("`{command}` failed: {e}")))?;
-        Ok(output.trim_end_matches(['\n', '\r']).to_owned())
     }
 
-    /// Reads a variable name after `$` (`$name` or `${name}`) and returns
-    /// its value, or an empty string if it is unset. A `$` not followed by
-    /// a name is literal.
-    fn read_variable(&mut self, expander: &dyn Expander) -> String {
+    /// Reads a variable name after `$` (`$name` or `${name}`). A `$` not
+    /// followed by a name is literal.
+    fn read_variable(&mut self, word: &mut Word) {
         let braced = self.chars.peek() == Some(&'{');
         if braced {
             self.bump();
@@ -253,9 +340,10 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         if name.is_empty() {
-            return if braced { "${".into() } else { "$".into() };
+            word.push_str(if braced { "${" } else { "$" });
+        } else {
+            word.parts.push(Part::Variable(name));
         }
-        expander.variable(&name).unwrap_or_default()
     }
 }
 
@@ -271,17 +359,24 @@ fn escaped(c: char) -> char {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
 
     use super::*;
 
-    struct Fake(HashMap<&'static str, &'static str>);
+    #[derive(Default)]
+    struct Fake {
+        commands_run: Cell<usize>,
+    }
 
     impl Expander for Fake {
         fn variable(&self, name: &str) -> Option<String> {
-            self.0.get(name).map(|v| (*v).to_owned())
+            HashMap::from([("HOME", "/home/a"), ("folder", "msgraph://a@b.c/")])
+                .get(name)
+                .map(|v| (*v).to_owned())
         }
         fn command(&self, command: &str) -> Result<String, String> {
+            self.commands_run.set(self.commands_run.get() + 1);
             match command {
                 "pass show work" => Ok("s3cret\n".into()),
                 _ => Err("not found".into()),
@@ -290,16 +385,22 @@ mod tests {
     }
 
     fn lex(source: &str) -> Vec<Result<Command, SyntaxError>> {
-        let fake = Fake(HashMap::from([
-            ("HOME", "/home/a"),
-            ("folder", "msgraph://a@b.c/"),
-        ]));
         let mut lexer = Lexer::new(source);
-        std::iter::from_fn(|| lexer.next_command(&fake)).collect()
+        std::iter::from_fn(|| lexer.next_command()).collect()
     }
 
     fn words(source: &str) -> Vec<Vec<String>> {
-        lex(source).into_iter().map(|c| c.unwrap().words).collect()
+        let fake = Fake::default();
+        lex(source)
+            .into_iter()
+            .map(|c| {
+                c.unwrap()
+                    .words
+                    .iter()
+                    .map(|w| w.expand(&fake).unwrap())
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -344,10 +445,35 @@ mod tests {
     }
 
     #[test]
-    fn substitutes_backticks_without_trailing_newline() {
+    fn runs_backticks_only_when_expanded() {
+        let commands = lex(r#"set pass=`pass show work` quoted="x`pass show work`y""#);
+        let fake = Fake::default();
+        let words = &commands[0].as_ref().unwrap().words;
+        assert_eq!(fake.commands_run.get(), 0, "lexing runs nothing");
+        let expanded: Vec<_> = words.iter().map(|w| w.expand(&fake).unwrap()).collect();
+        assert_eq!(expanded, ["set", "pass=s3cret", "quoted=xs3crety"]);
+        assert_eq!(fake.commands_run.get(), 2);
+    }
+
+    #[test]
+    fn splits_assignments_and_tells_empty_values_from_missing_ones() {
+        let commands = lex(r#"set a=1 b="" c= d=$HOME"#);
+        let fake = Fake::default();
+        let split: Vec<_> = commands[0].as_ref().unwrap().words[1..]
+            .iter()
+            .map(|w| {
+                let (name, value) = w.split_assignment().unwrap();
+                (name, value.map(|v| v.expand(&fake).unwrap()))
+            })
+            .collect();
         assert_eq!(
-            words(r#"set pass=`pass show work` quoted="x`pass show work`y""#),
-            [vec!["set", "pass=s3cret", "quoted=xs3crety"]]
+            split,
+            [
+                ("a".to_owned(), Some("1".to_owned())),
+                ("b".to_owned(), Some(String::new())),
+                ("c".to_owned(), None),
+                ("d".to_owned(), Some("/home/a".to_owned())),
+            ]
         );
     }
 
@@ -356,7 +482,7 @@ mod tests {
         let commands = lex("set a=1 \\\n  b=2\nset c=3\n");
         let lines: Vec<_> = commands.iter().map(|c| c.as_ref().unwrap().line).collect();
         assert_eq!(lines, [1, 3]);
-        assert_eq!(commands[0].as_ref().unwrap().words, ["set", "a=1", "b=2"]);
+        assert_eq!(words("set a=1 \\\n  b=2\n"), [vec!["set", "a=1", "b=2"]]);
     }
 
     #[test]
@@ -366,10 +492,7 @@ mod tests {
         assert!(
             matches!(&commands[0], Err(e) if e.line == 1 && e.message.contains("unterminated"))
         );
-        assert_eq!(commands[1].as_ref().unwrap().words, ["set", "c=1"]);
+        assert!(commands[1].is_ok());
         assert!(matches!(&commands[2], Err(e) if e.line == 3));
-        let commands = lex("set b=`missing`\nset c=1\n");
-        assert!(matches!(&commands[0], Err(e) if e.line == 1 && e.message.contains("failed")));
-        assert_eq!(commands[1].as_ref().unwrap().words, ["set", "c=1"]);
     }
 }

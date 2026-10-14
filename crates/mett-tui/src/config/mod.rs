@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
-use lexer::{Command, Expander, Lexer};
+use lexer::{Command, Expander, Lexer, Word};
 pub use vars::{Kind, VARS, Value};
 
 /// How deeply `source` may nest, to stop loops.
@@ -207,8 +207,7 @@ impl Config {
     fn run(&mut self, source: &str, origin: &Origin<'_>) {
         let mut lexer = Lexer::new(source);
         loop {
-            let next = lexer.next_command(&Expand { config: self });
-            match next {
+            match lexer.next_command() {
                 None => break,
                 Some(Ok(command)) => self.execute(command, origin),
                 Some(Err(e)) => self.errors.push(format!(
@@ -224,29 +223,33 @@ impl Config {
     fn execute(&mut self, command: Command, origin: &Origin<'_>) {
         let at = format!("{}:{}", origin.file.display(), command.line);
         let (name, args) = command.words.split_first().expect("commands are not empty");
-        let result = match name.as_str() {
-            "set" => self.set(args),
-            "unset" => self.each(args, |c, name| c.unset(name)),
-            "toggle" => self.each(args, |c, name| c.toggle(name)),
-            "reset" => self.each(args, |c, name| c.reset_named(name)),
-            "source" => match args {
-                [path] => {
-                    let path = self.resolve_source(path, origin.file);
-                    self.source(&path, origin.depth + 1);
+        let result = match self.expand(name) {
+            Err(e) => Err(e),
+            Ok(name) => match name.as_str() {
+                "set" => self.set(args),
+                "unset" => self.each(args, |c, name| c.unset(name)),
+                "toggle" => self.each(args, |c, name| c.toggle(name)),
+                "reset" => self.each(args, |c, name| c.reset_named(name)),
+                "source" => match args {
+                    [path] => self.expand(path).map(|path| {
+                        let path = self.resolve_source(&path, origin.file);
+                        self.source(&path, origin.depth + 1);
+                    }),
+                    _ => Err("source: expected one file name".to_owned()),
+                },
+                // Ignored commands are not expanded, so their backticks
+                // never run.
+                other if NOT_YET_SUPPORTED.contains(&other) => {
+                    self.pending
+                        .push(format!("{other} is not supported yet; ignored"));
                     Ok(())
                 }
-                _ => Err("source: expected one file name".to_owned()),
+                other => {
+                    self.pending
+                        .push(format!("unknown command {other}; ignored"));
+                    Ok(())
+                }
             },
-            other if NOT_YET_SUPPORTED.contains(&other) => {
-                self.warnings
-                    .push(format!("{at}: {other} is not supported yet; ignored"));
-                Ok(())
-            }
-            other => {
-                self.warnings
-                    .push(format!("{at}: unknown command {other}; ignored"));
-                Ok(())
-            }
         };
         if let Err(message) = result {
             self.errors.push(format!("{at}: {message}"));
@@ -256,15 +259,21 @@ impl Config {
             .extend(pending.into_iter().map(|w| format!("{at}: {w}")));
     }
 
-    /// Applies `f` to each name, collecting the first error.
+    /// Expands a word now, with the values set so far.
+    fn expand(&self, word: &Word) -> Result<String, String> {
+        word.expand(&Expand { config: self })
+    }
+
+    /// Applies `f` to each (expanded) name, collecting the first error.
     fn each(
         &mut self,
-        names: &[String],
+        names: &[Word],
         mut f: impl FnMut(&mut Self, &str) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut result = Ok(());
         for name in names {
-            if let Err(e) = f(self, name)
+            let outcome = self.expand(name).and_then(|name| f(self, &name));
+            if let Err(e) = outcome
                 && result.is_ok()
             {
                 result = Err(e);
@@ -274,45 +283,24 @@ impl Config {
     }
 
     /// `set` with mutt's forms: `var`, `novar`, `invvar`, `&var`, `?var`,
-    /// `var=value` and `var = value`, several per command.
-    fn set(&mut self, args: &[String]) -> Result<(), String> {
+    /// `var=value`, `var= value` and `var = value`, several per command.
+    fn set(&mut self, args: &[Word]) -> Result<(), String> {
         let mut args = args.iter().peekable();
         let mut result = Ok(());
         while let Some(arg) = args.next() {
-            let outcome = if let Some((name, value)) = arg.split_once('=') {
-                // `var=value`, or `var= value` with the value as the next word.
-                let value = if value.is_empty() && arg.ends_with('=') && arg.len() > 1 {
-                    match args.peek() {
-                        Some(next) if !next.contains('=') => args.next().map_or("", |v| v.as_str()),
-                        _ => "",
-                    }
-                } else {
-                    value
-                };
-                self.assign(name, value)
-            } else if args.peek().is_some_and(|next| next.as_str() == "=") {
+            let is_equals = |w: &&Word| w.literal().as_deref() == Some("=");
+            let outcome = if let Some((name, value)) = arg.split_assignment() {
+                // `var=value`; for a bare `var=`, mutt takes the next word as
+                // the value (so `set spoolfile= =@inbox` works).
+                let value = value.or_else(|| args.next().cloned()).unwrap_or_default();
+                self.assign(&name, &value)
+            } else if args.peek().is_some_and(is_equals) {
                 // `var = value`
                 args.next();
-                let value = args.next().map_or("", |v| v.as_str());
-                self.assign(arg, value)
-            } else if let Some(name) = arg.strip_prefix('&') {
-                self.reset_named(name)
-            } else if arg.starts_with('?') {
-                // A query, meaningful only interactively.
-                Ok(())
-            } else if let Some(name) = arg.strip_prefix("inv").filter(|n| is_bool(n)) {
-                self.toggle(name)
-            } else if let Some(name) = arg.strip_prefix("no").filter(|n| is_bool(n)) {
-                self.unset(name)
+                let value = args.next().cloned().unwrap_or_default();
+                self.expand(arg).and_then(|name| self.assign(&name, &value))
             } else {
-                match vars::find(arg) {
-                    Some(var) if var.kind == Kind::Bool => {
-                        self.values.insert(var.name, Value::Bool(true));
-                        Ok(())
-                    }
-                    Some(var) => Err(format!("{}: needs a value", var.name)),
-                    None => self.unknown_variable(arg),
-                }
+                self.expand(arg).and_then(|arg| self.set_flag(&arg))
             };
             if let Err(e) = outcome
                 && result.is_ok()
@@ -323,15 +311,42 @@ impl Config {
         result
     }
 
-    fn assign(&mut self, name: &str, value: &str) -> Result<(), String> {
+    /// `set` without a value: `var`, `novar`, `invvar`, `&var` or `?var`.
+    fn set_flag(&mut self, arg: &str) -> Result<(), String> {
+        if let Some(name) = arg.strip_prefix('&') {
+            self.reset_named(name)
+        } else if arg.starts_with('?') {
+            // A query, meaningful only interactively.
+            Ok(())
+        } else if let Some(name) = arg.strip_prefix("inv").filter(|n| is_bool(n)) {
+            self.toggle(name)
+        } else if let Some(name) = arg.strip_prefix("no").filter(|n| is_bool(n)) {
+            self.unset(name)
+        } else {
+            match vars::find(arg) {
+                Some(var) if var.kind == Kind::Bool => {
+                    self.values.insert(var.name, Value::Bool(true));
+                    Ok(())
+                }
+                Some(var) => Err(format!("{}: needs a value", var.name)),
+                None => self.unknown_variable(arg),
+            }
+        }
+    }
+
+    /// Assigns `value` to `name`. The value is expanded only for variables
+    /// mett uses, so settings it ignores never run their backticks.
+    fn assign(&mut self, name: &str, value: &Word) -> Result<(), String> {
         if name.starts_with("my_") {
-            self.user.insert(name.to_owned(), value.to_owned());
+            let value = self.expand(value)?;
+            self.user.insert(name.to_owned(), value);
             return Ok(());
         }
         let Some(var) = vars::find(name) else {
             return self.unknown_variable(name);
         };
-        let value = vars::parse(var, value, self.home.as_deref())?;
+        let value = self.expand(value)?;
+        let value = vars::parse(var, &value, self.home.as_deref())?;
         self.values.insert(var.name, value);
         Ok(())
     }
@@ -621,8 +636,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_values_and_bare_assignments_follow_mutt() {
+        let config = load("set realname=\"\" msgraph_focused_inbox\nset spoolfile= =@inbox\n");
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(config.string("realname"), "");
+        assert_eq!(
+            config.get("msgraph_focused_inbox"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(config.string("spoolfile"), "=@inbox");
+    }
+
+    #[test]
+    fn ignored_settings_never_run_their_backticks() {
+        let marker = std::env::temp_dir().join(format!("mett-ran-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let config = load(&format!(
+            "set imap_pass=`touch {0}; false`\nbind index x `touch {0}`\n",
+            marker.display()
+        ));
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
+        assert!(!marker.exists(), "an ignored backtick ran");
+    }
+
+    #[test]
     fn dumps_settings_as_set_commands() {
-        let config = load("set realname=\"A \\\"B\\\"\" my_x=1\n");
+        let config = load("set realname=\"A \\\"B\\\"\" my_x=1 my_lit='$HOME `x`'\n");
         let dump = config.dump();
         assert!(
             dump.contains(&"set realname=\"A \\\"B\\\"\"".to_owned()),

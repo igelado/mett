@@ -37,7 +37,21 @@ impl fmt::Display for Value {
             Value::Bool(true) => f.write_str("yes"),
             Value::Bool(false) => f.write_str("no"),
             Value::Number(n) => write!(f, "{n}"),
-            Value::Str(s) => write!(f, "\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+            // Escaped so that reading it back gives the same text: no
+            // expansion, no command substitution, and newlines kept.
+            Value::Str(s) => {
+                f.write_str("\"")?;
+                for c in s.chars() {
+                    match c {
+                        '\\' | '"' | '$' | '`' => write!(f, "\\{c}")?,
+                        '\n' => f.write_str("\\n")?,
+                        '\r' => f.write_str("\\r")?,
+                        '\t' => f.write_str("\\t")?,
+                        c => write!(f, "{c}")?,
+                    }
+                }
+                f.write_str("\"")
+            }
         }
     }
 }
@@ -177,5 +191,9 @@ mod tests {
         assert_eq!(Value::Bool(true).to_string(), "yes");
         assert_eq!(Value::Number(5).to_string(), "5");
         assert_eq!(Value::Str(r#"a "b""#.into()).to_string(), r#""a \"b\"""#);
+        assert_eq!(
+            Value::Str("$HOME `x`\n".into()).to_string(),
+            r#""\$HOME \`x\`\n""#
+        );
     }
 }
