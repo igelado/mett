@@ -17,6 +17,15 @@ use crate::worker::{Event, Request, RequestId, Response};
 /// How many messages to request per page.
 const PAGE_SIZE: u32 = 100;
 
+/// Where a pending move goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    /// The entry at this position.
+    Entry(usize),
+    /// The last message of the folder.
+    Last,
+}
+
 /// Rows used by the help line, the status bar and the message line.
 const CHROME_ROWS: usize = 3;
 
@@ -116,9 +125,9 @@ pub struct App {
     /// line so that later messages can't hide them. A later successful save
     /// of the same message clears its entry.
     save_failures: HashMap<MessageId, String>,
-    /// The user asked for the next message while more were loading; move
-    /// on once they arrive.
-    pending_next: bool,
+    /// Where the user asked to move while more messages were loading; the
+    /// selection moves there once they arrive.
+    pending: Option<Target>,
     /// Pending flag updates, so a failure can be undone in the index.
     flag_updates: HashMap<RequestId, MessageId>,
     next_request: u64,
@@ -141,7 +150,7 @@ impl App {
             listing_page: None,
             unlisted: None,
             save_failures: HashMap::new(),
-            pending_next: false,
+            pending: None,
             flag_updates: HashMap::new(),
             next_request: 0,
         };
@@ -184,8 +193,8 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Effect> {
-        // Any new action replaces a pending "next message".
-        self.pending_next = false;
+        // Any new action replaces a pending move.
+        self.pending = None;
         match self.menu() {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
@@ -198,19 +207,24 @@ impl App {
         match action {
             Action::Quit => self.quit = true,
             Action::NextEntry if self.selected < last => self.selected += 1,
-            Action::NextEntry if self.more_to_list() => return self.wait_for_next(),
+            Action::NextEntry if self.more_to_list() => {
+                return self.wait_for(Target::Entry(self.selected + 1));
+            }
             Action::NextEntry => self.status = "You are on the last message.".into(),
             Action::PreviousEntry if self.selected > 0 => self.selected -= 1,
             Action::PreviousEntry => self.status = "You are on the first message.".into(),
             Action::FirstEntry => self.selected = 0,
             Action::LastEntry => {
                 self.selected = last;
-                return self.retry_listing();
+                if self.more_to_list() {
+                    return self.wait_for(Target::Last);
+                }
             }
             Action::NextPage => {
-                self.selected = (self.selected + page).min(last);
-                if self.selected == last {
-                    return self.retry_listing();
+                let target = self.selected + page;
+                self.selected = target.min(last);
+                if target > last && self.more_to_list() {
+                    return self.wait_for(Target::Entry(target));
                 }
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
@@ -231,7 +245,7 @@ impl App {
             // message.
             Action::NextEntry if self.selected + 1 >= self.messages.len() => {
                 if self.more_to_list() {
-                    return self.wait_for_next();
+                    return self.wait_for(Target::Entry(self.selected + 1));
                 }
                 self.status = "You are on the last message.".into();
             }
@@ -317,11 +331,11 @@ impl App {
                             self.status.clear();
                         }
                     }
-                    effects.extend(self.apply_pending_next());
+                    effects.extend(self.apply_pending());
                     return effects;
                 }
                 Err(e) => {
-                    self.pending_next = false;
+                    self.pending = None;
                     self.listing = None;
                     self.unlisted = self.listing_page.take();
                     self.report(e);
@@ -427,23 +441,39 @@ impl App {
 
     /// Remembers that the user asked for the next message, and makes sure
     /// more messages are on their way.
-    fn wait_for_next(&mut self) -> Vec<Effect> {
-        self.pending_next = true;
+    fn wait_for(&mut self, target: Target) -> Vec<Effect> {
+        self.pending = Some(target);
         self.status = "Loading more messages...".into();
         self.retry_listing()
     }
 
-    /// Moves to the next message if the user asked for it while it was
-    /// loading and it has now arrived.
-    fn apply_pending_next(&mut self) -> Vec<Effect> {
-        if !self.pending_next || self.selected + 1 >= self.messages.len() {
+    /// Moves towards a pending target now that more messages have arrived.
+    /// An entry target is reached once it is loaded, or settles on the last
+    /// message once the folder is fully loaded; the last-message target
+    /// follows the end of the index until loading finishes.
+    fn apply_pending(&mut self) -> Vec<Effect> {
+        let Some(target) = self.pending else {
             return Vec::new();
-        }
-        self.pending_next = false;
-        self.selected += 1;
+        };
+        let last = self.messages.len().saturating_sub(1);
+        let loading = self.listing.is_some();
+        let selected = match target {
+            Target::Entry(entry) if entry <= last => entry,
+            Target::Entry(_) | Target::Last if !loading => last,
+            Target::Last => {
+                self.selected = last;
+                return Vec::new();
+            }
+            Target::Entry(_) => return Vec::new(),
+        };
+        self.pending = None;
         if self.status.starts_with("Loading ") {
             self.status.clear();
         }
+        if selected == self.selected {
+            return Vec::new();
+        }
+        self.selected = selected;
         match self.menu() {
             Menu::Index => Vec::new(),
             Menu::Pager => {
@@ -876,6 +906,25 @@ mod tests {
             matches!(effects.as_slice(), [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m1"),
             "{effects:?}"
         );
+    }
+
+    #[test]
+    fn last_entry_follows_the_folder_while_it_loads() {
+        let (mut app, second) = loading_more(2);
+        act(&mut app, Action::LastEntry);
+        assert_eq!(app.selected, 1);
+        deliver_last_page(&mut app, second, summaries(5));
+        assert_eq!(app.selected, 6, "the real last message");
+    }
+
+    #[test]
+    fn next_page_completes_once_the_page_arrives() {
+        let (mut app, second) = loading_more(5);
+        // 20 rows per page: the target, entry 20, isn't loaded yet.
+        act(&mut app, Action::NextPage);
+        assert_eq!(app.selected, 4);
+        deliver_last_page(&mut app, second, summaries(30));
+        assert_eq!(app.selected, 20);
     }
 
     #[test]

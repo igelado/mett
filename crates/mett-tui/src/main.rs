@@ -98,7 +98,8 @@ async fn run<S: mett_core::MailStore + 'static>(
             event = input_rx.recv() => match event.transpose()? {
                 None => return Err(std::io::Error::other("terminal input closed")),
                 Some(event) => match event {
-                TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                // Repeats too, so holding a key keeps moving.
+                TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
                     match keymap.lookup(app.menu(), Key::from(key)) {
                         Some(action) => Msg::Action(action),
                         None => {
