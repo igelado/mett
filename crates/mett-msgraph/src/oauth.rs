@@ -22,6 +22,9 @@ use crate::settings::AuthSettings;
 
 /// How long to wait for the user to finish signing in in the browser.
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Upper bound on each request to the identity platform, whatever the HTTP
+/// client's own settings, so a stalled response can't block sign-in forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 /// The tokens returned by a successful request.
@@ -131,7 +134,12 @@ async fn post_form<T: DeserializeOwned>(
     url: Url,
     form: &[(&str, &str)],
 ) -> Result<T, FlowError> {
-    let response = http.post(url).form(form).send().await?;
+    let response = http
+        .post(url)
+        .form(form)
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await?;
     let status = response.status();
     let body = response.bytes().await?;
     if status.is_success() {

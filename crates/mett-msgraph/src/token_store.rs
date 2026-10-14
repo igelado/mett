@@ -137,7 +137,7 @@ impl FileStore {
     /// Runs a read-modify-write `update` while holding the update lock.
     fn update(&self, update: impl FnOnce(&mut TokenFile) -> bool) -> Result<(), TokenStoreError> {
         let lock_path = sibling(&self.path, "", ".lock");
-        if let Some(dir) = self.path.parent() {
+        if let Some(dir) = parent_dir(&self.path) {
             create_private_dir(dir).map_err(|e| self.error(e))?;
         }
         let mut options = fs::OpenOptions::new();
@@ -195,7 +195,7 @@ impl TokenStore for FileStore {
 /// Atomically replaces `path` with `data`, creating it (and its directory)
 /// readable only by the user.
 fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = parent_dir(path) {
         create_private_dir(dir)?;
     }
     if !cfg!(unix) {
@@ -222,6 +222,12 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// The directory containing `path`, or `None` for a bare file name (which
+/// lives in the current directory).
+fn parent_dir(path: &Path) -> Option<&Path> {
+    path.parent().filter(|dir| !dir.as_os_str().is_empty())
 }
 
 /// `path` with its file name wrapped in `prefix` and `suffix`.
@@ -277,6 +283,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_store_round_trips_privately() {
         let dir = temp_dir("filestore");
@@ -325,6 +332,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_store_keeps_accounts_apart() {
         let dir = temp_dir("shared");
@@ -371,6 +379,24 @@ mod tests {
             assert_eq!(store.load(&account).unwrap().as_deref(), Some("r9"));
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parent_dir_of_a_bare_file_name_is_none() {
+        assert_eq!(parent_dir(Path::new("tokens.json")), None);
+        assert_eq!(parent_dir(Path::new("a/tokens.json")), Some(Path::new("a")));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn file_store_is_unsupported_off_unix() {
+        let dir = temp_dir("unsupported");
+        let err = FileStore::new(dir.join("t.tokens"))
+            .save(&"alice@contoso.com".into(), "r")
+            .unwrap_err();
+        assert!(matches!(err, TokenStoreError::File { source, .. }
+            if source.kind() == io::ErrorKind::Unsupported));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
