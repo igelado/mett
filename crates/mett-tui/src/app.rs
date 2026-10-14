@@ -65,10 +65,25 @@ pub struct Pager {
     pub message: Option<Message>,
     /// The message laid out as lines (headers and body), not yet wrapped.
     pub lines: Vec<String>,
+    /// `lines` wrapped to [`Pager::rows_width`]. Cached, so redrawing and
+    /// scrolling don't re-wrap the whole message.
+    pub rows: Vec<String>,
+    /// The width `rows` were wrapped to, if they have been.
+    pub rows_width: Option<usize>,
     /// The request fetching it.
     pub request: RequestId,
     /// The first visible row, after wrapping.
     pub scroll: usize,
+}
+
+impl Pager {
+    /// Re-wraps the message if the width changed.
+    fn layout(&mut self, width: usize) {
+        if self.rows_width != Some(width) {
+            self.rows = text::wrap_all(&self.lines, width);
+            self.rows_width = Some(width);
+        }
+    }
 }
 
 /// The whole UI state.
@@ -224,8 +239,8 @@ impl App {
     fn clamp_scroll(&mut self) {
         let (width, height) = (self.width, self.body_height);
         if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
-            let rows = text::wrap_all(&pager.lines, width).len();
-            pager.scroll = pager.scroll.min(rows.saturating_sub(height));
+            pager.layout(width);
+            pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
         }
     }
 
@@ -241,6 +256,8 @@ impl App {
             id,
             message: None,
             lines: Vec::new(),
+            rows: Vec::new(),
+            rows_width: None,
             request: effect_id(&fetch),
             scroll: 0,
         }));
@@ -327,6 +344,8 @@ impl App {
             }
         };
         pager.lines = text::pager_lines(&message);
+        pager.rows_width = None;
+        pager.layout(self.width);
         let message_id = message.summary.id.clone();
         pager.message = Some(message);
 
@@ -650,7 +669,8 @@ mod tests {
         let mut app = loaded(1);
         // 4 header lines and a blank line, 40 body lines; 20 visible rows.
         open(&mut app, 40);
-        let rows = text::wrap_all(&pager(&app).lines, 80).len();
+        let rows = pager(&app).rows.len();
+        assert_eq!(rows, text::wrap_all(&pager(&app).lines, 80).len());
         act(&mut app, Action::NextLine);
         act(&mut app, Action::NextPage);
         act(&mut app, Action::PreviousLine);
@@ -688,7 +708,8 @@ mod tests {
             id: fetch,
             event: Event::MessageFetched(Ok(message)),
         }));
-        let rows = text::wrap_all(&pager(&app).lines, 10).len();
+        let rows = pager(&app).rows.len();
+        assert_eq!(rows, text::wrap_all(&pager(&app).lines, 10).len());
         assert!(rows > 10);
         for _ in 0..rows {
             act(&mut app, Action::NextLine);

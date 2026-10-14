@@ -149,8 +149,16 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         frame.render_widget(Paragraph::new("Loading message..."), area);
         return "---mett: loading---".into();
     };
-    // Wrapped here, at the width being drawn, so no text is clipped.
-    let lines = wrap_all(&pager.lines, usize::from(area.width));
+    // The app keeps the message wrapped to the terminal width; wrap here
+    // only if the drawing area differs, so no text is clipped.
+    let width = usize::from(area.width);
+    let rewrapped;
+    let lines = if pager.rows_width == Some(width) {
+        &pager.rows
+    } else {
+        rewrapped = wrap_all(&pager.lines, width);
+        &rewrapped
+    };
     let height = usize::from(area.height);
     let last_top = lines.len().saturating_sub(height);
     let top = pager.scroll.min(last_top);

@@ -125,8 +125,11 @@ async fn run<S: mett_core::MailStore + 'static>(
 
     // Give pending changes (such as marking a message read) a moment to
     // reach the mailbox, rather than cancelling them by exiting.
+    // The outcome is reported after the terminal is restored, so a change
+    // that couldn't be saved isn't lost silently.
     if app.saving() {
-        app.status = "Saving changes...".into();
+        const SAVING: &str = "Saving changes...";
+        app.status = SAVING.into();
         terminal.draw(|frame| view::render(&app, &keymap, frame))?;
         let deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
         while app.saving() {
@@ -136,6 +139,17 @@ async fn run<S: mett_core::MailStore + 'static>(
                 }
                 Ok(None) | Err(_) => break,
             }
+        }
+        if app.saving() {
+            return Err(std::io::Error::other(
+                "gave up waiting for changes to be saved; some messages may still be unread",
+            ));
+        }
+        if app.status != SAVING {
+            return Err(std::io::Error::other(format!(
+                "could not save changes: {}",
+                app.status
+            )));
         }
     }
     Ok(())
