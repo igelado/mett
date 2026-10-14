@@ -1,0 +1,21 @@
+//! Domain model and ports for mett.
+//!
+//! This crate is the centre of mett's hexagonal architecture (see
+//! `docs/DESIGN.md`). It defines the types the rest of the application works
+//! with and the traits (ports) that adapters such as `mett-msgraph`
+//! implement. It performs no I/O and depends on no adapter.
+
+mod error;
+mod folder;
+mod ids;
+mod message;
+mod ports;
+
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
+
+pub use error::{Error, Result};
+pub use folder::{Folder, UnknownWellKnownFolder, WellKnownFolder};
+pub use ids::{AccountId, FolderId, MessageId, PageCursor};
+pub use message::{Address, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary};
+pub use ports::{AccessToken, Authenticator, MailStore, MessagePage, Page};

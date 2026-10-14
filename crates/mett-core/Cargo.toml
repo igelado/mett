@@ -1,0 +1,21 @@
+[package]
+name = "mett-core"
+description = "Domain model and ports (traits) for the mett mail client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# In-memory adapters for tests in this and other crates.
+mock = []
+
+[dependencies]
+chrono.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

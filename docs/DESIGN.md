@@ -59,7 +59,8 @@ I/O and talks to the UI over channels.
 
 ### 4.1 Workspace layout
 
-The project is a Cargo workspace. The crate boundaries enforce the layering:
+The project is a Cargo workspace, with each crate in `crates/<name>/`. The
+crate boundaries enforce the layering:
 a crate may only depend on crates below it in the diagram.
 
 | Crate          | Responsibility                                                     | Depends on                     |
@@ -105,6 +106,12 @@ Microsoft Graph, and a mock implementation is used in tests.
 - **Mitigation:** keep the ports shaped around what mett needs, not around a
   generic mail abstraction. Expose provider-specific features through optional
   extension traits.
+- **Implementation:** port methods are declared as
+  `fn …(&self, …) -> impl Future<Output = Result<…>> + Send`. Implementations
+  write plain `async fn`s, the futures can run on a multi-threaded runtime,
+  and no `async-trait` macro is needed. The worker uses the ports through
+  generics, not `dyn`. `mett-core`'s `mock` feature provides an in-memory
+  `MailStore` for tests in other crates.
 
 ### 5.2 Elm Architecture for the TUI
 

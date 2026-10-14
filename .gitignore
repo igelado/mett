@@ -21,3 +21,6 @@ CLAUDE.md
 *.tmp
 *.log
 tmp/
+
+# Rust build output
+target/
