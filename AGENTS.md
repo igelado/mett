@@ -19,6 +19,8 @@ where to store things, or similar project-wide conventions:
 - The design document lives in `docs/DESIGN.md`. Keep it up to date with
   design decisions.
 - Project documentation lives in `docs/`.
+- Each crate has a `README.md` describing what it does and how to test it,
+  including any manual testing (for example, against real services).
 - Configuration uses mutt's muttrc format. Extend it for Office365 only where
   the existing format is not enough (see `docs/CONFIG-OFFICE365.md`).
 - mett reads its own `mettrc` files, never mutt's muttrc files.

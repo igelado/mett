@@ -140,6 +140,8 @@ METT_ACCOUNT=alice@contoso.com METT_CLIENT_ID=<app-id> \
 
 Set `METT_FLOW=device` to use the device code flow instead of the browser,
 and `METT_CLOUD` (`usgov`, `usgov-dod` or `china`) for a national cloud.
+[crates/mett-msgraph/README.md](../crates/mett-msgraph/README.md) has step-by-step
+instructions and troubleshooting.
 
 ### 4.2 Authentication
 
