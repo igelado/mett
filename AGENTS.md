@@ -50,6 +50,10 @@ GitLab enforces this workflow:
 - An MR can be merged only if its pipeline succeeds. Skipped pipelines don't
   count as successful.
 - The source branch is deleted after merge by default.
+- An MR can be merged only when all review threads are resolved.
+- CI is defined in `.gitlab-ci.yml`. Its jobs run on the shared Linux Docker
+  runners (`os/linux`, `type/docker`, `size/medium`). Add new checks there,
+  so that they gate merging.
 
 ## Locally generated files
 
