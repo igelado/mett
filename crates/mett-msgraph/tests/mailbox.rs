@@ -446,7 +446,9 @@ async fn maps_graph_errors_to_port_errors() {
 async fn unsent_drafts_use_their_creation_time() {
     let server = MockServer::start().await;
     let mut draft = message("d1", "2026-10-14T10:00:00Z");
-    draft["sentDateTime"] = Value::Null;
+    // Graph may fill in a placeholder sent date for a draft.
+    draft["sentDateTime"] = json!("0001-01-01T00:00:00Z");
+    draft["isDraft"] = json!(true);
     draft["createdDateTime"] = json!("2026-10-10T08:00:00Z");
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/drafts-id/messages"))

@@ -25,7 +25,7 @@ use crate::settings::AuthSettings;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The message fields the index needs.
-const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isRead,flag,hasAttachments";
+const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments";
 
 /// A [`MailStore`] backed by Microsoft Graph.
 ///
@@ -594,8 +594,10 @@ struct GraphMessage {
     to_recipients: Vec<Recipient>,
     #[serde(default)]
     cc_recipients: Vec<Recipient>,
-    /// Missing for unsent drafts.
+    /// Missing, or a placeholder, for unsent drafts.
     sent_date_time: Option<String>,
+    #[serde(default)]
+    is_draft: bool,
     created_date_time: Option<String>,
     #[serde(default)]
     is_read: bool,
@@ -672,8 +674,10 @@ impl GraphMessage {
         // The date is when the message was sent, as in mutt's index, or for
         // an unsent draft, when it was created. It matches the listing's
         // sort order.
-        let timestamp = self
-            .sent_date_time
+        // Graph may give drafts a placeholder sent date (such as year 1),
+        // so drafts always use their creation date.
+        let sent = self.sent_date_time.filter(|_| !self.is_draft);
+        let timestamp = sent
             .or(self.created_date_time)
             .ok_or_else(|| Error::Backend("message has no timestamp".into()))?;
         let received = DateTime::parse_from_rfc3339(&timestamp)
