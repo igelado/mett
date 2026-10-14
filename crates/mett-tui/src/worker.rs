@@ -109,7 +109,8 @@ async fn resolve<S: MailStore>(store: &S, path: &FolderPath) -> Result<Folder> {
 }
 
 /// Walks down `names` from `start` (or the top of the mailbox). Names match
-/// exactly, or else ignoring case, as Office365 folder names do.
+/// exactly, or else ignoring case (in any script), as Office365 folder
+/// names do.
 async fn descend<S: MailStore>(
     store: &S,
     start: Option<Folder>,
@@ -122,7 +123,10 @@ async fn descend<S: MailStore>(
         let children = || folders.iter().filter(|f| f.parent.as_ref() == parent);
         let found = children()
             .find(|f| &f.name == name)
-            .or_else(|| children().find(|f| f.name.eq_ignore_ascii_case(name)))
+            .or_else(|| {
+                let name = name.to_lowercase();
+                children().find(|f| f.name.to_lowercase() == name)
+            })
             .ok_or_else(|| Error::NotFound {
                 kind: "folder",
                 id: names.join("/"),
@@ -150,6 +154,7 @@ mod tests {
             .with_folder(mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox)))
             .with_folder(child("proj", "Projects", "in"))
             .with_folder(child("mett", "mett", "proj"))
+            .with_folder(child("team", "équipe", "in"))
             .with_folder(mock::folder("arc", "Archive", None))
     }
 
@@ -168,6 +173,11 @@ mod tests {
         assert_eq!(
             resolve(&store, &nested).await.unwrap().id,
             FolderId::new("mett")
+        );
+        let accented = FolderPath::WellKnown(WellKnownFolder::Inbox, vec!["ÉQUIPE".into()]);
+        assert_eq!(
+            resolve(&store, &accented).await.unwrap().id,
+            FolderId::new("team")
         );
         let named = FolderPath::Named(vec!["Archive".into()]);
         assert_eq!(

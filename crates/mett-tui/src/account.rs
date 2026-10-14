@@ -97,8 +97,13 @@ pub fn auth_settings(config: &Config, url: &MailboxUrl) -> Result<AuthSettings, 
         .collect();
     let endpoint = config.string("msgraph_endpoint");
     if !endpoint.is_empty() {
-        settings.graph_url =
-            Some(Url::parse(endpoint).map_err(|e| format!("msgraph_endpoint: {e}"))?);
+        let url = Url::parse(endpoint).map_err(|e| format!("msgraph_endpoint: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+            return Err(format!(
+                "msgraph_endpoint: {endpoint:?} is not an http(s) URL"
+            ));
+        }
+        settings.graph_url = Some(url);
     }
     Ok(settings)
 }
@@ -215,6 +220,10 @@ mod tests {
         assert!(bad("set msgraph_client_id=a msgraph_cloud=mars\n").contains("msgraph_cloud"));
         assert!(bad("set msgraph_client_id=a msgraph_auth_flow=magic\n").contains("auth_flow"));
         assert!(bad("set msgraph_client_id=a msgraph_redirect_port=70000\n").contains("port"));
+        assert!(
+            bad("set msgraph_client_id=a msgraph_endpoint=mailto:x@example.com\n")
+                .contains("not an http(s) URL")
+        );
     }
 
     #[test]
