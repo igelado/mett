@@ -230,9 +230,11 @@ impl Config {
     fn execute(&mut self, command: Command, origin: &Origin<'_>) {
         let at = format!("{}:{}", origin.file.display(), command.line);
         let (name, args) = command.words.split_first().expect("commands are not empty");
-        let result = match self.expand(name) {
-            Err(e) => Err(e),
-            Ok(name) => match name.as_str() {
+        // Command names are taken literally, never expanded: deciding
+        // whether a command is supported must not run anything.
+        let result = match name.literal() {
+            None => Err("a command name can't contain $variables or backticks".to_owned()),
+            Some(name) => match name.as_str() {
                 "set" => self.set(args),
                 "unset" => self.each(args, |c, name| c.unset(name)),
                 "toggle" => self.each(args, |c, name| c.toggle(name)),
@@ -640,6 +642,15 @@ mod tests {
             "{:?}",
             config.warnings
         );
+    }
+
+    #[test]
+    fn command_names_are_never_expanded() {
+        let marker = std::env::temp_dir().join(format!("mett-cmd-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let config = load(&format!("`touch {}`x a b\n", marker.display()));
+        assert_eq!(config.errors.len(), 1, "{:?}", config.errors);
+        assert!(!marker.exists(), "the command name was expanded");
     }
 
     #[test]

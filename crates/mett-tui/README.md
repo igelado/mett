@@ -9,7 +9,7 @@ Architecture (`docs/DESIGN.md` §5.2):
   for each menu (the Command pattern, §5.3).
 - **`worker.rs`:** the background actor that owns all mailbox I/O (§5.4).
 - **`config/`:** reads `mettrc`, mutt's configuration format with mett's
-  extensions (`docs/CONFIG-OFFICE365.md`).
+  extensions ([docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md)).
 
 So far it can browse a mailbox: the message index and the pager. It isn't
 connected to Office365 yet; `--demo` opens a built-in sample mailbox.

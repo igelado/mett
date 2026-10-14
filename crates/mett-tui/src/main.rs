@@ -41,6 +41,7 @@ struct Options {
     files: config::Files,
     dump: bool,
     demo: bool,
+    version: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
@@ -55,6 +56,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-n" => options.files.no_system = true,
             "-D" => options.dump = true,
             "--demo" => options.demo = true,
+            "-v" | "--version" => options.version = true,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -66,10 +68,6 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if matches!(args.as_slice(), [flag] if flag == "--version" || flag == "-v") {
-        println!("mett {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
-    }
     let options = match parse_args(&args) {
         Ok(options) => options,
         Err(e) => {
@@ -77,6 +75,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if options.version {
+        println!("mett {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
 
     // The demo mailbox needs no configuration.
     if !options.demo {
