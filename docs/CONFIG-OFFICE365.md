@@ -138,7 +138,8 @@ METT_ACCOUNT=alice@contoso.com METT_CLIENT_ID=<app-id> \
     cargo run -p mett-msgraph --example signin
 ```
 
-Set `METT_FLOW=device` to use the device code flow instead of the browser.
+Set `METT_FLOW=device` to use the device code flow instead of the browser,
+and `METT_CLOUD` (`usgov`, `usgov-dod` or `china`) for a national cloud.
 
 ### 4.2 Authentication
 

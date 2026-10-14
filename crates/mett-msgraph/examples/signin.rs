@@ -9,6 +9,7 @@
 //!
 //! Optional variables:
 //! - `METT_TENANT`: overrides the tenant (default: the account's domain).
+//! - `METT_CLOUD`: `global` (default), `usgov`, `usgov-dod` or `china`.
 //! - `METT_FLOW=device`: uses the device code flow instead of the browser.
 //! - `METT_TOKEN_FILE`: stores the refresh token in this file instead of the
 //!   OS keyring.
@@ -41,6 +42,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client_id = env::var("METT_CLIENT_ID").map_err(|_| "set METT_CLIENT_ID")?;
     let mut settings = AuthSettings::new(account.into(), client_id);
     settings.tenant = env::var("METT_TENANT").ok();
+    if let Ok(cloud) = env::var("METT_CLOUD") {
+        settings.cloud = cloud.parse()?;
+    }
     if env::var("METT_FLOW").is_ok_and(|f| f == "device") {
         settings.flow = AuthFlow::DeviceCode;
     }
