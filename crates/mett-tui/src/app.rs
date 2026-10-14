@@ -223,6 +223,9 @@ impl App {
             // As in mutt, j and k in the pager show the next or previous
             // message.
             Action::NextEntry if self.selected + 1 >= self.messages.len() => {
+                if self.unlisted.is_some() {
+                    return self.retry_listing();
+                }
                 self.status = "You are on the last message.".into();
             }
             Action::PreviousEntry if self.selected == 0 => {
@@ -681,6 +684,40 @@ mod tests {
         }));
         assert_eq!(app.messages.len(), 3);
         assert!(!app.incomplete());
+    }
+
+    #[test]
+    fn the_pager_also_retries_a_failed_page() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(first, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: first,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: summaries(1),
+                next: Some(PageCursor::new("c")),
+            })),
+        }));
+        let Effect::Request(second, _) = effects[0].clone();
+        app.update(Msg::Response(Response {
+            id: second,
+            event: Event::MessagesListed(Err(Error::Network("offline".into()))),
+        }));
+
+        open(&mut app, 1);
+        let effects = act(&mut app, Action::NextEntry);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::ListMessages { .. })]
+            ),
+            "{effects:?}"
+        );
+        assert_eq!(app.status, "Loading more messages...");
     }
 
     #[test]
