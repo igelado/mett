@@ -103,6 +103,7 @@ async fn run<S: mett_core::MailStore + 'static>(
                         Some(action) => Msg::Action(action),
                         None => {
                             app.status = "Key is not bound.".into();
+                            // Restarts the loop, which redraws first.
                             continue;
                         }
                     }
