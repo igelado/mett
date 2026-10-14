@@ -34,7 +34,9 @@ impl Page {
     }
 
     /// The page that starts at `cursor`, with up to `size` items (at least
-    /// one).
+    /// one). A listing keeps the size it started with: backends that page
+    /// with opaque continuation links (such as Microsoft Graph) may ignore
+    /// a different `size` here.
     pub fn after(cursor: PageCursor, size: u32) -> Self {
         Self {
             size: size.max(1),

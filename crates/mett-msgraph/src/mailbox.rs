@@ -28,6 +28,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isRead,flag,hasAttachments";
 
 /// A [`MailStore`] backed by Microsoft Graph.
+///
+/// Messages are dated and sorted by when they were sent; unsent drafts use
+/// their creation date. Graph can only sort by one field at a time, so in
+/// a folder that mixes unsent drafts with other mail, the drafts are
+/// grouped together rather than interleaved by date. Drafts normally live
+/// only in the Drafts folder, where they all sort by creation date.
 pub struct GraphMailStore<A> {
     http: reqwest::Client,
     /// The Graph v1.0 root, for example `https://graph.microsoft.com/v1.0/`.
@@ -312,9 +318,9 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
                     .ok_or_else(|| {
                         Error::Backend(format!("page cursor is not for folder {folder}"))
                     })?;
-                let mut url = self.next_page_url(link)?;
-                set_query(&mut url, "$top", &top_for(&page));
-                url
+                // Graph's continuation links must be replayed unchanged, so
+                // the page keeps the size the listing started with.
+                self.next_page_url(link)?
             }
             None => {
                 let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
@@ -453,20 +459,6 @@ fn top_for(page: &Page) -> String {
     page.size().min(MAX_PAGE_SIZE).to_string()
 }
 
-/// Sets `key` in `url`'s query, replacing any existing value.
-fn set_query(url: &mut Url, key: &str, value: &str) {
-    let pairs: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(k, _)| k != key)
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    url.query_pairs_mut()
-        .clear()
-        .extend_pairs(pairs)
-        .append_pair(key, value);
-}
-
-/// Maps an unsuccessful Graph response to a port error.
 /// The object a request concerns.
 #[derive(Clone, Copy)]
 struct About<'a> {
@@ -492,6 +484,7 @@ impl<'a> About<'a> {
     }
 }
 
+/// Maps an unsuccessful Graph response to a port error.
 async fn error_from(response: reqwest::Response, about: About<'_>) -> Error {
     let status = response.status();
     let retry_after = response

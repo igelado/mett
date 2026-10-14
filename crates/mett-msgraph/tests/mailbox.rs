@@ -199,12 +199,12 @@ async fn lists_nested_folders() {
 }
 
 #[tokio::test]
-async fn later_pages_use_the_requested_size() {
+async fn later_pages_replay_graphs_link_unchanged() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
         .and(query_param("$skip", "10"))
-        .and(query_param("$top", "3"))
+        .and(query_param("$top", "10"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
         .expect(1)
         .mount(&server)
@@ -213,6 +213,7 @@ async fn later_pages_use_the_requested_size() {
         "inbox-id {}/v1.0/me/mailFolders/inbox-id/messages?$top=10&$skip=10",
         server.uri()
     ));
+    // A different size doesn't alter Graph's continuation link.
     store(&server)
         .list_messages(&FolderId::new("inbox-id"), Page::after(cursor, 3))
         .await
