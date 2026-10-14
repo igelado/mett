@@ -185,6 +185,10 @@ fn html_to_text(html: &str) -> String {
             .next()
             .unwrap_or("");
         match name {
+            // Separate table cells, so they don't run together.
+            "td" | "th" if !tag.starts_with('/') && !out.is_empty() && !out.ends_with('\n') => {
+                out.push('\t');
+            }
             "script" | "style" if !tag.starts_with('/') => {
                 let close = format!("</{name}");
                 rest = find_ignore_case(rest, &close)
@@ -321,6 +325,14 @@ mod tests {
         assert_eq!(
             html(r#"<p><a title="a>b" data-x='>'>Link</a></p>"#),
             ["Link"]
+        );
+    }
+
+    #[test]
+    fn html_table_cells_stay_apart() {
+        assert_eq!(
+            html("<table><tr><td>Alice</td><td>Bob</td></tr><tr><th>Carol</th></tr></table>"),
+            ["Alice   Bob", "Carol"]
         );
     }
 

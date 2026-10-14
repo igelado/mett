@@ -134,8 +134,13 @@ async fn run<S: mett_core::MailStore + 'static>(
         let deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
         while app.saving() {
             match tokio::time::timeout_at(deadline, response_rx.recv()).await {
+                // Only save results matter now. Anything else (say, a late
+                // message fetch) could start new work that would never be
+                // sent.
                 Ok(Some(response)) => {
-                    app.update(Msg::Response(response));
+                    if matches!(response.event, worker::Event::FlagsUpdated(_)) {
+                        app.update(Msg::Response(response));
+                    }
                 }
                 Ok(None) | Err(_) => break,
             }
