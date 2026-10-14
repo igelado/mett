@@ -233,7 +233,7 @@ mod tests {
         let Effect::Request(open, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
             id: open,
-            event: Event::InboxOpened(Ok(mock::folder(
+            event: Event::FolderOpened(Ok(mock::folder(
                 "in",
                 "Inbox",
                 Some(WellKnownFolder::Inbox),

@@ -1691,10 +1691,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "mett-core",
+ "mett-msgraph",
+ "open",
  "ratatui",
+ "reqwest",
  "tokio",
  "unicode-segmentation",
  "unicode-width",
+ "url",
 ]
 
 [[package]]

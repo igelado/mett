@@ -11,8 +11,9 @@ Architecture (`docs/DESIGN.md` §5.2):
 - **`config/`:** reads `mettrc`, mutt's configuration format with mett's
   extensions ([docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md)).
 
-So far it can browse a mailbox: the message index and the pager. It isn't
-connected to Office365 yet; `--demo` opens a built-in sample mailbox.
+So far it can browse a mailbox: the message index and the pager. It opens
+the Office365 folder set in `spoolfile`, signing in first if needed
+(`account.rs`); `--demo` opens a built-in sample mailbox instead.
 
 ## Automated tests
 
@@ -55,6 +56,24 @@ quick way to check it:
 ```sh
 cargo run -p mett-tui -- -D
 ```
+
+## Trying it with an Office365 account
+
+With an app registered (see `crates/mett-msgraph/README.md`) and a mettrc as
+above:
+
+```sh
+cargo run -p mett-tui            # or: -- -n -F path/to/mettrc
+```
+
+mett signs in before the interface starts, so the browser link or device
+code appears in the terminal; later runs reuse the stored refresh token.
+Check that the index lists the folder's messages, newest first, and that
+opening an unread one marks it read in Outlook too.
+
+Known limitation: if mett needs a new interactive sign-in while the
+interface is running (for example, the refresh token was revoked), the
+prompt is written over the screen. Quit and start mett again to sign in.
 
 ## Trying it by hand
 

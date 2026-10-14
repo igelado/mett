@@ -8,11 +8,12 @@
 
 use std::sync::Arc;
 
-use mett_core::FolderId;
 use mett_core::{
-    FlagsUpdate, Folder, MailStore, Message, MessageId, MessagePage, Page, Result, WellKnownFolder,
+    Error, FlagsUpdate, Folder, FolderId, MailStore, Message, MessageId, MessagePage, Page, Result,
 };
 use tokio::sync::mpsc;
+
+use crate::config::mailbox::FolderPath;
 
 /// Identifies a request, so its response can be matched to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -21,8 +22,8 @@ pub struct RequestId(pub u64);
 /// Work for the worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
-    /// Find the Inbox.
-    OpenInbox,
+    /// Find a folder by its path in the mailbox.
+    OpenFolder(FolderPath),
     /// List a page of messages in a folder.
     ListMessages {
         /// The folder.
@@ -39,8 +40,8 @@ pub enum Request {
 /// The outcome of a [`Request`].
 #[derive(Debug)]
 pub enum Event {
-    /// Outcome of [`Request::OpenInbox`].
-    InboxOpened(Result<Folder>),
+    /// Outcome of [`Request::OpenFolder`].
+    FolderOpened(Result<Folder>),
     /// Outcome of [`Request::ListMessages`].
     MessagesListed(Result<MessagePage>),
     /// Outcome of [`Request::FetchMessage`].
@@ -78,9 +79,7 @@ pub async fn run<S: MailStore + 'static>(
 
 async fn serve<S: MailStore>(store: &S, request: Request) -> Event {
     match request {
-        Request::OpenInbox => {
-            Event::InboxOpened(store.well_known_folder(WellKnownFolder::Inbox).await)
-        }
+        Request::OpenFolder(path) => Event::FolderOpened(resolve(store, &path).await),
         Request::ListMessages { folder, page } => {
             Event::MessagesListed(store.list_messages(&folder, page).await)
         }
@@ -91,12 +90,108 @@ async fn serve<S: MailStore>(store: &S, request: Request) -> Event {
     }
 }
 
+/// Finds the folder at `path`: a well-known folder, possibly followed by
+/// names of folders below it, or names from the top of the mailbox.
+async fn resolve<S: MailStore>(store: &S, path: &FolderPath) -> Result<Folder> {
+    match path {
+        FolderPath::Root => Err(Error::Backend(
+            "the mailbox itself isn't a folder; choose one, such as @inbox".into(),
+        )),
+        FolderPath::WellKnown(which, rest) => {
+            let start = store.well_known_folder(*which).await?;
+            if rest.is_empty() {
+                return Ok(start);
+            }
+            descend(store, Some(start), rest).await
+        }
+        FolderPath::Named(names) => descend(store, None, names).await,
+    }
+}
+
+/// Walks down `names` from `start` (or the top of the mailbox). Names match
+/// exactly, or else ignoring case (in any script), as Office365 folder
+/// names do.
+async fn descend<S: MailStore>(
+    store: &S,
+    start: Option<Folder>,
+    names: &[String],
+) -> Result<Folder> {
+    let folders = store.list_folders().await?;
+    let mut current = start;
+    for name in names {
+        let parent = current.as_ref().map(|f| &f.id);
+        let children = || folders.iter().filter(|f| f.parent.as_ref() == parent);
+        let found = children()
+            .find(|f| &f.name == name)
+            .or_else(|| {
+                let name = name.to_lowercase();
+                children().find(|f| f.name.to_lowercase() == name)
+            })
+            .ok_or_else(|| Error::NotFound {
+                kind: "folder",
+                id: names.join("/"),
+            })?;
+        current = Some(found.clone());
+    }
+    current.ok_or_else(|| Error::not_found("folder", names.join("/")))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
+    use mett_core::WellKnownFolder;
     use mett_core::mock::{self, MemoryStore};
 
     use super::*;
+
+    fn tree() -> MemoryStore {
+        let child = |id: &str, name: &str, parent: &str| {
+            let mut folder = mock::folder(id, name, None);
+            folder.parent = Some(FolderId::new(parent));
+            folder
+        };
+        MemoryStore::new()
+            .with_folder(mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox)))
+            .with_folder(child("proj", "Projects", "in"))
+            .with_folder(child("mett", "mett", "proj"))
+            .with_folder(child("team", "équipe", "in"))
+            .with_folder(mock::folder("arc", "Archive", None))
+    }
+
+    #[tokio::test]
+    async fn resolves_folder_paths() {
+        let store = tree();
+        let inbox = || FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        assert_eq!(
+            resolve(&store, &inbox()).await.unwrap().id,
+            FolderId::new("in")
+        );
+        let nested = FolderPath::WellKnown(
+            WellKnownFolder::Inbox,
+            vec!["projects".into(), "mett".into()],
+        );
+        assert_eq!(
+            resolve(&store, &nested).await.unwrap().id,
+            FolderId::new("mett")
+        );
+        let accented = FolderPath::WellKnown(WellKnownFolder::Inbox, vec!["ÉQUIPE".into()]);
+        assert_eq!(
+            resolve(&store, &accented).await.unwrap().id,
+            FolderId::new("team")
+        );
+        let named = FolderPath::Named(vec!["Archive".into()]);
+        assert_eq!(
+            resolve(&store, &named).await.unwrap().id,
+            FolderId::new("arc")
+        );
+        // A name is looked up only below its parent.
+        let wrong = FolderPath::Named(vec!["Projects".into()]);
+        assert!(matches!(
+            resolve(&store, &wrong).await,
+            Err(Error::NotFound { kind: "folder", .. })
+        ));
+        assert!(resolve(&store, &FolderPath::Root).await.is_err());
+    }
 
     #[tokio::test]
     async fn answers_each_request_with_its_id() {
@@ -107,10 +202,13 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::unbounded_channel();
         tokio::spawn(run(Arc::new(store), request_rx, response_tx));
 
-        request_tx.send((RequestId(1), Request::OpenInbox)).unwrap();
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        request_tx
+            .send((RequestId(1), Request::OpenFolder(inbox)))
+            .unwrap();
         let response = response_rx.recv().await.unwrap();
         assert_eq!(response.id, RequestId(1));
-        assert!(matches!(response.event, Event::InboxOpened(Ok(f)) if f.name == "Inbox"));
+        assert!(matches!(response.event, Event::FolderOpened(Ok(f)) if f.name == "Inbox"));
 
         request_tx
             .send((RequestId(2), Request::FetchMessage("m1".into())))

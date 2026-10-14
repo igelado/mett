@@ -5,6 +5,7 @@
 //! worker responses into a new state plus [`Effect`]s, effects go to the
 //! [`worker`], and [`view::render`] draws the state.
 
+mod account;
 mod action;
 mod app;
 mod config;
@@ -22,6 +23,7 @@ use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
 use crate::app::{App, Effect, Msg};
+use crate::config::mailbox::FolderPath;
 use crate::keymap::{Key, Keymap};
 use crate::worker::{Request, RequestId};
 
@@ -33,7 +35,7 @@ const USAGE: &str = "usage: mett [-n] [-F <file>] [-D] [--demo]
   --demo     open a built-in sample mailbox
   -v         print the version
 
-mett can't open an Office365 mailbox yet; --demo shows the interface.";
+mett opens the mailbox set in spoolfile (see docs/CONFIG-OFFICE365.md).";
 
 /// What the command line asks for.
 #[derive(Debug, Default)]
@@ -109,26 +111,61 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        if config.string("msgraph_client_id").is_empty() {
-            eprintln!(
-                "mett: msgraph_client_id is not set; see crates/mett-msgraph/README.md to register an app"
-            );
+        let page_size = match config.get("msgraph_page_size") {
+            Some(config::Value::Number(n)) if *n > 0 => match u32::try_from(*n) {
+                Ok(size) => size,
+                Err(_) => {
+                    eprintln!("mett: msgraph_page_size {n} is too large");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => {
+                eprintln!("mett: msgraph_page_size must be a positive number");
+                return ExitCode::FAILURE;
+            }
+        };
+        let Some(runtime) = runtime() else {
             return ExitCode::FAILURE;
-        }
-        eprintln!("mett: opening {spoolfile} isn't available yet; try mett --demo");
-        return ExitCode::FAILURE;
+        };
+        // Sign in before the TUI takes over the terminal, so that the
+        // browser link or device code can be seen.
+        let mailbox = match runtime.block_on(account::connect(&config, &spoolfile)) {
+            Ok(mailbox) => mailbox,
+            Err(e) => {
+                eprintln!("mett: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return start(&runtime, Arc::new(mailbox), spoolfile.folder, page_size);
     }
 
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
+    let Some(runtime) = runtime() else {
+        return ExitCode::FAILURE;
+    };
+    let inbox = FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new());
+    start(&runtime, Arc::new(demo::mailbox()), inbox, app::PAGE_SIZE)
+}
+
+fn runtime() -> Option<tokio::runtime::Runtime> {
+    match tokio::runtime::Runtime::new() {
+        Ok(runtime) => Some(runtime),
         Err(e) => {
             eprintln!("mett: cannot start: {e}");
-            return ExitCode::FAILURE;
+            None
         }
-    };
+    }
+}
+
+/// Runs the TUI on `store`, opening `folder`.
+fn start<S: mett_core::MailStore + 'static>(
+    runtime: &tokio::runtime::Runtime,
+    store: Arc<S>,
+    folder: FolderPath,
+    page_size: u32,
+) -> ExitCode {
     // `init` also restores the terminal if mett panics.
     let terminal = ratatui::init();
-    let result = runtime.block_on(run(terminal, Arc::new(demo::mailbox())));
+    let result = runtime.block_on(run(terminal, store, folder, page_size));
     ratatui::restore();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -142,6 +179,8 @@ fn main() -> ExitCode {
 async fn run<S: mett_core::MailStore + 'static>(
     mut terminal: DefaultTerminal,
     store: Arc<S>,
+    folder: FolderPath,
+    page_size: u32,
 ) -> std::io::Result<()> {
     let keymap = Keymap::mutt_defaults();
 
@@ -163,7 +202,7 @@ async fn run<S: mett_core::MailStore + 'static>(
     });
 
     let size = terminal.size()?;
-    let (mut app, effects) = App::new(size.width, size.height);
+    let (mut app, effects) = App::open(size.width, size.height, folder, page_size);
     dispatch(&request_tx, effects);
 
     while !app.quit {

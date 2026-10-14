@@ -1,8 +1,9 @@
 # Configuring Office365 accounts in mett
 
 Status: **partly implemented.** mett reads mettrc files (§1) with `set`,
-`unset`, `toggle`, `reset` and `source`, knows the variables in §4, and
-parses `msgraph://` URLs (§3) without the Focused Inbox views. Everything
+`unset`, `toggle`, `reset` and `source`, and opens the `msgraph://` folder
+in `spoolfile` (§3, without the Focused Inbox views), signing in with the
+§4.1–4.3 variables (except `msgraph_oauth_refresh_command`). Everything
 else is still a proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc
@@ -114,7 +115,7 @@ convention. Like other mutt variables, they can be set per account from an
 | `msgraph_client_id` | string | *(none, required)* | Application (client) ID of the user's Entra ID (Azure AD) app registration. mett refuses to open a `msgraph://` account without it. |
 | `msgraph_tenant` | string | *(domain of the account)* | Tenant used to sign in: a domain, a tenant GUID, `organizations`, `common` or `consumers`. The default, for example `contoso.com` for `msgraph://alice@contoso.com/`, works for both single-tenant and multi-tenant apps, provided the domain is verified in the tenant. Single-tenant apps can't use `organizations` or `common`, because Entra ID rejects them (error AADSTS50194). |
 | `msgraph_cloud` | string | `global` | `global`, `usgov`, `usgov-dod` or `china`. Selects the login and Graph endpoints. |
-| `msgraph_endpoint` | string | *(from `msgraph_cloud`)* | Overrides the Graph base URL, for testing or proxies. |
+| `msgraph_endpoint` | string | *(from `msgraph_cloud`)* | Overrides the Graph base URL, for testing or proxies. Must be `https`, except on this machine (`localhost`, loopback addresses). |
 
 #### Registering the app
 
@@ -153,7 +154,7 @@ instructions and troubleshooting.
 | `msgraph_auth_flow` | string | `auth-code` | `auth-code` (authorization code with PKCE, through the system browser and a loopback redirect) or `device-code` (for headless or SSH sessions). |
 | `msgraph_redirect_port` | number | `0` | Loopback port for `auth-code`. `0` picks a free port. |
 | `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. `User.Read` is required: after every sign-in and token refresh, mett reads the user principal name from Graph's `/me` and rejects the tokens unless it is this account. |
-| `msgraph_oauth_refresh_command` | string | `""` | When set, mett runs this command to obtain an access token instead of using its built-in OAuth2. This mirrors `imap_oauth_refresh_command`, so existing helper scripts can be reused. |
+| `msgraph_oauth_refresh_command` | string | `""` | When set, mett runs this command to obtain an access token instead of using its built-in OAuth2. This mirrors `imap_oauth_refresh_command`, so existing helper scripts can be reused. *Not supported yet: mett refuses to start when it is set.* |
 
 ### 4.3 Token storage
 
