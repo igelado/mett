@@ -130,6 +130,16 @@ The app registration needs:
   `msgraph_scopes`. An administrator may need to grant consent, depending on
   the tenant's policy.
 
+To check a registration before using mett, run the sign-in example. It signs
+in and prints the signed-in user:
+
+```sh
+METT_ACCOUNT=alice@contoso.com METT_CLIENT_ID=<app-id> \
+    cargo run -p mett-msgraph --example signin
+```
+
+Set `METT_FLOW=device` to use the device code flow instead of the browser.
+
 ### 4.2 Authentication
 
 | Variable | Type | Default | Description |
