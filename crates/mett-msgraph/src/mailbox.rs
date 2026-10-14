@@ -115,12 +115,24 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// Sends `request` for `about` (the object it concerns, named in a
     /// "not found" error).
     async fn send(&self, request: RequestBuilder, about: About<'_>) -> Result<reqwest::Response> {
+        self.send_with_token(request, about)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Like [`Self::send`], also returning the token the response was
+    /// obtained with.
+    async fn send_with_token(
+        &self,
+        request: RequestBuilder,
+        about: About<'_>,
+    ) -> Result<(reqwest::Response, AccessToken)> {
         let token = self.auth.access_token().await?;
         // Kept for a retry; JSON bodies can always be cloned.
         let retry = request.try_clone();
         let response = Self::attempt(request, &token).await?;
         if response.status() != StatusCode::UNAUTHORIZED {
-            return Self::checked(response, about).await;
+            return Ok((Self::checked(response, about).await?, token));
         }
         // Graph rejected a token that hadn't expired (it may have been
         // revoked): get a new one and try once more.
@@ -133,9 +145,9 @@ impl<A: Authenticator> GraphMailStore<A> {
                     // Rejected too: don't let the next request reuse it.
                     self.auth.token_rejected(&fresh).await;
                 }
-                Self::checked(response, about).await
+                Ok((Self::checked(response, about).await?, fresh))
             }
-            _ => Self::checked(response, about).await,
+            _ => Ok((Self::checked(response, about).await?, token)),
         }
     }
 
@@ -220,11 +232,12 @@ impl<A: Authenticator> GraphMailStore<A> {
             .collect();
         // Like other requests, retry once if Graph rejects the token, which
         // it reports inside the batch rather than on the response.
-        let mut batch = self.batch(&requests).await?;
+        // The token each batch was sent with is the one to reject: another
+        // request may have refreshed the cached token in the meantime.
+        let (mut batch, mut token) = self.batch(&requests).await?;
         if batch.responses.iter().any(|r| r.status == 401) {
-            let token = self.auth.access_token().await?;
             self.auth.token_rejected(&token).await;
-            batch = self.batch(&requests).await?;
+            (batch, token) = self.batch(&requests).await?;
         }
 
         let mut roles = Roles::default();
@@ -244,7 +257,6 @@ impl<A: Authenticator> GraphMailStore<A> {
                     if response.status == 401 {
                         // Rejected again: make sure the next request gets a
                         // new token.
-                        let token = self.auth.access_token().await?;
                         self.auth.token_rejected(&token).await;
                     }
                     return Err(Error::Auth(format!(
@@ -285,13 +297,19 @@ impl<A: Authenticator> GraphMailStore<A> {
 }
 
 impl<A: Authenticator> GraphMailStore<A> {
-    async fn batch(&self, requests: &[serde_json::Value]) -> Result<BatchResponse> {
-        self.json(
-            self.request(Method::POST, self.url(&["$batch"]))
-                .json(&json!({ "requests": requests })),
-            About::MAILBOX,
-        )
-        .await
+    /// Sends a `$batch` and returns its responses with the token used.
+    async fn batch(&self, requests: &[serde_json::Value]) -> Result<(BatchResponse, AccessToken)> {
+        let request = self
+            .request(Method::POST, self.url(&["$batch"]))
+            .json(&json!({ "requests": requests }));
+        let (response, token) = self.send_with_token(request, About::MAILBOX).await?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
+        let batch = serde_json::from_slice(&body)
+            .map_err(|e| Error::Backend(format!("unexpected response from Graph: {e}")))?;
+        Ok((batch, token))
     }
 }
 
