@@ -1,0 +1,38 @@
+# Minimal CI. MRs can only be merged when this pipeline succeeds (see AGENTS.md).
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+default:
+  tags: [os/linux, type/docker, size/medium]
+
+stages: [check]
+
+# Fails if a Markdown file links to a relative path that does not exist.
+docs:
+  stage: check
+  image: alpine:3.20
+  script:
+    - |
+      status=0
+      for f in $(find . -name '*.md' -not -path './.git/*' -not -path './target/*'); do
+        for link in $(grep -oE '\]\([^)#:[:space:]]+(#[^)]*)?\)' "$f" | sed -E 's/^\]\(//; s/\)$//; s/#.*//'); do
+          [ -e "$(dirname "$f")/$link" ] || { echo "$f: broken link: $link"; status=1; }
+        done
+      done
+      exit $status
+
+rust:
+  stage: check
+  image: rust:1.95
+  rules:
+    - exists: [Cargo.toml]
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+    - cargo test --workspace
