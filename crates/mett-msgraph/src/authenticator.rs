@@ -33,6 +33,20 @@ struct State {
     access: Option<AccessToken>,
     refresh: Option<String>,
     loaded: bool,
+    /// Tokens from an interactive sign-in whose user could not be confirmed
+    /// yet (for example, Graph was briefly unavailable). They are neither
+    /// used nor stored until the check succeeds, but keeping them avoids
+    /// asking the user to sign in again.
+    unconfirmed: Option<Tokens>,
+}
+
+/// The outcome of checking which user an interactive sign-in was for.
+enum Identity {
+    Confirmed,
+    /// Definitely another user: discard the tokens.
+    Mismatch(mett_core::Error),
+    /// Could not tell yet: keep the tokens and retry later.
+    Unknown(mett_core::Error),
 }
 
 impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
@@ -83,15 +97,29 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
     /// another mailbox under this account's name. Refreshed tokens don't need
     /// the check: they belong to the same user as the refresh token, which
     /// was checked when it was issued.
-    async fn check_identity(&self, tokens: &Tokens) -> Result<()> {
+    async fn check_identity(&self, tokens: &Tokens) -> Identity {
         let expected = self.settings.account.as_str();
-        let user = oauth::user_principal_name(&self.http, &self.settings, &tokens.access).await?;
-        if user.eq_ignore_ascii_case(expected) {
-            Ok(())
-        } else {
-            Err(mett_core::Error::Auth(format!(
+        match oauth::user_principal_name(&self.http, &self.settings, &tokens.access).await {
+            Ok(user) if user.eq_ignore_ascii_case(expected) => Identity::Confirmed,
+            Ok(user) => Identity::Mismatch(mett_core::Error::Auth(format!(
                 "signed in as {user}, but the account is {expected}"
-            )))
+            ))),
+            Err(e) => Identity::Unknown(mett_core::Error::Auth(format!(
+                "could not confirm that the sign-in was for {expected}: {e}"
+            ))),
+        }
+    }
+
+    /// Accepts `tokens` from an interactive sign-in once their user is
+    /// confirmed, or keeps them as unconfirmed if that is not possible yet.
+    async fn confirm(&self, state: &mut State, tokens: Tokens) -> Result<AccessToken> {
+        match self.check_identity(&tokens).await {
+            Identity::Confirmed => self.keep(state, tokens).await,
+            Identity::Mismatch(e) => Err(e),
+            Identity::Unknown(e) => {
+                state.unconfirmed = Some(tokens);
+                Err(e)
+            }
         }
     }
 
@@ -114,10 +142,18 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
     async fn access_token(&self) -> Result<AccessToken> {
         let mut state = self.state.lock().await;
 
+        let now = Utc::now();
         if let Some(token) = &state.access
-            && !token.expires_within(EXPIRY_MARGIN, Utc::now())
+            && !token.expires_within(EXPIRY_MARGIN, now)
         {
             return Ok(token.clone());
+        }
+
+        // Retry confirming a previous sign-in before asking for a new one.
+        if let Some(tokens) = state.unconfirmed.take()
+            && !tokens.access.expires_within(TimeDelta::zero(), now)
+        {
+            return self.confirm(&mut state, tokens).await;
         }
 
         if !state.loaded {
@@ -136,13 +172,21 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                     let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
                     blocking(move || store.clear(&account)).await?;
                 }
-                Err(e) => return Err(e.into()),
+                // A transient failure: keep the refresh token, and use the
+                // cached access token while it is still valid.
+                Err(e) => {
+                    return match &state.access {
+                        Some(token) if !token.expires_within(TimeDelta::zero(), now) => {
+                            Ok(token.clone())
+                        }
+                        _ => Err(e.into()),
+                    };
+                }
             }
         }
 
         let tokens = self.sign_in().await?;
-        self.check_identity(&tokens).await?;
-        self.keep(&mut state, tokens).await
+        self.confirm(&mut state, tokens).await
     }
 }
 

@@ -362,3 +362,68 @@ async fn sign_out_forgets_the_refresh_token() {
     auth.sign_out().await.unwrap();
     assert_eq!(stored(&store), None);
 }
+
+#[tokio::test]
+async fn uses_a_still_valid_token_when_refresh_fails_transiently() {
+    let server = MockServer::start().await;
+    // The first refresh issues a token inside the 5-minute refresh margin…
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a-short",
+            "refresh_token": "r1",
+            "expires_in": 120,
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // …and the next refresh fails transiently.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("temporarily_unavailable"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
+}
+
+#[tokio::test]
+async fn retries_confirming_the_user_without_signing_in_again() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a4").await;
+    // Graph is briefly unavailable, then confirms the user.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    me(&server, "a4", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    let prompts = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&prompts);
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, move |_| {
+        *counted.lock().unwrap() += 1
+    });
+
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    // Unconfirmed tokens are not stored.
+    assert_eq!(stored(&store), None);
+
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a4");
+    assert_eq!(stored(&store).as_deref(), Some("r-new"));
+    assert_eq!(*prompts.lock().unwrap(), 1, "signed in only once");
+}
