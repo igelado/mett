@@ -97,7 +97,8 @@ impl FlowError {
     /// `temporarily_unavailable`, leave the refresh token valid.
     pub(crate) fn needs_sign_in(&self) -> bool {
         matches!(self, Self::OAuth { code, .. }
-            if code == "invalid_grant" || code == "interaction_required")
+            if matches!(code.as_str(),
+                "invalid_grant" | "interaction_required" | "consent_required" | "login_required"))
     }
 
     /// Whether retrying the same request later may succeed: the identity

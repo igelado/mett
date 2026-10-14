@@ -127,6 +127,11 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
+    async fn sign_in_and_confirm(&self, state: &mut State) -> Result<AccessToken> {
+        let tokens = self.sign_in().await?;
+        self.confirm(state, tokens).await
+    }
+
     /// Caches `tokens` and stores a new refresh token if one was issued.
     ///
     /// The tokens are kept in memory first, so that if storing the refresh
@@ -160,9 +165,30 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         }
 
         // Retry confirming a previous sign-in before asking for a new one.
-        if let Some(tokens) = state.unconfirmed.take()
-            && !tokens.access.expires_within(TimeDelta::zero(), now)
-        {
+        if let Some(mut tokens) = state.unconfirmed.take() {
+            if tokens.access.expires_within(TimeDelta::zero(), now) {
+                // The access token expired before the user could be
+                // confirmed: get a fresh one with the sign-in's refresh token
+                // and confirm with that.
+                let Some(refresh) = tokens.refresh.clone() else {
+                    return self.sign_in_and_confirm(&mut state).await;
+                };
+                match oauth::refresh(&self.http, &self.settings, &refresh).await {
+                    Ok(fresh) => {
+                        tokens = Tokens {
+                            refresh: fresh.refresh.or(Some(refresh)),
+                            ..fresh
+                        };
+                    }
+                    Err(e) if e.needs_sign_in() => {
+                        return self.sign_in_and_confirm(&mut state).await;
+                    }
+                    Err(e) => {
+                        state.unconfirmed = Some(tokens);
+                        return Err(e.into());
+                    }
+                }
+            }
             let token = self.confirm(&mut state, tokens).await?;
             // The check may have taken a while; if the token expired in the
             // meantime, continue with the confirmed refresh token below.
@@ -202,8 +228,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             }
         }
 
-        let tokens = self.sign_in().await?;
-        self.confirm(&mut state, tokens).await
+        self.sign_in_and_confirm(&mut state).await
     }
 }
 

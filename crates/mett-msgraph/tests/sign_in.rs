@@ -518,3 +518,72 @@ async fn keeps_polling_after_a_transient_device_code_poll_failure() {
 
     assert_eq!(auth.access_token().await.unwrap().secret(), "a7");
 }
+
+#[tokio::test]
+async fn signs_in_again_when_the_refresh_token_needs_consent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(oauth_error("consent_required"))
+        .mount(&server)
+        .await;
+    device_sign_in(&server, "a8").await;
+    me(&server, "a8", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "needs-consent").unwrap();
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, |_| {});
+
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a8");
+    assert_eq!(stored(&store).as_deref(), Some("r-new"));
+}
+
+#[tokio::test]
+async fn confirms_with_a_refreshed_token_after_the_unconfirmed_one_expires() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    // The sign-in issues an access token that is already expired…
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("device_code=dev-code"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a-old",
+            "refresh_token": "r-signin",
+            "expires_in": 0,
+        })))
+        .mount(&server)
+        .await;
+    // …Graph can't confirm the user with it…
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .and(header("authorization", "Bearer a-old"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    // …so the next call refreshes with the sign-in's refresh token and
+    // confirms with the new access token.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-signin"))
+        .respond_with(tokens("a-fresh", "r-fresh"))
+        .mount(&server)
+        .await;
+    me(&server, "a-fresh", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    let prompts = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&prompts);
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, move |_| {
+        *counted.lock().unwrap() += 1
+    });
+
+    assert!(auth.access_token().await.is_err());
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-fresh");
+    assert_eq!(stored(&store).as_deref(), Some("r-fresh"));
+    assert_eq!(*prompts.lock().unwrap(), 1);
+}

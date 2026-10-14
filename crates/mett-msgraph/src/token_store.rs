@@ -4,6 +4,7 @@
 //! obtained from it on start-up.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -110,18 +111,14 @@ impl FileStore {
 
     /// The default `msgraph_token_file` for `account`:
     /// `$XDG_STATE_HOME/mett/<account>.tokens`, where `XDG_STATE_HOME`
-    /// defaults to `~/.local/state`. Returns `None` if neither
-    /// `XDG_STATE_HOME` nor `HOME` is set.
+    /// defaults to `~/.local/state` when it is unset or relative. Returns
+    /// `None` if there is neither a usable `XDG_STATE_HOME` nor a `HOME`.
     pub fn default_path(account: &AccountId) -> Option<PathBuf> {
-        let state = std::env::var_os("XDG_STATE_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .filter(|v| !v.is_empty())
-                    .map(|home| Path::new(&home).join(".local/state"))
-            })?;
-        Some(state.join("mett").join(format!("{account}.tokens")))
+        default_path_in(
+            account,
+            std::env::var_os("XDG_STATE_HOME"),
+            std::env::var_os("HOME"),
+        )
     }
 
     fn read(&self) -> Result<TokenFile, TokenStoreError> {
@@ -222,6 +219,22 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+fn default_path_in(
+    account: &AccountId,
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    // The XDG Base Directory spec says to ignore relative values.
+    let state = xdg_state_home
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|home| Path::new(&home).join(".local/state"))
+        })?;
+    Some(state.join("mett").join(format!("{account}.tokens")))
 }
 
 /// The directory containing `path`, or `None` for a bare file name (which
@@ -397,6 +410,26 @@ mod tests {
         assert!(matches!(err, TokenStoreError::File { source, .. }
             if source.kind() == io::ErrorKind::Unsupported));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_path_follows_the_xdg_spec() {
+        let alice = AccountId::new("alice@contoso.com");
+        let path = |xdg: Option<&str>, home: Option<&str>| {
+            default_path_in(&alice, xdg.map(Into::into), home.map(Into::into))
+        };
+        assert_eq!(
+            path(Some("/state"), Some("/home/a")),
+            Some(PathBuf::from("/state/mett/alice@contoso.com.tokens"))
+        );
+        // Unset, empty or relative XDG_STATE_HOME falls back to HOME.
+        let fallback = Some(PathBuf::from(
+            "/home/a/.local/state/mett/alice@contoso.com.tokens",
+        ));
+        assert_eq!(path(None, Some("/home/a")), fallback);
+        assert_eq!(path(Some(""), Some("/home/a")), fallback);
+        assert_eq!(path(Some("rel/state"), Some("/home/a")), fallback);
+        assert_eq!(path(None, None), None);
     }
 
     #[test]
