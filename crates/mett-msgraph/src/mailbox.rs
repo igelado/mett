@@ -32,6 +32,9 @@ pub struct GraphMailStore<A> {
     http: reqwest::Client,
     /// The Graph v1.0 root, for example `https://graph.microsoft.com/v1.0/`.
     base: Url,
+    /// The cloud's own Graph v1.0 root. Graph's page links point there even
+    /// when `base` is a proxy.
+    canonical: Url,
     auth: Arc<A>,
     /// The mailbox's folder roles, once looked up.
     roles: Mutex<Option<Arc<Roles>>>,
@@ -73,6 +76,14 @@ impl<A: Authenticator> GraphMailStore<A> {
         Self {
             http,
             base: settings.graph_api(""),
+            canonical: {
+                let mut url = settings.cloud.graph_url();
+                url.path_segments_mut()
+                    .expect("Graph URL can be a base")
+                    .pop_if_empty()
+                    .extend(["v1.0", ""]);
+                url
+            },
             auth,
             roles: Mutex::new(None),
         }
@@ -262,7 +273,14 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             // The cursor is Graph's `@odata.nextLink`, which already holds
             // the query; only the page size may change.
             Some(cursor) => {
-                let mut url = self.next_page_url(cursor.as_str())?;
+                let link = cursor
+                    .as_str()
+                    .strip_prefix(folder.as_str())
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .ok_or_else(|| {
+                        Error::Backend(format!("page cursor is not for folder {folder}"))
+                    })?;
+                let mut url = self.next_page_url(link)?;
                 set_query(&mut url, "$top", &top_for(&page));
                 url
             }
@@ -289,7 +307,11 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
                 .into_iter()
                 .map(GraphMessage::into_summary)
                 .collect::<Result<_>>()?,
-            next: page.next_link.map(PageCursor::new),
+            // The cursor records its folder, so it can't be used for
+            // another one by mistake.
+            next: page
+                .next_link
+                .map(|link| PageCursor::new(format!("{folder} {link}"))),
         })
     }
 
@@ -353,14 +375,33 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
 }
 
 impl<A> GraphMailStore<A> {
-    /// Checks that a `@odata.nextLink` points at this Graph endpoint before
-    /// following it, so the access token is never sent anywhere else.
+    /// Turns a `@odata.nextLink` into a URL on the configured endpoint.
+    ///
+    /// Only links below this endpoint's v1.0 root, or below the cloud's own
+    /// Graph root (which Graph uses even behind a proxy), are accepted, and
+    /// the latter are routed through the configured endpoint. The access
+    /// token is never sent anywhere else.
     fn next_page_url(&self, link: &str) -> Result<Url> {
-        let url = Url::parse(link)
+        let rest = [&self.base, &self.canonical]
+            .iter()
+            .find_map(|root| link.strip_prefix(root.as_str()))
+            .ok_or_else(|| {
+                let host = Url::parse(link)
+                    .map(|u| u.origin().ascii_serialization())
+                    .unwrap_or_else(|_| link.to_owned());
+                Error::Backend(format!(
+                    "refusing to follow a page link to another host: {host}"
+                ))
+            })?;
+        let url = self
+            .base
+            .join(rest)
             .map_err(|e| Error::Backend(format!("invalid page link from Graph: {e}")))?;
-        if url.origin() != self.base.origin() {
+        // `rest` could itself be scheme-relative (`//elsewhere/...`); make
+        // sure the result really is below this endpoint.
+        if url.origin() != self.base.origin() || !url.path().starts_with(self.base.path()) {
             return Err(Error::Backend(format!(
-                "refusing to follow a page link to another host: {}",
+                "refusing to follow a page link outside the Graph endpoint: {}",
                 url.origin().ascii_serialization()
             )));
         }

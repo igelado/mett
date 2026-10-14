@@ -209,7 +209,7 @@ async fn later_pages_use_the_requested_size() {
         .mount(&server)
         .await;
     let cursor = PageCursor::new(format!(
-        "{}/v1.0/me/mailFolders/inbox-id/messages?$top=10&$skip=10",
+        "inbox-id {}/v1.0/me/mailFolders/inbox-id/messages?$top=10&$skip=10",
         server.uri()
     ));
     store(&server)
@@ -278,11 +278,21 @@ async fn lists_messages_newest_first_with_paging() {
 async fn refuses_page_links_to_other_hosts() {
     let server = MockServer::start().await;
     let store = store(&server);
-    let cursor = PageCursor::new("https://attacker.example/v1.0/me/messages");
+    let cursor = PageCursor::new("inbox-id https://attacker.example/v1.0/me/messages");
     let result = store
         .list_messages(&FolderId::new("inbox-id"), Page::after(cursor, 10))
         .await;
     assert!(matches!(result, Err(Error::Backend(msg)) if msg.contains("another host")));
+
+    // A scheme-relative remainder can't escape to another host either.
+    let sneaky = "inbox-id https://graph.microsoft.com/v1.0///attacker.example/x";
+    let result = store
+        .list_messages(
+            &FolderId::new("inbox-id"),
+            Page::after(PageCursor::new(sneaky), 10),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Backend(_))), "{result:?}");
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -492,6 +502,44 @@ async fn caps_page_sizes_at_graphs_limit() {
         .await;
     store(&server)
         .list_messages(&FolderId::new("inbox-id"), Page::first(5000))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cursors_belong_to_their_folder() {
+    let server = MockServer::start().await;
+    let link = format!(
+        "{}/v1.0/me/mailFolders/inbox-id/messages?$skip=10",
+        server.uri()
+    );
+    let result = store(&server)
+        .list_messages(
+            &FolderId::new("archive-id"),
+            Page::after(PageCursor::new(format!("inbox-id {link}")), 10),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Backend(msg)) if msg.contains("not for folder")));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn follows_canonical_graph_links_through_a_proxy() {
+    let server = MockServer::start().await;
+    // Behind a proxy, Graph still writes its own host into page links.
+    let link = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox-id/messages?$skip=10";
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .and(query_param("$skip", "10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .list_messages(
+            &FolderId::new("inbox-id"),
+            Page::after(PageCursor::new(format!("inbox-id {link}")), 10),
+        )
         .await
         .unwrap();
 }
