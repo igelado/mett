@@ -103,9 +103,26 @@ pub fn auth_settings(config: &Config, url: &MailboxUrl) -> Result<AuthSettings, 
                 "msgraph_endpoint: {endpoint:?} is not an http(s) URL"
             ));
         }
+        // The access token and mail travel to this endpoint, so it must be
+        // encrypted; plain HTTP is only for local test servers.
+        if url.scheme() == "http" && !is_loopback(&url) {
+            return Err(format!(
+                "msgraph_endpoint: {endpoint:?} must use https (http is only allowed on this machine)"
+            ));
+        }
         settings.graph_url = Some(url);
     }
     Ok(settings)
+}
+
+/// Whether `url` points at this machine.
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// The token store chosen by `msgraph_token_store`.
@@ -224,6 +241,21 @@ mod tests {
             bad("set msgraph_client_id=a msgraph_endpoint=mailto:x@example.com\n")
                 .contains("not an http(s) URL")
         );
+        assert!(
+            bad("set msgraph_client_id=a msgraph_endpoint=http://proxy.example/\n")
+                .contains("must use https")
+        );
+        // Plain HTTP is fine for a local test server.
+        for local in [
+            "http://127.0.0.1:8080/",
+            "http://localhost/",
+            "http://[::1]/",
+        ] {
+            let config = config(&format!(
+                "set msgraph_client_id=a msgraph_endpoint={local}\n"
+            ));
+            assert!(auth_settings(&config, &url()).is_ok(), "{local}");
+        }
     }
 
     #[test]

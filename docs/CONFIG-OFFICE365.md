@@ -115,7 +115,7 @@ convention. Like other mutt variables, they can be set per account from an
 | `msgraph_client_id` | string | *(none, required)* | Application (client) ID of the user's Entra ID (Azure AD) app registration. mett refuses to open a `msgraph://` account without it. |
 | `msgraph_tenant` | string | *(domain of the account)* | Tenant used to sign in: a domain, a tenant GUID, `organizations`, `common` or `consumers`. The default, for example `contoso.com` for `msgraph://alice@contoso.com/`, works for both single-tenant and multi-tenant apps, provided the domain is verified in the tenant. Single-tenant apps can't use `organizations` or `common`, because Entra ID rejects them (error AADSTS50194). |
 | `msgraph_cloud` | string | `global` | `global`, `usgov`, `usgov-dod` or `china`. Selects the login and Graph endpoints. |
-| `msgraph_endpoint` | string | *(from `msgraph_cloud`)* | Overrides the Graph base URL, for testing or proxies. |
+| `msgraph_endpoint` | string | *(from `msgraph_cloud`)* | Overrides the Graph base URL, for testing or proxies. Must be `https`, except on this machine (`localhost`, loopback addresses). |
 
 #### Registering the app
 
