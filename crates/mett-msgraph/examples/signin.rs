@@ -103,7 +103,7 @@ async fn run(
     let mailbox = GraphMailStore::new(http, &settings, auth);
     let inbox = mailbox.well_known_folder(WellKnownFolder::Inbox).await?;
     println!(
-        "{}: {} messages, {} unread. Newest:",
+        "{}: {} items, {} unread. Newest:",
         inbox.name, inbox.total_count, inbox.unread_count
     );
     for message in mailbox

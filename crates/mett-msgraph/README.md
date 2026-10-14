@@ -64,7 +64,7 @@ you are and the newest messages in your Inbox:
 ```
 Signed in; the access token expires at <time>.
 Hello, Your Name <you@example.com>
-Inbox: 1234 messages, 5 unread. Newest:
+Inbox: 1234 items, 5 unread. Newest:
   N 2026-10-14 09:12 Alice Example <alice@example.com>  Weekly sync notes
     2026-10-13 17:40 Bob Builder <bob@example.com>  Re: Build failures
 ```

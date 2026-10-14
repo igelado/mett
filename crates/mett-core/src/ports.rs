@@ -154,6 +154,14 @@ pub trait Authenticator: Send + Sync {
     /// Returns a valid access token, refreshing or signing in again if
     /// needed.
     fn access_token(&self) -> impl Future<Output = Result<AccessToken>> + Send;
+
+    /// Tells the authenticator that a service rejected `token` (for
+    /// example, HTTP 401) before it expired, so the next
+    /// [`Authenticator::access_token`] gets a new one instead of the same.
+    fn token_rejected(&self, token: &AccessToken) -> impl Future<Output = ()> + Send {
+        let _ = token;
+        async {}
+    }
 }
 
 #[cfg(test)]

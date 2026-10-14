@@ -605,3 +605,78 @@ async fn opening_the_inbox_needs_only_the_root() {
         assert_eq!(inbox.parent, None);
     }
 }
+
+/// Hands out `old` until told it was rejected, then `new`.
+struct RotatingAuth {
+    rejected: std::sync::atomic::AtomicBool,
+}
+
+impl Authenticator for RotatingAuth {
+    async fn access_token(&self) -> mett_core::Result<AccessToken> {
+        let secret = if self.rejected.load(std::sync::atomic::Ordering::SeqCst) {
+            "new"
+        } else {
+            "old"
+        };
+        Ok(AccessToken::new(secret, DateTime::<Utc>::MAX_UTC))
+    }
+
+    async fn token_rejected(&self, token: &AccessToken) {
+        assert_eq!(token.secret(), "old");
+        self.rejected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn retries_once_with_a_new_token_after_a_401() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/m1"))
+        .and(header("authorization", "Bearer old"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/m1"))
+        .and(header("authorization", "Bearer new"))
+        .and(body_json(json!({ "isRead": true })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let settings = AuthSettings {
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let auth = Arc::new(RotatingAuth {
+        rejected: Default::default(),
+    });
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, auth);
+    store
+        .update_flags(
+            &MessageId::new("m1"),
+            FlagsUpdate {
+                read: Some(true),
+                flagged: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn permanent_delete_is_reported_unavailable_in_national_clouds() {
+    let server = MockServer::start().await;
+    let settings = AuthSettings {
+        cloud: mett_msgraph::Cloud::UsGov,
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth));
+    let result = store.delete_message(&MessageId::new("m1")).await;
+    assert!(matches!(result, Err(Error::Backend(msg)) if msg.contains("usgov")));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

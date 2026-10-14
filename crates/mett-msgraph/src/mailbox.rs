@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Address, Authenticator, Body, BodyKind, Error, Flags, FlagsUpdate, Folder, FolderId, MailStore,
-    Message, MessageId, MessagePage, MessageSummary, Page, PageCursor, Result, WellKnownFolder,
+    AccessToken, Address, Authenticator, Body, BodyKind, Error, Flags, FlagsUpdate, Folder,
+    FolderId, MailStore, Message, MessageId, MessagePage, MessageSummary, Page, PageCursor, Result,
+    WellKnownFolder,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 
-use crate::settings::AuthSettings;
+use crate::settings::{AuthSettings, Cloud};
 
 /// Upper bound on each Graph request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,6 +42,7 @@ pub struct GraphMailStore<A> {
     /// The cloud's own Graph v1.0 root. Graph's page links point there even
     /// when `base` is a proxy.
     canonical: Url,
+    cloud: Cloud,
     auth: Arc<A>,
     /// The mailbox's folder roles, once looked up.
     roles: Mutex<Option<Arc<Roles>>>,
@@ -84,6 +86,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         Self {
             http,
             base: settings.graph_api(""),
+            cloud: settings.cloud,
             canonical: {
                 let mut url = settings.cloud.graph_url();
                 url.path_segments_mut()
@@ -113,12 +116,35 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// "not found" error).
     async fn send(&self, request: RequestBuilder, about: About<'_>) -> Result<reqwest::Response> {
         let token = self.auth.access_token().await?;
-        let response = request
+        // Kept for a retry; JSON bodies can always be cloned.
+        let retry = request.try_clone();
+        let response = Self::attempt(request, &token).await?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Self::checked(response, about).await;
+        }
+        // Graph rejected a token that hadn't expired (it may have been
+        // revoked): get a new one and try once more.
+        self.auth.token_rejected(&token).await;
+        let fresh = self.auth.access_token().await?;
+        match retry {
+            Some(retry) if fresh != token => {
+                let response = Self::attempt(retry, &fresh).await?;
+                Self::checked(response, about).await
+            }
+            _ => Self::checked(response, about).await,
+        }
+    }
+
+    async fn attempt(request: RequestBuilder, token: &AccessToken) -> Result<reqwest::Response> {
+        request
             .bearer_auth(token.secret())
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|e| Error::Network(e.to_string()))?;
+            .map_err(|e| Error::Network(e.to_string()))
+    }
+
+    async fn checked(response: reqwest::Response, about: About<'_>) -> Result<reqwest::Response> {
         if response.status().is_success() {
             Ok(response)
         } else {
@@ -407,7 +433,14 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         // DELETE would only move it to Deleted Items; the port promises a
-        // permanent delete.
+        // permanent delete, which Graph offers only in the global cloud.
+        if self.cloud != Cloud::Global {
+            return Err(Error::Backend(format!(
+                "permanently deleting messages isn't available in the {} cloud; \
+                 move them to Deleted Items instead",
+                self.cloud
+            )));
+        }
         let url = self.url(&["me", "messages", id.as_str(), "permanentDelete"]);
         self.send(self.request(Method::POST, url), About::message(id.as_str()))
             .await
