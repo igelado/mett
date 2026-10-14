@@ -153,7 +153,7 @@ Set `METT_FLOW=device` to use the device code flow instead of the browser.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `msgraph_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. |
+| `msgraph_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. `file` is supported only on Unix, where file permissions keep the tokens private. |
 | `msgraph_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. Several accounts may share one file; each keeps its own token. |
 
 ### 4.4 Behaviour

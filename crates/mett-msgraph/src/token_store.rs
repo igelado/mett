@@ -85,7 +85,12 @@ impl TokenStore for KeyringStore {
 /// (`msgraph_token_store = file`).
 ///
 /// The file maps accounts to tokens, so accounts that share a
-/// `msgraph_token_file` keep separate tokens.
+/// `msgraph_token_file` keep separate tokens. Updates hold an exclusive lock
+/// on a `.lock` file next to it, so concurrent updates (from this or other
+/// processes) don't lose each other's changes.
+///
+/// Only Unix is supported, where the file is created with mode `0600`. On
+/// other platforms saving fails; use [`KeyringStore`] instead.
 #[derive(Debug, Clone)]
 pub struct FileStore {
     path: PathBuf,
@@ -129,6 +134,27 @@ impl FileStore {
             .map_err(|e| self.error(io::Error::new(io::ErrorKind::InvalidData, e)))
     }
 
+    /// Runs a read-modify-write `update` while holding the update lock.
+    fn update(&self, update: impl FnOnce(&mut TokenFile) -> bool) -> Result<(), TokenStoreError> {
+        let lock_path = sibling(&self.path, "", ".lock");
+        if let Some(dir) = self.path.parent() {
+            create_private_dir(dir).map_err(|e| self.error(e))?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let lock = options.open(&lock_path).map_err(|e| self.error(e))?;
+        // Released when `lock` is dropped.
+        lock.lock().map_err(|e| self.error(e))?;
+
+        let mut file = self.read()?;
+        if update(&mut file) {
+            self.write(&file)?;
+        }
+        Ok(())
+    }
+
     fn write(&self, file: &TokenFile) -> Result<(), TokenStoreError> {
         if file.accounts.is_empty() {
             return match fs::remove_file(&self.path) {
@@ -154,18 +180,15 @@ impl TokenStore for FileStore {
     }
 
     fn save(&self, account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError> {
-        let mut file = self.read()?;
-        file.accounts
-            .insert(account.as_str().to_owned(), refresh_token.to_owned());
-        self.write(&file)
+        self.update(|file| {
+            file.accounts
+                .insert(account.as_str().to_owned(), refresh_token.to_owned());
+            true
+        })
     }
 
     fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
-        let mut file = self.read()?;
-        if file.accounts.remove(account.as_str()).is_some() {
-            self.write(&file)?;
-        }
-        Ok(())
+        self.update(|file| file.accounts.remove(account.as_str()).is_some())
     }
 }
 
@@ -175,11 +198,16 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
+    if !cfg!(unix) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the file token store needs Unix permissions; use the keyring store",
+        ));
+    }
     // A new, uniquely named file: `create_new` guarantees that the 0600 mode
     // applies, which reusing an existing file would not.
     let random = crate::pkce::random_token().map_err(io::Error::other)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.{random}.tmp"));
+    let tmp = sibling(path, ".", &format!(".{random}.tmp"));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -194,6 +222,12 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// `path` with its file name wrapped in `prefix` and `suffix`.
+fn sibling(path: &Path, prefix: &str, suffix: &str) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{prefix}{name}{suffix}"))
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -308,6 +342,34 @@ mod tests {
         store.clear(&alice).unwrap();
         assert_eq!(store.load(&alice).unwrap(), None);
         assert_eq!(store.load(&bob).unwrap().as_deref(), Some("rb"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_updates_to_a_shared_file_are_not_lost() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("shared.tokens");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                // Separate instances, like separate processes would have.
+                let store = FileStore::new(&path);
+                std::thread::spawn(move || {
+                    for j in 0..10 {
+                        let account = AccountId::new(format!("user{i}@contoso.com"));
+                        store.save(&account, &format!("r{j}")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let store = FileStore::new(&path);
+        for i in 0..8 {
+            let account = AccountId::new(format!("user{i}@contoso.com"));
+            assert_eq!(store.load(&account).unwrap().as_deref(), Some("r9"));
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
