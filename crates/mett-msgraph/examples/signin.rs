@@ -11,8 +11,8 @@
 //! - `METT_TENANT`: overrides the tenant (default: the account's domain).
 //! - `METT_CLOUD`: `global` (default), `usgov`, `usgov-dod` or `china`.
 //! - `METT_FLOW=device`: uses the device code flow instead of the browser.
-//! - `METT_TOKEN_FILE`: stores the refresh token in this file instead of the
-//!   OS keyring (Unix only).
+//! - `METT_TOKEN_FILE` (Unix only): stores the refresh token in this file
+//!   instead of the OS keyring.
 
 use std::env;
 use std::error::Error;
