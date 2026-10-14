@@ -216,6 +216,10 @@ genuinely expected:
 - **HTML rendering:** built-in HTML-to-text conversion, or an external
   command (mailcap-style).
 - **Credential storage:** OS keyring, or an encrypted file.
+- **Implementation:** in `mett-msgraph`, the sign-in flow is the `AuthFlow`
+  setting, token storage is the `TokenStore` trait (`KeyringStore`,
+  `FileStore`, and `MemoryStore` for tests), and the UI side of sign-in is
+  the `Prompter` trait.
 - **Pros:** each choice is configurable and testable in isolation.
 - **Cons:** needless indirection when only one implementation exists, so the
   pattern is not applied speculatively.

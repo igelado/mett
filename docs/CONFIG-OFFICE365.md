@@ -130,21 +130,34 @@ The app registration needs:
   `msgraph_scopes`. An administrator may need to grant consent, depending on
   the tenant's policy.
 
+To check a registration before using mett, run the sign-in example. It signs
+in and prints the signed-in user:
+
+```sh
+METT_ACCOUNT=alice@contoso.com METT_CLIENT_ID=<app-id> \
+    cargo run -p mett-msgraph --example signin
+```
+
+Set `METT_FLOW=device` to use the device code flow instead of the browser,
+and `METT_CLOUD` (`usgov`, `usgov-dod` or `china`) for a national cloud.
+[crates/mett-msgraph/README.md](../crates/mett-msgraph/README.md) has step-by-step
+instructions and troubleshooting.
+
 ### 4.2 Authentication
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `msgraph_auth_flow` | string | `auth-code` | `auth-code` (authorization code with PKCE, through the system browser and a loopback redirect) or `device-code` (for headless or SSH sessions). |
 | `msgraph_redirect_port` | number | `0` | Loopback port for `auth-code`. `0` picks a free port. |
-| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. |
+| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. `User.Read` is required: after every sign-in and token refresh, mett reads the user principal name from Graph's `/me` and rejects the tokens unless it is this account. |
 | `msgraph_oauth_refresh_command` | string | `""` | When set, mett runs this command to obtain an access token instead of using its built-in OAuth2. This mirrors `imap_oauth_refresh_command`, so existing helper scripts can be reused. |
 
 ### 4.3 Token storage
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `msgraph_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. |
-| `msgraph_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. |
+| `msgraph_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. `file` is supported only on Unix, where file permissions keep the tokens private. |
+| `msgraph_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. Several accounts may share one file; each keeps its own token. |
 
 ### 4.4 Behaviour
 

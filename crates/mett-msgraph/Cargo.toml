@@ -1,0 +1,30 @@
+[package]
+name = "mett-msgraph"
+description = "Microsoft Graph adapter for mett: sign-in and mailbox access"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+mett-core.workspace = true
+
+base64.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+keyring.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+open.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock.workspace = true
+
+[lints]
+workspace = true
