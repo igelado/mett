@@ -25,7 +25,7 @@ use crate::settings::AuthSettings;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The message fields the index needs.
-const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,receivedDateTime,sentDateTime,createdDateTime,isRead,flag,hasAttachments";
+const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isRead,flag,hasAttachments";
 
 /// A [`MailStore`] backed by Microsoft Graph.
 pub struct GraphMailStore<A> {
@@ -321,12 +321,12 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
                 url.query_pairs_mut()
                     .append_pair("$top", &top_for(&page))
                     .append_pair("$select", SUMMARY_FIELDS)
-                    // Unreceived messages sort by when they were sent, or
-                    // else created: the time their summaries show.
-                    .append_pair(
-                        "$orderby",
-                        "receivedDateTime desc,sentDateTime desc,createdDateTime desc",
-                    );
+                    // Sort by the date the summaries show (see `split`).
+                    // Graph can't sort by "this field, else that one", so
+                    // the date is the sent date, which received and sent
+                    // mail both have; only unsent drafts fall back to
+                    // their creation date.
+                    .append_pair("$orderby", "sentDateTime desc,createdDateTime desc");
                 url
             }
         };
@@ -601,9 +601,7 @@ struct GraphMessage {
     to_recipients: Vec<Recipient>,
     #[serde(default)]
     cc_recipients: Vec<Recipient>,
-    /// Missing for messages that were never received, such as drafts and
-    /// sent mail.
-    received_date_time: Option<String>,
+    /// Missing for unsent drafts.
     sent_date_time: Option<String>,
     created_date_time: Option<String>,
     #[serde(default)]
@@ -678,11 +676,11 @@ impl GraphMessage {
     }
 
     fn split(self) -> Result<(MessageSummary, Rest)> {
-        // Sent messages and drafts were never received: use when they were
-        // sent or, failing that, created.
+        // The date is when the message was sent, as in mutt's index, or for
+        // an unsent draft, when it was created. It matches the listing's
+        // sort order.
         let timestamp = self
-            .received_date_time
-            .or(self.sent_date_time)
+            .sent_date_time
             .or(self.created_date_time)
             .ok_or_else(|| Error::Backend("message has no timestamp".into()))?;
         let received = DateTime::parse_from_rfc3339(&timestamp)

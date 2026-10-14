@@ -82,14 +82,15 @@ async fn mount_roles_with(server: &MockServer, status: u16) {
         .await;
 }
 
-fn message(id: &str, received: &str) -> Value {
+/// A message sent at `sent`.
+fn message(id: &str, sent: &str) -> Value {
     json!({
         "id": id,
         "parentFolderId": "inbox-id",
         "subject": format!("Subject {id}"),
         "from": { "emailAddress": { "name": "Bob", "address": "bob@fabrikam.com" } },
         "toRecipients": [{ "emailAddress": { "name": "", "address": "alice@contoso.com" } }],
-        "receivedDateTime": received,
+        "sentDateTime": sent,
         "isRead": false,
         "flag": { "flagStatus": "flagged" },
         "hasAttachments": true,
@@ -230,7 +231,7 @@ async fn lists_messages_newest_first_with_paging() {
         .and(query_param("$top", "2"))
         .and(query_param(
             "$orderby",
-            "receivedDateTime desc,sentDateTime desc,createdDateTime desc",
+            "sentDateTime desc,createdDateTime desc",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [message("m2", "2026-10-14T10:00:00Z"), message("m1", "2026-10-13T10:00:00Z")],
@@ -441,10 +442,10 @@ async fn maps_graph_errors_to_port_errors() {
 }
 
 #[tokio::test]
-async fn drafts_without_a_received_time_use_their_creation_time() {
+async fn unsent_drafts_use_their_creation_time() {
     let server = MockServer::start().await;
     let mut draft = message("d1", "2026-10-14T10:00:00Z");
-    draft["receivedDateTime"] = Value::Null;
+    draft["sentDateTime"] = Value::Null;
     draft["createdDateTime"] = json!("2026-10-10T08:00:00Z");
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/drafts-id/messages"))
@@ -545,15 +546,19 @@ async fn follows_canonical_graph_links_through_a_proxy() {
 }
 
 #[tokio::test]
-async fn sent_messages_use_their_sent_time() {
+async fn messages_are_dated_and_sorted_by_when_they_were_sent() {
     let server = MockServer::start().await;
-    let mut sent = message("s1", "2026-10-14T10:00:00Z");
-    sent["receivedDateTime"] = Value::Null;
-    sent["sentDateTime"] = json!("2026-10-13T09:00:00Z");
-    sent["createdDateTime"] = json!("2026-09-01T08:00:00Z");
+    let mut message = message("s1", "2026-10-13T09:00:00Z");
+    // Received a day later; the index still shows the sent date, as mutt
+    // does, so the date matches the sort order.
+    message["receivedDateTime"] = json!("2026-10-14T09:00:00Z");
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/sent-id/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [sent] })))
+        .and(query_param(
+            "$orderby",
+            "sentDateTime desc,createdDateTime desc",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [message] })))
         .mount(&server)
         .await;
     let page = store(&server)
