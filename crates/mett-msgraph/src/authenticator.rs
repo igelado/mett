@@ -112,7 +112,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                 Ok(tokens) => return self.keep(&mut state, tokens).await,
                 // The refresh token was revoked, expired or needs new
                 // consent: fall back to an interactive sign-in.
-                Err(FlowError::OAuth { .. }) => {
+                Err(e) if e.needs_sign_in() => {
                     state.refresh = None;
                     let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
                     blocking(move || store.clear(&account)).await?;

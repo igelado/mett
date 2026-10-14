@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use mett_core::{AccountId, Authenticator, Error};
 use mett_msgraph::{
@@ -248,4 +249,64 @@ async fn sign_out_forgets_the_refresh_token() {
 
     auth.sign_out().await.unwrap();
     assert_eq!(store.load(&account()).unwrap(), None);
+}
+
+#[tokio::test]
+async fn keeps_the_refresh_token_on_transient_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("temporarily_unavailable"))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        no_prompts(),
+    );
+
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    assert_eq!(store.load(&account()).unwrap().as_deref(), Some("r0"));
+}
+
+#[tokio::test]
+async fn gives_up_when_the_device_code_expires() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "dev-code",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://microsoft.com/devicelogin",
+            "expires_in": 1,
+            "interval": 0,
+            "message": "enter ABCD-EFGH",
+        })))
+        .mount(&server)
+        .await;
+    // The poll request stalls for longer than the device code is valid.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending").set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        |_| {},
+    );
+
+    let started = std::time::Instant::now();
+    let err = auth.access_token().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Auth(msg) if msg.contains("expired")),
+        "{err}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
 }

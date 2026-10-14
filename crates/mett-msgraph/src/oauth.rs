@@ -44,6 +44,16 @@ pub(crate) enum FlowError {
     Other(String),
 }
 
+impl FlowError {
+    /// Whether the error shows that a refresh token can't be used any more,
+    /// so the user has to sign in again. Other errors, such as
+    /// `temporarily_unavailable`, leave the refresh token valid.
+    pub(crate) fn needs_sign_in(&self) -> bool {
+        matches!(self, Self::OAuth { code, .. }
+            if code == "invalid_grant" || code == "interaction_required")
+    }
+}
+
 impl From<FlowError> for mett_core::Error {
     fn from(e: FlowError) -> Self {
         match e {
@@ -157,29 +167,31 @@ pub(crate) async fn device_code(
         message: code.message,
     });
 
+    // The deadline bounds both the waits and the poll requests themselves,
+    // so a stalled request can't outlive the device code.
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
+    let expired = || FlowError::Other("the device code expired".into());
     let mut interval = Duration::from_secs(code.interval);
     loop {
-        tokio::time::sleep(interval).await;
-        let result = request_token(
-            http,
-            settings,
-            &[
-                ("grant_type", DEVICE_CODE_GRANT),
-                ("client_id", &settings.client_id),
-                ("device_code", &code.device_code),
-            ],
-        )
-        .await;
+        tokio::time::sleep_until(deadline.min(Instant::now() + interval)).await;
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        let form = [
+            ("grant_type", DEVICE_CODE_GRANT),
+            ("client_id", settings.client_id.as_str()),
+            ("device_code", code.device_code.as_str()),
+        ];
+        let poll = request_token(http, settings, &form);
+        let result = tokio::time::timeout_at(deadline, poll)
+            .await
+            .map_err(|_| expired())?;
         match result {
             Err(FlowError::OAuth { code, .. }) if code == "authorization_pending" => {}
             Err(FlowError::OAuth { code, .. }) if code == "slow_down" => {
                 interval += Duration::from_secs(5);
             }
             other => return other,
-        }
-        if Instant::now() >= deadline {
-            return Err(FlowError::Other("the device code expired".into()));
         }
     }
 }

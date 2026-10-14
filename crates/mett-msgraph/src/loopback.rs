@@ -2,21 +2,25 @@
 //!
 //! The browser is redirected to `http://localhost:<port>/?code=…&state=…`.
 //! `localhost` can resolve to either 127.0.0.1 or ::1, so the listener binds
-//! both when it can.
+//! the same port on both, unless the host has no IPv6 loopback.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
 /// How long a single connection may take to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Upper bound on the request head, to ignore misbehaving clients.
-const MAX_HEAD_BYTES: usize = 16 * 1024;
+/// Upper bound on the request head. Larger requests are rejected without
+/// reading (or allocating) more than this.
+const MAX_HEAD_BYTES: u64 = 16 * 1024;
+/// How many random ports to try before giving up on one that is free on
+/// both loopback addresses.
+const BIND_ATTEMPTS: usize = 10;
 
 pub(crate) struct Listener {
     v4: TcpListener,
@@ -25,13 +29,34 @@ pub(crate) struct Listener {
 }
 
 impl Listener {
-    /// Binds 127.0.0.1 (and ::1 when available) on `port`; `0` picks a free
-    /// port.
+    /// Binds `port` on 127.0.0.1 and ::1; `0` picks a port that is free on
+    /// both. If the host has no IPv6 loopback, only 127.0.0.1 is bound.
+    ///
+    /// Fails if ::1 has the port taken: a browser that resolves `localhost`
+    /// to ::1 would then send the sign-in response somewhere else.
     pub async fn bind(port: u16) -> io::Result<Self> {
-        let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-        let port = v4.local_addr()?.port();
-        let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await.ok();
-        Ok(Self { v4, v6, port })
+        let attempts = if port == 0 { BIND_ATTEMPTS } else { 1 };
+        for _ in 0..attempts {
+            let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+            let port = v4.local_addr()?.port();
+            match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+                Ok(v6) => {
+                    return Ok(Self {
+                        v4,
+                        v6: Some(v6),
+                        port,
+                    });
+                }
+                // Taken on ::1 only: try another random port, if allowed.
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => {}
+                // No IPv6 loopback, so `localhost` can only mean 127.0.0.1.
+                Err(_) => return Ok(Self { v4, v6: None, port }),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("port {port} is in use on the IPv6 loopback (::1)"),
+        ))
     }
 
     pub fn port(&self) -> u16 {
@@ -71,23 +96,32 @@ impl Listener {
 
 /// Reads one request. Returns its query parameters if it is the redirect.
 async fn handle(stream: TcpStream) -> io::Result<Option<HashMap<String, String>>> {
-    let mut reader = BufReader::new(stream);
+    // `take` caps how much is read, so an oversized line can't make
+    // `read_line` allocate without bound.
+    let mut reader = BufReader::new(stream.take(MAX_HEAD_BYTES));
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
 
-    // Drain the headers so the browser sees a clean response.
-    let mut read = request_line.len();
+    // Read the headers up to the blank line that ends them. Reaching the cap
+    // or the end of the stream first means the request is too large or
+    // incomplete.
+    let mut complete = false;
     loop {
         let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        read += n;
-        if n == 0 || line == "\r\n" || line == "\n" || read > MAX_HEAD_BYTES {
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        if line == "\r\n" || line == "\n" {
+            complete = true;
             break;
         }
     }
 
-    let params = parse_request_line(&request_line);
+    let params = complete
+        .then(|| parse_request_line(&request_line))
+        .flatten();
     let (status, body) = match &params {
+        _ if !complete => ("431 Request Header Fields Too Large", "Request too large."),
         Some(p) if p.contains_key("error") => {
             ("200 OK", "Sign-in failed. Return to mett for details.")
         }
@@ -99,7 +133,7 @@ async fn handle(stream: TcpStream) -> io::Result<Option<HashMap<String, String>>
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
         html.len()
     );
-    let mut stream = reader.into_inner();
+    let mut stream = reader.into_inner().into_inner();
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(params)
@@ -134,6 +168,48 @@ mod tests {
         assert!(parse_request_line("GET /favicon.ico HTTP/1.1").is_none());
         assert!(parse_request_line("GET / HTTP/1.1").is_none());
         assert!(parse_request_line("POST /?code=a HTTP/1.1").is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_requests() {
+        let listener = Listener::bind(0).await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.port());
+        let wait = tokio::spawn(async move { listener.wait_for_redirect().await });
+
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let huge = "x".repeat(MAX_HEAD_BYTES as usize * 2);
+        let request = format!("GET /?code=c&state=s HTTP/1.1\r\nX-Pad: {huge}\r\n\r\n");
+        // The listener may close the connection before reading everything.
+        let _ = stream.write_all(request.as_bytes()).await;
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response).await;
+        assert!(response.starts_with("HTTP/1.1 431"), "{response}");
+
+        // The oversized request was not taken as the redirect.
+        assert!(!wait.is_finished());
+        wait.abort();
+    }
+
+    #[tokio::test]
+    async fn binds_a_port_free_on_both_loopbacks() {
+        let listener = Listener::bind(0).await.unwrap();
+        // If this host has an IPv6 loopback, the same port is bound on it.
+        if std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok() {
+            assert!(listener.v6.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_when_the_requested_port_is_taken_on_ipv6() {
+        let Ok(v6) = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else {
+            return; // No IPv6 loopback on this host.
+        };
+        let port = v6.local_addr().unwrap().port();
+        if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
+            return; // The port is taken on IPv4 too; nothing to test.
+        }
+        let err = Listener::bind(port).await.err().expect("bind must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
     }
 
     #[tokio::test]

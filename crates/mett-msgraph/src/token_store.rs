@@ -158,15 +158,25 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    // A new, uniquely named file: `create_new` guarantees that the 0600 mode
+    // applies, which reusing an existing file would not.
+    let random = crate::pkce::random_token().map_err(io::Error::other)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.{random}.tmp"));
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&tmp)?;
-    file.write_all(data)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)
+
+    let result = options.open(&tmp).and_then(|mut file| {
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -240,6 +250,27 @@ mod tests {
         store.clear(&account).unwrap();
         store.clear(&account).unwrap();
         assert_eq!(store.load(&account).unwrap(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_ignores_stale_world_readable_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("stale-tmp");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alice.tokens");
+        // Leftovers from an older version or another program.
+        for stale in [path.with_extension("tmp"), dir.join(".alice.tokens.tmp")] {
+            fs::write(&stale, "old").unwrap();
+            fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let account = AccountId::new("alice@contoso.com");
+        FileStore::new(&path).save(&account, "r1").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         fs::remove_dir_all(&dir).unwrap();
     }
 
