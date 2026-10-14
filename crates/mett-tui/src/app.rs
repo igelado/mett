@@ -112,9 +112,13 @@ pub struct App {
     /// A page that failed to load, so the index is incomplete. Loading it
     /// is retried when the user reaches the end of the index.
     unlisted: Option<Page>,
-    /// Changes that failed to save, kept apart from the status line so that
-    /// later messages can't hide them.
-    pub save_failures: Vec<String>,
+    /// Changes that failed to save, by message, kept apart from the status
+    /// line so that later messages can't hide them. A later successful save
+    /// of the same message clears its entry.
+    save_failures: HashMap<MessageId, String>,
+    /// The user asked for the next message while more were loading; move
+    /// on once they arrive.
+    pending_next: bool,
     /// Pending flag updates, so a failure can be undone in the index.
     flag_updates: HashMap<RequestId, MessageId>,
     next_request: u64,
@@ -136,7 +140,8 @@ impl App {
             listing: None,
             listing_page: None,
             unlisted: None,
-            save_failures: Vec::new(),
+            save_failures: HashMap::new(),
+            pending_next: false,
             flag_updates: HashMap::new(),
             next_request: 0,
         };
@@ -179,6 +184,8 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Effect> {
+        // Any new action replaces a pending "next message".
+        self.pending_next = false;
         match self.menu() {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
@@ -191,7 +198,7 @@ impl App {
         match action {
             Action::Quit => self.quit = true,
             Action::NextEntry if self.selected < last => self.selected += 1,
-            Action::NextEntry if self.unlisted.is_some() => return self.retry_listing(),
+            Action::NextEntry if self.more_to_list() => return self.wait_for_next(),
             Action::NextEntry => self.status = "You are on the last message.".into(),
             Action::PreviousEntry if self.selected > 0 => self.selected -= 1,
             Action::PreviousEntry => self.status = "You are on the first message.".into(),
@@ -223,8 +230,8 @@ impl App {
             // As in mutt, j and k in the pager show the next or previous
             // message.
             Action::NextEntry if self.selected + 1 >= self.messages.len() => {
-                if self.unlisted.is_some() {
-                    return self.retry_listing();
+                if self.more_to_list() {
+                    return self.wait_for_next();
                 }
                 self.status = "You are on the last message.".into();
             }
@@ -297,19 +304,24 @@ impl App {
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
                     self.messages.extend(page.messages);
+                    let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
                         // Keep loading until the whole folder is listed.
-                        return self.list(Page::after(cursor, PAGE_SIZE));
+                        effects = self.list(Page::after(cursor, PAGE_SIZE));
+                    } else {
+                        self.listing = None;
+                        self.listing_page = None;
+                        // Clear the "Loading" message, but not an error that
+                        // was reported while the folder was loading.
+                        if self.status.starts_with("Loading ") {
+                            self.status.clear();
+                        }
                     }
-                    self.listing = None;
-                    self.listing_page = None;
-                    // Clear the "Loading" message, but not an error that
-                    // was reported while the folder was loading.
-                    if self.status.starts_with("Loading ") {
-                        self.status.clear();
-                    }
+                    effects.extend(self.apply_pending_next());
+                    return effects;
                 }
                 Err(e) => {
+                    self.pending_next = false;
                     self.listing = None;
                     self.unlisted = self.listing_page.take();
                     self.report(e);
@@ -317,17 +329,22 @@ impl App {
             },
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::FlagsUpdated(result) => {
-                let message = self.flag_updates.remove(&id);
-                if let Err(e) = result {
-                    // Undo the optimistic change, so the index is right and
-                    // reopening the message tries again.
-                    if let Some(summary) =
-                        message.and_then(|m| self.messages.iter_mut().find(|s| s.id == m))
-                    {
-                        summary.flags.read = false;
+                let Some(message) = self.flag_updates.remove(&id) else {
+                    return Vec::new();
+                };
+                match result {
+                    Ok(()) => {
+                        self.save_failures.remove(&message);
                     }
-                    self.save_failures.push(e.to_string());
-                    self.report(e);
+                    Err(e) => {
+                        // Undo the optimistic change, so the index is right
+                        // and reopening the message tries again.
+                        if let Some(summary) = self.messages.iter_mut().find(|s| s.id == message) {
+                            summary.flags.read = false;
+                        }
+                        self.save_failures.insert(message, e.to_string());
+                        self.report(e);
+                    }
                 }
             }
             Event::InboxOpened(Err(e)) => self.report(e),
@@ -401,6 +418,46 @@ impl App {
         self.listing = Some(effect_id(&list));
         self.listing_page = Some(page);
         vec![list]
+    }
+
+    /// Whether more messages are loading or could be loaded.
+    fn more_to_list(&self) -> bool {
+        self.listing.is_some() || self.unlisted.is_some()
+    }
+
+    /// Remembers that the user asked for the next message, and makes sure
+    /// more messages are on their way.
+    fn wait_for_next(&mut self) -> Vec<Effect> {
+        self.pending_next = true;
+        self.status = "Loading more messages...".into();
+        self.retry_listing()
+    }
+
+    /// Moves to the next message if the user asked for it while it was
+    /// loading and it has now arrived.
+    fn apply_pending_next(&mut self) -> Vec<Effect> {
+        if !self.pending_next || self.selected + 1 >= self.messages.len() {
+            return Vec::new();
+        }
+        self.pending_next = false;
+        self.selected += 1;
+        if self.status.starts_with("Loading ") {
+            self.status.clear();
+        }
+        match self.menu() {
+            Menu::Index => Vec::new(),
+            Menu::Pager => {
+                self.screens.pop();
+                self.open_selected()
+            }
+        }
+    }
+
+    /// Changes that could not be saved, one per message.
+    pub fn save_failures(&self) -> Vec<String> {
+        let mut failures: Vec<_> = self.save_failures.values().cloned().collect();
+        failures.sort();
+        failures
     }
 
     /// Retries loading the rest of an incomplete folder.
@@ -742,8 +799,93 @@ mod tests {
             id: *second,
             event: Event::FlagsUpdated(Ok(())),
         }));
-        assert_eq!(app.save_failures, ["network error: offline"]);
+        assert_eq!(app.save_failures(), ["network error: offline"]);
         assert!(!app.saving());
+
+        // Saving the same message again successfully clears its failure.
+        act(&mut app, Action::Exit);
+        act(&mut app, Action::FirstEntry);
+        let retry = open(&mut app, 1);
+        let [Effect::Request(retry, _)] = retry.as_slice() else {
+            panic!("expected a retried flag update, got {retry:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: *retry,
+            event: Event::FlagsUpdated(Ok(())),
+        }));
+        assert!(app.save_failures().is_empty());
+    }
+
+    /// An app whose first page of `n` messages has loaded, with another page
+    /// still loading; returns the app and that request.
+    fn loading_more(n: usize) -> (App, RequestId) {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(first, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: first,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: summaries(n),
+                next: Some(PageCursor::new("c")),
+            })),
+        }));
+        let Effect::Request(second, _) = effects[0].clone();
+        (app, second)
+    }
+
+    fn deliver_last_page(
+        app: &mut App,
+        id: RequestId,
+        messages: Vec<MessageSummary>,
+    ) -> Vec<Effect> {
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages,
+                next: None,
+            })),
+        }))
+    }
+
+    #[test]
+    fn next_entry_waits_for_the_next_page_in_the_index() {
+        let (mut app, second) = loading_more(1);
+        act(&mut app, Action::NextEntry);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.status, "Loading more messages...");
+        let mut more = summaries(2);
+        more.remove(0);
+        deliver_last_page(&mut app, second, more);
+        assert_eq!(app.selected, 1, "moved on once the page arrived");
+    }
+
+    #[test]
+    fn next_entry_waits_for_the_next_page_in_the_pager() {
+        let (mut app, second) = loading_more(1);
+        open(&mut app, 1);
+        act(&mut app, Action::NextEntry);
+        let mut more = summaries(2);
+        more.remove(0);
+        let effects = deliver_last_page(&mut app, second, more);
+        assert_eq!(app.selected, 1);
+        assert!(
+            matches!(effects.as_slice(), [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m1"),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn another_action_cancels_a_pending_next_entry() {
+        let (mut app, second) = loading_more(2);
+        act(&mut app, Action::NextEntry);
+        act(&mut app, Action::NextEntry);
+        act(&mut app, Action::PreviousEntry);
+        deliver_last_page(&mut app, second, Vec::new());
+        assert_eq!(app.selected, 0);
     }
 
     #[test]

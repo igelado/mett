@@ -173,7 +173,7 @@ fn html_to_text(html: &str) -> String {
             rest = &rest[1..];
             continue;
         }
-        let Some(end) = rest.find('>') else {
+        let Some(end) = tag_end(rest) else {
             rest = "";
             break;
         };
@@ -202,6 +202,22 @@ fn html_to_text(html: &str) -> String {
     }
     out.push_str(&decode_entities(rest));
     collapse_blank_lines(&out)
+}
+
+/// The offset of the `>` that closes the tag at the start of `html`,
+/// skipping any `>` inside quoted attribute values.
+fn tag_end(html: &str) -> Option<usize> {
+    let mut quote = None;
+    for (i, c) in html.char_indices().skip(1) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '>' => return Some(i),
+            None => {}
+        }
+    }
+    None
 }
 
 fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
@@ -297,6 +313,14 @@ mod tests {
                 "<html><body><p>Hi <b>Alice</b>,</p><p>Fish &amp; chips?<br>Bob</p></body></html>"
             ),
             ["Hi Alice,", "Fish & chips?", "Bob"]
+        );
+    }
+
+    #[test]
+    fn html_attributes_may_contain_greater_than_signs() {
+        assert_eq!(
+            html(r#"<p><a title="a>b" data-x='>'>Link</a></p>"#),
+            ["Link"]
         );
     }
 

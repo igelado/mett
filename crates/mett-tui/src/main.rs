@@ -145,10 +145,11 @@ async fn run<S: mett_core::MailStore + 'static>(
             ));
         }
     }
-    if !app.save_failures.is_empty() {
+    let failures = app.save_failures();
+    if !failures.is_empty() {
         return Err(std::io::Error::other(format!(
             "some changes could not be saved: {}",
-            app.save_failures.join("; ")
+            failures.join("; ")
         )));
     }
     Ok(())
