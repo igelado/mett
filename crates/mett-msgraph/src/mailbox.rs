@@ -150,7 +150,24 @@ impl<A: Authenticator> GraphMailStore<A> {
         let mut roles = Roles::default();
         for response in batch.responses {
             // A mailbox may lack some well-known folders (404): skip them.
-            let (Ok(index), true) = (response.id.parse::<usize>(), response.status == 200) else {
+            // Any other failure is reported rather than cached, so a
+            // passing problem can't leave the roles wrong for good.
+            match response.status {
+                200 => {}
+                404 => continue,
+                429 => return Err(Error::Throttled { retry_after: None }),
+                s if s >= 500 => {
+                    return Err(Error::Network(format!(
+                        "Graph failed to look up a folder: HTTP {s}"
+                    )));
+                }
+                s => {
+                    return Err(Error::Backend(format!(
+                        "Graph refused to look up a folder: HTTP {s}"
+                    )));
+                }
+            }
+            let Ok(index) = response.id.parse::<usize>() else {
                 continue;
             };
             let Some(id) = response.body.and_then(|b| b.id).map(FolderId::new) else {
@@ -178,7 +195,9 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let roles = self.roles().await?;
         let top = |mut url: Url| {
-            url.query_pairs_mut().append_pair("$top", "100");
+            url.query_pairs_mut()
+                .append_pair("$top", "100")
+                .append_pair("includeHiddenFolders", "true");
             url
         };
         // `/me/mailFolders` lists only top-level folders; walk down through

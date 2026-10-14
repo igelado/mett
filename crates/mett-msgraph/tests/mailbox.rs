@@ -49,6 +49,12 @@ fn child(id: &str, name: &str, parent: &str, children: u32) -> Value {
 /// Answers the `$batch` role lookup: the root is `root-id` and only the
 /// Inbox (`inbox-id`) exists among the well-known folders.
 async fn mount_roles(server: &MockServer) {
+    mount_roles_with(server, 404).await;
+}
+
+/// Like [`mount_roles`], with `status` for the well-known folders other
+/// than the Inbox.
+async fn mount_roles_with(server: &MockServer, status: u16) {
     let names = [
         "msgfolderroot",
         "inbox",
@@ -65,7 +71,7 @@ async fn mount_roles(server: &MockServer) {
         .map(|(i, name)| match *name {
             "msgfolderroot" => json!({ "id": i.to_string(), "status": 200, "body": { "id": "root-id" } }),
             "inbox" => json!({ "id": i.to_string(), "status": 200, "body": { "id": "inbox-id" } }),
-            _ => json!({ "id": i.to_string(), "status": 404, "body": { "error": { "code": "ErrorFolderNotFound", "message": "" } } }),
+            _ => json!({ "id": i.to_string(), "status": status, "body": { "error": { "code": "Error", "message": "" } } }),
         })
         .collect();
     Mock::given(method("POST"))
@@ -132,11 +138,29 @@ async fn finds_well_known_folders_and_labels_them() {
 }
 
 #[tokio::test]
+async fn does_not_cache_roles_after_a_failed_lookup() {
+    let server = MockServer::start().await;
+    mount_roles_with(&server, 503).await;
+    let store = store(&server);
+    assert!(matches!(store.list_folders().await, Err(Error::Network(_))));
+    // Nothing was cached: the next call looks the roles up again.
+    server.reset().await;
+    mount_roles(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+    assert!(store.list_folders().await.is_ok());
+}
+
+#[tokio::test]
 async fn lists_nested_folders() {
     let server = MockServer::start().await;
     mount_roles(&server).await;
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders"))
+        .and(query_param("includeHiddenFolders", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [child("inbox-id", "Inbox", "root-id", 1)],
         })))
@@ -144,6 +168,7 @@ async fn lists_nested_folders() {
         .await;
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/inbox-id/childFolders"))
+        .and(query_param("includeHiddenFolders", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [child("projects-id", "Projects", "inbox-id", 1)],
         })))
