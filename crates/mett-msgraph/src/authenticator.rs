@@ -206,8 +206,15 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         let mut state = self.state.lock().await;
 
         let now = Utc::now();
+        // Without a refresh token, refreshing early isn't possible, so keep
+        // using the access token until it actually expires.
+        let margin = if state.refresh.is_some() {
+            EXPIRY_MARGIN
+        } else {
+            TimeDelta::zero()
+        };
         if let Some(token) = state.access.clone()
-            && !token.expires_within(EXPIRY_MARGIN, now)
+            && !token.expires_within(margin, now)
         {
             // A previous attempt to store the refresh token failed: retry,
             // but don't fail a caller who has a valid token. The failure

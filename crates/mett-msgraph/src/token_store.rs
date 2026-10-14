@@ -78,8 +78,22 @@ impl KeyringStore {
     }
 }
 
-impl TokenStore for KeyringStore {
-    fn load(&self, account: &AccountId) -> Result<Option<String>, TokenStoreError> {
+impl KeyringStore {
+    /// The keyring can't compare and delete in one step, so writes for an
+    /// account are serialised across mett processes with a lock file next to
+    /// where the file store would keep its tokens. Without a home directory
+    /// there is nowhere to put it, and writes go ahead unlocked.
+    fn lock(account: &AccountId) -> Result<Option<fs::File>, TokenStoreError> {
+        let Some(path) = FileStore::default_path(account) else {
+            return Ok(None);
+        };
+        let path = sibling(&path, "", ".keyring.lock");
+        lock_file(&path)
+            .map(Some)
+            .map_err(|source| TokenStoreError::File { path, source })
+    }
+
+    fn get(account: &AccountId) -> Result<Option<String>, TokenStoreError> {
         match Self::entry(account)?.get_password() {
             Ok(token) => Ok(Some(token)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -87,14 +101,38 @@ impl TokenStore for KeyringStore {
         }
     }
 
+    fn delete(account: &AccountId) -> Result<(), TokenStoreError> {
+        match Self::entry(account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl TokenStore for KeyringStore {
+    fn load(&self, account: &AccountId) -> Result<Option<String>, TokenStoreError> {
+        Self::get(account)
+    }
+
     fn save(&self, account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError> {
+        let _lock = Self::lock(account)?;
         Ok(Self::entry(account)?.set_password(refresh_token)?)
     }
 
     fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
-        match Self::entry(account)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(e.into()),
+        let _lock = Self::lock(account)?;
+        Self::delete(account)
+    }
+
+    fn clear_if(
+        &self,
+        account: &AccountId,
+        token: &str,
+    ) -> Result<Option<String>, TokenStoreError> {
+        let _lock = Self::lock(account)?;
+        match Self::get(account)? {
+            Some(stored) if stored == token => Self::delete(account).map(|()| None),
+            other => Ok(other),
         }
     }
 }
@@ -150,18 +188,7 @@ impl FileStore {
 
     /// Runs a read-modify-write `update` while holding the update lock.
     fn update(&self, update: impl FnOnce(&mut TokenFile) -> bool) -> Result<(), TokenStoreError> {
-        let lock_path = sibling(&self.path, "", ".lock");
-        if let Some(dir) = parent_dir(&self.path) {
-            create_private_dir(dir).map_err(|e| self.error(e))?;
-        }
-        let mut options = fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let lock = options.open(&lock_path).map_err(|e| self.error(e))?;
-        // Released when `lock` is dropped.
-        lock.lock().map_err(|e| self.error(e))?;
-
+        let _lock = lock_file(&sibling(&self.path, "", ".lock")).map_err(|e| self.error(e))?;
         let mut file = self.read()?;
         if update(&mut file) {
             self.write(&file)?;
@@ -271,6 +298,21 @@ fn default_path_in(
                 .map(|home| Path::new(&home).join(".local/state"))
         })?;
     Some(state.join("mett").join(format!("{account}.tokens")))
+}
+
+/// Opens (creating it, private) and exclusively locks `path`. The lock is
+/// released when the returned file is dropped.
+fn lock_file(path: &Path) -> io::Result<fs::File> {
+    if let Some(dir) = parent_dir(path) {
+        create_private_dir(dir)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// The directory containing `path`, or `None` for a bare file name (which

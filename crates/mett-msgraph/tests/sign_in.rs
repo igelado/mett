@@ -759,3 +759,34 @@ async fn uses_a_newer_stored_token_after_a_stale_one_is_rejected() {
         Some("r-newer")
     );
 }
+
+#[tokio::test]
+async fn keeps_using_a_token_without_refresh_token_until_it_expires() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    // No refresh token (no offline_access), and inside the refresh margin.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a-only",
+            "expires_in": 120,
+        })))
+        .mount(&server)
+        .await;
+    me(&server, "a-only", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    let prompts = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&prompts);
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, move |_| {
+        *counted.lock().unwrap() += 1
+    });
+
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-only");
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-only");
+    assert_eq!(*prompts.lock().unwrap(), 1, "signed in only once");
+}
