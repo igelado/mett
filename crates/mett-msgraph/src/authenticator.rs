@@ -168,12 +168,23 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         stored: Option<&str>,
     ) -> Result<AccessToken> {
         match self.check_identity(&tokens).await {
-            Identity::Confirmed => self.keep(state, tokens).await,
+            Identity::Confirmed => {
+                let token = self.keep(state, tokens).await?;
+                // The check may have outlasted a short-lived token. The
+                // refresh token is kept, so the next call refreshes it.
+                if token.expires_within(TimeDelta::zero(), Utc::now()) {
+                    return Err(mett_core::Error::Network(
+                        "the access token expired while confirming the user; retry".into(),
+                    ));
+                }
+                Ok(token)
+            }
             Identity::Mismatch(e) => {
                 if let Some(stored) = stored {
                     state.access = None;
-                    state.refresh = None;
-                    self.clear_if_stored(stored).await?;
+                    // Another mett instance may have stored a newer token in
+                    // the meantime: keep that one for the next attempt.
+                    state.refresh = self.clear_if_stored(stored).await?;
                 }
                 Err(e)
             }

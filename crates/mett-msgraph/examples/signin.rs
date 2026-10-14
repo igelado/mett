@@ -66,6 +66,7 @@ async fn run(
 
     let response = reqwest::Client::new()
         .get(me)
+        .timeout(std::time::Duration::from_secs(30))
         .bearer_auth(token.secret())
         .send()
         .await?;

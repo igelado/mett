@@ -864,3 +864,41 @@ async fn uses_the_cached_token_while_a_refreshed_one_is_unconfirmed() {
     // confirmed yet, so the still-valid a-short is returned.
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
 }
+
+#[tokio::test]
+async fn keeps_a_replacement_token_after_an_identity_mismatch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-stale"))
+        .respond_with(tokens("a-other", "r-other"))
+        .mount(&server)
+        .await;
+    me(&server, "a-other", "mallory@contoso.com").await;
+
+    // The first load sees r-stale; meanwhile another instance stored r-newer.
+    let store = Arc::new(ReplacedStore::default());
+    store.inner.save(&account(), "r-newer").unwrap();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        no_prompts(),
+    );
+
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    assert_eq!(
+        store.inner.load(&account()).unwrap().as_deref(),
+        Some("r-newer")
+    );
+
+    // The next call uses r-newer instead of prompting.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-newer"))
+        .respond_with(tokens("a-newer", "r-newer"))
+        .mount(&server)
+        .await;
+    me(&server, "a-newer", "alice@contoso.com").await;
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-newer");
+}
