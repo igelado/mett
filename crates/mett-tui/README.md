@@ -8,6 +8,8 @@ Architecture (`docs/DESIGN.md` §5.2):
 - **`action.rs` and `keymap.rs`:** mutt-style named actions, and key bindings
   for each menu (the Command pattern, §5.3).
 - **`worker.rs`:** the background actor that owns all mailbox I/O (§5.4).
+- **`config/`:** reads `mettrc`, mutt's configuration format with mett's
+  extensions ([docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md)).
 
 So far it can browse a mailbox: the message index and the pager. It isn't
 connected to Office365 yet; `--demo` opens a built-in sample mailbox.
@@ -24,6 +26,35 @@ cargo test -p mett-tui
 - **`view` tests:** render into ratatui's `TestBackend` and compare the
   screen line by line, so a layout change shows up as a failing test.
 - **`worker` test:** runs the worker against `mett-core`'s in-memory store.
+- **`config` tests:** the lexer (quoting, escapes, expansion, backticks,
+  line continuation), every form of `set`, `source` (including loops),
+  file lookup, and `msgraph://` URLs with mutt's `=` shortcut.
+
+## Configuration
+
+mett reads `/etc/mettrc` (unless `-n`), then the first of `~/.mettrc`,
+`~/.mett/mettrc` and `$XDG_CONFIG_HOME/mett/mettrc`, or the file given with
+`-F`. A minimal configuration for an Office365 account:
+
+```muttrc
+set my_me = you@example.com
+set from = $my_me realname = "Your Name"
+set folder = msgraph://$my_me/
+set spoolfile = =@inbox
+set msgraph_client_id = <your app's client ID>
+```
+
+So far `set`, `unset`, `toggle`, `reset` and `source` are supported, with
+mutt's quoting, `$` expansion, backticks and `my_` variables. Other mutt
+commands and unknown variables are ignored with a warning, so a mettrc can
+`source` an existing muttrc.
+
+`mett -D` prints every setting after reading the configuration, which is a
+quick way to check it:
+
+```sh
+cargo run -p mett-tui -- -D
+```
 
 ## Trying it by hand
 

@@ -7,6 +7,7 @@
 
 mod action;
 mod app;
+mod config;
 mod demo;
 mod keymap;
 mod text;
@@ -24,23 +25,98 @@ use crate::app::{App, Effect, Msg};
 use crate::keymap::{Key, Keymap};
 use crate::worker::{Request, RequestId};
 
-const USAGE: &str = "usage: mett --demo
+const USAGE: &str = "usage: mett [-n] [-F <file>] [-D] [--demo]
 
-mett can't connect to Office365 yet. `mett --demo` opens a built-in sample
-mailbox to try the interface.";
+  -F <file>  read <file> instead of the user's mettrc
+  -n         don't read the system-wide mettrc (/etc/mettrc)
+  -D         print every setting after reading the configuration, and exit
+  --demo     open a built-in sample mailbox
+  -v         print the version
+
+mett can't open an Office365 mailbox yet; --demo shows the interface.";
+
+/// What the command line asks for.
+#[derive(Debug, Default)]
+struct Options {
+    files: config::Files,
+    dump: bool,
+    demo: bool,
+    version: bool,
+}
+
+fn parse_args(args: &[String]) -> Result<Options, String> {
+    let mut options = Options::default();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-F" => {
+                let file = args.next().ok_or("-F needs a file name")?;
+                options.files.user_file = Some(file.into());
+            }
+            "-n" => options.files.no_system = true,
+            "-D" => options.dump = true,
+            "--demo" => options.demo = true,
+            "-v" | "--version" => options.version = true,
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    if options.dump && options.demo {
+        return Err("-D and --demo can't be used together".into());
+    }
+    Ok(options)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [flag] if flag == "--demo" => {}
-        [flag] if flag == "--version" || flag == "-v" => {
-            println!("mett {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
-        _ => {
-            eprintln!("{USAGE}");
+    let options = match parse_args(&args) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("mett: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
+    };
+    if options.version {
+        println!("mett {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+
+    // The demo mailbox needs no configuration.
+    if !options.demo {
+        let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+        let mut config = config::Config::new(home);
+        for file in config::locate(&options.files, &|name| std::env::var_os(name)) {
+            config.load_file(&file);
+        }
+        for warning in &config.warnings {
+            eprintln!("mett: warning: {warning}");
+        }
+        for error in &config.errors {
+            eprintln!("mett: {error}");
+        }
+        if !config.errors.is_empty() {
+            return ExitCode::FAILURE;
+        }
+        if options.dump {
+            for line in config.dump() {
+                println!("{line}");
+            }
+            return ExitCode::SUCCESS;
+        }
+        let spoolfile = match config.spoolfile() {
+            Ok(url) => url,
+            Err(e) => {
+                eprintln!("mett: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if config.string("msgraph_client_id").is_empty() {
+            eprintln!(
+                "mett: msgraph_client_id is not set; see crates/mett-msgraph/README.md to register an app"
+            );
+            return ExitCode::FAILURE;
+        }
+        eprintln!("mett: opening {spoolfile} isn't available yet; try mett --demo");
+        return ExitCode::FAILURE;
     }
 
     let runtime = match tokio::runtime::Runtime::new() {
