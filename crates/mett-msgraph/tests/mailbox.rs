@@ -228,7 +228,10 @@ async fn lists_messages_newest_first_with_paging() {
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
         .and(query_param("$top", "2"))
-        .and(query_param("$orderby", "receivedDateTime desc"))
+        .and(query_param(
+            "$orderby",
+            "receivedDateTime desc,createdDateTime desc",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [message("m2", "2026-10-14T10:00:00Z"), message("m1", "2026-10-13T10:00:00Z")],
             "@odata.nextLink": next,
@@ -415,7 +418,10 @@ async fn maps_graph_errors_to_port_errors() {
         let store = &store;
         async move { store.fetch_message(&MessageId::new(id)).await.unwrap_err() }
     };
-    assert!(matches!(fetch("missing").await, Error::NotFound { .. }));
+    assert!(matches!(
+        fetch("missing").await,
+        Error::NotFound { kind: "message", id } if id == "missing"
+    ));
     assert!(matches!(
         fetch("busy").await,
         Error::Throttled { retry_after: Some(d) } if d == Duration::from_secs(7)
@@ -472,4 +478,20 @@ async fn batch_item_failures_keep_their_meaning() {
         Err(Error::Throttled { retry_after: Some(d) }) if d == Duration::from_secs(9)
     ));
     assert!(matches!(store.list_folders().await, Err(Error::Auth(_))));
+}
+
+#[tokio::test]
+async fn caps_page_sizes_at_graphs_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .and(query_param("$top", "1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .list_messages(&FolderId::new("inbox-id"), Page::first(5000))
+        .await
+        .unwrap();
 }

@@ -89,7 +89,9 @@ impl<A: Authenticator> GraphMailStore<A> {
         url
     }
 
-    async fn send(&self, request: RequestBuilder) -> Result<reqwest::Response> {
+    /// Sends `request` for `about` (the object it concerns, named in a
+    /// "not found" error).
+    async fn send(&self, request: RequestBuilder, about: About<'_>) -> Result<reqwest::Response> {
         let token = self.auth.access_token().await?;
         let response = request
             .bearer_auth(token.secret())
@@ -100,13 +102,17 @@ impl<A: Authenticator> GraphMailStore<A> {
         if response.status().is_success() {
             Ok(response)
         } else {
-            Err(error_from(response).await)
+            Err(error_from(response, about).await)
         }
     }
 
-    async fn json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
+    async fn json<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        about: About<'_>,
+    ) -> Result<T> {
         let body = self
-            .send(request)
+            .send(request, about)
             .await?
             .bytes()
             .await
@@ -143,6 +149,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             .json(
                 self.request(Method::POST, self.url(&["$batch"]))
                     .json(&json!({ "requests": requests })),
+                About::MAILBOX,
             )
             .await?;
 
@@ -211,20 +218,18 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         };
         // `/me/mailFolders` lists only top-level folders; walk down through
         // `childFolders` for the rest.
-        let mut pending = vec![top(self.url(&["me", "mailFolders"]))];
+        let mut pending = vec![(top(self.url(&["me", "mailFolders"])), None)];
         let mut folders = Vec::new();
-        while let Some(mut url) = pending.pop() {
+        while let Some((mut url, parent)) = pending.pop() {
             loop {
+                let about = parent.as_deref().map_or(About::MAILBOX, About::folder);
                 let page: Collection<GraphFolder> =
-                    self.json(self.request(Method::GET, url)).await?;
+                    self.json(self.request(Method::GET, url), about).await?;
                 for folder in page.value {
                     if folder.child_folder_count > 0 {
-                        pending.push(top(self.url(&[
-                            "me",
-                            "mailFolders",
-                            &folder.id,
-                            "childFolders",
-                        ])));
+                        let children =
+                            top(self.url(&["me", "mailFolders", &folder.id, "childFolders"]));
+                        pending.push((children, Some(folder.id.clone())));
                     }
                     folders.push(roles.folder(folder));
                 }
@@ -240,7 +245,12 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
         let roles = self.roles().await?;
         let url = self.url(&["me", "mailFolders", which.as_str()]);
-        let folder: GraphFolder = self.json(self.request(Method::GET, url)).await?;
+        let folder: GraphFolder = self
+            .json(
+                self.request(Method::GET, url),
+                About::folder(which.as_str()),
+            )
+            .await?;
         Ok(Folder {
             well_known: Some(which),
             ..roles.folder(folder)
@@ -253,19 +263,26 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             // the query; only the page size may change.
             Some(cursor) => {
                 let mut url = self.next_page_url(cursor.as_str())?;
-                set_query(&mut url, "$top", &page.size().to_string());
+                set_query(&mut url, "$top", &top_for(&page));
                 url
             }
             None => {
                 let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
                 url.query_pairs_mut()
-                    .append_pair("$top", &page.size().to_string())
+                    .append_pair("$top", &top_for(&page))
                     .append_pair("$select", SUMMARY_FIELDS)
-                    .append_pair("$orderby", "receivedDateTime desc");
+                    // Drafts have no received time; they sort by creation
+                    // time, which is what their summaries show.
+                    .append_pair("$orderby", "receivedDateTime desc,createdDateTime desc");
                 url
             }
         };
-        let page: Collection<GraphMessage> = self.json(self.request(Method::GET, url)).await?;
+        let page: Collection<GraphMessage> = self
+            .json(
+                self.request(Method::GET, url),
+                About::folder(folder.as_str()),
+            )
+            .await?;
         Ok(MessagePage {
             messages: page
                 .value
@@ -286,7 +303,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .request(Method::GET, url)
             // Graph converts HTML bodies to text, better than mett could.
             .header("Prefer", "outlook.body-content-type=\"text\"");
-        let message: GraphMessage = self.json(request).await?;
+        let message: GraphMessage = self.json(request, About::message(id.as_str())).await?;
         message.into_message()
     }
 
@@ -303,9 +320,12 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             return Ok(());
         }
         let url = self.url(&["me", "messages", id.as_str()]);
-        self.send(self.request(Method::PATCH, url).json(&patch))
-            .await
-            .map(drop)
+        self.send(
+            self.request(Method::PATCH, url).json(&patch),
+            About::message(id.as_str()),
+        )
+        .await
+        .map(drop)
     }
 
     async fn move_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
@@ -314,7 +334,10 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             destination_id: to.as_str(),
         };
         let moved: IdOnly = self
-            .json(self.request(Method::POST, url).json(&body))
+            .json(
+                self.request(Method::POST, url).json(&body),
+                About::message(id.as_str()),
+            )
             .await?;
         Ok(MessageId::new(moved.id))
     }
@@ -323,7 +346,9 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         // DELETE would only move it to Deleted Items; the port promises a
         // permanent delete.
         let url = self.url(&["me", "messages", id.as_str(), "permanentDelete"]);
-        self.send(self.request(Method::POST, url)).await.map(drop)
+        self.send(self.request(Method::POST, url), About::message(id.as_str()))
+            .await
+            .map(drop)
     }
 }
 
@@ -343,6 +368,15 @@ impl<A> GraphMailStore<A> {
     }
 }
 
+/// The most messages Graph returns per request.
+const MAX_PAGE_SIZE: u32 = 1000;
+
+/// `$top` for `page`: its size, within Graph's limit. A larger request
+/// still gets a cursor for the rest.
+fn top_for(page: &Page) -> String {
+    page.size().min(MAX_PAGE_SIZE).to_string()
+}
+
 /// Sets `key` in `url`'s query, replacing any existing value.
 fn set_query(url: &mut Url, key: &str, value: &str) {
     let pairs: Vec<(String, String)> = url
@@ -357,7 +391,32 @@ fn set_query(url: &mut Url, key: &str, value: &str) {
 }
 
 /// Maps an unsuccessful Graph response to a port error.
-async fn error_from(response: reqwest::Response) -> Error {
+/// The object a request concerns.
+#[derive(Clone, Copy)]
+struct About<'a> {
+    kind: &'static str,
+    id: &'a str,
+}
+
+impl<'a> About<'a> {
+    const MAILBOX: About<'static> = About {
+        kind: "mailbox",
+        id: "me",
+    };
+
+    fn folder(id: &'a str) -> Self {
+        Self { kind: "folder", id }
+    }
+
+    fn message(id: &'a str) -> Self {
+        Self {
+            kind: "message",
+            id,
+        }
+    }
+}
+
+async fn error_from(response: reqwest::Response, about: About<'_>) -> Error {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -372,8 +431,8 @@ async fn error_from(response: reqwest::Response) -> Error {
     match status {
         StatusCode::TOO_MANY_REQUESTS => Error::Throttled { retry_after },
         StatusCode::NOT_FOUND => Error::NotFound {
-            kind: "item",
-            id: detail,
+            kind: about.kind,
+            id: about.id.to_owned(),
         },
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Error::Auth(detail),
         StatusCode::REQUEST_TIMEOUT => Error::Network(detail),
