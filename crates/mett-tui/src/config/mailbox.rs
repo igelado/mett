@@ -62,10 +62,12 @@ impl MailboxUrl {
                     let which = name.parse::<WellKnownFolder>().map_err(|_| {
                         MailboxError(format!("{url}: unknown well-known folder @{name}"))
                     })?;
-                    if let Some(virtual_view) = rest.iter().find(|s| s.starts_with('@')) {
-                        return Err(MailboxError(format!(
-                            "{url}: {virtual_view} is not supported yet"
-                        )));
+                    // `@inbox/@focused` and `@inbox/@other` are the Focused
+                    // Inbox views; any other name is a real folder.
+                    if which == WellKnownFolder::Inbox
+                        && let Some(view @ (&"@focused" | &"@other")) = rest.first()
+                    {
+                        return Err(MailboxError(format!("{url}: {view} is not supported yet")));
                     }
                     FolderPath::WellKnown(which, rest.iter().map(|s| (*s).to_owned()).collect())
                 }
@@ -160,6 +162,12 @@ mod tests {
         assert!(MailboxUrl::parse("msgraph://alice@contoso.com/@spam").is_err());
         let focused = MailboxUrl::parse("msgraph://alice@contoso.com/@inbox/@focused");
         assert!(matches!(focused, Err(MailboxError(m)) if m.contains("not supported yet")));
+        // Other @-names below a folder are ordinary folder names.
+        let url = MailboxUrl::parse("msgraph://alice@contoso.com/@inbox/@Projects").unwrap();
+        assert_eq!(
+            url.folder,
+            FolderPath::WellKnown(WellKnownFolder::Inbox, vec!["@Projects".into()])
+        );
     }
 
     #[test]
