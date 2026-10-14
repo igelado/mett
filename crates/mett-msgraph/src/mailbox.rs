@@ -25,8 +25,7 @@ use crate::settings::AuthSettings;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The message fields the index needs.
-const SUMMARY_FIELDS: &str =
-    "id,parentFolderId,subject,from,toRecipients,receivedDateTime,isRead,flag,hasAttachments";
+const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,receivedDateTime,createdDateTime,isRead,flag,hasAttachments";
 
 /// A [`MailStore`] backed by Microsoft Graph.
 pub struct GraphMailStore<A> {
@@ -155,7 +154,17 @@ impl<A: Authenticator> GraphMailStore<A> {
             match response.status {
                 200 => {}
                 404 => continue,
-                429 => return Err(Error::Throttled { retry_after: None }),
+                429 => {
+                    return Err(Error::Throttled {
+                        retry_after: response.retry_after(),
+                    });
+                }
+                401 | 403 => {
+                    return Err(Error::Auth(format!(
+                        "Graph refused a folder lookup: HTTP {}",
+                        response.status
+                    )));
+                }
                 s if s >= 500 => {
                     return Err(Error::Network(format!(
                         "Graph failed to look up a folder: HTTP {s}"
@@ -405,7 +414,20 @@ struct BatchResponse {
 struct BatchItem {
     id: String,
     status: u16,
+    #[serde(default)]
+    headers: HashMap<String, String>,
     body: Option<MaybeId>,
+}
+
+impl BatchItem {
+    /// The item's `Retry-After`, in seconds, if it has one.
+    fn retry_after(&self) -> Option<Duration> {
+        self.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .and_then(|(_, value)| value.trim().parse().ok())
+            .map(Duration::from_secs)
+    }
 }
 
 #[derive(Deserialize)]
@@ -444,7 +466,9 @@ struct GraphMessage {
     to_recipients: Vec<Recipient>,
     #[serde(default)]
     cc_recipients: Vec<Recipient>,
-    received_date_time: String,
+    /// Missing for messages that were never received, such as drafts.
+    received_date_time: Option<String>,
+    created_date_time: Option<String>,
     #[serde(default)]
     is_read: bool,
     flag: Option<FollowupFlag>,
@@ -517,13 +541,14 @@ impl GraphMessage {
     }
 
     fn split(self) -> Result<(MessageSummary, Rest)> {
-        let received = DateTime::parse_from_rfc3339(&self.received_date_time)
-            .map_err(|e| {
-                Error::Backend(format!(
-                    "invalid receivedDateTime {:?}: {e}",
-                    self.received_date_time
-                ))
-            })?
+        // Drafts and outgoing messages were never received: use when they
+        // were created instead.
+        let timestamp = self
+            .received_date_time
+            .or(self.created_date_time)
+            .ok_or_else(|| Error::Backend("message has no timestamp".into()))?;
+        let received = DateTime::parse_from_rfc3339(&timestamp)
+            .map_err(|e| Error::Backend(format!("invalid message timestamp {timestamp:?}: {e}")))?
             .with_timezone(&Utc);
         let summary = MessageSummary {
             id: MessageId::new(self.id),

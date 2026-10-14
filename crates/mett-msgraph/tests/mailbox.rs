@@ -423,3 +423,53 @@ async fn maps_graph_errors_to_port_errors() {
     assert!(matches!(fetch("denied").await, Error::Auth(msg) if msg.contains("ErrorAccessDenied")));
     assert!(matches!(fetch("down").await, Error::Network(_)));
 }
+
+#[tokio::test]
+async fn drafts_without_a_received_time_use_their_creation_time() {
+    let server = MockServer::start().await;
+    let mut draft = message("d1", "2026-10-14T10:00:00Z");
+    draft["receivedDateTime"] = Value::Null;
+    draft["createdDateTime"] = json!("2026-10-10T08:00:00Z");
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/drafts-id/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [draft] })))
+        .mount(&server)
+        .await;
+
+    let page = store(&server)
+        .list_messages(&FolderId::new("drafts-id"), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.messages[0].received,
+        DateTime::parse_from_rfc3339("2026-10-10T08:00:00Z").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn batch_item_failures_keep_their_meaning() {
+    let server = MockServer::start().await;
+    let item = |status: u16, headers: Value| json!({ "responses": [{ "id": "0", "status": status, "headers": headers, "body": {} }] });
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(item(429, json!({ "Retry-After": "9" }))),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item(403, json!({}))))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let store = store(&server);
+    assert!(matches!(
+        store.list_folders().await,
+        Err(Error::Throttled { retry_after: Some(d) }) if d == Duration::from_secs(9)
+    ));
+    assert!(matches!(store.list_folders().await, Err(Error::Auth(_))));
+}
