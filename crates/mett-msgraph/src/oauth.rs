@@ -83,6 +83,9 @@ pub(crate) enum FlowError {
     /// The identity platform could not be reached.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    /// The identity platform failed temporarily, for example with HTTP 503.
+    #[error("{0}")]
+    Unavailable(String),
     /// Anything else, such as a timeout or a malformed response.
     #[error("{0}")]
     Other(String),
@@ -96,13 +99,26 @@ impl FlowError {
         matches!(self, Self::OAuth { code, .. }
             if code == "invalid_grant" || code == "interaction_required")
     }
+
+    /// Whether retrying the same request later may succeed: the identity
+    /// platform was unreachable or temporarily failing.
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(_) | Self::Unavailable(_) => true,
+            Self::OAuth { code, .. } => code == "temporarily_unavailable" || code == "server_error",
+            Self::Other(_) => false,
+        }
+    }
 }
 
 impl From<FlowError> for mett_core::Error {
     fn from(e: FlowError) -> Self {
-        match e {
-            FlowError::Http(e) => Self::Network(e.to_string()),
-            e @ (FlowError::OAuth { .. } | FlowError::Other(_)) => Self::Auth(e.to_string()),
+        // Transient failures are network errors, not authentication errors:
+        // the UI should retry, not ask the user to sign in again.
+        if e.is_transient() {
+            Self::Network(e.to_string())
+        } else {
+            Self::Auth(e.to_string())
         }
     }
 }
@@ -158,6 +174,9 @@ async fn post_form<T: DeserializeOwned>(
             code: e.error,
             description: e.error_description.unwrap_or_default(),
         }),
+        Err(_) if status.is_server_error() => Err(FlowError::Unavailable(format!(
+            "identity platform returned HTTP {status}"
+        ))),
         Err(_) => Err(FlowError::Other(format!(
             "identity platform returned HTTP {status}"
         ))),
@@ -240,6 +259,9 @@ pub(crate) async fn device_code(
             Err(FlowError::OAuth { code, .. }) if code == "slow_down" => {
                 interval += Duration::from_secs(5);
             }
+            // The user may already have entered the code: keep polling
+            // until it expires rather than making them start over.
+            Err(e) if e.is_transient() => {}
             other => return other,
         }
     }

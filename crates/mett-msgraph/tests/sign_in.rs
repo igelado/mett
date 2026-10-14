@@ -190,7 +190,9 @@ async fn keeps_the_refresh_token_on_transient_errors() {
         no_prompts(),
     );
 
-    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    // Reported as a network problem, so the UI retries instead of asking
+    // the user to sign in again.
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     assert_eq!(stored(&store).as_deref(), Some("r0"));
 }
 
@@ -495,4 +497,24 @@ async fn keeps_working_in_memory_when_tokens_cannot_be_stored() {
     // …but the session keeps the tokens and doesn't ask to sign in again.
     assert_eq!(auth.access_token().await.unwrap().secret(), "a6");
     assert_eq!(*prompts.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn keeps_polling_after_a_transient_device_code_poll_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("device_code=dev-code"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    device_sign_in(&server, "a7").await;
+    me(&server, "a7", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, |_| {});
+
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a7");
 }
