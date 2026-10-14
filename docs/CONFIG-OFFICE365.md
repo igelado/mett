@@ -1,6 +1,9 @@
 # Configuring Office365 accounts in mett
 
-Status: **proposal**
+Status: **partly implemented.** mett reads mettrc files (§1) with `set`,
+`unset`, `toggle`, `reset` and `source`, knows the variables in §4, and
+parses `msgraph://` URLs (§3) without the Focused Inbox views. Everything
+else is still a proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc
 format described in [MUTTRC.md](MUTTRC.md) and adds the minimum extensions
