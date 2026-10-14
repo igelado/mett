@@ -3,9 +3,10 @@
 //! Enabled by the `mock` feature, so that other crates (the TUI, the worker)
 //! can be tested against [`MemoryStore`] without a network connection.
 
+use std::cmp::Reverse;
 use std::sync::{Mutex, MutexGuard};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::error::{Error, Result};
 use crate::folder::{Folder, WellKnownFolder};
@@ -121,20 +122,25 @@ impl MailStore for MemoryStore {
             .filter(|m| &m.summary.folder == folder)
             .map(|m| m.summary.clone())
             .collect();
-        messages.sort_by_key(|m| std::cmp::Reverse(m.received));
+        messages.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
 
-        // The cursor is the offset of the next page.
+        // The cursor holds the sort key of the last message returned, so the
+        // next page resumes after it even if messages were moved or deleted
+        // in between. An offset would skip messages in that case.
         let start = match page.cursor() {
             None => 0,
-            Some(cursor) => cursor
-                .as_str()
-                .parse::<usize>()
-                .map_err(|_| Error::Backend(format!("invalid page cursor: {cursor}")))?,
+            Some(cursor) => {
+                let (received, id) = decode_cursor(cursor)?;
+                let after = (Reverse(received), &id);
+                messages.partition_point(|m| sort_key(m) <= after)
+            }
         };
         let end = start
             .saturating_add(page.size() as usize)
             .min(messages.len());
-        let next = (end < messages.len()).then(|| PageCursor::new(end.to_string()));
+        let next = (end < messages.len())
+            .then(|| messages.get(end - 1).map(encode_cursor))
+            .flatten();
         let messages = messages.get(start..end).unwrap_or_default().to_vec();
 
         Ok(MessagePage { messages, next })
@@ -169,6 +175,23 @@ impl MailStore for MemoryStore {
         }
         Ok(())
     }
+}
+
+/// Listing order: newest first, with ties broken by ID.
+fn sort_key(m: &MessageSummary) -> (Reverse<DateTime<Utc>>, &MessageId) {
+    (Reverse(m.received), &m.id)
+}
+
+fn encode_cursor(m: &MessageSummary) -> PageCursor {
+    let received = m.received.to_rfc3339_opts(SecondsFormat::Nanos, true);
+    PageCursor::new(format!("{received}|{}", m.id))
+}
+
+fn decode_cursor(cursor: &PageCursor) -> Result<(DateTime<Utc>, MessageId)> {
+    let invalid = || Error::Backend(format!("invalid page cursor: {cursor}"));
+    let (received, id) = cursor.as_str().split_once('|').ok_or_else(invalid)?;
+    let received = DateTime::parse_from_rfc3339(received).map_err(|_| invalid())?;
+    Ok((received.with_timezone(&Utc), MessageId::new(id)))
 }
 
 /// Creates an empty folder for tests.
@@ -243,6 +266,31 @@ mod tests {
             .unwrap();
         assert_eq!(subjects(&second), ["first"]);
         assert_eq!(second.next, None);
+    }
+
+    #[tokio::test]
+    async fn pagination_survives_deleting_seen_messages() {
+        let store = store();
+        let inbox = FolderId::new("in");
+
+        let first = store.list_messages(&inbox, Page::first(2)).await.unwrap();
+        assert_eq!(subjects(&first), ["third", "second"]);
+        store.delete_message(&MessageId::new("m3")).await.unwrap();
+
+        let cursor = first.next.expect("a second page");
+        let second = store
+            .list_messages(&inbox, Page::after(cursor, 2))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&second), ["first"]);
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_cursors() {
+        let result = store()
+            .list_messages(&FolderId::new("in"), Page::after("junk".into(), 2))
+            .await;
+        assert!(matches!(result, Err(Error::Backend(_))));
     }
 
     #[tokio::test]
