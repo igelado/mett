@@ -16,7 +16,7 @@ mett-core = { workspace = true, features = ["mock"] }
 
 chrono.workspace = true
 ratatui.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 unicode-width.workspace = true
 
 [lints]

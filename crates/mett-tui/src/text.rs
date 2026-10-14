@@ -61,26 +61,28 @@ pub fn wrap(line: &str, width: usize) -> Vec<String> {
     for c in line.chars() {
         let w = c.width().unwrap_or(0);
         if row_width + w > width && !row.is_empty() {
-            // A space that doesn't fit is where the row ends.
             if c == ' ' {
+                // The row ends at this space, which is dropped.
                 rows.push(std::mem::take(&mut row));
                 row_width = 0;
                 break_at = None;
                 continue;
             }
-            match break_at.filter(|&i| i < row.len()) {
-                Some(i) => {
-                    let rest = row.split_off(i);
-                    rows.push(row.trim_end().to_owned());
-                    row_width = rest.width();
-                    row = rest;
-                }
-                None => {
-                    rows.push(std::mem::take(&mut row));
-                    row_width = 0;
-                }
+            // Move the last word to a new row, unless only indentation
+            // comes before it (which would leave a blank row).
+            if let Some(i) = break_at.filter(|&i| !row[..i].trim().is_empty()) {
+                let rest = row.split_off(i);
+                rows.push(row.trim_end().to_owned());
+                row_width = rest.width();
+                row = rest;
             }
             break_at = None;
+            // Still too wide (no break point, or the word itself is too
+            // long): break right here.
+            if row_width + w > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
         }
         row.push(c);
         row_width += w;
@@ -212,6 +214,13 @@ mod tests {
         assert_eq!(wrap("", 4), [""]);
         // Each of these characters is two cells wide.
         assert_eq!(wrap("日本語です", 4), ["日本", "語で", "す"]);
+        // After moving a word, a wide character must still fit.
+        assert_eq!(wrap("ab cdef界", 5), ["ab", "cdef", "界"]);
+        // Indentation alone doesn't make a blank row.
+        assert_eq!(wrap(" bbbb界", 5), [" bbbb", "界"]);
+        for row in wrap("aa bb 界界界 cc 日本語 d", 5) {
+            assert!(row.width() <= 5, "{row:?} is too wide");
+        }
     }
 
     #[test]

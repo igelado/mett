@@ -274,7 +274,11 @@ impl App {
                         return vec![more];
                     }
                     self.listing = None;
-                    self.status.clear();
+                    // Clear the "Loading" message, but not an error that
+                    // was reported while the folder was loading.
+                    if self.status.starts_with("Loading ") {
+                        self.status.clear();
+                    }
                 }
                 Err(e) => {
                     self.listing = None;
@@ -344,6 +348,12 @@ impl App {
         ));
         self.flag_updates.insert(effect_id(&update), message_id);
         vec![update]
+    }
+
+    /// Whether changes to the mailbox are still being saved. mett waits
+    /// for them before exiting, so they aren't lost.
+    pub fn saving(&self) -> bool {
+        !self.flag_updates.is_empty()
     }
 
     fn report(&mut self, error: Error) {
@@ -530,6 +540,56 @@ mod tests {
         // Reopening a read message doesn't update its flags again.
         act(&mut app, Action::Exit);
         assert!(open(&mut app, 1).is_empty());
+    }
+
+    #[test]
+    fn finishing_the_listing_keeps_an_error_reported_meanwhile() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(first, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: first,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: summaries(1),
+                next: Some(PageCursor::new("c")),
+            })),
+        }));
+        let Effect::Request(second, _) = effects[0].clone();
+
+        // An error is reported while the second page is loading…
+        let effects = open(&mut app, 1);
+        let Effect::Request(update, _) = effects[0].clone();
+        app.update(Msg::Response(Response {
+            id: update,
+            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
+        }));
+        // …and survives the end of the listing.
+        app.update(Msg::Response(Response {
+            id: second,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: Vec::new(),
+                next: None,
+            })),
+        }));
+        assert_eq!(app.status, "network error: offline");
+    }
+
+    #[test]
+    fn tracks_unsaved_flag_changes() {
+        let mut app = loaded(1);
+        assert!(!app.saving());
+        let effects = open(&mut app, 1);
+        assert!(app.saving());
+        let Effect::Request(update, _) = effects[0].clone();
+        app.update(Msg::Response(Response {
+            id: update,
+            event: Event::FlagsUpdated(Ok(())),
+        }));
+        assert!(!app.saving());
     }
 
     #[test]

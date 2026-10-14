@@ -121,8 +121,27 @@ async fn run<S: mett_core::MailStore + 'static>(
         let effects = app.update(msg);
         dispatch(&request_tx, effects);
     }
+
+    // Give pending changes (such as marking a message read) a moment to
+    // reach the mailbox, rather than cancelling them by exiting.
+    if app.saving() {
+        app.status = "Saving changes...".into();
+        terminal.draw(|frame| view::render(&app, &keymap, frame))?;
+        let deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
+        while app.saving() {
+            match tokio::time::timeout_at(deadline, response_rx.recv()).await {
+                Ok(Some(response)) => {
+                    app.update(Msg::Response(response));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    }
     Ok(())
 }
+
+/// How long to wait for pending changes when quitting.
+const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn dispatch(requests: &mpsc::UnboundedSender<(RequestId, Request)>, effects: Vec<Effect>) {
     for Effect::Request(id, request) in effects {
