@@ -73,6 +73,9 @@ a crate may only depend on crates below it in the diagram.
 ¹ Named after its storage technology once that is chosen, for example
 `mett-sqlite` or `mett-maildir` (see §10).
 
+Until `mett-tui` can open an Office365 mailbox, `mett --demo` runs the UI on
+`mett-core`'s in-memory `MailStore`.
+
 `mett-tui` is the only crate that knows about every adapter. It wires them
 together at startup, acting as the composition root.
 
