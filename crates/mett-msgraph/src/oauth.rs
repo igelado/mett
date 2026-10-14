@@ -62,6 +62,11 @@ pub(crate) async fn user_principal_name(
             description: "Graph rejected the access token".into(),
         });
     }
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(FlowError::Unavailable(format!(
+            "could not look up the signed-in user: Graph returned HTTP {status}"
+        )));
+    }
     if !status.is_success() {
         return Err(FlowError::Other(format!(
             "could not look up the signed-in user: Graph returned HTTP {status}"

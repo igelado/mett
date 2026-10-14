@@ -108,9 +108,16 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
             Err(e @ FlowError::OAuth { .. }) => Identity::Mismatch(mett_core::Error::Auth(
                 format!("could not confirm that the sign-in was for {expected}: {e}"),
             )),
-            Err(e) => Identity::Unknown(mett_core::Error::Auth(format!(
-                "could not confirm that the sign-in was for {expected}: {e}"
-            ))),
+            Err(e) => {
+                let message = format!("could not confirm that the sign-in was for {expected}: {e}");
+                // Keep the transient/permanent distinction, so that a Graph
+                // outage is retried rather than treated as an auth failure.
+                Identity::Unknown(if e.is_transient() {
+                    mett_core::Error::Network(message)
+                } else {
+                    mett_core::Error::Auth(message)
+                })
+            }
         }
     }
 

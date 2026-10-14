@@ -421,7 +421,8 @@ async fn retries_confirming_the_user_without_signing_in_again() {
         *counted.lock().unwrap() += 1
     });
 
-    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    // A Graph outage is a network error: the UI retries.
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     // Unconfirmed tokens are not stored.
     assert_eq!(stored(&store), None);
 
