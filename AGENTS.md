@@ -54,6 +54,9 @@ GitLab enforces this workflow:
 - CI is defined in `.gitlab-ci.yml`. Its jobs run on the shared Linux Docker
   runners (`os/linux`, `type/docker`, `size/medium`). Add new checks there,
   so that they gate merging.
+- CodeRabbit reviews every MR automatically, configured in
+  `.coderabbit.yaml`. Its comments are review threads, so they must be
+  resolved before merging.
 
 ## Locally generated files
 
