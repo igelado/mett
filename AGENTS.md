@@ -43,6 +43,14 @@ where to store things, or similar project-wide conventions:
 4. Address every error and review concern on the same branch.
 5. Then merge the MR into `main` and delete the feature branch.
 
+GitLab enforces this workflow:
+
+- `main` is protected. Nobody can push to it directly or force-push, and only
+  Maintainers can merge.
+- An MR can be merged only if its pipeline succeeds. Skipped pipelines don't
+  count as successful.
+- The source branch is deleted after merge by default.
+
 ## Locally generated files
 
 Do not commit locally generated files. Keep `.gitignore` up to date: whenever
