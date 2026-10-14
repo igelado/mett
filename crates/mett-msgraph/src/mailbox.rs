@@ -34,9 +34,37 @@ pub struct GraphMailStore<A> {
     /// The Graph v1.0 root, for example `https://graph.microsoft.com/v1.0/`.
     base: Url,
     auth: Arc<A>,
-    /// Folder IDs of well-known folders seen so far, so that
-    /// [`MailStore::list_folders`] can label them.
-    well_known: Mutex<HashMap<FolderId, WellKnownFolder>>,
+    /// The mailbox's folder roles, once looked up.
+    roles: Mutex<Option<Arc<Roles>>>,
+}
+
+/// Which folders play special roles. Folder IDs don't change, so this is
+/// looked up once.
+#[derive(Debug, Default)]
+struct Roles {
+    /// The hidden root that top-level folders hang from.
+    root: Option<FolderId>,
+    /// Well-known folders by ID.
+    well_known: HashMap<FolderId, WellKnownFolder>,
+}
+
+impl Roles {
+    fn folder(&self, folder: GraphFolder) -> Folder {
+        let id = FolderId::new(folder.id);
+        Folder {
+            well_known: self.well_known.get(&id).copied(),
+            // Top-level folders hang from the hidden root; the port says
+            // they have no parent.
+            parent: folder
+                .parent_folder_id
+                .map(FolderId::new)
+                .filter(|p| Some(p) != self.root.as_ref()),
+            id,
+            name: folder.display_name,
+            unread_count: folder.unread_item_count,
+            total_count: folder.total_item_count,
+        }
+    }
 }
 
 impl<A: Authenticator> GraphMailStore<A> {
@@ -47,7 +75,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             http,
             base: settings.graph_api(""),
             auth,
-            well_known: Mutex::new(HashMap::new()),
+            roles: Mutex::new(None),
         }
     }
 
@@ -92,47 +120,114 @@ impl<A: Authenticator> GraphMailStore<A> {
         self.http.request(method, url)
     }
 
-    fn label(&self, folder: GraphFolder) -> Folder {
-        let well_known = self
-            .well_known
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&FolderId::new(&folder.id))
-            .copied();
-        folder.into_folder(well_known)
+    /// The mailbox's folder roles, looked up on first use with a single
+    /// `$batch` request for the root and every well-known folder.
+    async fn roles(&self) -> Result<Arc<Roles>> {
+        if let Some(roles) = self.roles.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Ok(roles);
+        }
+        let names: Vec<&str> = std::iter::once(ROOT)
+            .chain(WellKnownFolder::ALL.iter().map(|w| w.as_str()))
+            .collect();
+        let requests: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                json!({
+                    "id": i.to_string(),
+                    "method": "GET",
+                    "url": format!("/me/mailFolders/{name}?$select=id"),
+                })
+            })
+            .collect();
+        let batch: BatchResponse = self
+            .json(
+                self.request(Method::POST, self.url(&["$batch"]))
+                    .json(&json!({ "requests": requests })),
+            )
+            .await?;
+
+        let mut roles = Roles::default();
+        for response in batch.responses {
+            // A mailbox may lack some well-known folders (404): skip them.
+            let (Ok(index), true) = (response.id.parse::<usize>(), response.status == 200) else {
+                continue;
+            };
+            let Some(id) = response.body.and_then(|b| b.id).map(FolderId::new) else {
+                continue;
+            };
+            match index.checked_sub(1) {
+                None => roles.root = Some(id),
+                Some(i) => {
+                    if let Some(which) = WellKnownFolder::ALL.get(i) {
+                        roles.well_known.insert(id, *which);
+                    }
+                }
+            }
+        }
+        let roles = Arc::new(roles);
+        *self.roles.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&roles));
+        Ok(roles)
     }
 }
 
+/// Graph's well-known name for the hidden root of the folder tree.
+const ROOT: &str = "msgfolderroot";
+
 impl<A: Authenticator> MailStore for GraphMailStore<A> {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
-        let mut url = self.url(&["me", "mailFolders"]);
-        url.query_pairs_mut().append_pair("$top", "100");
+        let roles = self.roles().await?;
+        let top = |mut url: Url| {
+            url.query_pairs_mut().append_pair("$top", "100");
+            url
+        };
+        // `/me/mailFolders` lists only top-level folders; walk down through
+        // `childFolders` for the rest.
+        let mut pending = vec![top(self.url(&["me", "mailFolders"]))];
         let mut folders = Vec::new();
-        loop {
-            let page: Collection<GraphFolder> = self.json(self.request(Method::GET, url)).await?;
-            folders.extend(page.value.into_iter().map(|f| self.label(f)));
-            match page.next_link {
-                Some(next) => url = self.next_page_url(&next)?,
-                None => return Ok(folders),
+        while let Some(mut url) = pending.pop() {
+            loop {
+                let page: Collection<GraphFolder> =
+                    self.json(self.request(Method::GET, url)).await?;
+                for folder in page.value {
+                    if folder.child_folder_count > 0 {
+                        pending.push(top(self.url(&[
+                            "me",
+                            "mailFolders",
+                            &folder.id,
+                            "childFolders",
+                        ])));
+                    }
+                    folders.push(roles.folder(folder));
+                }
+                match page.next_link {
+                    Some(next) => url = self.next_page_url(&next)?,
+                    None => break,
+                }
             }
         }
+        Ok(folders)
     }
 
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
+        let roles = self.roles().await?;
         let url = self.url(&["me", "mailFolders", which.as_str()]);
         let folder: GraphFolder = self.json(self.request(Method::GET, url)).await?;
-        self.well_known
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(FolderId::new(&folder.id), which);
-        Ok(folder.into_folder(Some(which)))
+        Ok(Folder {
+            well_known: Some(which),
+            ..roles.folder(folder)
+        })
     }
 
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
         let url = match page.cursor() {
             // The cursor is Graph's `@odata.nextLink`, which already holds
-            // the query.
-            Some(cursor) => self.next_page_url(cursor.as_str())?,
+            // the query; only the page size may change.
+            Some(cursor) => {
+                let mut url = self.next_page_url(cursor.as_str())?;
+                set_query(&mut url, "$top", &page.size().to_string());
+                url
+            }
             None => {
                 let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
                 url.query_pairs_mut()
@@ -220,6 +315,19 @@ impl<A> GraphMailStore<A> {
     }
 }
 
+/// Sets `key` in `url`'s query, replacing any existing value.
+fn set_query(url: &mut Url, key: &str, value: &str) {
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != key)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(pairs)
+        .append_pair(key, value);
+}
+
 /// Maps an unsuccessful Graph response to a port error.
 async fn error_from(response: reqwest::Response) -> Error {
     let status = response.status();
@@ -269,6 +377,23 @@ struct IdOnly {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct BatchResponse {
+    responses: Vec<BatchItem>,
+}
+
+#[derive(Deserialize)]
+struct BatchItem {
+    id: String,
+    status: u16,
+    body: Option<MaybeId>,
+}
+
+#[derive(Deserialize)]
+struct MaybeId {
+    id: Option<String>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MoveRequest<'a> {
@@ -282,22 +407,11 @@ struct GraphFolder {
     display_name: String,
     parent_folder_id: Option<String>,
     #[serde(default)]
+    child_folder_count: u32,
+    #[serde(default)]
     unread_item_count: u32,
     #[serde(default)]
     total_item_count: u32,
-}
-
-impl GraphFolder {
-    fn into_folder(self, well_known: Option<WellKnownFolder>) -> Folder {
-        Folder {
-            id: FolderId::new(self.id),
-            parent: self.parent_folder_id.map(FolderId::new),
-            name: self.display_name,
-            well_known,
-            unread_count: self.unread_item_count,
-            total_count: self.total_item_count,
-        }
-    }
 }
 
 #[derive(Deserialize)]

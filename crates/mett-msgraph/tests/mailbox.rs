@@ -32,13 +32,48 @@ fn store(server: &MockServer) -> GraphMailStore<StaticAuth> {
 }
 
 fn folder(id: &str, name: &str) -> Value {
+    child(id, name, "root-id", 0)
+}
+
+fn child(id: &str, name: &str, parent: &str, children: u32) -> Value {
     json!({
         "id": id,
         "displayName": name,
-        "parentFolderId": "root",
+        "parentFolderId": parent,
+        "childFolderCount": children,
         "unreadItemCount": 2,
         "totalItemCount": 5,
     })
+}
+
+/// Answers the `$batch` role lookup: the root is `root-id` and only the
+/// Inbox (`inbox-id`) exists among the well-known folders.
+async fn mount_roles(server: &MockServer) {
+    let names = [
+        "msgfolderroot",
+        "inbox",
+        "drafts",
+        "sentitems",
+        "deleteditems",
+        "junkemail",
+        "archive",
+        "outbox",
+    ];
+    let responses: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| match *name {
+            "msgfolderroot" => json!({ "id": i.to_string(), "status": 200, "body": { "id": "root-id" } }),
+            "inbox" => json!({ "id": i.to_string(), "status": 200, "body": { "id": "inbox-id" } }),
+            _ => json!({ "id": i.to_string(), "status": 404, "body": { "error": { "code": "ErrorFolderNotFound", "message": "" } } }),
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "responses": responses })))
+        .expect(1)
+        .mount(server)
+        .await;
 }
 
 fn message(id: &str, received: &str) -> Value {
@@ -58,6 +93,7 @@ fn message(id: &str, received: &str) -> Value {
 #[tokio::test]
 async fn finds_well_known_folders_and_labels_them() {
     let server = MockServer::start().await;
+    mount_roles(&server).await;
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/inbox"))
         .and(header("authorization", "Bearer tok"))
@@ -73,15 +109,18 @@ async fn finds_well_known_folders_and_labels_them() {
         .await;
 
     let store = store(&server);
+    // Listing first still labels the Inbox, and the roles are looked up
+    // only once (the batch mock expects one request).
+    let folders = store.list_folders().await.unwrap();
     let inbox = store
         .well_known_folder(WellKnownFolder::Inbox)
         .await
         .unwrap();
     assert_eq!(inbox.id, FolderId::new("inbox-id"));
     assert_eq!(inbox.well_known, Some(WellKnownFolder::Inbox));
+    assert_eq!(inbox.parent, None, "top-level folders have no parent");
     assert_eq!((inbox.unread_count, inbox.total_count), (2, 5));
 
-    let folders = store.list_folders().await.unwrap();
     let labels: Vec<_> = folders
         .iter()
         .map(|f| (f.name.as_str(), f.well_known))
@@ -90,6 +129,68 @@ async fn finds_well_known_folders_and_labels_them() {
         labels,
         [("Inbox", Some(WellKnownFolder::Inbox)), ("Projects", None)]
     );
+}
+
+#[tokio::test]
+async fn lists_nested_folders() {
+    let server = MockServer::start().await;
+    mount_roles(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [child("inbox-id", "Inbox", "root-id", 1)],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/childFolders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [child("projects-id", "Projects", "inbox-id", 1)],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/projects-id/childFolders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [child("mett-id", "mett", "projects-id", 0)],
+        })))
+        .mount(&server)
+        .await;
+
+    let folders = store(&server).list_folders().await.unwrap();
+    let tree: Vec<_> = folders
+        .iter()
+        .map(|f| (f.name.as_str(), f.parent.as_ref().map(FolderId::as_str)))
+        .collect();
+    assert_eq!(
+        tree,
+        [
+            ("Inbox", None),
+            ("Projects", Some("inbox-id")),
+            ("mett", Some("projects-id")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn later_pages_use_the_requested_size() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .and(query_param("$skip", "10"))
+        .and(query_param("$top", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cursor = PageCursor::new(format!(
+        "{}/v1.0/me/mailFolders/inbox-id/messages?$top=10&$skip=10",
+        server.uri()
+    ));
+    store(&server)
+        .list_messages(&FolderId::new("inbox-id"), Page::after(cursor, 3))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
