@@ -25,7 +25,7 @@ use crate::settings::AuthSettings;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The message fields the index needs.
-const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,receivedDateTime,createdDateTime,isRead,flag,hasAttachments";
+const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,receivedDateTime,sentDateTime,createdDateTime,isRead,flag,hasAttachments";
 
 /// A [`MailStore`] backed by Microsoft Graph.
 pub struct GraphMailStore<A> {
@@ -38,6 +38,8 @@ pub struct GraphMailStore<A> {
     auth: Arc<A>,
     /// The mailbox's folder roles, once looked up.
     roles: Mutex<Option<Arc<Roles>>>,
+    /// The hidden root folder's ID, once looked up on its own.
+    root: Mutex<Option<Option<FolderId>>>,
 }
 
 /// Which folders play special roles. Folder IDs don't change, so this is
@@ -86,6 +88,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             },
             auth,
             roles: Mutex::new(None),
+            root: Mutex::new(None),
         }
     }
 
@@ -134,6 +137,30 @@ impl<A: Authenticator> GraphMailStore<A> {
 
     fn request(&self, method: Method, url: Url) -> RequestBuilder {
         self.http.request(method, url)
+    }
+
+    /// The hidden root folder's ID: from the roles if they are known,
+    /// otherwise looked up on its own (and cached).
+    async fn root(&self) -> Result<Option<FolderId>> {
+        if let Some(roles) = self
+            .roles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return Ok(roles.root.clone());
+        }
+        if let Some(root) = self.root.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return Ok(root);
+        }
+        let mut url = self.url(&["me", "mailFolders", ROOT]);
+        url.query_pairs_mut().append_pair("$select", "id");
+        let root: IdOnly = self
+            .json(self.request(Method::GET, url), About::folder(ROOT))
+            .await?;
+        let root = Some(FolderId::new(root.id));
+        *self.root.lock().unwrap_or_else(|e| e.into_inner()) = Some(root.clone());
+        Ok(root)
     }
 
     /// The mailbox's folder roles, looked up on first use with a single
@@ -254,7 +281,12 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
-        let roles = self.roles().await?;
+        // Only the root is needed here, so other well-known folders failing
+        // to resolve can't get in the way.
+        let roles = Roles {
+            root: self.root().await?,
+            well_known: HashMap::new(),
+        };
         let url = self.url(&["me", "mailFolders", which.as_str()]);
         let folder: GraphFolder = self
             .json(
@@ -289,9 +321,12 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
                 url.query_pairs_mut()
                     .append_pair("$top", &top_for(&page))
                     .append_pair("$select", SUMMARY_FIELDS)
-                    // Drafts have no received time; they sort by creation
-                    // time, which is what their summaries show.
-                    .append_pair("$orderby", "receivedDateTime desc,createdDateTime desc");
+                    // Unreceived messages sort by when they were sent, or
+                    // else created: the time their summaries show.
+                    .append_pair(
+                        "$orderby",
+                        "receivedDateTime desc,sentDateTime desc,createdDateTime desc",
+                    );
                 url
             }
         };
@@ -566,8 +601,10 @@ struct GraphMessage {
     to_recipients: Vec<Recipient>,
     #[serde(default)]
     cc_recipients: Vec<Recipient>,
-    /// Missing for messages that were never received, such as drafts.
+    /// Missing for messages that were never received, such as drafts and
+    /// sent mail.
     received_date_time: Option<String>,
+    sent_date_time: Option<String>,
     created_date_time: Option<String>,
     #[serde(default)]
     is_read: bool,
@@ -641,10 +678,11 @@ impl GraphMessage {
     }
 
     fn split(self) -> Result<(MessageSummary, Rest)> {
-        // Drafts and outgoing messages were never received: use when they
-        // were created instead.
+        // Sent messages and drafts were never received: use when they were
+        // sent or, failing that, created.
         let timestamp = self
             .received_date_time
+            .or(self.sent_date_time)
             .or(self.created_date_time)
             .ok_or_else(|| Error::Backend("message has no timestamp".into()))?;
         let received = DateTime::parse_from_rfc3339(&timestamp)

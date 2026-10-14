@@ -230,7 +230,7 @@ async fn lists_messages_newest_first_with_paging() {
         .and(query_param("$top", "2"))
         .and(query_param(
             "$orderby",
-            "receivedDateTime desc,createdDateTime desc",
+            "receivedDateTime desc,sentDateTime desc,createdDateTime desc",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [message("m2", "2026-10-14T10:00:00Z"), message("m1", "2026-10-13T10:00:00Z")],
@@ -542,4 +542,58 @@ async fn follows_canonical_graph_links_through_a_proxy() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn sent_messages_use_their_sent_time() {
+    let server = MockServer::start().await;
+    let mut sent = message("s1", "2026-10-14T10:00:00Z");
+    sent["receivedDateTime"] = Value::Null;
+    sent["sentDateTime"] = json!("2026-10-13T09:00:00Z");
+    sent["createdDateTime"] = json!("2026-09-01T08:00:00Z");
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/sent-id/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [sent] })))
+        .mount(&server)
+        .await;
+    let page = store(&server)
+        .list_messages(&FolderId::new("sent-id"), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.messages[0].received,
+        DateTime::parse_from_rfc3339("2026-10-13T09:00:00Z").unwrap()
+    );
+}
+
+#[tokio::test]
+async fn opening_the_inbox_needs_only_the_root() {
+    let server = MockServer::start().await;
+    // Any $batch would fail; opening the Inbox must not need it.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/msgfolderroot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "root-id" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(folder("inbox-id", "Inbox")))
+        .mount(&server)
+        .await;
+
+    let store = store(&server);
+    for _ in 0..2 {
+        let inbox = store
+            .well_known_folder(WellKnownFolder::Inbox)
+            .await
+            .unwrap();
+        assert_eq!(inbox.parent, None);
+    }
 }
