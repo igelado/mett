@@ -209,7 +209,10 @@ impl Config {
     }
 
     fn run(&mut self, source: &str, origin: &Origin<'_>) {
-        let mut lexer = Lexer::new(source);
+        // Files written on Windows use CRLF; treat them like LF so that a
+        // trailing backslash still continues the line.
+        let source = source.replace("\r\n", "\n");
+        let mut lexer = Lexer::new(&source);
         loop {
             match lexer.next_command() {
                 None => break,
@@ -566,6 +569,15 @@ mod tests {
     fn reset_all_clears_user_variables() {
         let config = load("set my_account=a@b.c\nreset all\nset from=$my_account\n");
         assert_eq!(config.string("from"), "");
+    }
+
+    #[test]
+    fn crlf_files_continue_lines() {
+        let config = load("set from=a@b.c \\\r\n  realname=Alice\r\nset timeout=7\r\n");
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert_eq!(config.string("realname"), "Alice");
+        assert_eq!(config.get("timeout"), Some(&Value::Number(7)));
     }
 
     #[test]

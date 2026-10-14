@@ -164,7 +164,8 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    /// A lexer over `source`.
+    /// A lexer over `source`. Callers should convert CRLF line endings to
+    /// LF first, so that line continuations work in either.
     pub fn new(source: &'a str) -> Self {
         Self {
             chars: source.chars().peekable(),
@@ -281,7 +282,7 @@ impl<'a> Lexer<'a> {
                 }
                 '$' => {
                     self.bump();
-                    self.read_variable(&mut word);
+                    self.read_variable(&mut word)?;
                 }
                 _ => {
                     self.bump();
@@ -313,7 +314,7 @@ impl<'a> Lexer<'a> {
                     let command = self.read_backtick()?;
                     word.parts.push(Part::Command(command));
                 }
-                Some('$') => self.read_variable(word),
+                Some('$') => self.read_variable(word)?,
                 Some(c) => word.push_char(c),
                 None => return Err(self.error("unterminated double quote")),
             }
@@ -354,7 +355,7 @@ impl<'a> Lexer<'a> {
 
     /// Reads a variable name after `$` (`$name` or `${name}`). A `$` not
     /// followed by a name is literal.
-    fn read_variable(&mut self, word: &mut Word) {
+    fn read_variable(&mut self, word: &mut Word) -> Result<(), SyntaxError> {
         let braced = self.chars.peek() == Some(&'{');
         if braced {
             self.bump();
@@ -368,7 +369,10 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        if braced && self.chars.peek() == Some(&'}') {
+        if braced && !name.is_empty() {
+            if self.chars.peek() != Some(&'}') {
+                return Err(self.error(format!("missing }} after ${{{name}")));
+            }
             self.bump();
         }
         if name.is_empty() {
@@ -376,6 +380,7 @@ impl<'a> Lexer<'a> {
         } else {
             word.parts.push(Part::Variable(name));
         }
+        Ok(())
     }
 }
 
@@ -511,6 +516,13 @@ mod tests {
             ]
         );
         assert_eq!(commands[1].as_ref().unwrap().line, 3);
+    }
+
+    #[test]
+    fn unterminated_braced_variables_are_errors() {
+        let commands = lex("set realname=\"${HOME\"\nset x=${A}\n");
+        assert!(matches!(&commands[0], Err(e) if e.message.contains("missing }")));
+        assert!(commands[1].is_ok());
     }
 
     #[test]
