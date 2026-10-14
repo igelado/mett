@@ -10,12 +10,13 @@ use std::collections::HashMap;
 use mett_core::{Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 
 use crate::action::Action;
+use crate::config::mailbox::FolderPath;
 use crate::keymap::Menu;
 use crate::text;
 use crate::worker::{Event, Request, RequestId, Response};
 
-/// How many messages to request per page.
-const PAGE_SIZE: u32 = 100;
+/// How many messages to request per page, unless configured.
+pub const PAGE_SIZE: u32 = 100;
 
 /// Where a pending move goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,18 +132,28 @@ pub struct App {
     /// Pending flag updates, so a failure can be undone in the index.
     flag_updates: HashMap<RequestId, MessageId>,
     next_request: u64,
+    /// How many messages to request per page.
+    page_size: u32,
 }
 
 impl App {
-    /// A new app for a `width`×`height` terminal, and the effects that start
-    /// loading the Inbox.
+    /// A new app for a `width`×`height` terminal that opens the Inbox, and
+    /// the effects that start loading it.
+    #[cfg(test)]
     pub fn new(width: u16, height: u16) -> (Self, Vec<Effect>) {
+        let inbox = FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new());
+        Self::open(width, height, inbox, PAGE_SIZE)
+    }
+
+    /// A new app that opens the folder at `path`, listing `page_size`
+    /// messages per request, and the effects that start loading it.
+    pub fn open(width: u16, height: u16, path: FolderPath, page_size: u32) -> (Self, Vec<Effect>) {
         let mut app = Self {
             screens: vec![Screen::Index],
             folder: None,
             messages: Vec::new(),
             selected: 0,
-            status: "Opening Inbox...".into(),
+            status: "Opening folder...".into(),
             quit: false,
             width: usize::from(width),
             body_height: body_height(height),
@@ -153,8 +164,9 @@ impl App {
             pending: None,
             flag_updates: HashMap::new(),
             next_request: 0,
+            page_size,
         };
-        let effect = app.request(Request::OpenInbox);
+        let effect = app.request(Request::OpenFolder(path));
         (app, vec![effect])
     }
 
@@ -310,10 +322,10 @@ impl App {
 
     fn on_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
-            Event::InboxOpened(Ok(folder)) => {
+            Event::FolderOpened(Ok(folder)) => {
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
-                return self.list(Page::first(PAGE_SIZE));
+                return self.list(Page::first(self.page_size));
             }
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
@@ -321,7 +333,7 @@ impl App {
                     let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
                         // Keep loading until the whole folder is listed.
-                        effects = self.list(Page::after(cursor, PAGE_SIZE));
+                        effects = self.list(Page::after(cursor, self.page_size));
                     } else {
                         self.listing = None;
                         self.listing_page = None;
@@ -361,7 +373,7 @@ impl App {
                     }
                 }
             }
-            Event::InboxOpened(Err(e)) => self.report(e),
+            Event::FolderOpened(Err(e)) => self.report(e),
             Event::MessagesListed(_) => {}
         }
         Vec::new()
@@ -542,13 +554,13 @@ mod tests {
     /// An app whose Inbox has been opened and listed with `n` messages.
     fn loaded(n: usize) -> App {
         let (mut app, effects) = App::new(80, 23);
-        let [Effect::Request(open, Request::OpenInbox)] = effects.as_slice() else {
-            panic!("expected OpenInbox, got {effects:?}");
+        let [Effect::Request(open, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
         };
         let folder = mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
         let effects = app.update(Msg::Response(Response {
             id: *open,
-            event: Event::InboxOpened(Ok(folder)),
+            event: Event::FolderOpened(Ok(folder)),
         }));
         let [Effect::Request(list, Request::ListMessages { .. })] = effects.as_slice() else {
             panic!("expected ListMessages, got {effects:?}");
@@ -609,7 +621,7 @@ mod tests {
         let folder = mock::folder("in", "Inbox", None);
         let effects = app.update(Msg::Response(Response {
             id: open,
-            event: Event::InboxOpened(Ok(folder)),
+            event: Event::FolderOpened(Ok(folder)),
         }));
         let Effect::Request(first, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
@@ -700,7 +712,7 @@ mod tests {
         let Effect::Request(open_inbox, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
-            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
         let Effect::Request(first, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
@@ -736,7 +748,7 @@ mod tests {
         let Effect::Request(open_inbox, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
-            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
         let Effect::Request(first, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
@@ -779,7 +791,7 @@ mod tests {
         let Effect::Request(open_inbox, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
-            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
         let Effect::Request(first, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
@@ -853,7 +865,7 @@ mod tests {
         let Effect::Request(open_inbox, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
-            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
         let Effect::Request(first, _) = effects[0].clone();
         let effects = app.update(Msg::Response(Response {

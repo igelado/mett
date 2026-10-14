@@ -1,8 +1,9 @@
 # Configuring Office365 accounts in mett
 
 Status: **partly implemented.** mett reads mettrc files (§1) with `set`,
-`unset`, `toggle`, `reset` and `source`, knows the variables in §4, and
-parses `msgraph://` URLs (§3) without the Focused Inbox views. Everything
+`unset`, `toggle`, `reset` and `source`, and opens the `msgraph://` folder
+in `spoolfile` (§3, without the Focused Inbox views), signing in with the
+§4.1–4.3 variables (except `msgraph_oauth_refresh_command`). Everything
 else is still a proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc
