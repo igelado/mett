@@ -5,8 +5,9 @@
 # graphify knowledge graph (regenerated locally with `graphify update .`)
 graphify-out/
 
-# Claude Code per-user settings
+# Claude Code per-user settings and instructions
 .claude/settings.local.json
+CLAUDE.md
 
 # Editor and OS files
 *.swp
