@@ -261,13 +261,17 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         }
 
         // Retry confirming a previous sign-in before asking for a new one.
-        if let Some(Unconfirmed { mut tokens, stored }) = state.unconfirmed.take() {
+        // Breaking out of this block continues with the normal refresh path.
+        'unconfirmed: {
+            let Some(Unconfirmed { mut tokens, stored }) = state.unconfirmed.take() else {
+                break 'unconfirmed;
+            };
             if tokens.access.expires_within(TimeDelta::zero(), now) {
                 // The access token expired before the user could be
                 // confirmed: get a fresh one with the sign-in's refresh token
                 // and confirm with that.
                 let Some(refresh) = tokens.refresh.clone() else {
-                    return self.sign_in_and_confirm(&mut state).await;
+                    break 'unconfirmed;
                 };
                 match oauth::refresh(&self.http, &self.settings, &refresh).await {
                     Ok(fresh) => {
@@ -276,8 +280,13 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                             ..fresh
                         };
                     }
+                    // Rejected: remove it if it is the stored token, and let
+                    // the normal path try any replacement another mett
+                    // instance has stored before prompting.
                     Err(e) if e.needs_sign_in() => {
-                        return self.sign_in_and_confirm(&mut state).await;
+                        state.refresh = self.clear_if_stored(&refresh).await?;
+                        state.loaded = true;
+                        break 'unconfirmed;
                     }
                     Err(e) => {
                         state.unconfirmed = Some(Unconfirmed { tokens, stored });

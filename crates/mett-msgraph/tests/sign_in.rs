@@ -902,3 +902,52 @@ async fn keeps_a_replacement_token_after_an_identity_mismatch() {
     me(&server, "a-newer", "alice@contoso.com").await;
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-newer");
 }
+
+#[tokio::test]
+async fn tries_a_replacement_token_when_an_unconfirmed_refresh_is_rejected() {
+    let server = MockServer::start().await;
+    // A refresh from r-stale issues an already-expired token that Graph
+    // can't confirm; refreshing it later is rejected.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-stale"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a-old",
+            "refresh_token": "r-rotated",
+            "expires_in": 0,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .and(header("authorization", "Bearer a-old"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-rotated"))
+        .respond_with(oauth_error("invalid_grant"))
+        .mount(&server)
+        .await;
+    // Another instance stored r-newer, which works.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-newer"))
+        .respond_with(tokens("a-newer", "r-newer"))
+        .mount(&server)
+        .await;
+    me(&server, "a-newer", "alice@contoso.com").await;
+
+    let store = Arc::new(ReplacedStore::default());
+    store.inner.save(&account(), "r-newer").unwrap();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        no_prompts(),
+    );
+
+    assert!(auth.access_token().await.is_err());
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-newer");
+}
