@@ -214,13 +214,14 @@ impl<A: Authenticator> GraphMailStore<A> {
                 })
             })
             .collect();
-        let batch: BatchResponse = self
-            .json(
-                self.request(Method::POST, self.url(&["$batch"]))
-                    .json(&json!({ "requests": requests })),
-                About::MAILBOX,
-            )
-            .await?;
+        // Like other requests, retry once if Graph rejects the token, which
+        // it reports inside the batch rather than on the response.
+        let mut batch = self.batch(&requests).await?;
+        if batch.responses.iter().any(|r| r.status == 401) {
+            let token = self.auth.access_token().await?;
+            self.auth.token_rejected(&token).await;
+            batch = self.batch(&requests).await?;
+        }
 
         let mut roles = Roles::default();
         for response in batch.responses {
@@ -237,8 +238,8 @@ impl<A: Authenticator> GraphMailStore<A> {
                 }
                 401 | 403 => {
                     if response.status == 401 {
-                        // The token was rejected: make sure the next request
-                        // gets a new one.
+                        // Rejected again: make sure the next request gets a
+                        // new token.
                         let token = self.auth.access_token().await?;
                         self.auth.token_rejected(&token).await;
                     }
@@ -276,6 +277,17 @@ impl<A: Authenticator> GraphMailStore<A> {
         let roles = Arc::new(roles);
         *self.roles.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&roles));
         Ok(roles)
+    }
+}
+
+impl<A: Authenticator> GraphMailStore<A> {
+    async fn batch(&self, requests: &[serde_json::Value]) -> Result<BatchResponse> {
+        self.json(
+            self.request(Method::POST, self.url(&["$batch"]))
+                .json(&json!({ "requests": requests })),
+            About::MAILBOX,
+        )
+        .await
     }
 }
 

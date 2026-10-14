@@ -731,13 +731,51 @@ impl Authenticator for CountingAuth {
 }
 
 #[tokio::test]
-async fn a_401_inside_a_batch_rejects_the_token() {
+async fn a_401_inside_a_batch_is_retried_once_with_a_new_token() {
+    let server = MockServer::start().await;
+    let rejected = json!({ "responses": [{ "id": "0", "status": 401, "body": {} }] });
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .and(header("authorization", "Bearer old"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rejected))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .and(header("authorization", "Bearer new"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "responses": [{ "id": "0", "status": 200, "body": { "id": "root-id" } }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+
+    let settings = AuthSettings {
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let auth = Arc::new(RotatingAuth {
+        rejected: Default::default(),
+    });
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, auth);
+    store.list_folders().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_repeated_401_inside_a_batch_is_an_auth_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1.0/$batch"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "responses": [{ "id": "0", "status": 401, "body": {} }],
         })))
+        .expect(2)
         .mount(&server)
         .await;
     let settings = AuthSettings {
@@ -747,5 +785,5 @@ async fn a_401_inside_a_batch_rejects_the_token() {
     let auth = Arc::new(CountingAuth::default());
     let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::clone(&auth));
     assert!(matches!(store.list_folders().await, Err(Error::Auth(_))));
-    assert_eq!(auth.rejected.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(auth.rejected.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
