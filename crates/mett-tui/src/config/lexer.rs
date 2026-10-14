@@ -108,6 +108,21 @@ impl Word {
         Some(out)
     }
 
+    /// For a word starting with `=` (as in `set var =value`), the rest of
+    /// the word after that `=`.
+    pub fn strip_leading_equals(&self) -> Option<Word> {
+        let Some(Part::Literal(text)) = self.parts.first() else {
+            return None;
+        };
+        let rest = text.strip_prefix('=')?;
+        let mut word = Word::default();
+        if !rest.is_empty() {
+            word.parts.push(Part::Literal(rest.to_owned()));
+        }
+        word.parts.extend(self.parts[1..].iter().cloned());
+        Some(word)
+    }
+
     /// Splits `name=value` at the first literal `=`, if the name before it
     /// is literal text. The value is `None` for a bare `name=` (nothing
     /// after the `=`, not even `""`).

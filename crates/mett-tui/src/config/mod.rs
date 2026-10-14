@@ -299,6 +299,10 @@ impl Config {
                 args.next();
                 let value = args.next().cloned().unwrap_or_default();
                 self.expand(arg).and_then(|name| self.assign(&name, &value))
+            } else if let Some(value) = args.peek().and_then(|w| w.strip_leading_equals()) {
+                // `var =value`
+                args.next();
+                self.expand(arg).and_then(|name| self.assign(&name, &value))
             } else {
                 self.expand(arg).and_then(|arg| self.set_flag(&arg))
             };
@@ -385,6 +389,7 @@ impl Config {
             for var in VARS {
                 self.reset(var);
             }
+            self.user.clear();
             return Ok(());
         }
         if name.starts_with("my_") {
@@ -538,6 +543,21 @@ mod tests {
             Some(&Value::Bool(false))
         );
         assert_eq!(config.string("signature"), "/home/a/.sig");
+    }
+
+    #[test]
+    fn accepts_spaces_on_either_side_of_equals() {
+        let config = load("set from =a@b.c realname= Alice timeout = 7\n");
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(config.string("from"), "a@b.c");
+        assert_eq!(config.string("realname"), "Alice");
+        assert_eq!(config.get("timeout"), Some(&Value::Number(7)));
+    }
+
+    #[test]
+    fn reset_all_clears_user_variables() {
+        let config = load("set my_account=a@b.c\nreset all\nset from=$my_account\n");
+        assert_eq!(config.string("from"), "");
     }
 
     #[test]
