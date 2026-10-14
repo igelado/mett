@@ -97,13 +97,13 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
-    /// Checks that an interactive sign-in was for the configured account.
+    /// Checks that tokens were issued to the configured account.
     ///
     /// `login_hint` is only a hint, and the device code flow has none, so the
-    /// user can sign in as someone else. Accepting those tokens would show
-    /// another mailbox under this account's name. Refreshed tokens don't need
-    /// the check: they belong to the same user as the refresh token, which
-    /// was checked when it was issued.
+    /// user can sign in as someone else. Refreshed tokens are checked too: if
+    /// the user's UPN changed and the old one now belongs to someone else, a
+    /// stored refresh token would otherwise show the original user's mailbox
+    /// under this account's name.
     async fn check_identity(&self, tokens: &Tokens) -> Identity {
         let expected = self.settings.account.as_str();
         match oauth::user_principal_name(&self.http, &self.settings, &tokens.access).await {
@@ -128,12 +128,27 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
-    /// Accepts `tokens` from an interactive sign-in once their user is
-    /// confirmed, or keeps them as unconfirmed if that is not possible yet.
-    async fn confirm(&self, state: &mut State, tokens: Tokens) -> Result<AccessToken> {
+    /// Accepts `tokens` once their user is confirmed, or keeps them as
+    /// unconfirmed if that is not possible yet.
+    ///
+    /// `stored` is the stored refresh token the tokens were obtained with, if
+    /// any; it is removed if it turns out to belong to another user.
+    async fn confirm(
+        &self,
+        state: &mut State,
+        tokens: Tokens,
+        stored: Option<&str>,
+    ) -> Result<AccessToken> {
         match self.check_identity(&tokens).await {
             Identity::Confirmed => self.keep(state, tokens).await,
-            Identity::Mismatch(e) => Err(e),
+            Identity::Mismatch(e) => {
+                if let Some(stored) = stored {
+                    state.access = None;
+                    state.refresh = None;
+                    self.clear_if_stored(stored).await?;
+                }
+                Err(e)
+            }
             Identity::Unknown(e) => {
                 state.unconfirmed = Some(tokens);
                 Err(e)
@@ -143,7 +158,15 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
 
     async fn sign_in_and_confirm(&self, state: &mut State) -> Result<AccessToken> {
         let tokens = self.sign_in().await?;
-        self.confirm(state, tokens).await
+        self.confirm(state, tokens, None).await
+    }
+
+    /// Removes `token` from the store if it is still the stored one, and
+    /// returns the stored token otherwise.
+    async fn clear_if_stored(&self, token: &str) -> Result<Option<String>> {
+        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
+        let token = token.to_owned();
+        blocking(move || store.clear_if(&account, &token)).await
     }
 
     /// Caches `tokens` and stores a new refresh token if one was issued.
@@ -220,7 +243,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                     }
                 }
             }
-            let token = self.confirm(&mut state, tokens).await?;
+            let token = self.confirm(&mut state, tokens, None).await?;
             // The check may have taken a while; if the token expired in the
             // meantime, continue with the confirmed refresh token below.
             if !token.expires_within(EXPIRY_MARGIN, Utc::now()) {
@@ -234,15 +257,25 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             state.loaded = true;
         }
 
-        if let Some(refresh) = state.refresh.clone() {
+        // Two attempts: if the refresh token is rejected but another mett
+        // instance has stored a newer one in the meantime, try that once.
+        let mut attempts = 0;
+        while let Some(refresh) = state.refresh.clone() {
+            attempts += 1;
             match oauth::refresh(&self.http, &self.settings, &refresh).await {
-                Ok(tokens) => return self.keep(&mut state, tokens).await,
+                Ok(tokens) => {
+                    let tokens = Tokens {
+                        refresh: tokens.refresh.or_else(|| Some(refresh.clone())),
+                        ..tokens
+                    };
+                    return self.confirm(&mut state, tokens, Some(&refresh)).await;
+                }
                 // The refresh token was revoked, expired or needs new
-                // consent: fall back to an interactive sign-in.
+                // consent. Remove it, unless it has been replaced, and fall
+                // back to an interactive sign-in.
                 Err(e) if e.needs_sign_in() => {
-                    state.refresh = None;
-                    let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
-                    blocking(move || store.clear(&account)).await?;
+                    let newer = self.clear_if_stored(&refresh).await?;
+                    state.refresh = newer.filter(|_| attempts < 2);
                 }
                 // A transient failure: keep the refresh token, and use the
                 // cached access token while it is still valid.

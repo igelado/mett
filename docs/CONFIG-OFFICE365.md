@@ -146,7 +146,7 @@ Set `METT_FLOW=device` to use the device code flow instead of the browser.
 |----------|------|---------|-------------|
 | `msgraph_auth_flow` | string | `auth-code` | `auth-code` (authorization code with PKCE, through the system browser and a loopback redirect) or `device-code` (for headless or SSH sessions). |
 | `msgraph_redirect_port` | number | `0` | Loopback port for `auth-code`. `0` picks a free port. |
-| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. `User.Read` is required: after an interactive sign-in, mett reads the user principal name from Graph's `/me` and rejects the sign-in unless it is this account. |
+| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. `User.Read` is required: after every sign-in and token refresh, mett reads the user principal name from Graph's `/me` and rejects the tokens unless it is this account. |
 | `msgraph_oauth_refresh_command` | string | `""` | When set, mett runs this command to obtain an access token instead of using its built-in OAuth2. This mirrors `imap_oauth_refresh_command`, so existing helper scripts can be reused. |
 
 ### 4.3 Token storage

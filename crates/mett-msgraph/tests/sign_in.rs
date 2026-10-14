@@ -120,6 +120,7 @@ async fn uses_and_rotates_the_stored_refresh_token() {
         .expect(1)
         .mount(&server)
         .await;
+    me(&server, "a1", "alice@contoso.com").await;
 
     let store = Arc::new(MemoryStore::default());
     store.save(&account(), "r0").unwrap();
@@ -387,6 +388,7 @@ async fn uses_a_still_valid_token_when_refresh_fails_transiently() {
         .with_priority(2)
         .mount(&server)
         .await;
+    me(&server, "a-short", "alice@contoso.com").await;
 
     let store = Arc::new(MemoryStore::default());
     store.save(&account(), "r0").unwrap();
@@ -540,6 +542,7 @@ async fn sign_out_keeps_state_when_the_stored_token_cannot_be_removed() {
         .respond_with(tokens("a1", "r0"))
         .mount(&server)
         .await;
+    me(&server, "a1", "alice@contoso.com").await;
     let store = Arc::new(FlakyStore::default());
     store.save(&account(), "r0").unwrap();
     let auth = GraphAuthenticator::new(
@@ -669,4 +672,90 @@ async fn confirms_with_a_refreshed_token_after_the_unconfirmed_one_expires() {
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-fresh");
     assert_eq!(stored(&store).as_deref(), Some("r-fresh"));
     assert_eq!(*prompts.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn rejects_a_refreshed_token_for_another_user() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(tokens("a-other", "r-other"))
+        .mount(&server)
+        .await;
+    me(&server, "a-other", "former-alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    let err = auth.access_token().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Auth(msg) if msg.contains("former-alice")),
+        "{err}"
+    );
+    // The stored token belongs to someone else, so it is removed.
+    assert_eq!(stored(&store), None);
+}
+
+/// A store in which another mett instance replaced the token: the first
+/// load still sees `r-stale`, later reads see `r-newer`.
+#[derive(Default)]
+struct ReplacedStore {
+    loads: std::sync::atomic::AtomicUsize,
+    inner: MemoryStore,
+}
+
+impl TokenStore for ReplacedStore {
+    fn load(&self, account: &AccountId) -> Result<Option<String>, mett_msgraph::TokenStoreError> {
+        if self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Ok(Some("r-stale".into()));
+        }
+        self.inner.load(account)
+    }
+
+    fn save(&self, account: &AccountId, token: &str) -> Result<(), mett_msgraph::TokenStoreError> {
+        self.inner.save(account, token)
+    }
+
+    fn clear(&self, account: &AccountId) -> Result<(), mett_msgraph::TokenStoreError> {
+        self.inner.clear(account)
+    }
+}
+
+#[tokio::test]
+async fn uses_a_newer_stored_token_after_a_stale_one_is_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-stale"))
+        .respond_with(oauth_error("invalid_grant"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-newer"))
+        .respond_with(tokens("a-newer", "r-newer"))
+        .mount(&server)
+        .await;
+    me(&server, "a-newer", "alice@contoso.com").await;
+
+    let store = Arc::new(ReplacedStore::default());
+    store.inner.save(&account(), "r-newer").unwrap();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        no_prompts(),
+    );
+
+    // The rejected stale token didn't remove the newer one, which was used.
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-newer");
+    assert_eq!(
+        store.inner.load(&account()).unwrap().as_deref(),
+        Some("r-newer")
+    );
 }

@@ -49,6 +49,23 @@ pub trait TokenStore: Send + Sync + 'static {
     fn save(&self, account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError>;
     /// Removes the stored refresh token, if any.
     fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError>;
+
+    /// Removes the stored refresh token only if it is `token`. Otherwise,
+    /// returns the token that is stored instead (if any): another process
+    /// may have replaced a token that this one found rejected.
+    ///
+    /// The default implementation is not atomic; stores that can be shared
+    /// between processes should override it.
+    fn clear_if(
+        &self,
+        account: &AccountId,
+        token: &str,
+    ) -> Result<Option<String>, TokenStoreError> {
+        match self.load(account)? {
+            Some(stored) if stored == token => self.clear(account).map(|()| None),
+            other => Ok(other),
+        }
+    }
 }
 
 /// Stores refresh tokens in the OS keyring (`msgraph_token_store = keyring`).
@@ -187,6 +204,25 @@ impl TokenStore for FileStore {
     fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
         self.update(|file| file.accounts.remove(account.as_str()).is_some())
     }
+
+    fn clear_if(
+        &self,
+        account: &AccountId,
+        token: &str,
+    ) -> Result<Option<String>, TokenStoreError> {
+        let mut other = None;
+        self.update(|file| match file.accounts.get(account.as_str()) {
+            Some(stored) if stored == token => {
+                file.accounts.remove(account.as_str());
+                true
+            }
+            stored => {
+                other = stored.cloned();
+                false
+            }
+        })?;
+        Ok(other)
+    }
 }
 
 /// Atomically replaces `path` with `data`, creating it (and its directory)
@@ -283,6 +319,21 @@ impl TokenStore for MemoryStore {
     fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
         self.tokens().remove(account);
         Ok(())
+    }
+
+    fn clear_if(
+        &self,
+        account: &AccountId,
+        token: &str,
+    ) -> Result<Option<String>, TokenStoreError> {
+        let mut tokens = self.tokens();
+        match tokens.get(account) {
+            Some(stored) if stored == token => {
+                tokens.remove(account);
+                Ok(None)
+            }
+            stored => Ok(stored.cloned()),
+        }
     }
 }
 
@@ -410,6 +461,24 @@ mod tests {
         assert!(matches!(err, TokenStoreError::File { source, .. }
             if source.kind() == io::ErrorKind::Unsupported));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_store_clears_only_the_given_token() {
+        let dir = temp_dir("clear-if");
+        let store = FileStore::new(dir.join("t.tokens"));
+        let alice = AccountId::new("alice@contoso.com");
+
+        store.save(&alice, "newer").unwrap();
+        assert_eq!(
+            store.clear_if(&alice, "older").unwrap().as_deref(),
+            Some("newer")
+        );
+        assert_eq!(store.load(&alice).unwrap().as_deref(), Some("newer"));
+        assert_eq!(store.clear_if(&alice, "newer").unwrap(), None);
+        assert_eq!(store.load(&alice).unwrap(), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
