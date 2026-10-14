@@ -1,0 +1,22 @@
+# Locally generated files that must not be pushed.
+# Keep this file up to date when adopting new tools/skills or producing
+# temporary or intermediate files (see AGENTS.md).
+
+# graphify knowledge graph (regenerated locally with `graphify update .`)
+graphify-out/
+
+# Claude Code per-user settings
+.claude/settings.local.json
+
+# Editor and OS files
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.log
+tmp/
