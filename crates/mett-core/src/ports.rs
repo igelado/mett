@@ -15,26 +15,41 @@ use crate::ids::{FolderId, MessageId, PageCursor};
 use crate::message::{FlagsUpdate, Message, MessageSummary};
 
 /// Which page of a listing to fetch.
+///
+/// A page always holds at least one item, so that following
+/// [`MessagePage::next`] is guaranteed to make progress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
-    /// Maximum number of items to return.
-    pub size: u32,
-    /// Where to continue from, or `None` for the first page.
-    pub cursor: Option<PageCursor>,
+    size: u32,
+    cursor: Option<PageCursor>,
 }
 
 impl Page {
-    /// The first page, with up to `size` items.
+    /// The first page, with up to `size` items (at least one).
     pub fn first(size: u32) -> Self {
-        Self { size, cursor: None }
+        Self {
+            size: size.max(1),
+            cursor: None,
+        }
     }
 
-    /// The page that starts at `cursor`, with up to `size` items.
+    /// The page that starts at `cursor`, with up to `size` items (at least
+    /// one).
     pub fn after(cursor: PageCursor, size: u32) -> Self {
         Self {
-            size,
+            size: size.max(1),
             cursor: Some(cursor),
         }
+    }
+
+    /// Maximum number of items to return. Never zero.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Where to continue from, or `None` for the first page.
+    pub fn cursor(&self) -> Option<&PageCursor> {
+        self.cursor.as_ref()
     }
 }
 
@@ -142,6 +157,13 @@ pub trait Authenticator: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pages_are_never_empty() {
+        assert_eq!(Page::first(0).size(), 1);
+        assert_eq!(Page::after(PageCursor::new("c"), 0).size(), 1);
+        assert_eq!(Page::first(50).size(), 50);
+    }
 
     #[test]
     fn access_token_debug_hides_secret() {

@@ -59,6 +59,34 @@ impl State {
             .ok_or_else(|| Error::not_found("folder", id))
     }
 
+    /// Returns `folder` with its counts derived from the stored messages, so
+    /// they always agree with [`MailStore::list_messages`].
+    fn with_counts(&self, folder: &Folder) -> Folder {
+        let in_folder = self
+            .messages
+            .iter()
+            .filter(|m| m.summary.folder == folder.id);
+        let (total, unread) = in_folder.fold((0, 0), |(total, unread), m| {
+            (total + 1, unread + u32::from(!m.summary.flags.read))
+        });
+        Folder {
+            total_count: total,
+            unread_count: unread,
+            ..folder.clone()
+        }
+    }
+
+    /// Returns an ID derived from `id` that no stored message uses.
+    fn fresh_id(&mut self, id: &MessageId) -> MessageId {
+        loop {
+            self.moves += 1;
+            let candidate = MessageId::new(format!("{id}~{}", self.moves));
+            if !self.messages.iter().any(|m| m.summary.id == candidate) {
+                return candidate;
+            }
+        }
+    }
+
     fn message_mut(&mut self, id: &MessageId) -> Result<&mut Message> {
         self.messages
             .iter_mut()
@@ -69,15 +97,17 @@ impl State {
 
 impl MailStore for MemoryStore {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
-        Ok(self.state().folders.clone())
+        let state = self.state();
+        Ok(state.folders.iter().map(|f| state.with_counts(f)).collect())
     }
 
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
-        self.state()
+        let state = self.state();
+        state
             .folders
             .iter()
             .find(|f| f.well_known == Some(which))
-            .cloned()
+            .map(|f| state.with_counts(f))
             .ok_or_else(|| Error::not_found("folder", which))
     }
 
@@ -94,14 +124,16 @@ impl MailStore for MemoryStore {
         messages.sort_by_key(|m| std::cmp::Reverse(m.received));
 
         // The cursor is the offset of the next page.
-        let start = match &page.cursor {
+        let start = match page.cursor() {
             None => 0,
             Some(cursor) => cursor
                 .as_str()
                 .parse::<usize>()
                 .map_err(|_| Error::Backend(format!("invalid page cursor: {cursor}")))?,
         };
-        let end = start.saturating_add(page.size as usize).min(messages.len());
+        let end = start
+            .saturating_add(page.size() as usize)
+            .min(messages.len());
         let next = (end < messages.len()).then(|| PageCursor::new(end.to_string()));
         let messages = messages.get(start..end).unwrap_or_default().to_vec();
 
@@ -120,8 +152,8 @@ impl MailStore for MemoryStore {
     async fn move_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
         let mut state = self.state();
         state.folder(to)?;
-        state.moves += 1;
-        let new_id = MessageId::new(format!("{id}~{}", state.moves));
+        state.message_mut(id)?;
+        let new_id = state.fresh_id(id);
         let message = state.message_mut(id)?;
         message.summary.id = new_id.clone();
         message.summary.folder = to.clone();
@@ -270,6 +302,47 @@ mod tests {
         assert!(store.fetch_message(&MessageId::new("m1")).await.is_err());
         let moved = store.fetch_message(&new_id).await.unwrap();
         assert_eq!(moved.summary.folder, archive);
+    }
+
+    #[tokio::test]
+    async fn folder_counts_follow_the_messages() {
+        let store = store();
+        let counts = |f: Folder| (f.total_count, f.unread_count);
+        let inbox = || store.well_known_folder(WellKnownFolder::Inbox);
+        assert_eq!(counts(inbox().await.unwrap()), (3, 3));
+
+        store
+            .update_flags(
+                &MessageId::new("m1"),
+                FlagsUpdate {
+                    read: Some(true),
+                    flagged: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(counts(inbox().await.unwrap()), (3, 2));
+
+        store
+            .move_message(&MessageId::new("m2"), &FolderId::new("arc"))
+            .await
+            .unwrap();
+        store.delete_message(&MessageId::new("m3")).await.unwrap();
+        let folders = store.list_folders().await.unwrap();
+        let totals: Vec<_> = folders.into_iter().map(counts).collect();
+        assert_eq!(totals, [(1, 0), (1, 1)]);
+    }
+
+    #[tokio::test]
+    async fn moved_ids_never_collide() {
+        let store = store().with_message(message("m1~1", "in", "decoy", at(4)));
+        let new_id = store
+            .move_message(&MessageId::new("m1"), &FolderId::new("arc"))
+            .await
+            .unwrap();
+        assert_ne!(new_id, MessageId::new("m1~1"));
+        let decoy = store.fetch_message(&MessageId::new("m1~1")).await.unwrap();
+        assert_eq!(decoy.summary.subject, "decoy");
     }
 
     #[tokio::test]
