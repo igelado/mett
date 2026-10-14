@@ -3,7 +3,7 @@
 //! Only the refresh token is stored. Access tokens are short-lived and are
 //! obtained from it on start-up.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -81,16 +81,20 @@ impl TokenStore for KeyringStore {
     }
 }
 
-/// Stores one account's refresh token in a file readable only by the user
+/// Stores refresh tokens in a file readable only by the user
 /// (`msgraph_token_store = file`).
+///
+/// The file maps accounts to tokens, so accounts that share a
+/// `msgraph_token_file` keep separate tokens.
 #[derive(Debug, Clone)]
 pub struct FileStore {
     path: PathBuf,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct TokenFile {
-    refresh_token: String,
+    /// Refresh tokens by account.
+    accounts: BTreeMap<String, String>,
 }
 
 impl FileStore {
@@ -115,6 +119,27 @@ impl FileStore {
         Some(state.join("mett").join(format!("{account}.tokens")))
     }
 
+    fn read(&self) -> Result<TokenFile, TokenStoreError> {
+        let data = match fs::read(&self.path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(TokenFile::default()),
+            Err(e) => return Err(self.error(e)),
+        };
+        serde_json::from_slice(&data)
+            .map_err(|e| self.error(io::Error::new(io::ErrorKind::InvalidData, e)))
+    }
+
+    fn write(&self, file: &TokenFile) -> Result<(), TokenStoreError> {
+        if file.accounts.is_empty() {
+            return match fs::remove_file(&self.path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(self.error(e)),
+                _ => Ok(()),
+            };
+        }
+        let json = serde_json::to_vec(file).map_err(|e| self.error(io::Error::other(e)))?;
+        write_private(&self.path, &json).map_err(|e| self.error(e))
+    }
+
     fn error(&self, source: io::Error) -> TokenStoreError {
         TokenStoreError::File {
             path: self.path.clone(),
@@ -124,31 +149,23 @@ impl FileStore {
 }
 
 impl TokenStore for FileStore {
-    fn load(&self, _account: &AccountId) -> Result<Option<String>, TokenStoreError> {
-        let data = match fs::read(&self.path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(self.error(e)),
-        };
-        let file: TokenFile = serde_json::from_slice(&data)
-            .map_err(|e| self.error(io::Error::new(io::ErrorKind::InvalidData, e)))?;
-        Ok(Some(file.refresh_token))
+    fn load(&self, account: &AccountId) -> Result<Option<String>, TokenStoreError> {
+        Ok(self.read()?.accounts.remove(account.as_str()))
     }
 
-    fn save(&self, _account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError> {
-        let json = serde_json::to_vec(&TokenFile {
-            refresh_token: refresh_token.to_owned(),
-        })
-        .map_err(|e| self.error(io::Error::other(e)))?;
-        write_private(&self.path, &json).map_err(|e| self.error(e))
+    fn save(&self, account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError> {
+        let mut file = self.read()?;
+        file.accounts
+            .insert(account.as_str().to_owned(), refresh_token.to_owned());
+        self.write(&file)
     }
 
-    fn clear(&self, _account: &AccountId) -> Result<(), TokenStoreError> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(self.error(e)),
+    fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
+        let mut file = self.read()?;
+        if file.accounts.remove(account.as_str()).is_some() {
+            self.write(&file)?;
         }
+        Ok(())
     }
 }
 
@@ -271,6 +288,26 @@ mod tests {
         FileStore::new(&path).save(&account, "r1").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_store_keeps_accounts_apart() {
+        let dir = temp_dir("shared");
+        let store = FileStore::new(dir.join("shared.tokens"));
+        let (alice, bob) = (
+            AccountId::new("alice@contoso.com"),
+            AccountId::new("bob@fabrikam.com"),
+        );
+
+        store.save(&alice, "ra").unwrap();
+        store.save(&bob, "rb").unwrap();
+        assert_eq!(store.load(&alice).unwrap().as_deref(), Some("ra"));
+        assert_eq!(store.load(&bob).unwrap().as_deref(), Some("rb"));
+
+        store.clear(&alice).unwrap();
+        assert_eq!(store.load(&alice).unwrap(), None);
+        assert_eq!(store.load(&bob).unwrap().as_deref(), Some("rb"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

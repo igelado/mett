@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{TimeDelta, Utc};
 use mett_core::AccessToken;
 use serde::Deserialize;
@@ -27,6 +29,38 @@ const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 pub(crate) struct Tokens {
     pub access: AccessToken,
     pub refresh: Option<String>,
+    pub id_token: Option<String>,
+}
+
+impl Tokens {
+    /// The user the tokens were issued to, from the ID token's
+    /// `preferred_username` (the UPN for work accounts) or `email` claims.
+    ///
+    /// The ID token comes straight from the token endpoint over TLS, so its
+    /// claims are read without verifying the signature, as OpenID Connect
+    /// allows for this case.
+    pub fn signed_in_as(&self) -> Vec<String> {
+        #[derive(Deserialize)]
+        struct Claims {
+            preferred_username: Option<String>,
+            email: Option<String>,
+            upn: Option<String>,
+        }
+        let claims = self
+            .id_token
+            .as_deref()
+            .and_then(|jwt| jwt.split('.').nth(1))
+            .and_then(|payload| URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok())
+            .and_then(|json| serde_json::from_slice::<Claims>(&json).ok());
+        claims
+            .map(|c| {
+                [c.preferred_username, c.email, c.upn]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Why a sign-in request failed.
@@ -67,6 +101,7 @@ impl From<FlowError> for mett_core::Error {
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    id_token: Option<String>,
     expires_in: i64,
 }
 
@@ -125,6 +160,7 @@ async fn request_token(
     Ok(Tokens {
         access: AccessToken::new(r.access_token, issued + TimeDelta::seconds(r.expires_in)),
         refresh: r.refresh_token,
+        id_token: r.id_token,
     })
 }
 

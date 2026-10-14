@@ -146,7 +146,7 @@ Set `METT_FLOW=device` to use the device code flow instead of the browser.
 |----------|------|---------|-------------|
 | `msgraph_auth_flow` | string | `auth-code` | `auth-code` (authorization code with PKCE, through the system browser and a loopback redirect) or `device-code` (for headless or SSH sessions). |
 | `msgraph_redirect_port` | number | `0` | Loopback port for `auth-code`. `0` picks a free port. |
-| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. |
+| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. mett always adds `openid` and `profile`: it checks the ID token they return to make sure the user signed in as this account, and rejects the sign-in otherwise. |
 | `msgraph_oauth_refresh_command` | string | `""` | When set, mett runs this command to obtain an access token instead of using its built-in OAuth2. This mirrors `imap_oauth_refresh_command`, so existing helper scripts can be reused. |
 
 ### 4.3 Token storage
@@ -154,7 +154,7 @@ Set `METT_FLOW=device` to use the device code flow instead of the browser.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `msgraph_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. |
-| `msgraph_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. |
+| `msgraph_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. Several accounts may share one file; each keeps its own token. |
 
 ### 4.4 Behaviour
 

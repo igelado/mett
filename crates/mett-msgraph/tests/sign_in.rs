@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mett_core::{AccountId, Authenticator, Error};
 use mett_msgraph::{
     AuthFlow, AuthSettings, GraphAuthenticator, MemoryStore, SignInPrompt, TokenStore,
@@ -28,12 +30,39 @@ fn settings(server: &MockServer, flow: AuthFlow) -> AuthSettings {
     }
 }
 
-fn tokens(access: &str, refresh: &str) -> ResponseTemplate {
+/// An unsigned ID token for `user`. mett reads the claims without checking
+/// the signature, as it receives them directly from the token endpoint.
+fn id_token(user: &str) -> String {
+    let encode = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+    format!(
+        "{}.{}.sig",
+        encode(json!({"alg": "none"})),
+        encode(json!({"preferred_username": user}))
+    )
+}
+
+fn tokens_for(user: &str, access: &str, refresh: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
         "token_type": "Bearer",
         "access_token": access,
         "refresh_token": refresh,
+        "id_token": id_token(user),
         "expires_in": 3600,
+    }))
+}
+
+fn tokens(access: &str, refresh: &str) -> ResponseTemplate {
+    tokens_for("Alice@Contoso.com", access, refresh)
+}
+
+fn device_code_response() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "device_code": "dev-code",
+        "user_code": "ABCD-EFGH",
+        "verification_uri": "https://microsoft.com/devicelogin",
+        "expires_in": 900,
+        "interval": 0,
+        "message": "Go to https://microsoft.com/devicelogin and enter ABCD-EFGH",
     }))
 }
 
@@ -88,14 +117,7 @@ async fn falls_back_to_device_code_when_the_refresh_token_is_revoked() {
         .await;
     Mock::given(method("POST"))
         .and(path(DEVICE_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "device_code": "dev-code",
-            "user_code": "ABCD-EFGH",
-            "verification_uri": "https://microsoft.com/devicelogin",
-            "expires_in": 900,
-            "interval": 0,
-            "message": "Go to https://microsoft.com/devicelogin and enter ABCD-EFGH",
-        })))
+        .respond_with(device_code_response())
         .mount(&server)
         .await;
     // The first poll is still pending, the second succeeds.
@@ -309,4 +331,58 @@ async fn gives_up_when_the_device_code_expires() {
         "{err}"
     );
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn rejects_a_sign_in_as_another_user() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("device_code=dev-code"))
+        .respond_with(tokens_for("mallory@contoso.com", "a-m", "r-m"))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        |_| {},
+    );
+
+    let err = auth.access_token().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Auth(msg) if msg.contains("signed in as mallory@contoso.com")),
+        "{err}"
+    );
+    assert_eq!(store.load(&account()).unwrap(), None);
+}
+
+#[tokio::test]
+async fn requests_the_identity_scopes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("openid"))
+        .and(body_string_contains("profile"))
+        .respond_with(tokens("a1", "r1"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        store,
+        no_prompts(),
+    );
+    auth.access_token().await.unwrap();
 }

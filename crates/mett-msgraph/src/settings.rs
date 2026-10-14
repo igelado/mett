@@ -23,6 +23,10 @@ pub const DEFAULT_SCOPES: &[&str] = &[
 /// sent as they are, without a resource prefix.
 const OIDC_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access"];
 
+/// Always requested, so that the token response includes an ID token naming
+/// the signed-in user, which mett checks against the configured account.
+const IDENTITY_SCOPES: &[&str] = &["openid", "profile"];
+
 /// The Microsoft cloud that hosts the tenant (`msgraph_cloud`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Cloud {
@@ -174,14 +178,21 @@ impl AuthSettings {
     }
 
     /// The `scope` parameter: Graph scopes are qualified with the cloud's
-    /// Graph resource, so that national clouds get the right audience.
+    /// Graph resource, so that national clouds get the right audience, and
+    /// the identity scopes are added if missing.
     pub(crate) fn scope_param(&self) -> String {
         let graph = self.cloud.graph_url();
+        let missing = IDENTITY_SCOPES
+            .iter()
+            .filter(|s| !self.scopes.iter().any(|have| have == *s))
+            .map(|s| (*s).to_owned());
         self.scopes
             .iter()
+            .cloned()
+            .chain(missing)
             .map(|scope| {
                 if scope.contains('/') || OIDC_SCOPES.contains(&scope.as_str()) {
-                    scope.clone()
+                    scope
                 } else {
                     format!("{graph}{scope}")
                 }
@@ -246,7 +257,7 @@ mod tests {
         };
         assert_eq!(
             s.scope_param(),
-            "https://microsoftgraph.chinacloudapi.cn/Mail.Read offline_access"
+            "https://microsoftgraph.chinacloudapi.cn/Mail.Read offline_access openid profile"
         );
     }
 
