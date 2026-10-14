@@ -128,8 +128,7 @@ async fn run<S: mett_core::MailStore + 'static>(
     // The outcome is reported after the terminal is restored, so a change
     // that couldn't be saved isn't lost silently.
     if app.saving() {
-        const SAVING: &str = "Saving changes...";
-        app.status = SAVING.into();
+        app.status = "Saving changes...".into();
         terminal.draw(|frame| view::render(&app, &keymap, frame))?;
         let deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
         while app.saving() {
@@ -145,12 +144,12 @@ async fn run<S: mett_core::MailStore + 'static>(
                 "gave up waiting for changes to be saved; some messages may still be unread",
             ));
         }
-        if app.status != SAVING {
-            return Err(std::io::Error::other(format!(
-                "could not save changes: {}",
-                app.status
-            )));
-        }
+    }
+    if !app.save_failures.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "some changes could not be saved: {}",
+            app.save_failures.join("; ")
+        )));
     }
     Ok(())
 }

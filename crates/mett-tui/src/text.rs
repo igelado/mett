@@ -127,7 +127,26 @@ pub fn body_lines(body: &Body) -> Vec<String> {
         BodyKind::Text => body.content.replace("\r\n", "\n"),
         BodyKind::Html => html_to_text(&body.content),
     };
-    text.lines().map(str::to_owned).collect()
+    // Tabs would be dropped by the terminal buffer, so expand them.
+    text.lines().map(expand_tabs).collect()
+}
+
+/// Replaces tabs with spaces up to the next 8-column tab stop, counting
+/// columns in display cells.
+fn expand_tabs(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut column = 0;
+    for g in line.graphemes(true) {
+        if g == "\t" {
+            let n = 8 - column % 8;
+            out.extend(std::iter::repeat_n(' ', n));
+            column += n;
+        } else {
+            out.push_str(g);
+            column += g.width();
+        }
+    }
+    out
 }
 
 /// A crude HTML-to-text conversion: drops tags, `<script>` and `<style>`
@@ -237,6 +256,18 @@ mod tests {
         assert_eq!(truncate("Alice Example", 5), "Alice");
         assert_eq!(truncate("a👩‍💻b", 2), "a");
         assert_eq!(truncate("a👩‍💻b", 3), "a👩‍💻");
+    }
+
+    #[test]
+    fn tabs_are_expanded_to_tab_stops() {
+        let body = Body {
+            kind: BodyKind::Text,
+            content: "a\tb\n\tindented\n日本\tx".into(),
+        };
+        assert_eq!(
+            body_lines(&body),
+            ["a       b", "        indented", "日本    x"]
+        );
     }
 
     #[test]

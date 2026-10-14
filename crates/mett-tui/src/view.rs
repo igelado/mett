@@ -137,8 +137,13 @@ fn display_name(address: &Address) -> &str {
 fn index_status(app: &App) -> String {
     let folder = app.folder.as_ref().map_or("", |f| f.name.as_str());
     let new = app.messages.iter().filter(|m| !m.flags.read).count();
+    let incomplete = if app.incomplete() {
+        " [incomplete]"
+    } else {
+        ""
+    };
     format!(
-        "-*-mett: {folder} [Msgs:{} New:{new}]---",
+        "-*-mett: {folder} [Msgs:{} New:{new}]{incomplete}---",
         app.messages.len()
     )
 }

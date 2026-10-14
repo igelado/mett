@@ -107,6 +107,14 @@ pub struct App {
     pub body_height: usize,
     /// The request whose messages the index is waiting for, if any.
     listing: Option<RequestId>,
+    /// The page that `listing` asked for.
+    listing_page: Option<Page>,
+    /// A page that failed to load, so the index is incomplete. Loading it
+    /// is retried when the user reaches the end of the index.
+    unlisted: Option<Page>,
+    /// Changes that failed to save, kept apart from the status line so that
+    /// later messages can't hide them.
+    pub save_failures: Vec<String>,
     /// Pending flag updates, so a failure can be undone in the index.
     flag_updates: HashMap<RequestId, MessageId>,
     next_request: u64,
@@ -126,6 +134,9 @@ impl App {
             width: usize::from(width),
             body_height: body_height(height),
             listing: None,
+            listing_page: None,
+            unlisted: None,
+            save_failures: Vec::new(),
             flag_updates: HashMap::new(),
             next_request: 0,
         };
@@ -180,12 +191,21 @@ impl App {
         match action {
             Action::Quit => self.quit = true,
             Action::NextEntry if self.selected < last => self.selected += 1,
+            Action::NextEntry if self.unlisted.is_some() => return self.retry_listing(),
             Action::NextEntry => self.status = "You are on the last message.".into(),
             Action::PreviousEntry if self.selected > 0 => self.selected -= 1,
             Action::PreviousEntry => self.status = "You are on the first message.".into(),
             Action::FirstEntry => self.selected = 0,
-            Action::LastEntry => self.selected = last,
-            Action::NextPage => self.selected = (self.selected + page).min(last),
+            Action::LastEntry => {
+                self.selected = last;
+                return self.retry_listing();
+            }
+            Action::NextPage => {
+                self.selected = (self.selected + page).min(last);
+                if self.selected == last {
+                    return self.retry_listing();
+                }
+            }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
             Action::DisplayMessage => return self.open_selected(),
             Action::Exit | Action::NextLine | Action::PreviousLine => {}
@@ -267,30 +287,19 @@ impl App {
     fn on_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
             Event::InboxOpened(Ok(folder)) => {
-                let list = self.request(Request::ListMessages {
-                    folder: folder.id.clone(),
-                    page: Page::first(PAGE_SIZE),
-                });
-                self.listing = Some(effect_id(&list));
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
-                return vec![list];
+                return self.list(Page::first(PAGE_SIZE));
             }
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
                     self.messages.extend(page.messages);
-                    if let Some(cursor) = page.next
-                        && let Some(folder) = &self.folder
-                    {
+                    if let Some(cursor) = page.next {
                         // Keep loading until the whole folder is listed.
-                        let more = self.request(Request::ListMessages {
-                            folder: folder.id.clone(),
-                            page: Page::after(cursor, PAGE_SIZE),
-                        });
-                        self.listing = Some(effect_id(&more));
-                        return vec![more];
+                        return self.list(Page::after(cursor, PAGE_SIZE));
                     }
                     self.listing = None;
+                    self.listing_page = None;
                     // Clear the "Loading" message, but not an error that
                     // was reported while the folder was loading.
                     if self.status.starts_with("Loading ") {
@@ -299,6 +308,7 @@ impl App {
                 }
                 Err(e) => {
                     self.listing = None;
+                    self.unlisted = self.listing_page.take();
                     self.report(e);
                 }
             },
@@ -313,6 +323,7 @@ impl App {
                     {
                         summary.flags.read = false;
                     }
+                    self.save_failures.push(e.to_string());
                     self.report(e);
                 }
             }
@@ -367,6 +378,38 @@ impl App {
         ));
         self.flag_updates.insert(effect_id(&update), message_id);
         vec![update]
+    }
+
+    /// Whether part of the folder could not be listed. The index then
+    /// shows only the messages loaded so far.
+    pub fn incomplete(&self) -> bool {
+        self.unlisted.is_some()
+    }
+
+    /// Lists `page` of the open folder.
+    fn list(&mut self, page: Page) -> Vec<Effect> {
+        let Some(folder) = &self.folder else {
+            return Vec::new();
+        };
+        let list = self.request(Request::ListMessages {
+            folder: folder.id.clone(),
+            page: page.clone(),
+        });
+        self.listing = Some(effect_id(&list));
+        self.listing_page = Some(page);
+        vec![list]
+    }
+
+    /// Retries loading the rest of an incomplete folder.
+    fn retry_listing(&mut self) -> Vec<Effect> {
+        if self.listing.is_some() {
+            return Vec::new();
+        }
+        let Some(page) = self.unlisted.take() else {
+            return Vec::new();
+        };
+        self.status = "Loading more messages...".into();
+        self.list(page)
     }
 
     /// Whether changes to the mailbox are still being saved. mett waits
@@ -595,6 +638,75 @@ mod tests {
             })),
         }));
         assert_eq!(app.status, "network error: offline");
+    }
+
+    #[test]
+    fn a_failed_page_leaves_the_index_incomplete_until_retried() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::InboxOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(first, _) = effects[0].clone();
+        let effects = app.update(Msg::Response(Response {
+            id: first,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: summaries(2),
+                next: Some(PageCursor::new("c")),
+            })),
+        }));
+        let Effect::Request(second, _) = effects[0].clone();
+        app.update(Msg::Response(Response {
+            id: second,
+            event: Event::MessagesListed(Err(Error::Network("offline".into()))),
+        }));
+        assert!(app.incomplete());
+
+        // Reaching the end of the index retries the failed page.
+        act(&mut app, Action::NextEntry);
+        let effects = act(&mut app, Action::NextEntry);
+        let [Effect::Request(retry, Request::ListMessages { page, .. })] = effects.as_slice()
+        else {
+            panic!("expected a retry, got {effects:?}");
+        };
+        assert_eq!(page.cursor(), Some(&PageCursor::new("c")));
+        assert!(!app.incomplete());
+        app.update(Msg::Response(Response {
+            id: *retry,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: summaries(1),
+                next: None,
+            })),
+        }));
+        assert_eq!(app.messages.len(), 3);
+        assert!(!app.incomplete());
+    }
+
+    #[test]
+    fn records_every_failed_save() {
+        let mut app = loaded(2);
+        let first = open(&mut app, 1);
+        act(&mut app, Action::Exit);
+        act(&mut app, Action::NextEntry);
+        let second = open(&mut app, 1);
+        let ([Effect::Request(first, _)], [Effect::Request(second, _)]) =
+            (first.as_slice(), second.as_slice())
+        else {
+            panic!("expected one flag update per message");
+        };
+
+        app.update(Msg::Response(Response {
+            id: *first,
+            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
+        }));
+        // A later success doesn't hide the earlier failure.
+        app.update(Msg::Response(Response {
+            id: *second,
+            event: Event::FlagsUpdated(Ok(())),
+        }));
+        assert_eq!(app.save_failures, ["network error: offline"]);
+        assert!(!app.saving());
     }
 
     #[test]
