@@ -787,3 +787,56 @@ async fn a_repeated_401_inside_a_batch_is_an_auth_error() {
     assert!(matches!(store.list_folders().await, Err(Error::Auth(_))));
     assert_eq!(auth.rejected.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn a_token_rejected_on_retry_is_reported_too() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let settings = AuthSettings {
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let auth = Arc::new(RotatingAuth {
+        rejected: Default::default(),
+    });
+    let rejections = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = GraphMailStore::new(
+        reqwest::Client::new(),
+        &settings,
+        Arc::new(Recording {
+            inner: auth,
+            rejections: Arc::clone(&rejections),
+        }),
+    );
+    assert!(matches!(
+        store.fetch_message(&MessageId::new("m1")).await,
+        Err(Error::Auth(_))
+    ));
+    assert_eq!(*rejections.lock().unwrap(), ["old", "new"]);
+}
+
+/// Wraps an authenticator, recording which tokens were rejected.
+struct Recording {
+    inner: Arc<RotatingAuth>,
+    rejections: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Authenticator for Recording {
+    async fn access_token(&self) -> mett_core::Result<AccessToken> {
+        self.inner.access_token().await
+    }
+
+    async fn token_rejected(&self, token: &AccessToken) {
+        self.rejections
+            .lock()
+            .unwrap()
+            .push(token.secret().to_owned());
+        if token.secret() == "old" {
+            self.inner.token_rejected(token).await;
+        }
+    }
+}

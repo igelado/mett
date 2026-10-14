@@ -129,6 +129,10 @@ impl<A: Authenticator> GraphMailStore<A> {
         match retry {
             Some(retry) if fresh != token => {
                 let response = Self::attempt(retry, &fresh).await?;
+                if response.status() == StatusCode::UNAUTHORIZED {
+                    // Rejected too: don't let the next request reuse it.
+                    self.auth.token_rejected(&fresh).await;
+                }
                 Self::checked(response, about).await
             }
             _ => Self::checked(response, about).await,
