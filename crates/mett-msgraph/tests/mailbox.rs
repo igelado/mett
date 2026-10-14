@@ -77,7 +77,6 @@ async fn mount_roles_with(server: &MockServer, status: u16) {
     Mock::given(method("POST"))
         .and(path("/v1.0/$batch"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "responses": responses })))
-        .expect(1)
         .mount(server)
         .await;
 }
@@ -116,8 +115,7 @@ async fn finds_well_known_folders_and_labels_them() {
         .await;
 
     let store = store(&server);
-    // Listing first still labels the Inbox, and the roles are looked up
-    // only once (the batch mock expects one request).
+    // Listing first still labels the Inbox.
     let folders = store.list_folders().await.unwrap();
     let inbox = store
         .well_known_folder(WellKnownFolder::Inbox)
@@ -679,4 +677,75 @@ async fn permanent_delete_is_reported_unavailable_in_national_clouds() {
     let result = store.delete_message(&MessageId::new("m1")).await;
     assert!(matches!(result, Err(Error::Backend(msg)) if msg.contains("usgov")));
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn recognises_well_known_folders_created_later() {
+    let server = MockServer::start().await;
+    // At first the mailbox has no Archive folder…
+    mount_roles(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [folder("archive-id", "Archive")],
+        })))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let first = store.list_folders().await.unwrap();
+    assert_eq!(first[0].well_known, None);
+
+    // …then it is created, and the next listing recognises it.
+    let with_archive: Vec<Value> = [
+        json!({ "id": "0", "status": 200, "body": { "id": "root-id" } }),
+        json!({ "id": "6", "status": 200, "body": { "id": "archive-id" } }),
+    ]
+    .into();
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "responses": with_archive })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let second = store.list_folders().await.unwrap();
+    assert_eq!(second[0].well_known, Some(WellKnownFolder::Archive));
+}
+
+/// Counts rejected tokens.
+#[derive(Default)]
+struct CountingAuth {
+    rejected: std::sync::atomic::AtomicUsize,
+}
+
+impl Authenticator for CountingAuth {
+    async fn access_token(&self) -> mett_core::Result<AccessToken> {
+        Ok(AccessToken::new("tok", DateTime::<Utc>::MAX_UTC))
+    }
+
+    async fn token_rejected(&self, _: &AccessToken) {
+        self.rejected
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn a_401_inside_a_batch_rejects_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/$batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "responses": [{ "id": "0", "status": 401, "body": {} }],
+        })))
+        .mount(&server)
+        .await;
+    let settings = AuthSettings {
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let auth = Arc::new(CountingAuth::default());
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::clone(&auth));
+    assert!(matches!(store.list_folders().await, Err(Error::Auth(_))));
+    assert_eq!(auth.rejected.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

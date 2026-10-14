@@ -195,12 +195,11 @@ impl<A: Authenticator> GraphMailStore<A> {
         Ok(root)
     }
 
-    /// The mailbox's folder roles, looked up on first use with a single
-    /// `$batch` request for the root and every well-known folder.
+    /// The mailbox's folder roles, looked up with a single `$batch` request
+    /// for the root and every well-known folder. Looked up afresh on every
+    /// call (once per folder listing), so a well-known folder created since
+    /// is recognised; the result is cached for [`Self::root`].
     async fn roles(&self) -> Result<Arc<Roles>> {
-        if let Some(roles) = self.roles.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            return Ok(roles);
-        }
         let names: Vec<&str> = std::iter::once(ROOT)
             .chain(WellKnownFolder::ALL.iter().map(|w| w.as_str()))
             .collect();
@@ -237,6 +236,12 @@ impl<A: Authenticator> GraphMailStore<A> {
                     });
                 }
                 401 | 403 => {
+                    if response.status == 401 {
+                        // The token was rejected: make sure the next request
+                        // gets a new one.
+                        let token = self.auth.access_token().await?;
+                        self.auth.token_rejected(&token).await;
+                    }
                     return Err(Error::Auth(format!(
                         "Graph refused a folder lookup: HTTP {}",
                         response.status
