@@ -333,12 +333,18 @@ impl<'a> Lexer<'a> {
                 // An escaped character (such as \`) belongs to the shell
                 // command; pass both characters through.
                 Some('\\') => {
-                    command.extend(self.bump());
+                    self.bump();
                     match self.chars.peek() {
-                        Some('\n') | None => {
-                            return Err(self.error("unterminated backtick"));
+                        // A trailing backslash continues the command on the
+                        // next line, as elsewhere in a mettrc.
+                        Some('\n') => {
+                            self.bump();
                         }
-                        Some(_) => command.extend(self.bump()),
+                        None => return Err(self.error("unterminated backtick")),
+                        Some(_) => {
+                            command.push('\\');
+                            command.extend(self.bump());
+                        }
                     }
                 }
                 Some(_) => command.extend(self.bump()),
@@ -492,6 +498,19 @@ mod tests {
                 Part::Command(r"echo \`date\`".into())
             ]
         );
+    }
+
+    #[test]
+    fn backtick_commands_can_continue_on_the_next_line() {
+        let commands = lex("set x=`printf %s \\\n  one`\nset y=2\n");
+        assert_eq!(
+            commands[0].as_ref().unwrap().words[1].parts,
+            [
+                Part::Literal("x=".into()),
+                Part::Command("printf %s   one".into())
+            ]
+        );
+        assert_eq!(commands[1].as_ref().unwrap().line, 3);
     }
 
     #[test]
