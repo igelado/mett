@@ -52,7 +52,8 @@ pub trait TokenStore: Send + Sync + 'static {
 
     /// Removes the stored refresh token only if it is `token`. Otherwise,
     /// returns the token that is stored instead (if any): another process
-    /// may have replaced a token that this one found rejected.
+    /// may have replaced a token that this one found rejected. A store that
+    /// can't do this safely may leave `token` in place, returning `None`.
     ///
     /// The default implementation is not atomic; stores that can be shared
     /// between processes should override it.
@@ -127,8 +128,13 @@ impl TokenStore for KeyringStore {
         account: &AccountId,
         token: &str,
     ) -> Result<Option<String>, TokenStoreError> {
-        let _lock = Self::lock(account);
+        let lock = Self::lock(account);
         match Self::get(account)? {
+            // Without the lock, another process could store a replacement
+            // between the check and the delete, so leave the rejected token
+            // in place: it does no harm, as the next refresh with it fails
+            // and comes back here.
+            Some(stored) if stored == token && lock.is_none() => Ok(None),
             Some(stored) if stored == token => Self::delete(account).map(|()| None),
             other => Ok(other),
         }
