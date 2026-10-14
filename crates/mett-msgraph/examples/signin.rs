@@ -1,6 +1,7 @@
-//! Signs in to Microsoft Graph and prints who you are.
+//! Signs in to Microsoft Graph, prints who you are and lists the newest
+//! messages in your Inbox.
 //!
-//! Use it to check an app registration before mett can read mail:
+//! Use it to check an app registration and mailbox access:
 //!
 //! ```sh
 //! METT_ACCOUNT=alice@contoso.com METT_CLIENT_ID=<app-id> \
@@ -18,10 +19,10 @@ use std::env;
 use std::error::Error;
 use std::sync::Arc;
 
-use mett_core::Authenticator;
+use mett_core::{Authenticator, MailStore, Page, WellKnownFolder};
 use mett_msgraph::{
-    AuthFlow, AuthSettings, FileStore, GraphAuthenticator, KeyringStore, Prompter, SignInPrompt,
-    TokenStore,
+    AuthFlow, AuthSettings, FileStore, GraphAuthenticator, GraphMailStore, KeyringStore, Prompter,
+    SignInPrompt, TokenStore,
 };
 
 fn prompt(prompt: SignInPrompt) {
@@ -66,7 +67,13 @@ async fn run(
     prompter: impl Prompter,
 ) -> Result<(), Box<dyn Error>> {
     let me = settings.cloud.graph_url().join("v1.0/me")?;
-    let auth = GraphAuthenticator::new(settings, reqwest::Client::new(), Arc::new(store), prompter);
+    let http = reqwest::Client::new();
+    let auth = Arc::new(GraphAuthenticator::new(
+        settings.clone(),
+        http.clone(),
+        Arc::new(store),
+        prompter,
+    ));
     let token = auth.access_token().await?;
     eprintln!(
         "Signed in; the access token expires at {}.",
@@ -92,5 +99,26 @@ async fn run(
             .or(body["userPrincipalName"].as_str())
             .unwrap_or("?")
     );
+
+    let mailbox = GraphMailStore::new(http, &settings, auth);
+    let inbox = mailbox.well_known_folder(WellKnownFolder::Inbox).await?;
+    println!(
+        "{}: {} items, {} unread. Newest:",
+        inbox.name, inbox.total_count, inbox.unread_count
+    );
+    for message in mailbox
+        .list_messages(&inbox.id, Page::first(5))
+        .await?
+        .messages
+    {
+        let from = message.from.map(|a| a.to_string()).unwrap_or_default();
+        println!(
+            "  {} {} {}  {}",
+            if message.flags.read { ' ' } else { 'N' },
+            message.received.format("%Y-%m-%d %H:%M"),
+            from,
+            message.subject
+        );
+    }
     Ok(())
 }

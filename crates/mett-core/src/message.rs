@@ -84,7 +84,8 @@ pub struct MessageSummary {
     pub from: Option<Address>,
     /// The `To:` recipients.
     pub to: Vec<Address>,
-    /// When the message was received.
+    /// The message's date, which the index shows and sorts by: when it was
+    /// sent (mutt's default index date), or created for an unsent draft.
     pub received: DateTime<Utc>,
     /// Read and flagged state.
     pub flags: Flags,

@@ -1,10 +1,16 @@
 # mett-msgraph
 
 The Microsoft Graph adapter for mett. It implements `mett-core`'s ports
-against Microsoft Graph. So far it provides sign-in: `GraphAuthenticator`
-implements the `Authenticator` port with OAuth2 (authorization code with
-PKCE, or device code), stores refresh tokens, and checks that the signed-in
-user is the configured account.
+against Microsoft Graph:
+
+- **`GraphAuthenticator`** implements the `Authenticator` port with OAuth2
+  (authorization code with PKCE, or device code). It stores refresh tokens,
+  and checks that the signed-in user is the configured account.
+- **`GraphMailStore`** implements the `MailStore` port on the signed-in
+  user's mailbox (`/me`). It lists folders and messages (newest first, paged
+  by Graph's `@odata.nextLink`), fetches messages (with Graph converting
+  HTML bodies to text), updates read and flagged state, moves messages, and
+  deletes them permanently.
 
 The configuration it implements (`msgraph_*` variables) is described in
 [docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md) §4.
@@ -15,9 +21,10 @@ The configuration it implements (`msgraph_*` variables) is described in
 cargo test -p mett-msgraph
 ```
 
-The tests run every sign-in flow against a mock identity platform and a mock
-Graph ([wiremock](https://crates.io/crates/wiremock)). They need no network
-access and no Microsoft account.
+The tests run every sign-in flow and every mailbox operation against a mock
+identity platform and a mock Graph
+([wiremock](https://crates.io/crates/wiremock)). They need no network access
+and no Microsoft account.
 
 ## Testing sign-in with a real account
 
@@ -51,12 +58,19 @@ METT_ACCOUNT=you@example.com METT_CLIENT_ID=<application-id> \
     cargo run -p mett-msgraph --example signin
 ```
 
-The example opens your browser to sign in. When it succeeds, it prints:
+The example opens your browser to sign in. When it succeeds, it prints who
+you are and the newest messages in your Inbox:
 
 ```
 Signed in; the access token expires at <time>.
 Hello, Your Name <you@example.com>
+Inbox: 1234 items, 5 unread. Newest:
+  N 2026-10-14 09:12 Alice Example <alice@example.com>  Weekly sync notes
+    2026-10-13 17:40 Bob Builder <bob@example.com>  Re: Build failures
 ```
+
+The Inbox listing checks mailbox access (`Mail.ReadWrite`). The example only
+reads: it doesn't change any messages.
 
 `METT_ACCOUNT` must be your user principal name (UPN). Usually that's your
 e-mail address. If you sign in as a different user, the example fails with

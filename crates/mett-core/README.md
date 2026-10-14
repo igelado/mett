@@ -5,7 +5,7 @@ defines the domain types (folders, messages, flags, typed IDs and errors) and
 the ports that adapters implement:
 
 - **`MailStore`:** list folders and messages, fetch, flag, move and delete.
-  `mett-msgraph` will implement it for Microsoft Graph.
+  `mett-msgraph`'s `GraphMailStore` implements it for Microsoft Graph.
 - **`Authenticator`:** provides access tokens. Implemented by
   `mett-msgraph`'s `GraphAuthenticator`.
 

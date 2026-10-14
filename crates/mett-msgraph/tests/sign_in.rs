@@ -982,3 +982,36 @@ async fn request_timeouts_are_transient() {
     assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     assert_eq!(stored(&store).as_deref(), Some("r0"));
 }
+
+#[tokio::test]
+async fn a_rejected_token_is_refreshed_on_the_next_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(tokens("a1", "r1"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(tokens("a2", "r2"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    me(&server, "a1", "alice@contoso.com").await;
+    me(&server, "a2", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    let first = auth.access_token().await.unwrap();
+    assert_eq!(first.secret(), "a1");
+    auth.token_rejected(&first).await;
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a2");
+}

@@ -264,6 +264,15 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
 }
 
 impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
+    /// Forgets the cached access token if it is `token`, so the next call
+    /// refreshes it.
+    async fn token_rejected(&self, token: &AccessToken) {
+        let mut state = self.state.lock().await;
+        if state.access.as_ref() == Some(token) {
+            state.access = None;
+        }
+    }
+
     async fn access_token(&self) -> Result<AccessToken> {
         let mut state = self.state.lock().await;
 

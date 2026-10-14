@@ -17,9 +17,10 @@ pub struct Folder {
     pub name: String,
     /// The folder's well-known role, if it has one.
     pub well_known: Option<WellKnownFolder>,
-    /// Number of unread messages.
+    /// Number of unread items. Backends may count items other than
+    /// messages (Office365 counts every Outlook item in the folder).
     pub unread_count: u32,
-    /// Total number of messages.
+    /// Total number of items, counted as for [`Folder::unread_count`].
     pub total_count: u32,
 }
 
