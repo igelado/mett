@@ -215,7 +215,8 @@ genuinely expected:
   PKCE.
 - **HTML rendering:** built-in HTML-to-text conversion, or an external
   command (mailcap-style).
-- **Credential storage:** OS keyring, or an encrypted file.
+- **Credential storage:** OS keyring, or a plain file readable only by the
+  user (mode `0600`, Unix only). The file is not encrypted.
 - **Implementation:** in `mett-msgraph`, the sign-in flow is the `AuthFlow`
   setting, token storage is the `TokenStore` trait (`KeyringStore`,
   `FileStore`, and `MemoryStore` for tests), and the UI side of sign-in is

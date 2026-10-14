@@ -961,3 +961,24 @@ async fn tries_a_replacement_token_when_an_unconfirmed_refresh_is_rejected() {
     assert!(auth.access_token().await.is_err());
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-newer");
 }
+
+#[tokio::test]
+async fn request_timeouts_are_transient() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(408))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
+    assert_eq!(stored(&store).as_deref(), Some("r0"));
+}

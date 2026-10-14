@@ -11,8 +11,8 @@
 //! - `METT_TENANT`: overrides the tenant (default: the account's domain).
 //! - `METT_CLOUD`: `global` (default), `usgov`, `usgov-dod` or `china`.
 //! - `METT_FLOW=device`: uses the device code flow instead of the browser.
-//! - `METT_TOKEN_FILE`: stores the refresh token in this file instead of the
-//!   OS keyring.
+//! - `METT_TOKEN_FILE` (Unix only): stores the refresh token in this file
+//!   instead of the OS keyring.
 
 use std::env;
 use std::error::Error;
@@ -50,6 +50,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     match env::var_os("METT_TOKEN_FILE") {
+        // The file store needs Unix permissions to keep the token private.
+        Some(_) if !cfg!(unix) => Err(
+            "METT_TOKEN_FILE is supported only on Unix; leave it unset to use the OS keyring"
+                .into(),
+        ),
         Some(path) => run(settings, FileStore::new(path), prompt).await,
         None => run(settings, KeyringStore, prompt).await,
     }
