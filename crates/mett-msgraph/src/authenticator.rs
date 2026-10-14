@@ -176,7 +176,9 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                 // cached access token while it is still valid.
                 Err(e) => {
                     return match &state.access {
-                        Some(token) if !token.expires_within(TimeDelta::zero(), now) => {
+                        // Checked against the time after the refresh attempt,
+                        // which may have taken a while.
+                        Some(token) if !token.expires_within(TimeDelta::zero(), Utc::now()) => {
                             Ok(token.clone())
                         }
                         _ => Err(e.into()),
