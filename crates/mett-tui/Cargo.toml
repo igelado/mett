@@ -11,7 +11,14 @@ name = "mett"
 path = "src/main.rs"
 
 [dependencies]
-mett-core.workspace = true
+# The `mock` store backs `mett --demo` until the Graph mailbox is wired in.
+mett-core = { workspace = true, features = ["mock"] }
+
+chrono.workspace = true
+ratatui.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [lints]
 workspace = true
