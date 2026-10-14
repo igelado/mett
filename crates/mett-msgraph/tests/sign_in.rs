@@ -455,24 +455,49 @@ async fn signs_in_again_when_graph_rejects_the_new_token() {
     assert_eq!(stored(&store), None);
 }
 
-/// A token store that can be read but not written.
+/// A token store whose writes fail while `broken` is set.
 #[derive(Default)]
-struct ReadOnlyStore;
+struct FlakyStore {
+    broken: std::sync::atomic::AtomicBool,
+    inner: MemoryStore,
+}
 
-impl TokenStore for ReadOnlyStore {
-    fn load(&self, _: &AccountId) -> Result<Option<String>, mett_msgraph::TokenStoreError> {
-        Ok(None)
+impl FlakyStore {
+    fn broken() -> Self {
+        let store = Self::default();
+        store.set_broken(true);
+        store
     }
 
-    fn save(&self, _: &AccountId, _: &str) -> Result<(), mett_msgraph::TokenStoreError> {
-        Err(mett_msgraph::TokenStoreError::File {
-            path: "/read-only/tokens".into(),
-            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        })
+    fn set_broken(&self, broken: bool) {
+        self.broken
+            .store(broken, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn clear(&self, _: &AccountId) -> Result<(), mett_msgraph::TokenStoreError> {
+    fn check(&self) -> Result<(), mett_msgraph::TokenStoreError> {
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(mett_msgraph::TokenStoreError::File {
+                path: "/read-only/tokens".into(),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            });
+        }
         Ok(())
+    }
+}
+
+impl TokenStore for FlakyStore {
+    fn load(&self, account: &AccountId) -> Result<Option<String>, mett_msgraph::TokenStoreError> {
+        self.inner.load(account)
+    }
+
+    fn save(&self, account: &AccountId, token: &str) -> Result<(), mett_msgraph::TokenStoreError> {
+        self.check()?;
+        self.inner.save(account, token)
+    }
+
+    fn clear(&self, account: &AccountId) -> Result<(), mett_msgraph::TokenStoreError> {
+        self.check()?;
+        self.inner.clear(account)
     }
 }
 
@@ -484,10 +509,11 @@ async fn keeps_working_in_memory_when_tokens_cannot_be_stored() {
 
     let prompts = Arc::new(Mutex::new(0));
     let counted = Arc::clone(&prompts);
+    let store = Arc::new(FlakyStore::broken());
     let auth = GraphAuthenticator::new(
         settings(&server, AuthFlow::DeviceCode),
         reqwest::Client::new(),
-        Arc::new(ReadOnlyStore),
+        Arc::clone(&store),
         move |_: SignInPrompt| *counted.lock().unwrap() += 1,
     );
 
@@ -498,6 +524,62 @@ async fn keeps_working_in_memory_when_tokens_cannot_be_stored() {
     // …but the session keeps the tokens and doesn't ask to sign in again.
     assert_eq!(auth.access_token().await.unwrap().secret(), "a6");
     assert_eq!(*prompts.lock().unwrap(), 1);
+
+    // Once the store works again, the refresh token is stored on the next
+    // call.
+    store.set_broken(false);
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a6");
+    assert_eq!(store.load(&account()).unwrap().as_deref(), Some("r-new"));
+}
+
+#[tokio::test]
+async fn sign_out_keeps_state_when_the_stored_token_cannot_be_removed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(tokens("a1", "r0"))
+        .mount(&server)
+        .await;
+    let store = Arc::new(FlakyStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        no_prompts(),
+    );
+    auth.access_token().await.unwrap();
+
+    store.set_broken(true);
+    assert!(auth.sign_out().await.is_err());
+    // Still signed in, consistently with the store; sign-out can be retried.
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
+    store.set_broken(false);
+    auth.sign_out().await.unwrap();
+    assert_eq!(store.load(&account()).unwrap(), None);
+}
+
+#[tokio::test]
+async fn throttled_token_requests_are_transient() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "error": "too_many_requests",
+        })))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
+    assert_eq!(stored(&store).as_deref(), Some("r0"));
 }
 
 #[tokio::test]

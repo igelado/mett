@@ -145,9 +145,17 @@ async fn handle(stream: TcpStream, state: &str) -> io::Result<Option<HashMap<Str
         html.len()
     );
     let mut stream = reader.into_inner().into_inner();
-    stream.write_all(response.as_bytes()).await?;
-    stream.shutdown().await?;
-    Ok(params)
+    let sent = async {
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await
+    }
+    .await;
+    // Once a valid redirect has arrived, answering the browser is best
+    // effort: it may already have closed the connection.
+    match params {
+        Some(params) => Ok(Some(params)),
+        None => sent.map(|()| None),
+    }
 }
 
 /// Parses `GET /?a=b HTTP/1.1` into its query parameters, if the request is

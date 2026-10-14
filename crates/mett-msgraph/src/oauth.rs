@@ -175,15 +175,20 @@ async fn post_form<T: DeserializeOwned>(
             FlowError::Other(format!("invalid response from identity platform: {e}"))
         });
     }
-    match serde_json::from_slice::<ErrorResponse>(&body) {
-        Ok(e) => Err(FlowError::OAuth {
+    let error = serde_json::from_slice::<ErrorResponse>(&body).ok();
+    // Throttling and server errors are temporary whatever the body says.
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let code = error.map(|e| format!(" ({})", e.error)).unwrap_or_default();
+        return Err(FlowError::Unavailable(format!(
+            "identity platform returned HTTP {status}{code}"
+        )));
+    }
+    match error {
+        Some(e) => Err(FlowError::OAuth {
             code: e.error,
             description: e.error_description.unwrap_or_default(),
         }),
-        Err(_) if status.is_server_error() => Err(FlowError::Unavailable(format!(
-            "identity platform returned HTTP {status}"
-        ))),
-        Err(_) => Err(FlowError::Other(format!(
+        None => Err(FlowError::Other(format!(
             "identity platform returned HTTP {status}"
         ))),
     }

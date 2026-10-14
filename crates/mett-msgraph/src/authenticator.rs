@@ -33,6 +33,8 @@ struct State {
     access: Option<AccessToken>,
     refresh: Option<String>,
     loaded: bool,
+    /// `refresh` could not be stored yet; storing it is retried on each call.
+    unsaved: bool,
     /// Tokens from an interactive sign-in whose user could not be confirmed
     /// yet (for example, Graph was briefly unavailable). They are neither
     /// used nor stored until the check succeeds, but keeping them avoids
@@ -69,14 +71,19 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
 
     /// Forgets the cached tokens and removes the stored refresh token, so the
     /// next call signs in interactively.
+    ///
+    /// The stored token is removed first: if that fails, the cached tokens
+    /// are kept too, so that the state stays consistent and sign-out can be
+    /// retried.
     pub async fn sign_out(&self) -> Result<()> {
         let mut state = self.state.lock().await;
+        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
+        blocking(move || store.clear(&account)).await?;
         *state = State {
             loaded: true,
             ..State::default()
         };
-        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
-        blocking(move || store.clear(&account)).await
+        Ok(())
     }
 
     async fn sign_in(&self) -> Result<Tokens, FlowError> {
@@ -152,11 +159,22 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         if let Some(refresh) = tokens.refresh
             && state.refresh.as_ref() != Some(&refresh)
         {
-            state.refresh = Some(refresh.clone());
-            let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
-            blocking(move || store.save(&account, &refresh)).await?;
+            state.refresh = Some(refresh);
+            state.unsaved = true;
         }
+        self.save_refresh_token(state).await?;
         Ok(tokens.access)
+    }
+
+    /// Stores the in-memory refresh token if it hasn't been stored yet.
+    async fn save_refresh_token(&self, state: &mut State) -> Result<()> {
+        let Some(refresh) = state.refresh.clone().filter(|_| state.unsaved) else {
+            return Ok(());
+        };
+        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
+        blocking(move || store.save(&account, &refresh)).await?;
+        state.unsaved = false;
+        Ok(())
     }
 }
 
@@ -165,10 +183,16 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         let mut state = self.state.lock().await;
 
         let now = Utc::now();
-        if let Some(token) = &state.access
+        if let Some(token) = state.access.clone()
             && !token.expires_within(EXPIRY_MARGIN, now)
         {
-            return Ok(token.clone());
+            // A previous attempt to store the refresh token failed: retry,
+            // but don't fail a caller who has a valid token. The failure
+            // was reported when it first happened.
+            if state.unsaved {
+                let _ = self.save_refresh_token(&mut state).await;
+            }
+            return Ok(token);
         }
 
         // Retry confirming a previous sign-in before asking for a new one.
