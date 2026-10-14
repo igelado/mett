@@ -81,16 +81,14 @@ impl KeyringStore {
 impl KeyringStore {
     /// The keyring can't compare and delete in one step, so writes for an
     /// account are serialised across mett processes with a lock file next to
-    /// where the file store would keep its tokens. Without a home directory
-    /// there is nowhere to put it, and writes go ahead unlocked.
-    fn lock(account: &AccountId) -> Result<Option<fs::File>, TokenStoreError> {
-        let Some(path) = FileStore::default_path(account) else {
-            return Ok(None);
-        };
-        let path = sibling(&path, "", ".keyring.lock");
-        lock_file(&path)
-            .map(Some)
-            .map_err(|source| TokenStoreError::File { path, source })
+    /// where the file store would keep its tokens.
+    ///
+    /// The lock is best effort: if there is no home directory, or the state
+    /// directory isn't writable, the keyring itself still works, so writes
+    /// go ahead unlocked rather than fail.
+    fn lock(account: &AccountId) -> Option<fs::File> {
+        let path = FileStore::default_path(account)?;
+        lock_file(&sibling(&path, "", ".keyring.lock")).ok()
     }
 
     fn get(account: &AccountId) -> Result<Option<String>, TokenStoreError> {
@@ -115,12 +113,12 @@ impl TokenStore for KeyringStore {
     }
 
     fn save(&self, account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError> {
-        let _lock = Self::lock(account)?;
+        let _lock = Self::lock(account);
         Ok(Self::entry(account)?.set_password(refresh_token)?)
     }
 
     fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
-        let _lock = Self::lock(account)?;
+        let _lock = Self::lock(account);
         Self::delete(account)
     }
 
@@ -129,7 +127,7 @@ impl TokenStore for KeyringStore {
         account: &AccountId,
         token: &str,
     ) -> Result<Option<String>, TokenStoreError> {
-        let _lock = Self::lock(account)?;
+        let _lock = Self::lock(account);
         match Self::get(account)? {
             Some(stored) if stored == token => Self::delete(account).map(|()| None),
             other => Ok(other),

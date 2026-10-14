@@ -35,11 +35,39 @@ struct State {
     loaded: bool,
     /// `refresh` could not be stored yet; storing it is retried on each call.
     unsaved: bool,
-    /// Tokens from an interactive sign-in whose user could not be confirmed
-    /// yet (for example, Graph was briefly unavailable). They are neither
-    /// used nor stored until the check succeeds, but keeping them avoids
-    /// asking the user to sign in again.
-    unconfirmed: Option<Tokens>,
+    /// Tokens whose user could not be confirmed yet (for example, Graph was
+    /// briefly unavailable). They are neither used nor stored until the
+    /// check succeeds, but keeping them avoids asking the user to sign in
+    /// again.
+    unconfirmed: Option<Unconfirmed>,
+}
+
+struct Unconfirmed {
+    tokens: Tokens,
+    /// The stored refresh token they were obtained with, if any, to remove
+    /// if they turn out to belong to another user.
+    stored: Option<String>,
+}
+
+impl State {
+    /// Whether the cached access token can be returned at `now`. Without a
+    /// refresh token, refreshing early isn't possible, so the token is used
+    /// until it actually expires.
+    fn usable(&self, token: &AccessToken, now: chrono::DateTime<Utc>) -> bool {
+        let margin = if self.refresh.is_some() {
+            EXPIRY_MARGIN
+        } else {
+            TimeDelta::zero()
+        };
+        !token.expires_within(margin, now)
+    }
+
+    /// The cached access token, if it has not actually expired yet.
+    fn unexpired_access(&self) -> Option<AccessToken> {
+        self.access
+            .clone()
+            .filter(|t| !t.expires_within(TimeDelta::zero(), Utc::now()))
+    }
 }
 
 /// The outcome of checking which user an interactive sign-in was for.
@@ -150,7 +178,10 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
                 Err(e)
             }
             Identity::Unknown(e) => {
-                state.unconfirmed = Some(tokens);
+                state.unconfirmed = Some(Unconfirmed {
+                    tokens,
+                    stored: stored.map(str::to_owned),
+                });
                 Err(e)
             }
         }
@@ -206,15 +237,8 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         let mut state = self.state.lock().await;
 
         let now = Utc::now();
-        // Without a refresh token, refreshing early isn't possible, so keep
-        // using the access token until it actually expires.
-        let margin = if state.refresh.is_some() {
-            EXPIRY_MARGIN
-        } else {
-            TimeDelta::zero()
-        };
         if let Some(token) = state.access.clone()
-            && !token.expires_within(margin, now)
+            && state.usable(&token, now)
         {
             // A previous attempt to store the refresh token failed: retry,
             // but don't fail a caller who has a valid token. The failure
@@ -226,7 +250,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         }
 
         // Retry confirming a previous sign-in before asking for a new one.
-        if let Some(mut tokens) = state.unconfirmed.take() {
+        if let Some(Unconfirmed { mut tokens, stored }) = state.unconfirmed.take() {
             if tokens.access.expires_within(TimeDelta::zero(), now) {
                 // The access token expired before the user could be
                 // confirmed: get a fresh one with the sign-in's refresh token
@@ -245,15 +269,18 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                         return self.sign_in_and_confirm(&mut state).await;
                     }
                     Err(e) => {
-                        state.unconfirmed = Some(tokens);
+                        state.unconfirmed = Some(Unconfirmed { tokens, stored });
                         return Err(e.into());
                     }
                 }
             }
-            let token = self.confirm(&mut state, tokens, None).await?;
-            // The check may have taken a while; if the token expired in the
-            // meantime, continue with the confirmed refresh token below.
-            if !token.expires_within(EXPIRY_MARGIN, Utc::now()) {
+            let token = match self.confirm(&mut state, tokens, stored.as_deref()).await {
+                Ok(token) => token,
+                Err(e) => return state.unexpired_access().ok_or(e),
+            };
+            // The check may have taken a while; if the token is no longer
+            // usable, continue with the confirmed refresh token below.
+            if state.usable(&token, Utc::now()) {
                 return Ok(token);
             }
         }
@@ -275,7 +302,13 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                         refresh: tokens.refresh.or_else(|| Some(refresh.clone())),
                         ..tokens
                     };
-                    return self.confirm(&mut state, tokens, Some(&refresh)).await;
+                    // If the user can't be confirmed right now, keep using
+                    // the cached token while it is valid, as for a failed
+                    // refresh.
+                    return match self.confirm(&mut state, tokens, Some(&refresh)).await {
+                        Ok(token) => Ok(token),
+                        Err(e) => state.unexpired_access().ok_or(e),
+                    };
                 }
                 // The refresh token was revoked, expired or needs new
                 // consent. Remove it, unless it has been replaced, and fall
@@ -286,16 +319,9 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                 }
                 // A transient failure: keep the refresh token, and use the
                 // cached access token while it is still valid.
-                Err(e) => {
-                    return match &state.access {
-                        // Checked against the time after the refresh attempt,
-                        // which may have taken a while.
-                        Some(token) if !token.expires_within(TimeDelta::zero(), Utc::now()) => {
-                            Ok(token.clone())
-                        }
-                        _ => Err(e.into()),
-                    };
-                }
+                // (Checked against the time after the refresh attempt, which
+                // may have taken a while.)
+                Err(e) => return state.unexpired_access().ok_or_else(|| e.into()),
             }
         }
 

@@ -790,3 +790,77 @@ async fn keeps_using_a_token_without_refresh_token_until_it_expires() {
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-only");
     assert_eq!(*prompts.lock().unwrap(), 1, "signed in only once");
 }
+
+#[tokio::test]
+async fn clears_the_stored_token_on_a_late_identity_mismatch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(tokens("a-x", "r-x"))
+        .mount(&server)
+        .await;
+    // Graph is down at first; later it reports another user.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    me(&server, "a-x", "mallory@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
+    assert_eq!(stored(&store).as_deref(), Some("r0"));
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    assert_eq!(stored(&store), None);
+}
+
+#[tokio::test]
+async fn uses_the_cached_token_while_a_refreshed_one_is_unconfirmed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "a-short",
+            "refresh_token": "r1",
+            "expires_in": 120,
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(tokens("a-next", "r2"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    me(&server, "a-short", "alice@contoso.com").await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .and(header("authorization", "Bearer a-next"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
+    // a-short is inside the refresh margin; the refreshed a-next can't be
+    // confirmed yet, so the still-valid a-short is returned.
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
+}
