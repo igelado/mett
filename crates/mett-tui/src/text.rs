@@ -6,7 +6,8 @@
 
 use chrono::Local;
 use mett_core::{Address, Body, BodyKind, Message};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// The lines the pager shows for `message`: the headers mutt shows by
 /// default, a blank line, then the body. They are not wrapped yet; see
@@ -47,7 +48,9 @@ pub fn wrap_all(lines: &[String], width: usize) -> Vec<String> {
 }
 
 /// Wraps `line` into rows of at most `width` terminal cells, breaking after
-/// a space where possible. Widths are display cells, so wide (CJK, emoji)
+/// a space where possible. Text is measured and split in grapheme clusters
+/// (what the terminal shows as one character, such as an emoji made of
+/// several code points), and widths are display cells, so wide (CJK, emoji)
 /// characters count double.
 pub fn wrap(line: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -58,10 +61,10 @@ pub fn wrap(line: &str, width: usize) -> Vec<String> {
     let mut row_width = 0;
     // Byte offset in `row` just after its last space.
     let mut break_at = None;
-    for c in line.chars() {
-        let w = c.width().unwrap_or(0);
+    for g in line.graphemes(true) {
+        let w = g.width();
         if row_width + w > width && !row.is_empty() {
-            if c == ' ' {
+            if g == " " {
                 // The row ends at this space, which is dropped.
                 rows.push(std::mem::take(&mut row));
                 row_width = 0;
@@ -84,9 +87,9 @@ pub fn wrap(line: &str, width: usize) -> Vec<String> {
                 row_width = 0;
             }
         }
-        row.push(c);
+        row.push_str(g);
         row_width += w;
-        if c == ' ' {
+        if g == " " {
             break_at = Some(row.len());
         }
     }
@@ -94,16 +97,17 @@ pub fn wrap(line: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// Truncates `text` to at most `width` terminal cells.
+/// Truncates `text` to at most `width` terminal cells, without splitting a
+/// grapheme cluster.
 pub fn truncate(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+    for g in text.graphemes(true) {
+        let w = g.width();
         if used + w > width {
             break;
         }
-        out.push(c);
+        out.push_str(g);
         used += w;
     }
     out
@@ -218,6 +222,9 @@ mod tests {
         assert_eq!(wrap("ab cdef界", 5), ["ab", "cdef", "界"]);
         // Indentation alone doesn't make a blank row.
         assert_eq!(wrap(" bbbb界", 5), [" bbbb", "界"]);
+        // A multi-code-point emoji is one two-cell grapheme.
+        assert_eq!(wrap("ab👩‍💻", 4), ["ab👩‍💻"]);
+        assert_eq!(wrap("abc👩‍💻", 4), ["abc", "👩‍💻"]);
         for row in wrap("aa bb 界界界 cc 日本語 d", 5) {
             assert!(row.width() <= 5, "{row:?} is too wide");
         }
@@ -228,6 +235,8 @@ mod tests {
         assert_eq!(fit("Alice", 7), "Alice  ");
         assert_eq!(fit("日本語", 5), "日本 ");
         assert_eq!(truncate("Alice Example", 5), "Alice");
+        assert_eq!(truncate("a👩‍💻b", 2), "a");
+        assert_eq!(truncate("a👩‍💻b", 3), "a👩‍💻");
     }
 
     #[test]
