@@ -27,7 +27,7 @@ where to store things, or similar project-wide conventions:
 
 ## Naming
 
-- Workspace crates are prefixed with `mett-`.
+- Workspace crates are prefixed with `mett-` and live in `crates/<name>/`.
 - Name crates after the concrete technology or service they wrap (for
   example `mett-msgraph` for the Microsoft Graph adapter, not a generic
   name such as `mett-graph`).

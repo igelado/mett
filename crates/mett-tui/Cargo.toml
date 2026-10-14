@@ -1,0 +1,17 @@
+[package]
+name = "mett-tui"
+description = "mett: a mutt-like terminal mail client for Office365"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mett"
+path = "src/main.rs"
+
+[dependencies]
+mett-core.workspace = true
+
+[lints]
+workspace = true
