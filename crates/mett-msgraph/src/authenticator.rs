@@ -104,6 +104,10 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
             Ok(user) => Identity::Mismatch(mett_core::Error::Auth(format!(
                 "signed in as {user}, but the account is {expected}"
             ))),
+            // Graph rejected the token: retrying with it can't help.
+            Err(e @ FlowError::OAuth { .. }) => Identity::Mismatch(mett_core::Error::Auth(
+                format!("could not confirm that the sign-in was for {expected}: {e}"),
+            )),
             Err(e) => Identity::Unknown(mett_core::Error::Auth(format!(
                 "could not confirm that the sign-in was for {expected}: {e}"
             ))),
@@ -124,16 +128,22 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
     }
 
     /// Caches `tokens` and stores a new refresh token if one was issued.
+    ///
+    /// The tokens are kept in memory first, so that if storing the refresh
+    /// token fails, this session keeps working without another sign-in; the
+    /// error is still reported.
     async fn keep(&self, state: &mut State, tokens: Tokens) -> Result<AccessToken> {
-        if let Some(refresh) = tokens.refresh {
-            if state.refresh.as_ref() != Some(&refresh) {
-                let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
-                let token = refresh.clone();
-                blocking(move || store.save(&account, &token)).await?;
-            }
-            state.refresh = Some(refresh);
-        }
+        // From now on the in-memory tokens are authoritative; don't let a
+        // later load from the store replace them.
+        state.loaded = true;
         state.access = Some(tokens.access.clone());
+        if let Some(refresh) = tokens.refresh
+            && state.refresh.as_ref() != Some(&refresh)
+        {
+            state.refresh = Some(refresh.clone());
+            let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
+            blocking(move || store.save(&account, &refresh)).await?;
+        }
         Ok(tokens.access)
     }
 }
@@ -153,7 +163,12 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         if let Some(tokens) = state.unconfirmed.take()
             && !tokens.access.expires_within(TimeDelta::zero(), now)
         {
-            return self.confirm(&mut state, tokens).await;
+            let token = self.confirm(&mut state, tokens).await?;
+            // The check may have taken a while; if the token expired in the
+            // meantime, continue with the confirmed refresh token below.
+            if !token.expires_within(EXPIRY_MARGIN, Utc::now()) {
+                return Ok(token);
+            }
         }
 
         if !state.loaded {

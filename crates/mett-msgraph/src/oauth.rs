@@ -55,6 +55,13 @@ pub(crate) async fn user_principal_name(
         .send()
         .await?;
     let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // A definitive answer: Graph does not accept this token at all.
+        return Err(FlowError::OAuth {
+            code: "invalid_token".into(),
+            description: "Graph rejected the access token".into(),
+        });
+    }
     if !status.is_success() {
         return Err(FlowError::Other(format!(
             "could not look up the signed-in user: Graph returned HTTP {status}"

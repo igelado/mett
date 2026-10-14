@@ -427,3 +427,72 @@ async fn retries_confirming_the_user_without_signing_in_again() {
     assert_eq!(stored(&store).as_deref(), Some("r-new"));
     assert_eq!(*prompts.lock().unwrap(), 1, "signed in only once");
 }
+
+#[tokio::test]
+async fn signs_in_again_when_graph_rejects_the_new_token() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a5").await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let prompts = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&prompts);
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, move |_| {
+        *counted.lock().unwrap() += 1
+    });
+
+    assert!(auth.access_token().await.is_err());
+    assert!(auth.access_token().await.is_err());
+    // The rejected token was not retried: each call signed in afresh.
+    assert_eq!(*prompts.lock().unwrap(), 2);
+    assert_eq!(stored(&store), None);
+}
+
+/// A token store that can be read but not written.
+#[derive(Default)]
+struct ReadOnlyStore;
+
+impl TokenStore for ReadOnlyStore {
+    fn load(&self, _: &AccountId) -> Result<Option<String>, mett_msgraph::TokenStoreError> {
+        Ok(None)
+    }
+
+    fn save(&self, _: &AccountId, _: &str) -> Result<(), mett_msgraph::TokenStoreError> {
+        Err(mett_msgraph::TokenStoreError::File {
+            path: "/read-only/tokens".into(),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        })
+    }
+
+    fn clear(&self, _: &AccountId) -> Result<(), mett_msgraph::TokenStoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn keeps_working_in_memory_when_tokens_cannot_be_stored() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a6").await;
+    me(&server, "a6", "alice@contoso.com").await;
+
+    let prompts = Arc::new(Mutex::new(0));
+    let counted = Arc::clone(&prompts);
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(ReadOnlyStore),
+        move |_: SignInPrompt| *counted.lock().unwrap() += 1,
+    );
+
+    // The storage failure is reported…
+    assert!(
+        matches!(auth.access_token().await, Err(Error::Auth(msg)) if msg.contains("stored credentials"))
+    );
+    // …but the session keeps the tokens and doesn't ask to sign in again.
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a6");
+    assert_eq!(*prompts.lock().unwrap(), 1);
+}
