@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{AccessToken, Authenticator, Result};
 use tokio::sync::Mutex;
 
@@ -77,6 +77,10 @@ enum Identity {
     Mismatch(mett_core::Error),
     /// Could not tell yet: keep the tokens and retry later.
     Unknown(mett_core::Error),
+    /// Graph rejected the access token itself (HTTP 401), for example
+    /// because it expired before the check. That says nothing about the
+    /// user, so retry with a fresh access token from the refresh token.
+    Rejected(mett_core::Error),
 }
 
 impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
@@ -139,8 +143,7 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
             Ok(user) => Identity::Mismatch(mett_core::Error::Auth(format!(
                 "signed in as {user}, but the account is {expected}"
             ))),
-            // Graph rejected the token: retrying with it can't help.
-            Err(e @ FlowError::OAuth { .. }) => Identity::Mismatch(mett_core::Error::Auth(
+            Err(e @ FlowError::OAuth { .. }) => Identity::Rejected(mett_core::Error::Auth(
                 format!("could not confirm that the sign-in was for {expected}: {e}"),
             )),
             Err(e) => {
@@ -193,6 +196,23 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
                     tokens,
                     stored: stored.map(str::to_owned),
                 });
+                Err(e)
+            }
+            // Retrying with the rejected access token can't help. Keep the
+            // refresh token, with the access token marked as expired, so
+            // the next call gets a new access token and checks again.
+            // Without a refresh token, the next call signs in afresh.
+            Identity::Rejected(e) => {
+                if tokens.refresh.is_some() {
+                    let expired = AccessToken::new(tokens.access.secret(), DateTime::UNIX_EPOCH);
+                    state.unconfirmed = Some(Unconfirmed {
+                        tokens: Tokens {
+                            access: expired,
+                            ..tokens
+                        },
+                        stored: stored.map(str::to_owned),
+                    });
+                }
                 Err(e)
             }
         }

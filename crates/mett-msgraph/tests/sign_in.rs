@@ -434,14 +434,24 @@ async fn retries_confirming_the_user_without_signing_in_again() {
 }
 
 #[tokio::test]
-async fn signs_in_again_when_graph_rejects_the_new_token() {
+async fn gets_a_new_access_token_when_graph_rejects_the_new_one() {
     let server = MockServer::start().await;
     device_sign_in(&server, "a5").await;
+    // Graph rejects a5 itself (say it expired in transit)…
     Mock::given(method("GET"))
         .and(path("/v1.0/me"))
+        .and(header("authorization", "Bearer a5"))
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
+    // …so mett refreshes with the sign-in's refresh token and checks again.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("refresh_token=r-new"))
+        .respond_with(tokens("a5b", "r-new"))
+        .mount(&server)
+        .await;
+    me(&server, "a5b", "alice@contoso.com").await;
 
     let store = Arc::new(MemoryStore::default());
     let prompts = Arc::new(Mutex::new(0));
@@ -450,11 +460,11 @@ async fn signs_in_again_when_graph_rejects_the_new_token() {
         *counted.lock().unwrap() += 1
     });
 
-    assert!(auth.access_token().await.is_err());
-    assert!(auth.access_token().await.is_err());
-    // The rejected token was not retried: each call signed in afresh.
-    assert_eq!(*prompts.lock().unwrap(), 2);
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
     assert_eq!(stored(&store), None);
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a5b");
+    assert_eq!(stored(&store).as_deref(), Some("r-new"));
+    assert_eq!(*prompts.lock().unwrap(), 1, "signed in only once");
 }
 
 /// A token store whose writes fail while `broken` is set.

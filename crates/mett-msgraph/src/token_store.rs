@@ -79,20 +79,8 @@ impl KeyringStore {
     }
 }
 
-impl KeyringStore {
-    /// The keyring can't compare and delete in one step, so writes for an
-    /// account are serialised across mett processes with a lock file next to
-    /// where the file store would keep its tokens.
-    ///
-    /// The lock is best effort: if there is no home directory, or the state
-    /// directory isn't writable, the keyring itself still works, so writes
-    /// go ahead unlocked rather than fail.
-    fn lock(account: &AccountId) -> Option<fs::File> {
-        let path = FileStore::default_path(account)?;
-        lock_file(&sibling(&path, "", ".keyring.lock")).ok()
-    }
-
-    fn get(account: &AccountId) -> Result<Option<String>, TokenStoreError> {
+impl TokenStore for KeyringStore {
+    fn load(&self, account: &AccountId) -> Result<Option<String>, TokenStoreError> {
         match Self::entry(account)?.get_password() {
             Ok(token) => Ok(Some(token)),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -100,42 +88,29 @@ impl KeyringStore {
         }
     }
 
-    fn delete(account: &AccountId) -> Result<(), TokenStoreError> {
+    fn save(&self, account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError> {
+        Ok(Self::entry(account)?.set_password(refresh_token)?)
+    }
+
+    fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
         match Self::entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
-}
 
-impl TokenStore for KeyringStore {
-    fn load(&self, account: &AccountId) -> Result<Option<String>, TokenStoreError> {
-        Self::get(account)
-    }
-
-    fn save(&self, account: &AccountId, refresh_token: &str) -> Result<(), TokenStoreError> {
-        let _lock = Self::lock(account);
-        Ok(Self::entry(account)?.set_password(refresh_token)?)
-    }
-
-    fn clear(&self, account: &AccountId) -> Result<(), TokenStoreError> {
-        let _lock = Self::lock(account);
-        Self::delete(account)
-    }
-
+    /// The keyring can't compare and delete in one step, and there is no
+    /// lock that every process sharing it is sure to use. So a rejected
+    /// token is left in place rather than risk deleting a replacement that
+    /// another process stored in between. It does no harm: the next refresh
+    /// with it fails the same way, and the next sign-in overwrites it.
     fn clear_if(
         &self,
         account: &AccountId,
         token: &str,
     ) -> Result<Option<String>, TokenStoreError> {
-        let lock = Self::lock(account);
-        match Self::get(account)? {
-            // Without the lock, another process could store a replacement
-            // between the check and the delete, so leave the rejected token
-            // in place: it does no harm, as the next refresh with it fails
-            // and comes back here.
-            Some(stored) if stored == token && lock.is_none() => Ok(None),
-            Some(stored) if stored == token => Self::delete(account).map(|()| None),
+        match self.load(account)? {
+            Some(stored) if stored == token => Ok(None),
             other => Ok(other),
         }
     }
