@@ -330,6 +330,17 @@ impl<'a> Lexer<'a> {
                     return Ok(command);
                 }
                 Some('\n') | None => return Err(self.error("unterminated backtick")),
+                // An escaped character (such as \`) belongs to the shell
+                // command; pass both characters through.
+                Some('\\') => {
+                    command.extend(self.bump());
+                    match self.chars.peek() {
+                        Some('\n') | None => {
+                            return Err(self.error("unterminated backtick"));
+                        }
+                        Some(_) => command.extend(self.bump()),
+                    }
+                }
                 Some(_) => command.extend(self.bump()),
             }
         }
@@ -468,6 +479,19 @@ mod tests {
         let expanded: Vec<_> = words.iter().map(|w| w.expand(&fake).unwrap()).collect();
         assert_eq!(expanded, ["set", "pass=s3cret", "quoted=xs3crety"]);
         assert_eq!(fake.commands_run.get(), 2);
+    }
+
+    #[test]
+    fn escaped_backticks_belong_to_the_command() {
+        let commands = lex(r"set x=`echo \`date\``");
+        let words = &commands[0].as_ref().unwrap().words;
+        assert_eq!(
+            words[1].parts,
+            [
+                Part::Literal("x=".into()),
+                Part::Command(r"echo \`date\`".into())
+            ]
+        );
     }
 
     #[test]

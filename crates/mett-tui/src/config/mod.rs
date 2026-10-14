@@ -106,6 +106,9 @@ pub struct Config {
     pub warnings: Vec<String>,
     /// Warnings from the command being run, waiting for its location.
     pending: Vec<String>,
+    /// Ignored commands and variables already warned about: each is
+    /// reported once, where it first appears.
+    warned: std::collections::HashSet<String>,
     home: Option<String>,
 }
 
@@ -125,6 +128,7 @@ impl Config {
             errors: Vec::new(),
             warnings: Vec::new(),
             pending: Vec::new(),
+            warned: Default::default(),
             home,
         };
         for var in VARS {
@@ -240,13 +244,11 @@ impl Config {
                 // Ignored commands are not expanded, so their backticks
                 // never run.
                 other if NOT_YET_SUPPORTED.contains(&other) => {
-                    self.pending
-                        .push(format!("{other} is not supported yet; ignored"));
+                    self.warn_once(other, format!("{other} is not supported yet; ignored"));
                     Ok(())
                 }
                 other => {
-                    self.pending
-                        .push(format!("unknown command {other}; ignored"));
+                    self.warn_once(other, format!("unknown command {other}; ignored"));
                     Ok(())
                 }
             },
@@ -414,9 +416,15 @@ impl Config {
     /// Unknown variables are reported, but don't stop the configuration
     /// from loading (a shared muttrc sets many mett doesn't use).
     fn unknown_variable(&mut self, name: &str) -> Result<(), String> {
-        self.pending
-            .push(format!("unknown variable {name}; ignored"));
+        self.warn_once(name, format!("unknown variable {name}; ignored"));
         Ok(())
+    }
+
+    /// Queues `warning` about `item` unless `item` was already reported.
+    fn warn_once(&mut self, item: &str, warning: String) {
+        if self.warned.insert(item.to_owned()) {
+            self.pending.push(warning);
+        }
     }
 
     /// A `source` path: `~` is the home directory, and a relative path is
@@ -620,6 +628,14 @@ mod tests {
             "{:?}",
             config.warnings
         );
+    }
+
+    #[test]
+    fn warns_about_each_ignored_item_once() {
+        let config = load("bind a b c\nbind d e f\nset imap_user=x\nset imap_user=y\n");
+        assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
+        assert!(config.warnings[0].starts_with("/conf/mettrc:1:"));
+        assert!(config.warnings[1].starts_with("/conf/mettrc:3:"));
     }
 
     #[test]

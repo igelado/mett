@@ -46,7 +46,10 @@ impl MailboxUrl {
             .strip_prefix(SCHEME)
             .ok_or_else(|| MailboxError(format!("{url}: not a msgraph:// mailbox")))?;
         let (account, path) = rest.split_once('/').unwrap_or((rest, ""));
-        if account.is_empty() || !account.contains('@') {
+        let valid_upn = account.split_once('@').is_some_and(|(user, domain)| {
+            !user.is_empty() && !domain.is_empty() && !domain.contains('@')
+        });
+        if !valid_upn {
             return Err(MailboxError(format!(
                 "{url}: expected msgraph://<user@domain>/<folder>"
             )));
@@ -146,6 +149,14 @@ mod tests {
     fn rejects_bad_urls() {
         assert!(MailboxUrl::parse("imaps://outlook.office365.com/").is_err());
         assert!(MailboxUrl::parse("msgraph:///@inbox").is_err());
+        for bad in [
+            "msgraph://@/@inbox",
+            "msgraph://alice@/",
+            "msgraph://@contoso.com/",
+            "msgraph://a@b@c/",
+        ] {
+            assert!(MailboxUrl::parse(bad).is_err(), "{bad}");
+        }
         assert!(MailboxUrl::parse("msgraph://alice@contoso.com/@spam").is_err());
         let focused = MailboxUrl::parse("msgraph://alice@contoso.com/@inbox/@focused");
         assert!(matches!(focused, Err(MailboxError(m)) if m.contains("not supported yet")));

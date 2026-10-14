@@ -58,6 +58,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             other => return Err(format!("unknown option {other}")),
         }
     }
+    if options.dump && options.demo {
+        return Err("-D and --demo can't be used together".into());
+    }
     Ok(options)
 }
 
