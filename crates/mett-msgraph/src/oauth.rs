@@ -6,8 +6,6 @@
 
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{TimeDelta, Utc};
 use mett_core::AccessToken;
 use serde::Deserialize;
@@ -32,32 +30,40 @@ const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 pub(crate) struct Tokens {
     pub access: AccessToken,
     pub refresh: Option<String>,
-    pub id_token: Option<String>,
 }
 
-impl Tokens {
-    /// The user principal name the tokens were issued to: the ID token's
-    /// `preferred_username` claim, or its `upn` claim if that is missing.
-    /// The `email` claim is ignored: it can name an address that belongs to
-    /// another principal.
-    ///
-    /// The ID token comes straight from the token endpoint over TLS, so its
-    /// claims are read without verifying the signature, as OpenID Connect
-    /// allows for this case.
-    pub fn signed_in_as(&self) -> Option<String> {
-        #[derive(Deserialize)]
-        struct Claims {
-            preferred_username: Option<String>,
-            upn: Option<String>,
-        }
-        let claims = self
-            .id_token
-            .as_deref()
-            .and_then(|jwt| jwt.split('.').nth(1))
-            .and_then(|payload| URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok())
-            .and_then(|json| serde_json::from_slice::<Claims>(&json).ok());
-        claims.and_then(|c| c.preferred_username.or(c.upn))
+/// Returns the user principal name of the user `token` was issued to, as
+/// Microsoft Graph reports it (`GET /me`). Unlike the ID token's username
+/// claims, this is the directory's authoritative identifier.
+pub(crate) async fn user_principal_name(
+    http: &reqwest::Client,
+    settings: &AuthSettings,
+    token: &AccessToken,
+) -> Result<String, FlowError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Me {
+        user_principal_name: String,
     }
+    let mut url = settings.graph_api("me");
+    url.query_pairs_mut()
+        .append_pair("$select", "userPrincipalName");
+    let response = http
+        .get(url)
+        .bearer_auth(token.secret())
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(FlowError::Other(format!(
+            "could not look up the signed-in user: Graph returned HTTP {status}"
+        )));
+    }
+    let body = response.bytes().await?;
+    let me: Me = serde_json::from_slice(&body)
+        .map_err(|e| FlowError::Other(format!("invalid response from Graph /me: {e}")))?;
+    Ok(me.user_principal_name)
 }
 
 /// Why a sign-in request failed.
@@ -98,7 +104,6 @@ impl From<FlowError> for mett_core::Error {
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
-    id_token: Option<String>,
     expires_in: i64,
 }
 
@@ -162,7 +167,6 @@ async fn request_token(
     Ok(Tokens {
         access: AccessToken::new(r.access_token, issued + TimeDelta::seconds(r.expires_in)),
         refresh: r.refresh_token,
-        id_token: r.id_token,
     })
 }
 
@@ -264,7 +268,7 @@ pub(crate) async fn auth_code(
         .append_pair("login_hint", settings.account.as_str());
     prompter.prompt(SignInPrompt::OpenBrowser { url });
 
-    let params = tokio::time::timeout(BROWSER_TIMEOUT, listener.wait_for_redirect())
+    let params = tokio::time::timeout(BROWSER_TIMEOUT, listener.wait_for_redirect(&state))
         .await
         .map_err(|_| FlowError::Other("timed out waiting for the browser sign-in".into()))?
         .map_err(|e| FlowError::Other(format!("loopback listener failed: {e}")))?;

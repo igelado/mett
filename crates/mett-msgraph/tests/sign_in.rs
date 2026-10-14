@@ -1,18 +1,16 @@
-//! Sign-in flows against a mock identity platform.
+//! Sign-in flows against a mock identity platform and Graph.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mett_core::{AccountId, Authenticator, Error};
 use mett_msgraph::{
     AuthFlow, AuthSettings, GraphAuthenticator, MemoryStore, SignInPrompt, TokenStore,
 };
 use serde_json::json;
 use url::Url;
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TOKEN_PATH: &str = "/contoso.com/oauth2/v2.0/token";
@@ -22,47 +20,23 @@ fn account() -> AccountId {
     AccountId::new("alice@contoso.com")
 }
 
+/// Settings that send both identity-platform and Graph requests to `server`.
 fn settings(server: &MockServer, flow: AuthFlow) -> AuthSettings {
+    let url = Url::parse(&server.uri()).unwrap();
     AuthSettings {
         flow,
-        login_url: Some(Url::parse(&server.uri()).unwrap()),
+        login_url: Some(url.clone()),
+        graph_url: Some(url),
         ..AuthSettings::new(account(), "client-id")
     }
 }
 
-/// An unsigned ID token for `user`. mett reads the claims without checking
-/// the signature, as it receives them directly from the token endpoint.
-fn id_token(user: &str) -> String {
-    let encode = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
-    format!(
-        "{}.{}.sig",
-        encode(json!({"alg": "none"})),
-        encode(json!({"preferred_username": user}))
-    )
-}
-
-fn tokens_for(user: &str, access: &str, refresh: &str) -> ResponseTemplate {
+fn tokens(access: &str, refresh: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
         "token_type": "Bearer",
         "access_token": access,
         "refresh_token": refresh,
-        "id_token": id_token(user),
         "expires_in": 3600,
-    }))
-}
-
-fn tokens(access: &str, refresh: &str) -> ResponseTemplate {
-    tokens_for("Alice@Contoso.com", access, refresh)
-}
-
-fn device_code_response() -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({
-        "device_code": "dev-code",
-        "user_code": "ABCD-EFGH",
-        "verification_uri": "https://microsoft.com/devicelogin",
-        "expires_in": 900,
-        "interval": 0,
-        "message": "Go to https://microsoft.com/devicelogin and enter ABCD-EFGH",
     }))
 }
 
@@ -73,9 +47,65 @@ fn oauth_error(code: &str) -> ResponseTemplate {
     }))
 }
 
-/// A prompter that records prompts and must not be asked for anything.
+fn device_code_response(expires_in: u64) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "device_code": "dev-code",
+        "user_code": "ABCD-EFGH",
+        "verification_uri": "https://microsoft.com/devicelogin",
+        "expires_in": expires_in,
+        "interval": 0,
+        "message": "Go to https://microsoft.com/devicelogin and enter ABCD-EFGH",
+    }))
+}
+
+/// Graph's `GET /me` reports `upn` for requests made with `access`.
+async fn me(server: &MockServer, access: &str, upn: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .and(header("authorization", format!("Bearer {access}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "userPrincipalName": upn,
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Sets up a device code sign-in that issues `access` / `r-new` tokens.
+async fn device_sign_in(server: &MockServer, access: &str) {
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .and(body_string_contains("device_code=dev-code"))
+        .respond_with(tokens(access, "r-new"))
+        .with_priority(2)
+        .mount(server)
+        .await;
+}
+
+/// A prompter for tests in which no sign-in prompt may appear.
 fn no_prompts() -> impl Fn(SignInPrompt) + Send + Sync {
     |prompt| panic!("unexpected sign-in prompt: {prompt:?}")
+}
+
+fn authenticator<P: Fn(SignInPrompt) + Send + Sync>(
+    settings: AuthSettings,
+    store: &Arc<MemoryStore>,
+    prompter: P,
+) -> GraphAuthenticator<MemoryStore, P> {
+    GraphAuthenticator::new(
+        settings,
+        reqwest::Client::new(),
+        Arc::clone(store),
+        prompter,
+    )
+}
+
+fn stored(store: &MemoryStore) -> Option<String> {
+    store.load(&account()).unwrap()
 }
 
 #[tokio::test]
@@ -93,17 +123,16 @@ async fn uses_and_rotates_the_stored_refresh_token() {
 
     let store = Arc::new(MemoryStore::default());
     store.save(&account(), "r0").unwrap();
-    let auth = GraphAuthenticator::new(
+    let auth = authenticator(
         settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        Arc::clone(&store),
+        &store,
         no_prompts(),
     );
 
     // The second call is served from the cache: the mock expects one request.
     assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
     assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
-    assert_eq!(store.load(&account()).unwrap().as_deref(), Some("r1"));
+    assert_eq!(stored(&store).as_deref(), Some("r1"));
 }
 
 #[tokio::test]
@@ -115,12 +144,7 @@ async fn falls_back_to_device_code_when_the_refresh_token_is_revoked() {
         .respond_with(oauth_error("invalid_grant"))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(DEVICE_PATH))
-        .respond_with(device_code_response())
-        .mount(&server)
-        .await;
-    // The first poll is still pending, the second succeeds.
+    // The first poll is still pending; the next one succeeds.
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
         .and(body_string_contains("device_code=dev-code"))
@@ -129,27 +153,19 @@ async fn falls_back_to_device_code_when_the_refresh_token_is_revoked() {
         .with_priority(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("device_code=dev-code"))
-        .respond_with(tokens("a2", "r2"))
-        .with_priority(2)
-        .mount(&server)
-        .await;
+    device_sign_in(&server, "a2").await;
+    me(&server, "a2", "Alice@Contoso.com").await;
 
     let store = Arc::new(MemoryStore::default());
     store.save(&account(), "revoked").unwrap();
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&prompts);
-    let auth = GraphAuthenticator::new(
-        settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        Arc::clone(&store),
-        move |p| recorded.lock().unwrap().push(p),
-    );
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, move |p| {
+        recorded.lock().unwrap().push(p)
+    });
 
     assert_eq!(auth.access_token().await.unwrap().secret(), "a2");
-    assert_eq!(store.load(&account()).unwrap().as_deref(), Some("r2"));
+    assert_eq!(stored(&store).as_deref(), Some("r-new"));
     let prompts = prompts.lock().unwrap();
     assert!(matches!(
         prompts.as_slice(),
@@ -157,12 +173,92 @@ async fn falls_back_to_device_code_when_the_refresh_token_is_revoked() {
     ));
 }
 
-/// Plays the browser: follows the sign-in URL's redirect URI back to mett,
-/// passing `code` and either the request's `state` or `state_override`.
-fn browser(
-    code: &'static str,
-    state_override: Option<&'static str>,
-) -> impl Fn(SignInPrompt) + Send + Sync {
+#[tokio::test]
+async fn keeps_the_refresh_token_on_transient_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("temporarily_unavailable"))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), "r0").unwrap();
+    let auth = authenticator(
+        settings(&server, AuthFlow::DeviceCode),
+        &store,
+        no_prompts(),
+    );
+
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    assert_eq!(stored(&store).as_deref(), Some("r0"));
+}
+
+#[tokio::test]
+async fn rejects_a_sign_in_as_another_user() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a-m").await;
+    me(&server, "a-m", "mallory@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, |_| {});
+
+    let err = auth.access_token().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Auth(msg) if msg.contains("signed in as mallory@contoso.com")),
+        "{err}"
+    );
+    assert_eq!(stored(&store), None);
+}
+
+#[tokio::test]
+async fn rejects_a_sign_in_whose_user_cannot_be_confirmed() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a-x").await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, |_| {});
+
+    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
+    assert_eq!(stored(&store), None);
+}
+
+#[tokio::test]
+async fn gives_up_when_the_device_code_expires() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(1))
+        .mount(&server)
+        .await;
+    // The poll request stalls for longer than the device code is valid.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending").set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, |_| {});
+
+    let started = std::time::Instant::now();
+    let err = auth.access_token().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Auth(msg) if msg.contains("expired")),
+        "{err}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+/// Plays the browser: follows the sign-in URL's redirect URI back to mett
+/// with `code`. With `stale_first`, it first delivers a late redirect from an
+/// earlier sign-in (another `state`), which mett must ignore.
+fn browser(code: &'static str, stale_first: bool) -> impl Fn(SignInPrompt) + Send + Sync {
     move |prompt| {
         let SignInPrompt::OpenBrowser { url } = prompt else {
             panic!("expected a browser prompt, got {prompt:?}");
@@ -170,22 +266,29 @@ fn browser(
         let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(query["code_challenge_method"], "S256");
         assert_eq!(query["login_hint"], "alice@contoso.com");
-        let state = state_override.map_or_else(|| query["state"].clone(), str::to_owned);
         let mut redirect = Url::parse(&query["redirect_uri"]).unwrap();
         // Use the IPv4 loopback explicitly; the test host may lack IPv6.
         redirect.set_host(Some("127.0.0.1")).unwrap();
-        redirect
-            .query_pairs_mut()
-            .append_pair("code", code)
-            .append_pair("state", &state);
+        let with = |code: &str, state: &str| {
+            let mut url = redirect.clone();
+            url.query_pairs_mut()
+                .append_pair("code", code)
+                .append_pair("state", state);
+            url
+        };
+        let stale = with("stale-code", "an-earlier-state");
+        let current = with(code, &query["state"]);
         tokio::spawn(async move {
-            reqwest::get(redirect).await.unwrap();
+            if stale_first {
+                let response = reqwest::get(stale).await.unwrap();
+                assert_eq!(response.status(), 400);
+            }
+            reqwest::get(current).await.unwrap();
         });
     }
 }
 
-#[tokio::test]
-async fn signs_in_with_the_authorization_code_flow() {
+async fn auth_code_sign_in(stale_first: bool) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
@@ -199,34 +302,27 @@ async fn signs_in_with_the_authorization_code_flow() {
         .expect(1)
         .mount(&server)
         .await;
+    me(&server, "a3", "alice@contoso.com").await;
 
     let store = Arc::new(MemoryStore::default());
-    let auth = GraphAuthenticator::new(
+    let auth = authenticator(
         settings(&server, AuthFlow::AuthCode { redirect_port: 0 }),
-        reqwest::Client::new(),
-        Arc::clone(&store),
-        browser("the-code", None),
+        &store,
+        browser("the-code", stale_first),
     );
 
     assert_eq!(auth.access_token().await.unwrap().secret(), "a3");
-    assert_eq!(store.load(&account()).unwrap().as_deref(), Some("r3"));
+    assert_eq!(stored(&store).as_deref(), Some("r3"));
 }
 
 #[tokio::test]
-async fn rejects_a_redirect_with_the_wrong_state() {
-    let server = MockServer::start().await;
-    let auth = GraphAuthenticator::new(
-        settings(&server, AuthFlow::AuthCode { redirect_port: 0 }),
-        reqwest::Client::new(),
-        Arc::new(MemoryStore::default()),
-        browser("the-code", Some("forged")),
-    );
+async fn signs_in_with_the_authorization_code_flow() {
+    auth_code_sign_in(false).await;
+}
 
-    let err = auth.access_token().await.unwrap_err();
-    assert!(
-        matches!(&err, Error::Auth(msg) if msg.contains("state mismatch")),
-        "{err}"
-    );
+#[tokio::test]
+async fn ignores_a_late_redirect_from_an_earlier_sign_in() {
+    auth_code_sign_in(true).await;
 }
 
 #[tokio::test]
@@ -245,16 +341,11 @@ async fn reports_an_unreachable_identity_platform_as_a_network_error() {
 
     let store = Arc::new(MemoryStore::default());
     store.save(&account(), "r0").unwrap();
-    let auth = GraphAuthenticator::new(
-        settings,
-        reqwest::Client::new(),
-        Arc::clone(&store),
-        no_prompts(),
-    );
+    let auth = authenticator(settings, &store, no_prompts());
 
     assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     // A network failure must not discard the refresh token.
-    assert_eq!(store.load(&account()).unwrap().as_deref(), Some("r0"));
+    assert_eq!(stored(&store).as_deref(), Some("r0"));
 }
 
 #[tokio::test]
@@ -262,167 +353,12 @@ async fn sign_out_forgets_the_refresh_token() {
     let server = MockServer::start().await;
     let store = Arc::new(MemoryStore::default());
     store.save(&account(), "r0").unwrap();
-    let auth = GraphAuthenticator::new(
+    let auth = authenticator(
         settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        Arc::clone(&store),
+        &store,
         no_prompts(),
     );
 
     auth.sign_out().await.unwrap();
-    assert_eq!(store.load(&account()).unwrap(), None);
-}
-
-#[tokio::test]
-async fn keeps_the_refresh_token_on_transient_errors() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .respond_with(oauth_error("temporarily_unavailable"))
-        .mount(&server)
-        .await;
-
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = GraphAuthenticator::new(
-        settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        Arc::clone(&store),
-        no_prompts(),
-    );
-
-    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
-    assert_eq!(store.load(&account()).unwrap().as_deref(), Some("r0"));
-}
-
-#[tokio::test]
-async fn gives_up_when_the_device_code_expires() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(DEVICE_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "device_code": "dev-code",
-            "user_code": "ABCD-EFGH",
-            "verification_uri": "https://microsoft.com/devicelogin",
-            "expires_in": 1,
-            "interval": 0,
-            "message": "enter ABCD-EFGH",
-        })))
-        .mount(&server)
-        .await;
-    // The poll request stalls for longer than the device code is valid.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .respond_with(oauth_error("authorization_pending").set_delay(Duration::from_secs(30)))
-        .mount(&server)
-        .await;
-
-    let auth = GraphAuthenticator::new(
-        settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        Arc::new(MemoryStore::default()),
-        |_| {},
-    );
-
-    let started = std::time::Instant::now();
-    let err = auth.access_token().await.unwrap_err();
-    assert!(
-        matches!(&err, Error::Auth(msg) if msg.contains("expired")),
-        "{err}"
-    );
-    assert!(started.elapsed() < Duration::from_secs(10));
-}
-
-#[tokio::test]
-async fn rejects_a_sign_in_as_another_user() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(DEVICE_PATH))
-        .respond_with(device_code_response())
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("device_code=dev-code"))
-        .respond_with(tokens_for("mallory@contoso.com", "a-m", "r-m"))
-        .mount(&server)
-        .await;
-
-    let store = Arc::new(MemoryStore::default());
-    let auth = GraphAuthenticator::new(
-        settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        Arc::clone(&store),
-        |_| {},
-    );
-
-    let err = auth.access_token().await.unwrap_err();
-    assert!(
-        matches!(&err, Error::Auth(msg) if msg.contains("signed in as mallory@contoso.com")),
-        "{err}"
-    );
-    assert_eq!(store.load(&account()).unwrap(), None);
-}
-
-#[tokio::test]
-async fn requests_the_identity_scopes() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("openid"))
-        .and(body_string_contains("profile"))
-        .respond_with(tokens("a1", "r1"))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = GraphAuthenticator::new(
-        settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        store,
-        no_prompts(),
-    );
-    auth.access_token().await.unwrap();
-}
-
-#[tokio::test]
-async fn ignores_a_matching_email_claim_for_another_principal() {
-    let server = MockServer::start().await;
-    let encode = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
-    let id_token = format!(
-        "{}.{}.sig",
-        encode(json!({"alg": "none"})),
-        encode(json!({
-            "preferred_username": "mallory@contoso.com",
-            "email": "alice@contoso.com",
-        }))
-    );
-    Mock::given(method("POST"))
-        .and(path(DEVICE_PATH))
-        .respond_with(device_code_response())
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "a-m",
-            "refresh_token": "r-m",
-            "id_token": id_token,
-            "expires_in": 3600,
-        })))
-        .mount(&server)
-        .await;
-
-    let store = Arc::new(MemoryStore::default());
-    let auth = GraphAuthenticator::new(
-        settings(&server, AuthFlow::DeviceCode),
-        reqwest::Client::new(),
-        Arc::clone(&store),
-        |_| {},
-    );
-
-    assert!(matches!(auth.access_token().await, Err(Error::Auth(_))));
-    assert_eq!(store.load(&account()).unwrap(), None);
+    assert_eq!(stored(&store), None);
 }

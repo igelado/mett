@@ -68,12 +68,14 @@ impl Listener {
         format!("http://localhost:{}", self.port())
     }
 
-    /// Waits for the browser's redirect and returns its query parameters.
-    /// Other requests (such as `/favicon.ico`) get a 404 and are ignored.
-    pub async fn wait_for_redirect(&self) -> io::Result<HashMap<String, String>> {
+    /// Waits for the browser's redirect for the request with `state` and
+    /// returns its query parameters. Other requests, such as `/favicon.ico`
+    /// or a late redirect from an earlier sign-in with a different `state`,
+    /// are answered and ignored.
+    pub async fn wait_for_redirect(&self, state: &str) -> io::Result<HashMap<String, String>> {
         loop {
             let stream = self.accept().await?;
-            match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream)).await {
+            match tokio::time::timeout(REQUEST_TIMEOUT, handle(stream, state)).await {
                 Ok(Ok(Some(params))) => return Ok(params),
                 // Not the redirect, a broken connection or a slow client:
                 // keep waiting for the real one.
@@ -94,8 +96,9 @@ impl Listener {
     }
 }
 
-/// Reads one request. Returns its query parameters if it is the redirect.
-async fn handle(stream: TcpStream) -> io::Result<Option<HashMap<String, String>>> {
+/// Reads one request. Returns its query parameters if it is the redirect for
+/// the request with `state`.
+async fn handle(stream: TcpStream, state: &str) -> io::Result<Option<HashMap<String, String>>> {
     // `take` caps how much is read, so an oversized line can't make
     // `read_line` allocate without bound.
     let mut reader = BufReader::new(stream.take(MAX_HEAD_BYTES));
@@ -117,11 +120,19 @@ async fn handle(stream: TcpStream) -> io::Result<Option<HashMap<String, String>>
         }
     }
 
-    let params = complete
+    let redirect = complete
         .then(|| parse_request_line(&request_line))
         .flatten();
+    let stale = redirect
+        .as_ref()
+        .is_some_and(|p| p.get("state").map(String::as_str) != Some(state));
+    let params = redirect.filter(|_| !stale);
     let (status, body) = match &params {
         _ if !complete => ("431 Request Header Fields Too Large", "Request too large."),
+        _ if stale => (
+            "400 Bad Request",
+            "This sign-in response is not for mett's current request.",
+        ),
         Some(p) if p.contains_key("error") => {
             ("200 OK", "Sign-in failed. Return to mett for details.")
         }
@@ -174,7 +185,7 @@ mod tests {
     async fn rejects_oversized_requests() {
         let listener = Listener::bind(0).await.unwrap();
         let addr = format!("127.0.0.1:{}", listener.port());
-        let wait = tokio::spawn(async move { listener.wait_for_redirect().await });
+        let wait = tokio::spawn(async move { listener.wait_for_redirect("s").await });
 
         let mut stream = TcpStream::connect(&addr).await.unwrap();
         let huge = "x".repeat(MAX_HEAD_BYTES as usize * 2);
@@ -224,6 +235,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(favicon.status(), 404);
+            let stale = http
+                .get(format!("{base}/?code=old&state=old"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(stale.status(), 400);
             let ok = http
                 .get(format!("{base}/?code=c&state=s"))
                 .send()
@@ -231,7 +248,7 @@ mod tests {
                 .unwrap();
             assert_eq!(ok.status(), 200);
         });
-        let params = listener.wait_for_redirect().await.unwrap();
+        let params = listener.wait_for_redirect("s").await.unwrap();
         assert_eq!(params["code"], "c");
         client.await.unwrap();
     }

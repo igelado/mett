@@ -28,13 +28,6 @@ pub struct GraphAuthenticator<S, P> {
     state: Mutex<State>,
 }
 
-/// Where a set of tokens came from.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Origin {
-    Refresh,
-    SignIn,
-}
-
 #[derive(Default)]
 struct State {
     access: Option<AccessToken>,
@@ -83,32 +76,27 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
-    /// Checks that `tokens` were issued to the configured account.
+    /// Checks that an interactive sign-in was for the configured account.
     ///
     /// `login_hint` is only a hint, and the device code flow has none, so the
     /// user can sign in as someone else. Accepting those tokens would show
-    /// another mailbox under this account's name.
-    ///
-    /// Interactive sign-ins must name the user. Refreshes are checked when
-    /// the response includes an ID token; the refresh token itself was
-    /// already checked when it was first issued.
-    fn check_identity(&self, tokens: &Tokens, origin: Origin) -> Result<()> {
+    /// another mailbox under this account's name. Refreshed tokens don't need
+    /// the check: they belong to the same user as the refresh token, which
+    /// was checked when it was issued.
+    async fn check_identity(&self, tokens: &Tokens) -> Result<()> {
         let expected = self.settings.account.as_str();
-        let user = tokens.signed_in_as();
-        match &user {
-            Some(user) if user.eq_ignore_ascii_case(expected) => return Ok(()),
-            None if origin == Origin::Refresh => return Ok(()),
-            _ => {}
+        let user = oauth::user_principal_name(&self.http, &self.settings, &tokens.access).await?;
+        if user.eq_ignore_ascii_case(expected) {
+            Ok(())
+        } else {
+            Err(mett_core::Error::Auth(format!(
+                "signed in as {user}, but the account is {expected}"
+            )))
         }
-        Err(mett_core::Error::Auth(match user {
-            Some(user) => format!("signed in as {user}, but the account is {expected}"),
-            None => format!("could not confirm that the sign-in was for {expected}"),
-        }))
     }
 
     /// Caches `tokens` and stores a new refresh token if one was issued.
-    async fn keep(&self, state: &mut State, tokens: Tokens, origin: Origin) -> Result<AccessToken> {
-        self.check_identity(&tokens, origin)?;
+    async fn keep(&self, state: &mut State, tokens: Tokens) -> Result<AccessToken> {
         if let Some(refresh) = tokens.refresh {
             if state.refresh.as_ref() != Some(&refresh) {
                 let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
@@ -140,7 +128,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
 
         if let Some(refresh) = state.refresh.clone() {
             match oauth::refresh(&self.http, &self.settings, &refresh).await {
-                Ok(tokens) => return self.keep(&mut state, tokens, Origin::Refresh).await,
+                Ok(tokens) => return self.keep(&mut state, tokens).await,
                 // The refresh token was revoked, expired or needs new
                 // consent: fall back to an interactive sign-in.
                 Err(e) if e.needs_sign_in() => {
@@ -153,7 +141,8 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         }
 
         let tokens = self.sign_in().await?;
-        self.keep(&mut state, tokens, Origin::SignIn).await
+        self.check_identity(&tokens).await?;
+        self.keep(&mut state, tokens).await
     }
 }
 
