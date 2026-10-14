@@ -45,6 +45,12 @@ where to store things, or similar project-wide conventions:
 4. Address every error and review concern on the same branch.
 5. Then merge the MR into `main` and delete the feature branch.
 
+While an MR waits for CI or review (CodeRabbit can take a while), start the
+next feature on its own branch instead of waiting. Return to the waiting MR
+when its results arrive, and don't merge it before its review is complete.
+If review comments arrive after an MR was merged, fix them in a follow-up MR
+and reply in each thread with the fix.
+
 GitLab enforces this workflow:
 
 - `main` is protected. Nobody can push to it directly or force-push, and only

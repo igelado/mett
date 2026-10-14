@@ -69,7 +69,7 @@ Optional variables:
 | `METT_FLOW=device` | Use the device code flow: the example prints a code to enter at `https://microsoft.com/devicelogin`. Use this over SSH or without a browser. |
 | `METT_TENANT` | Sign in through this tenant (a domain or tenant ID) instead of the account's domain. |
 | `METT_CLOUD` | `usgov`, `usgov-dod` or `china` for national clouds (default `global`). |
-| `METT_TOKEN_FILE` | Store the refresh token in this file instead of the OS keyring. |
+| `METT_TOKEN_FILE` | Store the refresh token in this file instead of the OS keyring (Unix only). |
 
 ### 3. Check that the refresh token is reused
 

@@ -25,6 +25,17 @@ const BROWSER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
+/// Whether an HTTP status means "try again later": throttling, a timeout
+/// or a server error.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    use reqwest::StatusCode;
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+        )
+}
+
 /// The tokens returned by a successful request.
 #[derive(Debug)]
 pub(crate) struct Tokens {
@@ -62,7 +73,7 @@ pub(crate) async fn user_principal_name(
             description: "Graph rejected the access token".into(),
         });
     }
-    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if is_transient_status(status) {
         return Err(FlowError::Unavailable(format!(
             "could not look up the signed-in user: Graph returned HTTP {status}"
         )));
@@ -177,7 +188,7 @@ async fn post_form<T: DeserializeOwned>(
     }
     let error = serde_json::from_slice::<ErrorResponse>(&body).ok();
     // Throttling and server errors are temporary whatever the body says.
-    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if is_transient_status(status) {
         let code = error.map(|e| format!(" ({})", e.error)).unwrap_or_default();
         return Err(FlowError::Unavailable(format!(
             "identity platform returned HTTP {status}{code}"
