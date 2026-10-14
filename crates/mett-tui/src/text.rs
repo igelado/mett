@@ -162,6 +162,17 @@ fn html_to_text(html: &str) -> String {
             rest = after.find("-->").map_or("", |end| &after[end + 3..]);
             continue;
         }
+        // A `<` only starts a tag if a name, `/` or `!` follows it;
+        // otherwise it is text, as in `2 < 3`.
+        if !rest[1..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!')
+        {
+            out.push('<');
+            rest = &rest[1..];
+            continue;
+        }
         let Some(end) = rest.find('>') else {
             rest = "";
             break;
@@ -287,6 +298,11 @@ mod tests {
             ),
             ["Hi Alice,", "Fish & chips?", "Bob"]
         );
+    }
+
+    #[test]
+    fn html_keeps_literal_less_than_signs() {
+        assert_eq!(html("<p>2 < 3 and 4 <5</p>"), ["2 < 3 and 4 <5"]);
     }
 
     #[test]
