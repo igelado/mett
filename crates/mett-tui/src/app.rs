@@ -5,14 +5,20 @@
 //! to a [`Msg`]; side effects come back as [`Effect`]s for the main loop to
 //! carry out. This keeps the UI logic testable without a terminal.
 
+use std::collections::HashMap;
+
 use mett_core::{Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 
 use crate::action::Action;
 use crate::keymap::Menu;
+use crate::text;
 use crate::worker::{Event, Request, RequestId, Response};
 
 /// How many messages to request per page.
 const PAGE_SIZE: u32 = 100;
+
+/// Rows used by the help line, the status bar and the message line.
+const CHROME_ROWS: usize = 3;
 
 /// Input to [`App::update`].
 // Messages are handled one at a time, so their size doesn't matter.
@@ -23,9 +29,11 @@ pub enum Msg {
     Action(Action),
     /// The worker answered a request.
     Response(Response),
-    /// The terminal now has `height` rows.
+    /// The terminal was resized.
     Resize {
-        /// Total terminal height, in rows.
+        /// Terminal width, in cells.
+        width: u16,
+        /// Terminal height, in rows.
         height: u16,
     },
 }
@@ -55,9 +63,11 @@ pub struct Pager {
     pub id: MessageId,
     /// The message, once fetched.
     pub message: Option<Message>,
+    /// The message laid out as lines (headers and body), not yet wrapped.
+    pub lines: Vec<String>,
     /// The request fetching it.
     pub request: RequestId,
-    /// The first visible line.
+    /// The first visible row, after wrapping.
     pub scroll: usize,
 }
 
@@ -76,19 +86,21 @@ pub struct App {
     pub status: String,
     /// Set when the user quits.
     pub quit: bool,
+    /// Terminal width, in cells.
+    pub width: usize,
     /// Rows available for the index or pager body.
     pub body_height: usize,
     /// The request whose messages the index is waiting for, if any.
     listing: Option<RequestId>,
+    /// Pending flag updates, so a failure can be undone in the index.
+    flag_updates: HashMap<RequestId, MessageId>,
     next_request: u64,
 }
 
-/// Rows used by the help line, the status bar and the message line.
-const CHROME_ROWS: usize = 3;
-
 impl App {
-    /// A new app, and the effects that start loading the Inbox.
-    pub fn new(height: u16) -> (Self, Vec<Effect>) {
+    /// A new app for a `width`×`height` terminal, and the effects that start
+    /// loading the Inbox.
+    pub fn new(width: u16, height: u16) -> (Self, Vec<Effect>) {
         let mut app = Self {
             screens: vec![Screen::Index],
             folder: None,
@@ -96,8 +108,10 @@ impl App {
             selected: 0,
             status: "Opening Inbox...".into(),
             quit: false,
+            width: usize::from(width),
             body_height: body_height(height),
             listing: None,
+            flag_updates: HashMap::new(),
             next_request: 0,
         };
         let effect = app.request(Request::OpenInbox);
@@ -124,8 +138,10 @@ impl App {
         match msg {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
-            Msg::Resize { height } => {
+            Msg::Resize { width, height } => {
+                self.width = usize::from(width);
                 self.body_height = body_height(height);
+                self.clamp_scroll();
                 Vec::new()
             }
         }
@@ -164,9 +180,6 @@ impl App {
 
     fn on_pager_action(&mut self, action: Action) -> Vec<Effect> {
         let page = self.body_height.max(1);
-        let Some(Screen::Pager(pager)) = self.screens.last_mut() else {
-            return Vec::new();
-        };
         match action {
             Action::Quit => self.quit = true,
             Action::Exit => {
@@ -174,20 +187,13 @@ impl App {
             }
             // As in mutt, j and k in the pager show the next or previous
             // message.
+            Action::NextEntry if self.selected + 1 >= self.messages.len() => {
+                self.status = "You are on the last message.".into();
+            }
+            Action::PreviousEntry if self.selected == 0 => {
+                self.status = "You are on the first message.".into();
+            }
             Action::NextEntry | Action::PreviousEntry => {
-                let at_end = if action == Action::NextEntry {
-                    self.selected + 1 >= self.messages.len()
-                } else {
-                    self.selected == 0
-                };
-                if at_end {
-                    self.status = if action == Action::NextEntry {
-                        "You are on the last message.".into()
-                    } else {
-                        "You are on the first message.".into()
-                    };
-                    return Vec::new();
-                }
                 if action == Action::NextEntry {
                     self.selected += 1;
                 } else {
@@ -196,16 +202,34 @@ impl App {
                 self.screens.pop();
                 return self.open_selected();
             }
-            Action::NextLine => pager.scroll += 1,
-            Action::PreviousLine => pager.scroll = pager.scroll.saturating_sub(1),
-            Action::NextPage => pager.scroll += page,
-            Action::PreviousPage => pager.scroll = pager.scroll.saturating_sub(page),
+            Action::NextLine => self.scroll_by(1),
+            Action::PreviousLine => self.scroll_by(-1),
+            Action::NextPage => self.scroll_by(page as isize),
+            Action::PreviousPage => self.scroll_by(-(page as isize)),
             Action::FirstEntry | Action::LastEntry | Action::DisplayMessage => {}
         }
         Vec::new()
     }
 
-    /// Opens the pager on the selected message, marking it read.
+    /// Scrolls the pager by `rows`, within the message.
+    fn scroll_by(&mut self, rows: isize) {
+        if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
+            pager.scroll = pager.scroll.saturating_add_signed(rows);
+        }
+        self.clamp_scroll();
+    }
+
+    /// Keeps the pager's scroll position within the wrapped message, so that
+    /// the last page stays full and scrolling back responds at once.
+    fn clamp_scroll(&mut self) {
+        let (width, height) = (self.width, self.body_height);
+        if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
+            let rows = text::wrap_all(&pager.lines, width).len();
+            pager.scroll = pager.scroll.min(rows.saturating_sub(height));
+        }
+    }
+
+    /// Opens the pager on the selected message.
     fn open_selected(&mut self) -> Vec<Effect> {
         let Some(summary) = self.messages.get(self.selected) else {
             self.status = "No messages.".into();
@@ -214,24 +238,13 @@ impl App {
         let id = summary.id.clone();
         let fetch = self.request(Request::FetchMessage(id.clone()));
         self.screens.push(Screen::Pager(Pager {
-            id: id.clone(),
+            id,
             message: None,
+            lines: Vec::new(),
             request: effect_id(&fetch),
             scroll: 0,
         }));
-
-        let mut effects = vec![fetch];
-        let summary = &mut self.messages[self.selected];
-        if !summary.flags.read {
-            // Show it as read straight away, as mutt does.
-            summary.flags.read = true;
-            let update = FlagsUpdate {
-                read: Some(true),
-                flagged: None,
-            };
-            effects.push(self.request(Request::UpdateFlags(id, update)));
-        }
-        effects
+        vec![fetch]
     }
 
     fn on_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
@@ -268,25 +281,69 @@ impl App {
                     self.report(e);
                 }
             },
-            Event::MessageFetched(result) => {
-                // Only the pager that asked for it cares; anything else is a
-                // stale response from a message the user already left.
-                if let Some(Screen::Pager(pager)) = self.screens.last_mut()
-                    && pager.request == id
-                {
-                    match result {
-                        Ok(message) => pager.message = Some(message),
-                        Err(e) => {
-                            self.screens.pop();
-                            self.report(e);
-                        }
+            Event::MessageFetched(result) => return self.on_message_fetched(id, result),
+            Event::FlagsUpdated(result) => {
+                let message = self.flag_updates.remove(&id);
+                if let Err(e) = result {
+                    // Undo the optimistic change, so the index is right and
+                    // reopening the message tries again.
+                    if let Some(summary) =
+                        message.and_then(|m| self.messages.iter_mut().find(|s| s.id == m))
+                    {
+                        summary.flags.read = false;
                     }
+                    self.report(e);
                 }
             }
-            Event::InboxOpened(Err(e)) | Event::FlagsUpdated(Err(e)) => self.report(e),
-            Event::MessagesListed(_) | Event::FlagsUpdated(Ok(())) => {}
+            Event::InboxOpened(Err(e)) => self.report(e),
+            Event::MessagesListed(_) => {}
         }
         Vec::new()
+    }
+
+    fn on_message_fetched(
+        &mut self,
+        id: RequestId,
+        result: mett_core::Result<Message>,
+    ) -> Vec<Effect> {
+        // Only the pager that asked for it cares; anything else is a stale
+        // response for a message the user already left.
+        let Some(Screen::Pager(pager)) = self.screens.last_mut() else {
+            return Vec::new();
+        };
+        if pager.request != id {
+            return Vec::new();
+        }
+        let message = match result {
+            Ok(message) => message,
+            Err(e) => {
+                self.screens.pop();
+                self.report(e);
+                return Vec::new();
+            }
+        };
+        pager.lines = text::pager_lines(&message);
+        let message_id = message.summary.id.clone();
+        pager.message = Some(message);
+
+        // Now that it has been shown, mark it read (as mutt does), updating
+        // the index straight away.
+        let Some(summary) = self.messages.iter_mut().find(|s| s.id == message_id) else {
+            return Vec::new();
+        };
+        if summary.flags.read {
+            return Vec::new();
+        }
+        summary.flags.read = true;
+        let update = self.request(Request::UpdateFlags(
+            message_id.clone(),
+            FlagsUpdate {
+                read: Some(true),
+                flagged: None,
+            },
+        ));
+        self.flag_updates.insert(effect_id(&update), message_id);
+        vec![update]
     }
 
     fn report(&mut self, error: Error) {
@@ -322,7 +379,7 @@ mod tests {
 
     /// An app whose Inbox has been opened and listed with `n` messages.
     fn loaded(n: usize) -> App {
-        let (mut app, effects) = App::new(23);
+        let (mut app, effects) = App::new(80, 23);
         let [Effect::Request(open, Request::OpenInbox)] = effects.as_slice() else {
             panic!("expected OpenInbox, got {effects:?}");
         };
@@ -348,6 +405,33 @@ mod tests {
         app.update(Msg::Action(action))
     }
 
+    fn message(id: &str, body_lines: usize) -> Message {
+        let mut message = mock::message(id, "in", id, DateTime::UNIX_EPOCH);
+        message.body.content = (0..body_lines).map(|i| format!("line {i}\n")).collect();
+        message
+    }
+
+    /// Opens the selected message and delivers it with `body_lines` lines;
+    /// returns the effects of the delivery.
+    fn open(app: &mut App, body_lines: usize) -> Vec<Effect> {
+        let effects = act(app, Action::DisplayMessage);
+        let [Effect::Request(fetch, Request::FetchMessage(id))] = effects.as_slice() else {
+            panic!("expected FetchMessage, got {effects:?}");
+        };
+        let message = message(id.as_str(), body_lines);
+        app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Ok(message)),
+        }))
+    }
+
+    fn pager(app: &App) -> &Pager {
+        let Screen::Pager(pager) = app.screen() else {
+            panic!("not in the pager");
+        };
+        pager
+    }
+
     #[test]
     fn loads_the_inbox_on_start() {
         let app = loaded(3);
@@ -358,7 +442,7 @@ mod tests {
 
     #[test]
     fn keeps_listing_until_the_last_page() {
-        let (mut app, effects) = App::new(23);
+        let (mut app, effects) = App::new(80, 23);
         let Effect::Request(open, _) = effects[0].clone();
         let folder = mock::folder("in", "Inbox", None);
         let effects = app.update(Msg::Response(Response {
@@ -424,23 +508,41 @@ mod tests {
     }
 
     #[test]
-    fn displaying_a_message_fetches_it_and_marks_it_read() {
+    fn marks_a_message_read_once_it_is_shown() {
         let mut app = loaded(2);
         let effects = act(&mut app, Action::DisplayMessage);
         assert_eq!(app.menu(), Menu::Pager);
         assert!(matches!(
             effects.as_slice(),
-            [
-                Effect::Request(_, Request::FetchMessage(id)),
-                Effect::Request(_, Request::UpdateFlags(id2, FlagsUpdate { read: Some(true), .. })),
-            ] if id.as_str() == "m0" && id2.as_str() == "m0"
+            [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m0"
+        ));
+        assert!(!app.messages[0].flags.read, "not read before it is shown");
+
+        act(&mut app, Action::Exit);
+        let effects = open(&mut app, 1);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Request(_, Request::UpdateFlags(id, FlagsUpdate { read: Some(true), .. }))]
+                if id.as_str() == "m0"
         ));
         assert!(app.messages[0].flags.read);
 
         // Reopening a read message doesn't update its flags again.
         act(&mut app, Action::Exit);
-        let effects = act(&mut app, Action::DisplayMessage);
-        assert_eq!(effects.len(), 1);
+        assert!(open(&mut app, 1).is_empty());
+    }
+
+    #[test]
+    fn a_failed_flag_update_marks_the_message_unread_again() {
+        let mut app = loaded(1);
+        let effects = open(&mut app, 1);
+        let Effect::Request(update, _) = effects[0].clone();
+        app.update(Msg::Response(Response {
+            id: update,
+            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
+        }));
+        assert!(!app.messages[0].flags.read);
+        assert_eq!(app.status, "network error: offline");
     }
 
     #[test]
@@ -452,54 +554,85 @@ mod tests {
         let effects = act(&mut app, Action::NextEntry);
         let Effect::Request(second, _) = effects[0].clone();
 
-        let message = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH);
         app.update(Msg::Response(Response {
             id: first,
-            event: Event::MessageFetched(Ok(message("m0"))),
+            event: Event::MessageFetched(Ok(message("m0", 1))),
         }));
-        let Screen::Pager(pager) = app.screen() else {
-            panic!()
-        };
-        assert_eq!(pager.message, None, "stale response ignored");
+        assert_eq!(pager(&app).message, None, "stale response ignored");
+        assert!(!app.messages[0].flags.read);
 
         app.update(Msg::Response(Response {
             id: second,
-            event: Event::MessageFetched(Ok(message("m1"))),
+            event: Event::MessageFetched(Ok(message("m1", 1))),
         }));
-        let Screen::Pager(pager) = app.screen() else {
-            panic!()
-        };
-        assert_eq!(pager.message.as_ref().unwrap().summary.id.as_str(), "m1");
+        let shown = pager(&app).message.as_ref().unwrap();
+        assert_eq!(shown.summary.id.as_str(), "m1");
         assert_eq!(app.selected, 1);
     }
 
     #[test]
-    fn a_failed_fetch_returns_to_the_index_with_the_error() {
+    fn a_failed_fetch_returns_to_the_index_and_leaves_it_unread() {
         let mut app = loaded(1);
         let effects = act(&mut app, Action::DisplayMessage);
         let Effect::Request(fetch, _) = effects[0].clone();
-        app.update(Msg::Response(Response {
+        let effects = app.update(Msg::Response(Response {
             id: fetch,
             event: Event::MessageFetched(Err(Error::Network("offline".into()))),
         }));
+        assert!(effects.is_empty());
         assert_eq!(app.menu(), Menu::Index);
         assert_eq!(app.status, "network error: offline");
+        assert!(!app.messages[0].flags.read);
     }
 
     #[test]
-    fn pager_scrolls_and_exits() {
+    fn pager_scrolls_within_the_message() {
         let mut app = loaded(1);
-        act(&mut app, Action::DisplayMessage);
+        // 4 header lines and a blank line, 40 body lines; 20 visible rows.
+        open(&mut app, 40);
+        let rows = text::wrap_all(&pager(&app).lines, 80).len();
         act(&mut app, Action::NextLine);
         act(&mut app, Action::NextPage);
         act(&mut app, Action::PreviousLine);
-        let Screen::Pager(pager) = app.screen() else {
-            panic!()
-        };
-        assert_eq!(pager.scroll, 20);
+        assert_eq!(pager(&app).scroll, 20);
+
+        for _ in 0..5 {
+            act(&mut app, Action::NextPage);
+        }
+        assert_eq!(pager(&app).scroll, rows - 20, "stops at the last full page");
+        act(&mut app, Action::PreviousPage);
+        assert_eq!(
+            pager(&app).scroll,
+            rows - 40,
+            "responds at once after the end"
+        );
+
         act(&mut app, Action::Exit);
         assert_eq!(app.screen(), &Screen::Index);
         act(&mut app, Action::Quit);
         assert!(app.quit);
+    }
+
+    #[test]
+    fn long_lines_wrap_and_can_be_scrolled_to() {
+        let mut app = loaded(1);
+        app.update(Msg::Resize {
+            width: 10,
+            height: 8,
+        });
+        let effects = act(&mut app, Action::DisplayMessage);
+        let Effect::Request(fetch, _) = effects[0].clone();
+        let mut message = message("m0", 0);
+        message.body.content = "x".repeat(100);
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(message)),
+        }));
+        let rows = text::wrap_all(&pager(&app).lines, 10).len();
+        assert!(rows > 10);
+        for _ in 0..rows {
+            act(&mut app, Action::NextLine);
+        }
+        assert_eq!(pager(&app).scroll, rows - 5, "every row is reachable");
     }
 }

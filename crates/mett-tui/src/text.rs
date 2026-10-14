@@ -4,7 +4,116 @@
 //! `docs/DESIGN.md` §5.7 (for example, an external mailcap command) will
 //! replace it.
 
-use mett_core::{Body, BodyKind};
+use chrono::Local;
+use mett_core::{Address, Body, BodyKind, Message};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// The lines the pager shows for `message`: the headers mutt shows by
+/// default, a blank line, then the body. They are not wrapped yet; see
+/// [`wrap`].
+pub fn pager_lines(message: &Message) -> Vec<String> {
+    let addresses = |list: &[Address]| {
+        list.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let summary = &message.summary;
+    let mut lines = vec![format!(
+        "Date: {}",
+        summary
+            .received
+            .with_timezone(&Local)
+            .format("%a, %d %b %Y %H:%M:%S %z")
+    )];
+    if let Some(from) = &summary.from {
+        lines.push(format!("From: {from}"));
+    }
+    if !summary.to.is_empty() {
+        lines.push(format!("To: {}", addresses(&summary.to)));
+    }
+    if !message.cc.is_empty() {
+        lines.push(format!("Cc: {}", addresses(&message.cc)));
+    }
+    lines.push(format!("Subject: {}", summary.subject));
+    lines.push(String::new());
+    lines.extend(body_lines(&message.body));
+    lines
+}
+
+/// Wraps every line to `width` terminal cells.
+pub fn wrap_all(lines: &[String], width: usize) -> Vec<String> {
+    lines.iter().flat_map(|line| wrap(line, width)).collect()
+}
+
+/// Wraps `line` into rows of at most `width` terminal cells, breaking after
+/// a space where possible. Widths are display cells, so wide (CJK, emoji)
+/// characters count double.
+pub fn wrap(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_owned()];
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0;
+    // Byte offset in `row` just after its last space.
+    let mut break_at = None;
+    for c in line.chars() {
+        let w = c.width().unwrap_or(0);
+        if row_width + w > width && !row.is_empty() {
+            // A space that doesn't fit is where the row ends.
+            if c == ' ' {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+                break_at = None;
+                continue;
+            }
+            match break_at.filter(|&i| i < row.len()) {
+                Some(i) => {
+                    let rest = row.split_off(i);
+                    rows.push(row.trim_end().to_owned());
+                    row_width = rest.width();
+                    row = rest;
+                }
+                None => {
+                    rows.push(std::mem::take(&mut row));
+                    row_width = 0;
+                }
+            }
+            break_at = None;
+        }
+        row.push(c);
+        row_width += w;
+        if c == ' ' {
+            break_at = Some(row.len());
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+/// Truncates `text` to at most `width` terminal cells.
+pub fn truncate(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
+}
+
+/// Truncates or pads `text` to exactly `width` terminal cells.
+pub fn fit(text: &str, width: usize) -> String {
+    let mut out = truncate(text, width);
+    let used = out.width();
+    out.extend(std::iter::repeat_n(' ', width - used));
+    out
+}
 
 /// The body as plain-text lines.
 pub fn body_lines(body: &Body) -> Vec<String> {
@@ -94,6 +203,22 @@ mod tests {
             kind: BodyKind::Html,
             content: content.into(),
         })
+    }
+
+    #[test]
+    fn wraps_at_spaces_by_display_width() {
+        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("", 4), [""]);
+        // Each of these characters is two cells wide.
+        assert_eq!(wrap("日本語です", 4), ["日本", "語で", "す"]);
+    }
+
+    #[test]
+    fn fits_text_in_cells() {
+        assert_eq!(fit("Alice", 7), "Alice  ");
+        assert_eq!(fit("日本語", 5), "日本 ");
+        assert_eq!(truncate("Alice Example", 5), "Alice");
     }
 
     #[test]

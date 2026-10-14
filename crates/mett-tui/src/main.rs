@@ -77,20 +77,27 @@ async fn run<S: mett_core::MailStore + 'static>(
     // block, and forwarded to the async loop.
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
-        while let Ok(event) = event::read() {
-            if input_tx.send(event).is_err() {
+        loop {
+            let event = event::read();
+            let failed = event.is_err();
+            if input_tx.send(event).is_err() || failed {
                 break;
             }
         }
     });
 
-    let (mut app, effects) = App::new(terminal.size()?.height);
+    let size = terminal.size()?;
+    let (mut app, effects) = App::new(size.width, size.height);
     dispatch(&request_tx, effects);
 
     while !app.quit {
         terminal.draw(|frame| view::render(&app, &keymap, frame))?;
         let msg = tokio::select! {
-            Some(event) = input_rx.recv() => match event {
+            // Without input mett can't be used or quit, so a terminal read
+            // error ends it (and the terminal is restored).
+            event = input_rx.recv() => match event.transpose()? {
+                None => return Err(std::io::Error::other("terminal input closed")),
+                Some(event) => match event {
                 TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
                     match keymap.lookup(app.menu(), Key::from(key)) {
                         Some(action) => Msg::Action(action),
@@ -100,8 +107,9 @@ async fn run<S: mett_core::MailStore + 'static>(
                         }
                     }
                 }
-                TermEvent::Resize(_, height) => Msg::Resize { height },
+                TermEvent::Resize(width, height) => Msg::Resize { width, height },
                 _ => continue,
+                },
             },
             Some(response) = response_rx.recv() => Msg::Response(response),
             else => break,
