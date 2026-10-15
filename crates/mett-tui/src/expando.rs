@@ -186,7 +186,8 @@ impl Expandos for Status<'_> {
     }
 
     fn expando(&self, code: char, _arg: Option<&str>) -> String {
-        let count = |n: usize| if n == 0 { String::new() } else { n.to_string() };
+        // A count of none shows as 0 (which conditionals take as unset).
+        let count = |n: usize| n.to_string();
         match code {
             'b' => count(self.incoming),
             'd' => count(self.deleted),
@@ -283,6 +284,8 @@ mod tests {
             line,
             format!("-*-mett: Inbox [Msgs:5 Del:1]{}(all)---", "-".repeat(13))
         );
+        // Shown directly, a count of none is 0.
+        assert_eq!(expand("New:%n Del:%d", &status, 20), "New:0 Del:1");
     }
 
     #[test]
