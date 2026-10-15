@@ -413,38 +413,22 @@ fn macro_text(strokes: &[Stroke]) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
-    use mett_core::{MessagePage, WellKnownFolder, mock};
+    use mett_core::{WellKnownFolder, mock};
     use ratatui::crossterm::event::KeyCode;
 
     use super::*;
     use crate::app::composing::Input;
+    use crate::app::testing::*;
     use crate::config::mailbox::FolderPath;
-    use crate::worker::{Event, Response};
+    use crate::worker::Event;
 
     /// An app with three messages in its index.
     fn app() -> App {
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 10, inbox, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(Settings::default(), 10);
         let messages = (0..3)
             .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
             .collect();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         app
     }
 
@@ -592,26 +576,17 @@ mod tests {
         let (mut app, effects) = App::open(80, 10, inbox, Settings::default());
         app.push_after_load(crate::keymap::parse_strokes("<last-entry>").unwrap());
         assert!(app.next_stroke().is_none(), "nothing to move through yet");
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let open = first_request(&effects);
+        let effects = respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        );
+        let list = first_request(&effects);
         let messages = (0..3)
             .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
             .collect();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         play(&mut app);
         assert_eq!(app.selected, 2);
     }
@@ -704,13 +679,14 @@ mod tests {
         let Some(Effect::Request(id, _)) = effects.last().cloned() else {
             panic!("expected a request, got {effects:?}");
         };
-        app.update(Msg::Response(Response {
+        respond(
+            &mut app,
             id,
-            event: Event::Transferred(Ok((
+            Event::Transferred(Ok((
                 mett_core::FolderId::new("archive"),
                 vec![("m0".into(), Ok("a0".into()))],
             ))),
-        }));
+        );
         assert!(!app.waiting());
     }
 
@@ -939,13 +915,12 @@ mod tests {
         let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let (mut app, effects) = App::open(80, 10, inbox, Settings::default());
         app.push_after_load(crate::keymap::parse_strokes("<last-entry>").unwrap());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Err(mett_core::Error::Auth("expired".into()))),
-        }));
+        let open = first_request(&effects);
+        respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Err(mett_core::Error::Auth("expired".into()))),
+        );
         assert!(app.next_stroke().is_none(), "not before the folder is open");
         assert!(!app.after_load.is_empty(), "still waiting");
     }
@@ -953,10 +928,11 @@ mod tests {
     #[test]
     fn commands_keep_the_mailbox_s_addresses() {
         let mut app = app();
-        app.update(Msg::Response(Response {
-            id: crate::worker::RequestId(999),
-            event: Event::OwnAddresses(Ok(vec!["Alias@Contoso.com".into()])),
-        }));
+        respond(
+            &mut app,
+            crate::worker::RequestId(999),
+            Event::OwnAddresses(Ok(vec!["Alias@Contoso.com".into()])),
+        );
         assert!(app.settings.me.contains(&"alias@contoso.com".to_owned()));
         app.update(Msg::Configured(Reconfigured {
             outcome: Ok(vec![]),

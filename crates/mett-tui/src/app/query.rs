@@ -442,14 +442,15 @@ impl App {
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
-    use mett_core::{MessagePage, WellKnownFolder, mock};
+    use mett_core::mock;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
     use crate::alias::Alias;
+    use crate::app::testing::*;
     use crate::app::{Msg, Settings};
-    use crate::config::mailbox::FolderPath;
-    use crate::worker::{Event, Response};
+
+    use crate::worker::Event;
 
     fn settings(query: QuerySettings) -> Settings {
         let alias = |key: &str, value: &str| Alias {
@@ -470,38 +471,11 @@ mod tests {
 
     fn app(query: QuerySettings) -> App {
         let settings = settings(query);
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(settings, 24);
         let mut message = mock::message("m0", "in", "Hi", DateTime::UNIX_EPOCH).summary;
         message.from = Some(Address::new("carol@z.org").with_name("Carol Jones"));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![message], None);
         app
-    }
-
-    fn key(app: &mut App, code: KeyCode) -> Vec<Effect> {
-        app.update(Msg::Key(KeyEvent::from(code)))
-    }
-
-    fn typed(app: &mut App, text: &str) {
-        for c in text.chars() {
-            key(app, KeyCode::Char(c));
-        }
     }
 
     fn answer_text(app: &App) -> String {
@@ -570,10 +544,11 @@ mod tests {
         };
         assert_eq!(text, "car");
         assert!(app.waiting());
-        app.update(Msg::Response(Response {
-            id: *id,
-            event: Event::Queried(Ok(vec![Address::new("carol@z.org").with_name("Carol")])),
-        }));
+        respond(
+            &mut app,
+            *id,
+            Event::Queried(Ok(vec![Address::new("carol@z.org").with_name("Carol")])),
+        );
         app.update(Msg::Action(Action::DisplayMessage));
         assert_eq!(answer_text(&app), "Carol <carol@z.org>");
     }
@@ -607,10 +582,11 @@ mod tests {
             panic!("expected a query, got {effects:?}");
         };
         assert_eq!(command, "lookup %s");
-        app.update(Msg::Response(Response {
-            id: *id,
-            event: Event::Queried(Ok(vec![Address::new("carol@z.org")])),
-        }));
+        respond(
+            &mut app,
+            *id,
+            Event::Queried(Ok(vec![Address::new("carol@z.org")])),
+        );
         app.update(Msg::Action(Action::Mail));
         assert_eq!(answer_text(&app), "carol@z.org");
     }

@@ -292,31 +292,20 @@ mod tests {
     use mett_core::{Address, Body, MessageId, WellKnownFolder, mock};
 
     use super::*;
+    use crate::app::testing::*;
     use crate::app::{Msg, Settings};
-    use crate::worker::{Event, Response};
+    use crate::worker::Event;
 
     fn app() -> App {
         let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
+        let open = first_request(&effects);
+        respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        );
         app
-    }
-
-    fn sent(effects: &[Effect]) -> (RequestId, Request) {
-        match effects {
-            [Effect::Request(id, request)] => (*id, request.clone()),
-            _ => panic!("expected one request, got {effects:?}"),
-        }
-    }
-
-    fn respond(app: &mut App, id: RequestId, event: Event) -> Vec<Effect> {
-        app.update(Msg::Response(Response { id, event }))
     }
 
     fn postponed(id: &str, subject: &str) -> MessageSummary {
@@ -336,14 +325,7 @@ mod tests {
         assert!(app.waiting());
         let drafts_folder = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
         let (list, _) = sent(&respond(app, open, Event::FolderOpened(Ok(drafts_folder))));
-        respond(
-            app,
-            list,
-            Event::MessagesListed(Ok(MessagePage {
-                messages: drafts,
-                next: None,
-            })),
-        )
+        listed(app, list, drafts, None)
     }
 
     /// Answers the fetch of the recalled `message`, and the listing of its
@@ -500,23 +482,14 @@ mod tests {
             open,
             Event::FolderOpened(Ok(drafts_folder)),
         ));
-        let (next, request) = sent(&respond(
+        let (next, request) = sent(&listed(
             &mut app,
             list,
-            Event::MessagesListed(Ok(MessagePage {
-                messages: vec![postponed("d1", "Plans")],
-                next: Some(mett_core::PageCursor::new("drafts next")),
-            })),
+            vec![postponed("d1", "Plans")],
+            Some("drafts next"),
         ));
         assert!(matches!(request, Request::ListMessages { .. }));
-        respond(
-            &mut app,
-            next,
-            Event::MessagesListed(Ok(MessagePage {
-                messages: vec![postponed("d2", "Lunch")],
-                next: None,
-            })),
-        );
+        listed(&mut app, next, vec![postponed("d2", "Lunch")], None);
         let Screen::Postponed(menu) = app.screen() else {
             panic!("expected the postpone menu, got {:?}", app.screen());
         };
@@ -577,22 +550,11 @@ mod tests {
     fn a_pager_on_a_recalled_message_postponed_again_closes() {
         let path = FolderPath::WellKnown(WellKnownFolder::Drafts, vec![]);
         let (mut app, effects) = App::open(80, 24, path, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let open = first_request(&effects);
         let drafts = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
         let effects = respond(&mut app, open, Event::FolderOpened(Ok(drafts)));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        respond(
-            &mut app,
-            list,
-            Event::MessagesListed(Ok(MessagePage {
-                messages: vec![postponed("d1", "Plans")],
-                next: None,
-            })),
-        );
+        let list = first_request(&effects);
+        listed(&mut app, list, vec![postponed("d1", "Plans")], None);
         app.update(Msg::Action(Action::DisplayMessage));
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
         opened(&mut app, fetch, fetched("d1"));
@@ -627,22 +589,11 @@ mod tests {
     fn drafts_listed_again_after_sending(from_pager: bool) {
         let path = FolderPath::WellKnown(WellKnownFolder::Drafts, vec![]);
         let (mut app, effects) = App::open(80, 24, path, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let open = first_request(&effects);
         let drafts = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
         let effects = respond(&mut app, open, Event::FolderOpened(Ok(drafts)));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        respond(
-            &mut app,
-            list,
-            Event::MessagesListed(Ok(MessagePage {
-                messages: vec![postponed("d1", "Plans")],
-                next: None,
-            })),
-        );
+        let list = first_request(&effects);
+        listed(&mut app, list, vec![postponed("d1", "Plans")], None);
         if from_pager {
             app.update(Msg::Action(Action::DisplayMessage));
             assert!(matches!(app.screen(), Screen::Pager(_)));

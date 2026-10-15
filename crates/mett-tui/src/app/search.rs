@@ -458,31 +458,21 @@ impl App {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeDelta};
-    use mett_core::{Address, MessagePage, MessageSummary, WellKnownFolder, mock};
+    use mett_core::{Address, MessageSummary, WellKnownFolder, mock};
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     use super::*;
     use crate::app::composing::Input;
+    use crate::app::testing::*;
     use crate::app::{Msg, Settings};
-    use crate::config::mailbox::FolderPath;
     use crate::lineedit::LineEditor;
-    use crate::worker::{Event, Response};
+
+    use crate::worker::Event;
 
     /// Messages from alternating senders, newest first: m0 from Alice
     /// ("Lunch 0"), m1 from Bob ("Report 1"), and so on; m0 and m1 unread.
     fn app() -> App {
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(Settings::default(), 24);
         let messages = (0..6)
             .map(|i| {
                 let date = DateTime::UNIX_EPOCH + TimeDelta::minutes(100 - i);
@@ -498,18 +488,8 @@ mod tests {
                 m
             })
             .collect();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         app
-    }
-
-    fn act(app: &mut App, action: Action) -> Vec<Effect> {
-        app.update(Msg::Action(action))
     }
 
     fn answer(app: &mut App, text: &str) {
@@ -520,10 +500,6 @@ mod tests {
             app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
         }
         app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
-    }
-
-    fn ids(app: &App) -> Vec<&str> {
-        app.messages.iter().map(|m| m.id.as_str()).collect()
     }
 
     #[test]
@@ -592,10 +568,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "line 1[0-9]");
         let Screen::Pager(pager) = app.screen() else {
@@ -618,10 +591,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         // Both matches are on the last screen.
         act(&mut app, Action::Search);
         answer(&mut app, "line 5[89]");
@@ -648,10 +618,11 @@ mod tests {
         // Limit to Bob's messages: m0, being flagged, is hidden.
         act(&mut app, Action::Limit);
         answer(&mut app, "~f bob");
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(mett_core::Error::Network("offline".into()))),
-        }));
+        respond(
+            &mut app,
+            flag,
+            Event::FlagsUpdated(Err(mett_core::Error::Network("offline".into()))),
+        );
         act(&mut app, Action::Limit);
         answer(&mut app, "all");
         assert!(!app.messages[0].flags.flagged, "back as in the mailbox");
@@ -685,10 +656,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = "first line\nsome words before the important phrase\n".into();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "important phrase");
         assert_ne!(app.status, "Not found.");
@@ -707,10 +675,11 @@ mod tests {
         };
         act(&mut app, Action::Limit);
         answer(&mut app, "~f bob");
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(mett_core::Error::Auth("expired".into()))),
-        }));
+        respond(
+            &mut app,
+            flag,
+            Event::FlagsUpdated(Err(mett_core::Error::Auth("expired".into()))),
+        );
         app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
             account: mett_core::AccountId::new("demo@example.com"),
             outcome: Err("expired".into()),
@@ -737,10 +706,11 @@ mod tests {
         let Effect::Request(fetch, _) = effects[0].clone() else {
             panic!("expected a fetch, got {effects:?}");
         };
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(mock::message("m1", "in", "s", DateTime::UNIX_EPOCH))),
-        }));
+        respond(
+            &mut app,
+            fetch,
+            Event::MessageFetched(Ok(mock::message("m1", "in", "s", DateTime::UNIX_EPOCH))),
+        );
         act(&mut app, Action::SearchNext);
         assert_eq!(app.status, "No search pattern.", "not the index's ~f bob");
         act(&mut app, Action::Search);
@@ -764,10 +734,7 @@ mod tests {
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         // One line, many rows, with two matches far down it.
         message.body.content = format!("{} needle one needle two\nend\n", "word ".repeat(60));
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "needle");
         let shown = |app: &App| {
@@ -809,30 +776,10 @@ mod tests {
     /// An app whose first page (m0 from Alice) is listed, with more to
     /// come; returns the app and the request for the next page.
     fn loading() -> (App, crate::worker::RequestId) {
-        let inbox = crate::config::mailbox::FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(Settings::default(), 24);
         let mut first = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
         first.from = Some(Address::new("alice@contoso.com"));
-        let effects = app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![first],
-                next: Some(mett_core::PageCursor::new("c")),
-            })),
-        }));
-        let Effect::Request(next, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let next = page(&mut app, list, vec![first], "c");
         (app, next)
     }
 
@@ -848,13 +795,7 @@ mod tests {
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         assert_eq!(app.status, "Searching...");
-        app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, next, vec![bob()], None);
         assert_eq!(app.selected, 1);
         assert_eq!(app.status, "");
     }
@@ -865,13 +806,7 @@ mod tests {
         act(&mut app, Action::Limit);
         answer(&mut app, "~f bob");
         assert_eq!(app.status, "No messages matched the criteria.");
-        app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, next, vec![bob()], None);
         assert_eq!(ids(&app), ["m1"]);
         assert_eq!(app.status, "");
     }
@@ -885,10 +820,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = "one\ntwo\n".into();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "$");
         let line = |app: &App| {
@@ -911,10 +843,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = "apple banana apple banana\n".into();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "banana");
         act(&mut app, Action::Search);
@@ -938,13 +867,7 @@ mod tests {
         answer(&mut app, "~f alice|~f bob");
         assert_eq!(app.status, "Searching...");
         assert_eq!(app.selected, 0);
-        app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, next, vec![bob()], None);
         assert_eq!(app.selected, 1, "the next match, not the wrap");
         act(&mut app, Action::SearchNext);
         assert_eq!(app.selected, 0);
@@ -963,10 +886,7 @@ mod tests {
         assert_eq!(app.status, "Searching...");
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         let Screen::Pager(pager) = app.screen() else {
             panic!("not in the pager");
         };
@@ -983,10 +903,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = "one two one\n".into();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "one");
         let Screen::Pager(pager) = app.screen() else {
@@ -1014,10 +931,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = format!("{} needle\n{}", "word ".repeat(80), "more\n".repeat(40));
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         // Resized while something else covered the pager.
         app.width = 40;
         act(&mut app, Action::Search);
@@ -1033,38 +947,30 @@ mod tests {
     fn a_search_waits_for_the_folder_to_open() {
         let inbox = crate::config::mailbox::FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let open = first_request(&effects);
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         assert_eq!(app.status, "Searching...");
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let effects = respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        );
+        let list = first_request(&effects);
         let mut alice = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
         alice.from = Some(Address::new("alice@contoso.com"));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![alice, bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![alice, bob()], None);
         assert_eq!(app.selected, 1);
     }
 
     #[test]
     fn a_search_loads_a_page_that_failed() {
         let (mut app, next) = loading();
-        app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Err(mett_core::Error::Network("offline".into()))),
-        }));
+        respond(
+            &mut app,
+            next,
+            Event::MessagesListed(Err(mett_core::Error::Network("offline".into()))),
+        );
         act(&mut app, Action::Search);
         let effects = {
             if let Some(Input::Line { editor, .. }) = &mut app.input {
@@ -1079,13 +985,7 @@ mod tests {
             panic!("expected the page again, got {effects:?}");
         };
         assert_eq!(app.status, "Searching...");
-        app.update(Msg::Response(Response {
-            id: again,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, again, vec![bob()], None);
         assert_eq!(app.selected, 1);
     }
 
@@ -1110,22 +1010,17 @@ mod tests {
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         assert_eq!(app.status, "Searching...");
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("ar", "Archive", None))),
-        }));
+        let effects = respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Ok(mock::folder("ar", "Archive", None))),
+        );
         let Some(Effect::Request(list, _)) = effects.first().cloned() else {
             panic!("expected a request, got {effects:?}");
         };
         let mut other = mock::message("m9", "ar", "Old", DateTime::UNIX_EPOCH).summary;
         other.from = Some(Address::new("carol@contoso.com"));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![other, bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![other, bob()], None);
         assert_eq!(app.selected, 0, "the old search doesn't run here");
     }
 
@@ -1150,10 +1045,7 @@ mod tests {
         message.body.content = (0..60)
             .map(|i| format!("row {i:02} {}\n", "x".repeat(140)))
             .collect();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         let Some(Screen::Pager(pager)) = app.screens.last_mut() else {
             panic!("not in the pager");
         };
@@ -1169,27 +1061,18 @@ mod tests {
     fn a_search_before_any_message_includes_the_first() {
         let inbox = crate::config::mailbox::FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let open = first_request(&effects);
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let effects = respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        );
+        let list = first_request(&effects);
         let mut other = bob();
         other.id = "m2".into();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob(), other],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![bob(), other], None);
         assert_eq!(app.selected, 0, "the first match");
         assert_eq!(app.status, "");
     }
@@ -1206,23 +1089,17 @@ mod tests {
         assert_ne!(app.status, "Searching...");
     }
 
-    fn signed_out(app: &mut App) {
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-    }
-
     #[test]
     fn a_search_waits_for_a_page_through_a_sign_in() {
         let (mut app, next) = loading();
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Err(mett_core::Error::Auth("expired".into()))),
-        }));
+        respond(
+            &mut app,
+            next,
+            Event::MessagesListed(Err(mett_core::Error::Auth("expired".into()))),
+        );
         let effects = app.retry();
         let again = effects
             .iter()
@@ -1231,13 +1108,7 @@ mod tests {
                 _ => None,
             })
             .expect("the page again");
-        app.update(Msg::Response(Response {
-            id: again,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, again, vec![bob()], None);
         assert_eq!(app.selected, 1);
     }
 
@@ -1251,10 +1122,11 @@ mod tests {
         act(&mut app, Action::Search);
         answer(&mut app, "line 1[0-9]");
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Err(mett_core::Error::Auth("expired".into()))),
-        }));
+        respond(
+            &mut app,
+            fetch,
+            Event::MessageFetched(Err(mett_core::Error::Auth("expired".into()))),
+        );
         let effects = app.retry();
         let again = effects
             .iter()
@@ -1265,10 +1137,7 @@ mod tests {
             .expect("fetched again");
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        app.update(Msg::Response(Response {
-            id: again,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, again, Event::MessageFetched(Ok(message)));
         let Screen::Pager(pager) = app.screen() else {
             panic!("not in the pager");
         };
@@ -1284,13 +1153,7 @@ mod tests {
         act(&mut app, Action::NextEntry);
         let mut second = bob();
         second.id = "m2".into();
-        app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob(), second],
-                next: None,
-            })),
-        }));
+        listed(&mut app, next, vec![bob(), second], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "m1");
     }
 
@@ -1303,10 +1166,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = format!("{} needle\n", "word ".repeat(30));
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "needle");
         act(&mut app, Action::BrowseMailboxes);
@@ -1336,10 +1196,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         message.body.content = format!("{}  y\n", "x".repeat(80));
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         act(&mut app, Action::Search);
         answer(&mut app, "x  y");
         act(&mut app, Action::Search);
@@ -1357,31 +1214,25 @@ mod tests {
     fn a_search_waits_for_the_folder_through_a_sign_in() {
         let inbox = crate::config::mailbox::FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let open = first_request(&effects);
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Err(mett_core::Error::Auth("expired".into()))),
-        }));
+        respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Err(mett_core::Error::Auth("expired".into()))),
+        );
         let (again, _) = request_of(&app.retry());
-        let effects = app.update(Msg::Response(Response {
-            id: again,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
+        let effects = respond(
+            &mut app,
+            again,
+            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        );
         let (list, _) = request_of(&effects);
         let mut alice = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
         alice.from = Some(Address::new("alice@contoso.com"));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![alice, bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![alice, bob()], None);
         assert_eq!(app.selected, 1);
     }
 
@@ -1404,24 +1255,12 @@ mod tests {
         // A page without a match: still nothing to move to.
         let mut alice = mock::message("m5", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
         alice.from = Some(Address::new("alice@contoso.com"));
-        let effects = app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![alice],
-                next: Some(mett_core::PageCursor::new("d")),
-            })),
-        }));
+        let effects = listed(&mut app, next, vec![alice], Some("d"));
         assert!(app.pending.is_some(), "still waiting");
         let Some(Effect::Request(last, _)) = effects.first().cloned() else {
             panic!("expected the next page, got {effects:?}");
         };
-        app.update(Msg::Response(Response {
-            id: last,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![bob()],
-                next: None,
-            })),
-        }));
+        listed(&mut app, last, vec![bob()], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "m1");
         assert!(app.pending.is_none());
     }
@@ -1449,13 +1288,7 @@ mod tests {
                 m
             })
             .collect();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         assert_eq!(ids(&app), ["m0", "m1"], "still shown, as in mutt");
     }
 }

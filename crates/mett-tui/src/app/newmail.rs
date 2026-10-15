@@ -791,8 +791,9 @@ mod tests {
 
     use super::*;
     use crate::action::Action;
+    use crate::app::testing::*;
     use crate::app::{Input, Msg, Settings};
-    use crate::worker::{Event, Response};
+    use crate::worker::Event;
     use mett_core::MessagePage;
 
     const MINUTE: Duration = Duration::from_secs(60);
@@ -828,20 +829,6 @@ mod tests {
             mailboxes: vec![entry("=@inbox", inbox()), entry("=Work", work())],
             ..Settings::default()
         }
-    }
-
-    fn respond(app: &mut App, id: RequestId, event: Event) -> Vec<Effect> {
-        app.update(Msg::Response(Response { id, event }))
-    }
-
-    fn requests(effects: &[Effect]) -> Vec<(RequestId, Request)> {
-        effects
-            .iter()
-            .filter_map(|e| match e {
-                Effect::Request(id, request) => Some((*id, request.clone())),
-                _ => None,
-            })
-            .collect()
     }
 
     fn folder(id: &str, name: &str, unread: u32) -> Folder {
@@ -898,10 +885,6 @@ mod tests {
             sort: crate::sort::Sort::parse("unsorted", true).unwrap(),
             ..crate::app::Ordering::default()
         }
-    }
-
-    fn ids(app: &App) -> Vec<&str> {
-        app.messages.iter().map(|m| m.id.as_str()).collect()
     }
 
     /// Fires the poll timer and returns the folder's listing request.

@@ -633,40 +633,24 @@ mod tests {
         assert_eq!(decode("text/plain; charset=x-unknown", b"x"), None);
     }
     use chrono::DateTime;
-    use mett_core::{AttachmentId, MessagePage, WellKnownFolder, mock};
+    use mett_core::{AttachmentId, mock};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
+    use crate::app::testing::*;
     use crate::app::{Msg, Settings};
-    use crate::config::mailbox::FolderPath;
-    use crate::worker::{Event, Response};
+
+    use crate::worker::Event;
 
     fn app() -> App {
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let settings = Settings {
             home: Some("/home/alice".into()),
             ..Settings::default()
         };
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(settings, 24);
         let mut message = mock::message("m0", "in", "Files", DateTime::UNIX_EPOCH).summary;
         message.has_attachments = true;
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![message], None);
         app
     }
 
@@ -679,21 +663,6 @@ mod tests {
             inline: false,
             kind,
         }
-    }
-
-    fn sent(effects: &[Effect]) -> (RequestId, Request) {
-        match effects {
-            [Effect::Request(id, request)] => (*id, request.clone()),
-            _ => panic!("expected one request, got {effects:?}"),
-        }
-    }
-
-    fn respond(app: &mut App, id: RequestId, event: Event) -> Vec<Effect> {
-        app.update(Msg::Response(Response { id, event }))
-    }
-
-    fn act(app: &mut App, action: Action) -> Vec<Effect> {
-        app.update(Msg::Action(action))
     }
 
     /// The attachment menu of m0, with a text file, a PDF and a link.
