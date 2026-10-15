@@ -1818,6 +1818,62 @@ async fn a_retry_without_files_takes_off_those_attached_before() {
     store.send(&reply).await.unwrap();
 }
 
+#[tokio::test]
+async fn a_kept_draft_is_sent_once_its_large_files_are_taken_off() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The upload's outcome is unknown: the draft is kept.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let mut message = draft(None);
+    message.attachments.push(attached("big.bin", 4_000_000));
+    let store = store(&server);
+    assert!(store.send(&message).await.is_err());
+
+    // Small enough to go inline now, but the kept draft is what is sent.
+    message.attachments.clear();
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/sendMail"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+}
+
+#[test]
+fn escaped_text_counts_towards_the_request_size() {
+    let mut message = draft(None);
+    message.attachments.push(attached("a.bin", 1_000_000));
+    message.body = "\\".repeat(1_500_000);
+    assert!(mett_msgraph::needs_server_draft(&message));
+}
+
 #[test]
 fn a_long_body_counts_towards_the_request_size() {
     let mut message = draft(None);

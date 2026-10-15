@@ -629,7 +629,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
-        if needs_server_draft(draft) {
+        if needs_server_draft(draft) || self.has_kept(draft) {
             return self.server_draft(draft).await;
         }
         // A plain draft is created with its content in one request.
@@ -759,7 +759,9 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
     }
 
     async fn send(&self, draft: &Draft) -> Result<()> {
-        if !needs_server_draft(draft) {
+        // A server draft kept from an earlier attempt is sent, not left
+        // behind.
+        if !needs_server_draft(draft) && !self.has_kept(draft) {
             let url = self.url(&["me", "sendMail"]);
             let body = json!({
                 "message": message_json(draft, true),
@@ -1060,6 +1062,14 @@ impl<A: Authenticator> GraphMailStore<A> {
         deleted
     }
 
+    /// Whether a server draft is kept for `draft`.
+    fn has_kept(&self, draft: &Draft) -> bool {
+        self.kept
+            .lock()
+            .expect("lock")
+            .contains_key(&(draft.origin.clone(), draft.attempt))
+    }
+
     /// Remembers a server draft kept after an attempt whose outcome is
     /// unknown, with the attachments it added.
     fn keep(&self, draft: &Draft, id: MessageId, base: Option<Vec<String>>) {
@@ -1113,14 +1123,23 @@ pub fn needs_server_draft(draft: &Draft) -> bool {
     if draft.attachments.is_empty() {
         return false;
     }
-    // Base64 takes 4 bytes for every 3; names and addresses are short
-    // next to the 4 MB.
+    // Base64 takes 4 bytes for every 3: too large already, without
+    // encoding it all to find out.
     let encoded: usize = draft
         .attachments
         .iter()
-        .map(|a| a.data.len().div_ceil(3) * 4 + a.name.len() + a.content_type.len())
+        .map(|a| a.data.len().div_ceil(3) * 4)
         .sum();
-    encoded + draft.body.len() + draft.subject.len() > INLINE_REQUEST
+    if encoded + draft.body.len() > INLINE_REQUEST {
+        return true;
+    }
+    // Otherwise, the request as sent: escaping may make the text much
+    // larger.
+    let request = json!({
+        "message": message_json(draft, true),
+        "saveToSentItems": draft.save_copy,
+    });
+    serde_json::to_vec(&request).map_or(true, |bytes| bytes.len() > INLINE_REQUEST)
 }
 
 /// A Graph `message` resource with `draft`'s content, and its attachments

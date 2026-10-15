@@ -17,6 +17,7 @@ mett-msgraph.workspace = true
 
 base64.workspace = true
 chrono.workspace = true
+encoding_rs.workspace = true
 open.workspace = true
 ratatui.workspace = true
 regex.workspace = true

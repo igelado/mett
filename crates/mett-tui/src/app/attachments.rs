@@ -404,6 +404,24 @@ pub enum FileOutcome {
     Failed(String),
 }
 
+/// `data` as text, in the charset `content_type` declares; without one,
+/// UTF-8, or Windows-1252 if it isn't. `None` for a charset mett doesn't
+/// know (the file is opened with another program instead).
+fn decode(content_type: &str, data: &[u8]) -> Option<String> {
+    let charset = content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("charset")
+            .then(|| value.trim().trim_matches('"'))
+    });
+    let encoding = match charset {
+        Some(label) => encoding_rs::Encoding::for_label(label.as_bytes())?,
+        None if std::str::from_utf8(data).is_ok() => encoding_rs::UTF_8,
+        None => encoding_rs::WINDOWS_1252,
+    };
+    Some(encoding.decode(data).0.into_owned())
+}
+
 /// The attachment as lines of text, if it is text (and not too large).
 fn shown_as_text(attachment: &Attachment, data: &[u8]) -> Option<Vec<String>> {
     let content_type = attachment.content_type.to_ascii_lowercase();
@@ -411,7 +429,7 @@ fn shown_as_text(attachment: &Attachment, data: &[u8]) -> Option<Vec<String>> {
     if !textual || data.len() > MAX_TEXT {
         return None;
     }
-    let content = String::from_utf8_lossy(data).into_owned();
+    let content = decode(&content_type, data)?;
     let kind = if content_type.starts_with("text/html") {
         mett_core::BodyKind::Html
     } else {
@@ -453,6 +471,23 @@ fn expand_home(path: &str, home: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn text_is_decoded_in_its_charset() {
+        assert_eq!(
+            decode("text/plain; charset=windows-1252", b"caf\xe9").as_deref(),
+            Some("caf\u{e9}")
+        );
+        assert_eq!(
+            decode("text/plain; charset=\"UTF-8\"", "café".as_bytes()).as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            decode("text/plain", b"caf\xe9").as_deref(),
+            Some("caf\u{e9}")
+        );
+        assert_eq!(decode("text/plain; charset=x-unknown", b"x"), None);
+    }
     use chrono::DateTime;
     use mett_core::{AttachmentId, MessagePage, WellKnownFolder, mock};
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
