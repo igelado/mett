@@ -11,6 +11,7 @@ mod app;
 mod config;
 mod demo;
 mod keymap;
+mod signin;
 mod text;
 mod view;
 mod worker;
@@ -25,6 +26,7 @@ use tokio::sync::mpsc;
 use crate::app::{App, Effect, Msg};
 use crate::config::mailbox::FolderPath;
 use crate::keymap::{Key, Keymap};
+use crate::signin::{CancelHandle, SignInEvent, TuiPrompter};
 use crate::worker::{Request, RequestId};
 
 const USAGE: &str = "usage: mett [-n] [-F <file>] [-D] [--demo]
@@ -127,23 +129,50 @@ fn main() -> ExitCode {
         let Some(runtime) = runtime() else {
             return ExitCode::FAILURE;
         };
-        // Sign in before the TUI takes over the terminal, so that the
-        // browser link or device code can be seen.
-        let mailbox = match runtime.block_on(account::connect(&config, &spoolfile)) {
+        // Signing in happens in the TUI, in the sign-in window, when the
+        // folder is first opened.
+        let (events, sign_in) = mpsc::unbounded_channel();
+        let (prompter, cancel) = TuiPrompter::new(spoolfile.account.clone(), events);
+        let mailbox = match account::mailbox(&config, &spoolfile, prompter) {
             Ok(mailbox) => mailbox,
             Err(e) => {
                 eprintln!("mett: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        return start(&runtime, Arc::new(mailbox), spoolfile.folder, page_size);
+        let session = Session {
+            folder: spoolfile.folder,
+            page_size,
+            sign_in,
+            cancel: Some(cancel),
+        };
+        return start(&runtime, Arc::new(mailbox), session);
     }
 
     let Some(runtime) = runtime() else {
         return ExitCode::FAILURE;
     };
-    let inbox = FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new());
-    start(&runtime, Arc::new(demo::mailbox()), inbox, app::PAGE_SIZE)
+    // The demo mailbox never signs in, so nothing is ever sent here.
+    let (_, sign_in) = mpsc::unbounded_channel();
+    let session = Session {
+        folder: FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new()),
+        page_size: app::PAGE_SIZE,
+        sign_in,
+        cancel: None,
+    };
+    start(&runtime, Arc::new(demo::mailbox()), session)
+}
+
+/// What the TUI works with, besides the mailbox.
+struct Session {
+    /// The folder to open.
+    folder: FolderPath,
+    /// How many messages to list per request.
+    page_size: u32,
+    /// Events from the mailbox's sign-in.
+    sign_in: mpsc::UnboundedReceiver<SignInEvent>,
+    /// Cancels the sign-in in progress, for mailboxes that sign in.
+    cancel: Option<CancelHandle>,
 }
 
 fn runtime() -> Option<tokio::runtime::Runtime> {
@@ -156,16 +185,15 @@ fn runtime() -> Option<tokio::runtime::Runtime> {
     }
 }
 
-/// Runs the TUI on `store`, opening `folder`.
+/// Runs the TUI on `store`.
 fn start<S: mett_core::MailStore + 'static>(
     runtime: &tokio::runtime::Runtime,
     store: Arc<S>,
-    folder: FolderPath,
-    page_size: u32,
+    session: Session,
 ) -> ExitCode {
     // `init` also restores the terminal if mett panics.
     let terminal = ratatui::init();
-    let result = runtime.block_on(run(terminal, store, folder, page_size));
+    let result = runtime.block_on(run(terminal, store, session));
     ratatui::restore();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -179,9 +207,14 @@ fn start<S: mett_core::MailStore + 'static>(
 async fn run<S: mett_core::MailStore + 'static>(
     mut terminal: DefaultTerminal,
     store: Arc<S>,
-    folder: FolderPath,
-    page_size: u32,
+    session: Session,
 ) -> std::io::Result<()> {
+    let Session {
+        folder,
+        page_size,
+        sign_in: mut sign_in_rx,
+        cancel,
+    } = session;
     let keymap = Keymap::mutt_defaults();
 
     let (request_tx, request_rx) = mpsc::unbounded_channel::<(RequestId, Request)>();
@@ -203,10 +236,10 @@ async fn run<S: mett_core::MailStore + 'static>(
 
     let size = terminal.size()?;
     let (mut app, effects) = App::open(size.width, size.height, folder, page_size);
-    dispatch(&request_tx, effects);
+    dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
 
     while !app.quit {
-        terminal.draw(|frame| view::render(&app, &keymap, frame))?;
+        draw(&mut terminal, &app, &keymap)?;
         let msg = tokio::select! {
             // Without input mett can't be used or quit, so a terminal read
             // error ends it (and the terminal is restored).
@@ -229,6 +262,7 @@ async fn run<S: mett_core::MailStore + 'static>(
                 },
             },
             Some(response) = response_rx.recv() => Msg::Response(response),
+            Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
             else => break,
         };
         if matches!(msg, Msg::Action(_)) {
@@ -236,28 +270,85 @@ async fn run<S: mett_core::MailStore + 'static>(
             app.status.clear();
         }
         let effects = app.update(msg);
-        dispatch(&request_tx, effects);
+        dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
     }
 
     // Give pending changes (such as marking a message read) a moment to
     // reach the mailbox, rather than cancelling them by exiting.
     // The outcome is reported after the terminal is restored, so a change
     // that couldn't be saved isn't lost silently.
-    if app.saving() {
+    // A save's sign-in failure may still be queued, behind its response
+    // and the key that quit: take it in, so its window can offer a retry.
+    while let Ok(event) = sign_in_rx.try_recv() {
+        // A sign-in that nothing left to save needs: the user has quit, so
+        // don't send them to the browser.
+        if matches!(event, SignInEvent::Prompt { .. }) && !app.saving() {
+            if let Some(cancel) = &cancel {
+                cancel.cancel();
+            }
+            continue;
+        }
+        let effects = app.update(Msg::SignIn(event));
+        dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+    }
+    let unsaved = !app.save_failures().is_empty();
+    if app.saving() || (unsaved && app.sign_in.is_some()) {
         app.status = "Saving changes...".into();
-        terminal.draw(|frame| view::render(&app, &keymap, frame))?;
-        let deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
-        while app.saving() {
-            match tokio::time::timeout_at(deadline, response_rx.recv()).await {
-                // Only save results matter now. Anything else (say, a late
-                // message fetch) could start new work that would never be
-                // sent.
-                Ok(Some(response)) => {
-                    if matches!(response.event, worker::Event::FlagsUpdated(_)) {
-                        app.update(Msg::Response(response));
+        let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
+        loop {
+            // A failed save's sign-in failure is sent before the save's own
+            // response; take it in first, so the window opens and the
+            // save can be retried even after nothing is left pending.
+            while let Ok(event) = sign_in_rx.try_recv() {
+                let effects = app.update(Msg::SignIn(event));
+                dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+            }
+            // A sign-in window keeps mett here only while a change is
+            // still unsaved, so the user can sign in or retry it; other
+            // sign-ins don't matter any more.
+            let unsaved = !app.save_failures().is_empty();
+            let waiting = app.saving() || (unsaved && app.sign_in.is_some());
+            if !waiting {
+                break;
+            }
+            draw(&mut terminal, &app, &keymap)?;
+            let msg = tokio::select! {
+                // Saving may need the user to sign in: the sign-in window
+                // still works, and only it takes keys.
+                event = input_rx.recv() => match event.transpose()? {
+                    None => break,
+                    Some(TermEvent::Key(key))
+                        if key.kind != KeyEventKind::Release && app.sign_in.is_some() =>
+                    {
+                        match keymap.lookup(app.menu(), Key::from(key)) {
+                            Some(action) => Msg::Action(action),
+                            None => continue,
+                        }
                     }
-                }
-                Ok(None) | Err(_) => break,
+                    Some(TermEvent::Resize(width, height)) => Msg::Resize { width, height },
+                    Some(_) => continue,
+                },
+                response = response_rx.recv() => match response {
+                    // Only save results matter now. Anything else (say, a
+                    // late message fetch) could start new work that would
+                    // never be sent.
+                    Some(response) if matches!(response.event, worker::Event::FlagsUpdated(_)) => {
+                        Msg::Response(response)
+                    }
+                    Some(_) => continue,
+                    None => break,
+                },
+                Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
+                // The user may take a while to sign in; the wait only
+                // counts while they don't have to.
+                () = tokio::time::sleep_until(deadline), if app.sign_in.is_none() => break,
+            };
+            let window_was_open = app.sign_in.is_some();
+            let effects = app.update(msg);
+            dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+            // The wait starts again once the user is done signing in.
+            if window_was_open || app.sign_in.is_some() {
+                deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
             }
         }
         if app.saving() {
@@ -276,12 +367,75 @@ async fn run<S: mett_core::MailStore + 'static>(
     Ok(())
 }
 
+/// Draws the screen, then prints the view's overlay, if any, as plain text
+/// that the terminal wraps by itself.
+fn draw(terminal: &mut DefaultTerminal, app: &App, keymap: &Keymap) -> std::io::Result<()> {
+    use std::io::Write;
+
+    use ratatui::crossterm::{cursor, queue, style};
+
+    let mut overlay = None;
+    terminal.draw(|frame| overlay = view::render(app, keymap, frame))?;
+    if let Some(overlay) = overlay {
+        // The cells already hold the same text, so ratatui's next draw,
+        // which compares against what it drew, leaves this alone.
+        let mut out = std::io::stdout();
+        queue!(
+            out,
+            cursor::MoveTo(overlay.x, overlay.y),
+            style::Print(&overlay.text)
+        )?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// Puts `text` on the clipboard with the OSC 52 escape sequence, which
+/// many terminals (and tmux, with `set-clipboard on`) support.
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    use base64::Engine;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()
+}
+
 /// How long to wait for pending changes when quitting.
 const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn dispatch(requests: &mpsc::UnboundedSender<(RequestId, Request)>, effects: Vec<Effect>) {
-    for Effect::Request(id, request) in effects {
-        // The worker only stops when this sender is dropped.
-        let _ = requests.send((id, request));
+/// Carries out `effects`.
+fn dispatch(
+    app: &mut App,
+    requests: &mpsc::UnboundedSender<(RequestId, Request)>,
+    cancel: Option<&CancelHandle>,
+    effects: Vec<Effect>,
+) {
+    for effect in effects {
+        match effect {
+            Effect::Request(id, request) => {
+                // The worker only stops when this sender is dropped.
+                let _ = requests.send((id, request));
+            }
+            // The browser's output would garble the screen; `open` sends
+            // it nowhere.
+            Effect::OpenUrl(url) => {
+                if let Err(e) = open::that_detached(&url) {
+                    app.status = format!("Could not open a browser: {e}");
+                }
+            }
+            Effect::CancelSignIn => {
+                if let Some(cancel) = cancel {
+                    cancel.cancel();
+                }
+            }
+            Effect::Copy(text) => {
+                if let Err(e) = copy_to_clipboard(&text) {
+                    app.status = format!("Could not copy: {e}");
+                }
+            }
+        }
     }
 }

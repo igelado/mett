@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use mett_core::{AccountId, Authenticator, Error};
 use mett_msgraph::{
-    AuthFlow, AuthSettings, GraphAuthenticator, MemoryStore, SignInPrompt, TokenStore,
+    AuthFlow, AuthSettings, Cancelled, GraphAuthenticator, MemoryStore, Prompter, SignInPrompt,
+    TokenStore,
 };
 use serde_json::json;
 use url::Url;
@@ -1014,4 +1015,349 @@ async fn a_rejected_token_is_refreshed_on_the_next_call() {
     assert_eq!(first.secret(), "a1");
     auth.token_rejected(&first).await;
     assert_eq!(auth.access_token().await.unwrap().secret(), "a2");
+}
+
+/// A prompter that records what it was told, and cancels the sign-in as
+/// soon as it shows a prompt.
+#[derive(Clone, Default)]
+struct Recorder(Arc<Recorded>);
+
+#[derive(Default)]
+struct Recorded {
+    prompts: Mutex<Vec<SignInPrompt>>,
+    outcomes: Mutex<Vec<Result<(), String>>>,
+    cancel: tokio::sync::Notify,
+}
+
+impl Prompter for Recorder {
+    fn prompt(&self, prompt: SignInPrompt) {
+        self.0.prompts.lock().unwrap().push(prompt);
+        self.0.cancel.notify_one();
+    }
+
+    fn finished(&self, outcome: Result<(), &Error>) {
+        self.0
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(outcome.map_err(ToString::to_string));
+    }
+
+    fn cancelled(&self) -> Cancelled<'_> {
+        Box::pin(self.0.cancel.notified())
+    }
+}
+
+#[tokio::test]
+async fn the_user_can_cancel_an_interactive_sign_in() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    // The user never enters the code.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending"))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let recorder = Recorder::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        recorder.clone(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), auth.access_token())
+        .await
+        .expect("cancelling ends the sign-in");
+    assert!(matches!(result, Err(Error::Auth(m)) if m.contains("cancelled")));
+    assert_eq!(recorder.0.prompts.lock().unwrap().len(), 1);
+    assert_eq!(
+        *recorder.0.outcomes.lock().unwrap(),
+        [Err("authentication failed: sign-in cancelled".to_owned())]
+    );
+    assert_eq!(stored(&store), None);
+}
+
+/// Records outcomes without ever cancelling.
+#[derive(Clone, Default)]
+struct Outcomes(Arc<Mutex<Vec<bool>>>);
+
+impl Prompter for Outcomes {
+    fn prompt(&self, _: SignInPrompt) {}
+
+    fn finished(&self, outcome: Result<(), &Error>) {
+        self.0.lock().unwrap().push(outcome.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn tells_the_prompter_when_a_sign_in_ends() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    me(&server, "a1", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    let outcomes = Outcomes::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        outcomes.clone(),
+    );
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
+    // A cached token needs no sign-in, so nothing more is reported.
+    auth.access_token().await.unwrap();
+    assert_eq!(*outcomes.0.lock().unwrap(), [true]);
+}
+
+/// A prompter that the test cancels by hand.
+#[derive(Clone, Default)]
+struct Cancellable(Arc<tokio::sync::Notify>);
+
+impl Prompter for Cancellable {
+    fn prompt(&self, _: SignInPrompt) {}
+
+    fn cancelled(&self) -> Cancelled<'_> {
+        Box::pin(self.0.notified())
+    }
+}
+
+#[tokio::test]
+async fn cancelling_while_confirming_the_user_keeps_nothing() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    // Confirming the user takes a while.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "userPrincipalName": "alice@contoso.com" }))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let prompter = Cancellable::default();
+    let auth = Arc::new(GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        prompter.clone(),
+    ));
+    let pending = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.access_token().await }
+    });
+    // Wait until the user is being confirmed, then cancel.
+    while !server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path() == "/v1.0/me")
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    prompter.0.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("cancelling ends the sign-in at once")
+        .unwrap();
+    assert!(matches!(result, Err(Error::Auth(m)) if m.contains("cancelled")));
+    assert_eq!(stored(&store), None);
+}
+
+#[tokio::test]
+async fn requests_waiting_on_a_cancelled_sign_in_do_not_prompt_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending"))
+        .mount(&server)
+        .await;
+
+    let recorder = Recorder::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        recorder.clone(),
+    );
+    // Two requests need a token at once; the user cancels the sign-in.
+    let (first, second) = tokio::join!(auth.access_token(), auth.access_token());
+    for result in [first, second] {
+        assert!(matches!(result, Err(Error::Auth(m)) if m.contains("cancelled")));
+    }
+    assert_eq!(recorder.0.prompts.lock().unwrap().len(), 1);
+
+    // A later request, such as the user retrying, signs in again.
+    assert!(auth.access_token().await.is_err());
+    assert_eq!(recorder.0.prompts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn reports_a_sign_in_confirmed_later_as_finished() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    // Graph can't confirm the user at first, nor when retrying.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    me(&server, "a1", "alice@contoso.com").await;
+
+    let outcomes = Outcomes::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        outcomes.clone(),
+    );
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
+    assert_eq!(*outcomes.0.lock().unwrap(), [false, false, true]);
+}
+
+/// Cancels each sign-in when prompted, and reports each ending on a
+/// channel.
+#[derive(Clone)]
+struct Ending {
+    prompts: Arc<Mutex<usize>>,
+    cancel: Arc<tokio::sync::Notify>,
+    ended: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl Prompter for Ending {
+    fn prompt(&self, _: SignInPrompt) {
+        *self.prompts.lock().unwrap() += 1;
+        self.cancel.notify_one();
+    }
+
+    fn finished(&self, _: Result<(), &Error>) {
+        let _ = self.ended.send(());
+        // Give the test's retry time to start while this call finishes.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fn cancelled(&self) -> Cancelled<'_> {
+        Box::pin(self.cancel.notified())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_as_soon_as_a_sign_in_ends_signs_in_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending"))
+        .mount(&server)
+        .await;
+    let (ended, mut endings) = tokio::sync::mpsc::unbounded_channel();
+    let prompter = Ending {
+        prompts: Arc::default(),
+        cancel: Arc::default(),
+        ended,
+    };
+    let auth = Arc::new(GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        prompter.clone(),
+    ));
+    let first = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.access_token().await }
+    });
+    // The user retries the moment the failure is reported, while the first
+    // call may still be finishing.
+    endings.recv().await.unwrap();
+    let retry = auth.access_token().await;
+    assert!(first.await.unwrap().is_err());
+    assert!(retry.is_err());
+    assert_eq!(
+        *prompter.prompts.lock().unwrap(),
+        2,
+        "the retry asked again"
+    );
+}
+
+#[tokio::test]
+async fn requests_waiting_on_an_unconfirmed_sign_in_share_its_failure() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    // Graph can't confirm the user the first time only.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    me(&server, "a1", "alice@contoso.com").await;
+
+    let outcomes = Outcomes::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        outcomes.clone(),
+    );
+    // Both arrive together: the second shares the first one's failure
+    // instead of confirming the tokens behind the user's back.
+    let (first, second) = tokio::join!(auth.access_token(), auth.access_token());
+    assert!(matches!(first, Err(Error::Network(_))));
+    assert!(matches!(second, Err(Error::Network(_))));
+    assert_eq!(*outcomes.0.lock().unwrap(), [false]);
+    // A later request (the user retrying) confirms them.
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
+    assert_eq!(*outcomes.0.lock().unwrap(), [false, true]);
+}
+
+#[tokio::test]
+async fn concurrent_retries_share_a_failed_confirmation() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    // Graph can't confirm the user twice: at sign-in, and at the retry.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    me(&server, "a1", "alice@contoso.com").await;
+
+    let outcomes = Outcomes::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        outcomes.clone(),
+    );
+    assert!(auth.access_token().await.is_err());
+    // The user retries: several requests at once. The first re-check
+    // fails, and the others share that instead of checking again.
+    let (a, b) = tokio::join!(auth.access_token(), auth.access_token());
+    assert!(a.is_err() && b.is_err());
+    assert_eq!(*outcomes.0.lock().unwrap(), [false, false]);
 }

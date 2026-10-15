@@ -1,5 +1,8 @@
 //! How interactive sign-in talks to the user.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use url::Url;
 
 /// What the user has to do to finish signing in.
@@ -23,13 +26,30 @@ pub enum SignInPrompt {
     },
 }
 
+/// A future that resolves when the user cancels a sign-in.
+pub type Cancelled<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// Shows sign-in prompts to the user.
 ///
-/// The TUI implements this by showing the prompt on screen; a closure
-/// `Fn(SignInPrompt)` works too.
+/// The TUI implements this with a sign-in window; a closure
+/// `Fn(SignInPrompt)` works too, and can't be cancelled.
 pub trait Prompter: Send + Sync {
     /// Shows `prompt`. Must not block: sign-in continues in the background.
     fn prompt(&self, prompt: SignInPrompt);
+
+    /// Called when an interactive sign-in ends, with its outcome, so that
+    /// the prompt can be taken down. A sign-in can fail before any prompt
+    /// was shown, for example if the identity platform rejects the app.
+    fn finished(&self, outcome: Result<(), &mett_core::Error>) {
+        let _ = outcome;
+    }
+
+    /// Resolves when the user cancels the interactive sign-in in progress.
+    /// It is created when that sign-in starts, so cancelling an earlier
+    /// sign-in must not resolve it. The default never resolves.
+    fn cancelled(&self) -> Cancelled<'_> {
+        Box::pin(std::future::pending())
+    }
 }
 
 impl<F> Prompter for F

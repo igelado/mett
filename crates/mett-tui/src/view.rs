@@ -7,13 +7,13 @@
 use chrono::Local;
 use mett_core::{Address, MessageSummary};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::action::Action;
-use crate::app::{App, Pager, Screen};
+use crate::app::{App, Pager, Row, Screen, SignIn};
 use crate::keymap::{Keymap, Menu};
 use crate::text::{fit, truncate, wrap_all};
 
@@ -38,12 +38,34 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
             (Action::PreviousEntry, "Prev"),
         ],
     ),
+    (
+        Menu::SignIn,
+        &[
+            (Action::Exit, "Close"),
+            (Action::OpenBrowser, "Browser"),
+            (Action::CopyLink, "Copy"),
+            (Action::Retry, "Retry"),
+        ],
+    ),
 ];
 
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
-/// Draws the whole screen.
-pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) {
+/// Text to print over the drawn screen, starting at a cell, and left for
+/// the terminal to wrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    /// The column.
+    pub x: u16,
+    /// The row.
+    pub y: u16,
+    /// The text.
+    pub text: String,
+}
+
+/// Draws the whole screen, and returns text that the main loop should print
+/// over it, if any.
+pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> {
     let [help, body, status, message] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -53,7 +75,7 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) {
     .areas(frame.area());
 
     frame.render_widget(
-        Paragraph::new(help_line(keymap, app.menu())).style(REVERSED),
+        Paragraph::new(help_line(app, keymap, app.menu())).style(REVERSED),
         help,
     );
     let status_line = match app.screen() {
@@ -65,16 +87,115 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) {
     };
     frame.render_widget(Paragraph::new(status_line).style(REVERSED), status);
     frame.render_widget(Paragraph::new(app.status.as_str()), message);
+    // The window may cover everything but the help line, which lists its
+    // keys: on a small terminal, the sign-in instructions matter more than
+    // the index behind them.
+    if let Some(window) = &app.sign_in {
+        let [_, below_help] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+        return render_sign_in(window, keymap, frame, below_help);
+    }
+    None
+}
+
+/// Draws the sign-in window across the middle of `area`. It spans the
+/// whole width, without side borders, so that the sign-in link can be
+/// copied from the terminal without stray characters.
+fn render_sign_in(
+    window: &SignIn,
+    keymap: &Keymap,
+    frame: &mut Frame,
+    area: Rect,
+) -> Option<Overlay> {
+    let rows = window.rows(usize::from(area.width));
+    let height = usize::from(area.height);
+    // Without room for everything, show what fits from the scroll
+    // position, and say how to scroll.
+    let fits = rows.len() + 2 <= height;
+    let top = if fits {
+        0
+    } else {
+        window
+            .scroll
+            .min(rows.len().saturating_sub(height.saturating_sub(2)))
+    };
+    let shown = rows.len().saturating_sub(top).min(height.saturating_sub(2));
+    let link_rows: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].1 == Row::Link)
+        .collect();
+    let link: String = link_rows.iter().map(|&i| rows[i].0.as_str()).collect();
+    let visible: Vec<Line> = rows
+        .into_iter()
+        .skip(top)
+        .map(|(row, kind)| {
+            let style = if kind == Row::Code {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            Line::styled(row, style)
+        })
+        .collect();
+    let mut title = format!(" Sign in to {} ", window.account);
+    if !fits {
+        let key = |action| keymap.key_for(Menu::SignIn, action);
+        if let (Some(down), Some(up)) = (key(Action::NextLine), key(Action::PreviousLine)) {
+            title.push_str(&format!("({down}/{up} to scroll) "));
+        }
+    }
+    let height = u16::try_from(visible.len() + 2).unwrap_or(u16::MAX);
+    let [popup] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(visible).block(
+            Block::new()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .title(title),
+        ),
+        popup,
+    );
+    // The link, if it is all on screen, for the main loop to print again
+    // as one line that the terminal wraps: then copying it from the screen
+    // gives the link without line breaks.
+    let (&first, &last) = (link_rows.first()?, link_rows.last()?);
+    if first < top || last >= top + shown {
+        return None;
+    }
+    Some(Overlay {
+        x: popup.x,
+        y: popup.y + 1 + u16::try_from(first - top).ok()?,
+        text: link,
+    })
+}
+
+/// Whether `action` does anything now, so that the help line only offers
+/// what works: the sign-in window can't retry before a sign-in failed, nor
+/// open or copy a link it hasn't got.
+fn available(app: &App, action: Action) -> bool {
+    let Some(window) = &app.sign_in else {
+        return true;
+    };
+    match action {
+        Action::Retry => window.failure.is_some(),
+        // After a failure, the link or code is spent: only Retry helps.
+        Action::OpenBrowser | Action::CopyLink => {
+            window.prompt.is_some() && window.failure.is_none()
+        }
+        _ => true,
+    }
 }
 
 /// `q:Quit  j:Next  …`, from the current key bindings.
-fn help_line(keymap: &Keymap, menu: Menu) -> String {
+fn help_line(app: &App, keymap: &Keymap, menu: Menu) -> String {
     let entries = HELP
         .iter()
         .find(|(m, _)| *m == menu)
         .map_or(&[][..], |(_, entries)| entries);
     entries
         .iter()
+        .filter(|(action, _)| available(app, *action))
         .filter_map(|(action, label)| {
             keymap
                 .key_for(menu, *action)
@@ -204,6 +325,7 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use mett_core::mock;
     use mett_core::{MessagePage, WellKnownFolder};
+    use mett_msgraph::SignInPrompt;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use unicode_width::UnicodeWidthStr;
@@ -230,7 +352,9 @@ mod tests {
 
     fn app(n: i64) -> App {
         let (mut app, effects) = App::new(WIDTH, HEIGHT);
-        let Effect::Request(open, _) = effects[0].clone();
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open,
             event: Event::FolderOpened(Ok(mock::folder(
@@ -239,7 +363,9 @@ mod tests {
                 Some(WellKnownFolder::Inbox),
             ))),
         }));
-        let Effect::Request(list, _) = effects[0].clone();
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let messages = (0..n)
             .map(|i| {
                 let mut m =
@@ -260,16 +386,22 @@ mod tests {
     }
 
     fn screen(app: &App) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        sized_screen(app, WIDTH, HEIGHT)
+    }
+
+    fn sized_screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render(app, &Keymap::mutt_defaults(), frame))
+            .draw(|frame| {
+                render(app, &Keymap::mutt_defaults(), frame);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        (0..HEIGHT)
+        (0..height)
             .map(|y| {
                 let mut line = String::new();
                 let mut x = 0;
-                while x < WIDTH {
+                while x < width {
                     let symbol = buffer[(x, y)].symbol();
                     line.push_str(symbol);
                     // A wide character also covers the next cell.
@@ -324,7 +456,9 @@ mod tests {
     fn draws_the_pager_with_headers_and_body() {
         let mut app = app(1);
         let effects = app.update(Msg::Action(Action::DisplayMessage));
-        let Effect::Request(fetch, _) = effects[0].clone();
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         assert_eq!(screen(&app)[1], "Loading message...");
 
         let mut message = mock::message("m0", "in", "Subject 0", received(0));
@@ -342,5 +476,88 @@ mod tests {
         assert_eq!(lines[5], "Body of Subject 0");
         // Shown, so now read.
         assert_eq!(lines[6], "---- 1/1: Alice Example  Subject 0   -- (all)");
+    }
+
+    #[test]
+    fn draws_the_sign_in_window_over_the_index() {
+        let mut app = app(2);
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::EnterCode {
+                verification_uri: "https://microsoft.com/devicelogin".into(),
+                user_code: "ABCD-EFGH".into(),
+                message: String::new(),
+            },
+        }));
+        let lines = sized_screen(&app, 60, 12);
+        assert_eq!(lines[0], "q:Close  o:Browser  c:Copy");
+        let window = lines.join("\n");
+        assert!(
+            window.contains("Sign in to alice@contoso.com"),
+            "{lines:#?}"
+        );
+        assert!(window.contains("    ABCD-EFGH"), "{lines:#?}");
+        assert!(
+            window.contains("Waiting for you to sign in..."),
+            "{lines:#?}"
+        );
+
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            outcome: Err("denied".into()),
+        }));
+        let lines = sized_screen(&app, 60, 12);
+        assert_eq!(lines[0], "q:Close  <Enter>:Retry");
+        let window = lines.join("\n");
+        assert!(window.contains("Sign-in failed: denied"), "{window}");
+    }
+
+    #[test]
+    fn a_long_sign_in_link_can_be_scrolled_into_view() {
+        let mut app = app(1);
+        let url = format!("https://login.example/authorize?{}end", "x".repeat(400));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        let lines = screen(&app);
+        assert!(lines[1].contains("j/k to scroll"), "{lines:#?}");
+        for _ in 0..20 {
+            app.update(Msg::Action(Action::NextLine));
+        }
+        let shown = screen(&app).join("\n");
+        assert!(shown.contains("end"), "{shown}");
+        assert!(shown.contains("Waiting for you to sign in..."), "{shown}");
+    }
+
+    #[test]
+    fn the_sign_in_link_is_handed_over_whole() {
+        let mut app = app(1);
+        let url = format!("https://login.example/authorize?{}end", "x".repeat(80));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 16)).unwrap();
+        let mut overlay = None;
+        terminal
+            .draw(|frame| overlay = render(&app, &Keymap::mutt_defaults(), frame))
+            .unwrap();
+        let link = overlay.take().expect("the link fits");
+        assert_eq!(link.text, url);
+        assert_eq!(link.x, 0);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, link.y)].symbol(), "h", "where the link starts");
+
+        // A link that doesn't fit isn't handed over.
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 5)).unwrap();
+        terminal
+            .draw(|frame| overlay = render(&app, &Keymap::mutt_defaults(), frame))
+            .unwrap();
+        assert!(overlay.is_none());
     }
 }

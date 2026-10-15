@@ -14,6 +14,8 @@ pub enum Menu {
     Index,
     /// The message pager.
     Pager,
+    /// The sign-in window (a mett addition).
+    SignIn,
 }
 
 /// A key press, normalised so that bindings compare reliably: Shift is
@@ -96,7 +98,7 @@ impl Keymap {
     /// mutt's default bindings for the actions mett implements.
     pub fn mutt_defaults() -> Self {
         use Action::*;
-        use KeyCode::{Backspace, Down, End, Enter, Home, Left, PageDown, PageUp, Right, Up};
+        use KeyCode::{Backspace, Down, End, Enter, Esc, Home, Left, PageDown, PageUp, Right, Up};
         let mut keymap = Self::default();
 
         let index: &[(Key, Action)] = &[
@@ -138,6 +140,21 @@ impl Keymap {
         ];
         for (key, action) in pager {
             keymap.bind(Menu::Pager, *key, *action);
+        }
+
+        let sign_in: &[(Key, Action)] = &[
+            (Key::char('q'), Exit),
+            (Key::new(Esc), Exit),
+            (Key::char('o'), OpenBrowser),
+            (Key::char('c'), CopyLink),
+            (Key::new(Enter), Retry),
+            (Key::char('j'), NextLine),
+            (Key::new(Down), NextLine),
+            (Key::char('k'), PreviousLine),
+            (Key::new(Up), PreviousLine),
+        ];
+        for (key, action) in sign_in {
+            keymap.bind(Menu::SignIn, *key, *action);
         }
 
         keymap

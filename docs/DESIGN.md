@@ -223,7 +223,10 @@ genuinely expected:
 - **Implementation:** in `mett-msgraph`, the sign-in flow is the `AuthFlow`
   setting, token storage is the `TokenStore` trait (`KeyringStore`,
   `FileStore`, and `MemoryStore` for tests), and the UI side of sign-in is
-  the `Prompter` trait.
+  the `Prompter` trait. The TUI's prompter forwards prompts to the main
+  loop, which shows them in a sign-in window over the current screen, both
+  at the first sign-in and when a token can no longer be refreshed. The
+  prompter is also told when a sign-in ends, and can cancel it.
 - **Pros:** each choice is configurable and testable in isolation.
 - **Cons:** needless indirection when only one implementation exists, so the
   pattern is not applied speculatively.

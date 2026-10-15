@@ -5,13 +5,15 @@
 //! to a [`Msg`]; side effects come back as [`Effect`]s for the main loop to
 //! carry out. This keeps the UI logic testable without a terminal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use mett_core::{Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
+use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
+use mett_msgraph::SignInPrompt;
 
 use crate::action::Action;
 use crate::config::mailbox::FolderPath;
 use crate::keymap::Menu;
+use crate::signin::SignInEvent;
 use crate::text;
 use crate::worker::{Event, Request, RequestId, Response};
 
@@ -39,6 +41,8 @@ pub enum Msg {
     Action(Action),
     /// The worker answered a request.
     Response(Response),
+    /// The authenticator needs the user, or finished signing in.
+    SignIn(SignInEvent),
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -53,6 +57,12 @@ pub enum Msg {
 pub enum Effect {
     /// Send `Request` to the worker.
     Request(RequestId, Request),
+    /// Open a URL in the user's browser.
+    OpenUrl(String),
+    /// Cancel the sign-in in progress.
+    CancelSignIn,
+    /// Put the text on the clipboard, through the terminal.
+    Copy(String),
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -96,6 +106,93 @@ impl Pager {
     }
 }
 
+/// The sign-in window, shown over the current screen while the user has
+/// to sign in, or after a sign-in failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignIn {
+    /// The account being signed in to.
+    pub account: AccountId,
+    /// What the user has to do, once known.
+    pub prompt: Option<SignInPrompt>,
+    /// Why the sign-in failed, once it has.
+    pub failure: Option<String>,
+    /// How far the window's text is scrolled, for terminals too small to
+    /// show it all.
+    pub scroll: usize,
+}
+
+/// What a row of the sign-in window shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    /// Text.
+    Text,
+    /// The device code, highlighted.
+    Code,
+    /// Part of the sign-in link.
+    Link,
+}
+
+impl SignIn {
+    /// The window's text wrapped to `width`, with what each row shows. The
+    /// keys are on the help line.
+    pub fn rows(&self, width: usize) -> Vec<(String, Row)> {
+        let mut lines: Vec<(String, Row)> = Vec::new();
+        // After a failure, the link or code is spent: don't offer it.
+        let prompt = self.prompt.as_ref().filter(|_| self.failure.is_none());
+        match prompt {
+            Some(SignInPrompt::OpenBrowser { url }) => {
+                lines.push((
+                    "Sign in in your browser. If it did not open, visit:".into(),
+                    Row::Text,
+                ));
+                lines.push((String::new(), Row::Text));
+                lines.push((url.to_string(), Row::Link));
+            }
+            Some(SignInPrompt::EnterCode {
+                verification_uri,
+                user_code,
+                ..
+            }) => {
+                lines.push((
+                    format!(
+                        "To sign in, visit {verification_uri} on any device and enter the code:"
+                    ),
+                    Row::Text,
+                ));
+                lines.push((String::new(), Row::Text));
+                lines.push((format!("    {user_code}"), Row::Code));
+            }
+            None => {}
+        }
+        if !lines.is_empty() {
+            lines.push((String::new(), Row::Text));
+        }
+        lines.push(match &self.failure {
+            Some(failure) => (format!("Sign-in failed: {failure}"), Row::Text),
+            None => ("Waiting for you to sign in...".into(), Row::Text),
+        });
+        lines
+            .into_iter()
+            .flat_map(|(line, kind)| {
+                text::wrap(&line, width)
+                    .into_iter()
+                    .map(move |row| (row, kind))
+            })
+            .collect()
+    }
+
+    /// What `c` copies: the sign-in link, or the device code.
+    fn copyable(&self) -> Option<String> {
+        if self.failure.is_some() {
+            return None;
+        }
+        match self.prompt.as_ref()? {
+            SignInPrompt::OpenBrowser { url } => Some(url.to_string()),
+            SignInPrompt::EnterCode { user_code, .. } => Some(user_code.clone()),
+        }
+    }
+}
+
 /// The whole UI state.
 #[derive(Debug)]
 pub struct App {
@@ -111,6 +208,19 @@ pub struct App {
     pub status: String,
     /// Set when the user quits.
     pub quit: bool,
+    /// The sign-in window, if it is open.
+    pub sign_in: Option<SignIn>,
+    /// The user cancelled the sign-in in progress: the outcome it still
+    /// reports isn't shown.
+    cancelled: bool,
+    /// The user closed a sign-in failure window: failures that arrive
+    /// late, from requests that were waiting on the same sign-in, aren't
+    /// shown either. Cleared by the next prompt or the user's next action.
+    dismissed: bool,
+    /// The folder to open, kept so that opening it can be retried.
+    path: FolderPath,
+    /// The request opening the folder, while it is pending.
+    opening: Option<RequestId>,
     /// Terminal width, in cells.
     pub width: usize,
     /// Rows available for the index or pager body.
@@ -131,6 +241,12 @@ pub struct App {
     pending: Option<Target>,
     /// Pending flag updates, so a failure can be undone in the index.
     flag_updates: HashMap<RequestId, MessageId>,
+    /// The message that last failed to open, so that opening it can be
+    /// retried.
+    unfetched: Option<MessageId>,
+    /// When the user asks to retry, the requests that had not reported
+    /// back yet; what failed among them is retried once they all have.
+    retry_after: HashSet<RequestId>,
     next_request: u64,
     /// How many messages to request per page.
     page_size: u32,
@@ -155,6 +271,11 @@ impl App {
             selected: 0,
             status: "Opening folder...".into(),
             quit: false,
+            sign_in: None,
+            cancelled: false,
+            dismissed: false,
+            path,
+            opening: None,
             width: usize::from(width),
             body_height: body_height(height),
             listing: None,
@@ -163,15 +284,28 @@ impl App {
             save_failures: HashMap::new(),
             pending: None,
             flag_updates: HashMap::new(),
+            unfetched: None,
+            retry_after: HashSet::new(),
             next_request: 0,
             page_size,
         };
-        let effect = app.request(Request::OpenFolder(path));
-        (app, vec![effect])
+        let effects = app.open_folder();
+        (app, effects)
+    }
+
+    /// Opens (or retries opening) the configured folder.
+    fn open_folder(&mut self) -> Vec<Effect> {
+        let effect = self.request(Request::OpenFolder(self.path.clone()));
+        self.opening = Some(effect_id(&effect));
+        self.status = "Opening folder...".into();
+        vec![effect]
     }
 
     /// The menu for the current screen, which selects the key bindings.
     pub fn menu(&self) -> Menu {
+        if self.sign_in.is_some() {
+            return Menu::SignIn;
+        }
         match self.screen() {
             Screen::Index => Menu::Index,
             Screen::Pager(_) => Menu::Pager,
@@ -190,10 +324,12 @@ impl App {
         match msg {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
+            Msg::SignIn(event) => self.on_sign_in(event),
             Msg::Resize { width, height } => {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);
                 self.clamp_scroll();
+                self.clamp_sign_in_scroll();
                 Vec::new()
             }
         }
@@ -205,12 +341,229 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Effect> {
-        // Any new action replaces a pending move.
-        self.pending = None;
+        // Any new action in a menu replaces a pending move; the sign-in
+        // window's keys don't move anywhere, so leave it.
+        if self.menu() != Menu::SignIn {
+            self.pending = None;
+            // What the user does next may need a sign-in that fails; show
+            // that.
+            self.dismissed = false;
+        }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
+            Menu::SignIn => self.on_sign_in_action(action),
         }
+    }
+
+    fn on_sign_in(&mut self, event: SignInEvent) -> Vec<Effect> {
+        match event {
+            SignInEvent::Prompt { account, prompt } => {
+                // Sign-ins happen one at a time, so a cancelled one has
+                // reported back before another prompts.
+                self.cancelled = false;
+                self.dismissed = false;
+                let effects = match &prompt {
+                    // The browser flow needs the browser: open it straight
+                    // away. The device code flow is for when there is none.
+                    SignInPrompt::OpenBrowser { url } => vec![Effect::OpenUrl(url.to_string())],
+                    SignInPrompt::EnterCode { .. } => Vec::new(),
+                };
+                self.sign_in = Some(SignIn {
+                    account,
+                    prompt: Some(prompt),
+                    failure: None,
+                    scroll: 0,
+                });
+                effects
+            }
+            SignInEvent::Finished {
+                outcome: Ok(()), ..
+            } => {
+                // Just close the window: the status line may already show
+                // how the request that needed the sign-in went. But a
+                // cancellation that came too late didn't happen.
+                self.sign_in = None;
+                if std::mem::take(&mut self.cancelled) && self.status == "Sign-in cancelled." {
+                    self.status.clear();
+                }
+                Vec::new()
+            }
+            SignInEvent::Finished {
+                outcome: Err(_), ..
+            } if self.cancelled || self.dismissed => {
+                self.cancelled = false;
+                self.sign_in = None;
+                Vec::new()
+            }
+            SignInEvent::Finished {
+                account,
+                outcome: Err(e),
+            } => {
+                // It can fail before showing a prompt.
+                let window = self.sign_in.get_or_insert(SignIn {
+                    account,
+                    prompt: None,
+                    failure: None,
+                    scroll: 0,
+                });
+                window.failure = Some(e);
+                // The failure replaces the prompt, which may have been
+                // scrolled further than the window is long now.
+                self.clamp_sign_in_scroll();
+                Vec::new()
+            }
+        }
+    }
+
+    fn on_sign_in_action(&mut self, action: Action) -> Vec<Effect> {
+        let Some(window) = &self.sign_in else {
+            return Vec::new();
+        };
+        let failed = window.failure.is_some();
+        match action {
+            Action::Exit if failed => {
+                self.sign_in = None;
+                self.dismissed = true;
+                // The user gave up: don't let a retry that was waiting
+                // start another sign-in.
+                self.retry_after.clear();
+            }
+            Action::Exit => {
+                self.sign_in = None;
+                self.cancelled = true;
+                // Don't let a retry that was waiting start another sign-in.
+                self.retry_after.clear();
+                self.status = "Sign-in cancelled.".into();
+                return vec![Effect::CancelSignIn];
+            }
+            Action::OpenBrowser if failed => {}
+            Action::OpenBrowser => {
+                let url = match &window.prompt {
+                    Some(SignInPrompt::OpenBrowser { url }) => url.to_string(),
+                    Some(SignInPrompt::EnterCode {
+                        verification_uri, ..
+                    }) => verification_uri.clone(),
+                    None => return Vec::new(),
+                };
+                return vec![Effect::OpenUrl(url)];
+            }
+            Action::CopyLink => {
+                let Some(text) = window.copyable() else {
+                    return Vec::new();
+                };
+                // The terminal may not allow it, and can't say whether it
+                // did.
+                self.status = "Copied to the clipboard, if your terminal allows it.".into();
+                return vec![Effect::Copy(text)];
+            }
+            Action::NextLine | Action::PreviousLine => {
+                self.clamp_sign_in_scroll();
+                if let Some(window) = &mut self.sign_in {
+                    window.scroll = if action == Action::NextLine {
+                        window.scroll + 1
+                    } else {
+                        window.scroll.saturating_sub(1)
+                    };
+                }
+                self.clamp_sign_in_scroll();
+            }
+            Action::Retry if failed => {
+                self.sign_in = None;
+                // Requests that needed the sign-in may not have reported
+                // back yet: retry them once they have. When quitting, only
+                // saving changes matters, and only their responses are
+                // still handled.
+                self.retry_after = if self.quit {
+                    self.flag_updates.keys().copied().collect()
+                } else {
+                    self.in_flight()
+                };
+                return self.retry();
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// The requests that [`Self::retry`] can repeat and that are still
+    /// waiting for their responses.
+    fn in_flight(&self) -> HashSet<RequestId> {
+        let fetching = match self.screen() {
+            Screen::Pager(Pager {
+                message: None,
+                request,
+                ..
+            }) => Some(*request),
+            _ => None,
+        };
+        self.opening
+            .into_iter()
+            .chain(self.listing)
+            .chain(fetching)
+            .chain(self.flag_updates.keys().copied())
+            .collect()
+    }
+
+    /// Retries once the last of the requests that were pending when the
+    /// user asked to retry has reported back.
+    fn retry_if_requested(&mut self, id: RequestId) -> Vec<Effect> {
+        if self.retry_after.remove(&id) && self.retry_after.is_empty() {
+            self.retry()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Keeps the sign-in window's scroll position within its text, which
+    /// a taller or wider terminal makes shorter.
+    fn clamp_sign_in_scroll(&mut self) {
+        // The window covers all but the help line, and has a border above
+        // and below its text.
+        let room = (self.body_height + CHROME_ROWS).saturating_sub(3);
+        let width = self.width;
+        if let Some(window) = &mut self.sign_in {
+            let last = window.rows(width).len().saturating_sub(room);
+            window.scroll = window.scroll.min(last);
+        }
+    }
+
+    /// Retries what failed for want of a sign-in: opening the folder,
+    /// listing the rest of it, opening the selected message and saving
+    /// changes.
+    fn retry(&mut self) -> Vec<Effect> {
+        if self.quit {
+            return self.retry_saves();
+        }
+        if self.folder.is_none() {
+            if self.opening.is_none() {
+                return self.open_folder();
+            }
+            return Vec::new();
+        }
+        let mut effects = self.retry_listing();
+        effects.extend(self.retry_saves());
+        // Open the message that failed to open, if it is still the one
+        // selected. (Opening another message forgets the failure.) The
+        // screen, not the menu: another sign-in window may be over it.
+        let failed = self.unfetched.take();
+        let selected = self.messages.get(self.selected).map(|s| &s.id);
+        if failed.is_some() && failed.as_ref() == selected && self.screen() == &Screen::Index {
+            effects.extend(self.open_selected());
+        }
+        effects
+    }
+
+    /// Saves again the changes that failed to save. Messages whose changes
+    /// failed are marked unread again; mark them read once more. (Their
+    /// failures are cleared once that succeeds.)
+    fn retry_saves(&mut self) -> Vec<Effect> {
+        let mut unsaved: Vec<MessageId> = self.save_failures.keys().cloned().collect();
+        unsaved.sort();
+        unsaved
+            .into_iter()
+            .flat_map(|message| self.mark_read(message))
+            .collect()
     }
 
     fn on_index_action(&mut self, action: Action) -> Vec<Effect> {
@@ -240,8 +593,21 @@ impl App {
                 }
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
+            // Opening the folder failed: try again.
+            Action::DisplayMessage if self.folder.is_none() => {
+                // Opening the folder failed: try again. (While it is still
+                // opening, there is nothing to display yet.)
+                if self.opening.is_none() {
+                    return self.open_folder();
+                }
+            }
             Action::DisplayMessage => return self.open_selected(),
-            Action::Exit | Action::NextLine | Action::PreviousLine => {}
+            Action::Exit
+            | Action::NextLine
+            | Action::PreviousLine
+            | Action::OpenBrowser
+            | Action::CopyLink
+            | Action::Retry => {}
         }
         Vec::new()
     }
@@ -277,7 +643,12 @@ impl App {
             Action::PreviousLine => self.scroll_by(-1),
             Action::NextPage => self.scroll_by(page as isize),
             Action::PreviousPage => self.scroll_by(-(page as isize)),
-            Action::FirstEntry | Action::LastEntry | Action::DisplayMessage => {}
+            Action::FirstEntry
+            | Action::LastEntry
+            | Action::DisplayMessage
+            | Action::OpenBrowser
+            | Action::CopyLink
+            | Action::Retry => {}
         }
         Vec::new()
     }
@@ -307,6 +678,7 @@ impl App {
             return Vec::new();
         };
         let id = summary.id.clone();
+        self.unfetched = None;
         let fetch = self.request(Request::FetchMessage(id.clone()));
         self.screens.push(Screen::Pager(Pager {
             id,
@@ -320,9 +692,18 @@ impl App {
         vec![fetch]
     }
 
-    fn on_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
+    fn on_response(&mut self, response: Response) -> Vec<Effect> {
+        let id = response.id;
+        let mut effects = self.handle_response(response);
+        effects.extend(self.retry_if_requested(id));
+        effects
+    }
+
+    fn handle_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
+            Event::FolderOpened(_) if self.opening != Some(id) => {}
             Event::FolderOpened(Ok(folder)) => {
+                self.opening = None;
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
                 return self.list(Page::first(self.page_size));
@@ -373,7 +754,10 @@ impl App {
                     }
                 }
             }
-            Event::FolderOpened(Err(e)) => self.report(e),
+            Event::FolderOpened(Err(e)) => {
+                self.opening = None;
+                self.report(e);
+            }
             Event::MessagesListed(_) => {}
         }
         Vec::new()
@@ -395,7 +779,9 @@ impl App {
         let message = match result {
             Ok(message) => message,
             Err(e) => {
+                let failed = pager.id.clone();
                 self.screens.pop();
+                self.unfetched = Some(failed);
                 self.report(e);
                 return Vec::new();
             }
@@ -405,9 +791,12 @@ impl App {
         pager.layout(self.width);
         let message_id = message.summary.id.clone();
         pager.message = Some(message);
+        // Now that it has been shown, mark it read, as mutt does.
+        self.mark_read(message_id)
+    }
 
-        // Now that it has been shown, mark it read (as mutt does), updating
-        // the index straight away.
+    /// Marks a message read, updating the index straight away.
+    fn mark_read(&mut self, message_id: MessageId) -> Vec<Effect> {
         let Some(summary) = self.messages.iter_mut().find(|s| s.id == message_id) else {
             return Vec::new();
         };
@@ -486,9 +875,10 @@ impl App {
             return Vec::new();
         }
         self.selected = selected;
-        match self.menu() {
-            Menu::Index => Vec::new(),
-            Menu::Pager => {
+        // The screen, not the menu: the sign-in window may be over it.
+        match self.screen() {
+            Screen::Index => Vec::new(),
+            Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()
             }
@@ -521,13 +911,21 @@ impl App {
     }
 
     fn report(&mut self, error: Error) {
+        // A request the user's cancelled sign-in held up: they know.
+        if matches!(&error, Error::Auth(m) if m == "sign-in cancelled") {
+            self.status = "Sign-in cancelled.".into();
+            return;
+        }
         self.status = error.to_string();
     }
 }
 
+/// The ID of a request effect.
 fn effect_id(effect: &Effect) -> RequestId {
-    let Effect::Request(id, _) = effect;
-    *id
+    match effect {
+        Effect::Request(id, _) => *id,
+        _ => unreachable!("not a request: {effect:?}"),
+    }
 }
 
 fn body_height(height: u16) -> usize {
@@ -617,13 +1015,17 @@ mod tests {
     #[test]
     fn keeps_listing_until_the_last_page() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open, _) = effects[0].clone();
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let folder = mock::folder("in", "Inbox", None);
         let effects = app.update(Msg::Response(Response {
             id: open,
             event: Event::FolderOpened(Ok(folder)),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -709,12 +1111,16 @@ mod tests {
     #[test]
     fn finishing_the_listing_keeps_an_error_reported_meanwhile() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -722,11 +1128,15 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
 
         // An error is reported while the second page is loading…
         let effects = open(&mut app, 1);
-        let Effect::Request(update, _) = effects[0].clone();
+        let Effect::Request(update, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: update,
             event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
@@ -745,12 +1155,16 @@ mod tests {
     #[test]
     fn a_failed_page_leaves_the_index_incomplete_until_retried() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -758,7 +1172,9 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: second,
             event: Event::MessagesListed(Err(Error::Network("offline".into()))),
@@ -788,12 +1204,16 @@ mod tests {
     #[test]
     fn the_pager_also_retries_a_failed_page() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -801,7 +1221,9 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: second,
             event: Event::MessagesListed(Err(Error::Network("offline".into()))),
@@ -862,12 +1284,16 @@ mod tests {
     /// still loading; returns the app and that request.
     fn loading_more(n: usize) -> (App, RequestId) {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -875,7 +1301,9 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         (app, second)
     }
 
@@ -955,7 +1383,9 @@ mod tests {
         assert!(!app.saving());
         let effects = open(&mut app, 1);
         assert!(app.saving());
-        let Effect::Request(update, _) = effects[0].clone();
+        let Effect::Request(update, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: update,
             event: Event::FlagsUpdated(Ok(())),
@@ -967,7 +1397,9 @@ mod tests {
     fn a_failed_flag_update_marks_the_message_unread_again() {
         let mut app = loaded(1);
         let effects = open(&mut app, 1);
-        let Effect::Request(update, _) = effects[0].clone();
+        let Effect::Request(update, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: update,
             event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
@@ -980,10 +1412,14 @@ mod tests {
     fn shows_the_fetched_message_and_ignores_stale_ones() {
         let mut app = loaded(2);
         let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         // Move on to the next message before the first one arrives.
         let effects = act(&mut app, Action::NextEntry);
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
 
         app.update(Msg::Response(Response {
             id: first,
@@ -1005,7 +1441,9 @@ mod tests {
     fn a_failed_fetch_returns_to_the_index_and_leaves_it_unread() {
         let mut app = loaded(1);
         let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone();
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: fetch,
             event: Event::MessageFetched(Err(Error::Network("offline".into()))),
@@ -1053,7 +1491,9 @@ mod tests {
             height: 8,
         });
         let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone();
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let mut message = message("m0", 0);
         message.body.content = "x".repeat(100);
         app.update(Msg::Response(Response {
@@ -1067,5 +1507,442 @@ mod tests {
             act(&mut app, Action::NextLine);
         }
         assert_eq!(pager(&app).scroll, rows - 5, "every row is reachable");
+    }
+
+    fn finished(outcome: Result<(), String>) -> SignInEvent {
+        SignInEvent::Finished {
+            account: AccountId::new("alice@contoso.com"),
+            outcome,
+        }
+    }
+
+    fn browser_prompt() -> SignInEvent {
+        SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: "https://login.example/authorize".parse().unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_sign_in_window_opens_the_browser_and_closes_once_signed_in() {
+        let (mut app, _) = App::new(80, 23);
+        let effects = app.update(Msg::SignIn(browser_prompt()));
+        assert_eq!(
+            effects,
+            [Effect::OpenUrl("https://login.example/authorize".into())]
+        );
+        assert_eq!(app.menu(), Menu::SignIn);
+        // o opens it again.
+        assert_eq!(
+            act(&mut app, Action::OpenBrowser),
+            [Effect::OpenUrl("https://login.example/authorize".into())]
+        );
+        assert_eq!(
+            act(&mut app, Action::CopyLink),
+            [Effect::Copy("https://login.example/authorize".into())]
+        );
+        app.update(Msg::SignIn(finished(Ok(()))));
+        assert_eq!(app.sign_in, None);
+        assert_eq!(app.menu(), Menu::Index);
+    }
+
+    #[test]
+    fn the_device_code_window_opens_the_page_only_when_asked() {
+        let (mut app, _) = App::new(80, 23);
+        let effects = app.update(Msg::SignIn(SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::EnterCode {
+                verification_uri: "https://microsoft.com/devicelogin".into(),
+                user_code: "ABCD".into(),
+                message: "Enter ABCD".into(),
+            },
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(
+            act(&mut app, Action::OpenBrowser),
+            [Effect::OpenUrl("https://microsoft.com/devicelogin".into())]
+        );
+    }
+
+    #[test]
+    fn cancelling_closes_the_window_without_reporting_a_failure() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        app.retry_after.insert(RequestId(1));
+        assert_eq!(act(&mut app, Action::Exit), [Effect::CancelSignIn]);
+        assert_eq!(app.sign_in, None);
+        assert!(app.retry_after.is_empty());
+        app.update(Msg::SignIn(finished(Err("sign-in cancelled".into()))));
+        assert_eq!(app.sign_in, None);
+        assert_eq!(app.status, "Sign-in cancelled.");
+        // The request it held up says the same, in the same words.
+        let opening = app.opening.unwrap();
+        app.update(Msg::Response(Response {
+            id: opening,
+            event: Event::FolderOpened(Err(Error::Auth("sign-in cancelled".into()))),
+        }));
+        assert_eq!(app.status, "Sign-in cancelled.");
+    }
+
+    #[test]
+    fn a_failed_sign_in_can_be_retried() {
+        let (mut app, effects) = App::new(80, 23);
+        let [Effect::Request(first, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
+        };
+        // The sign-in fails before any prompt, and so does the request.
+        app.update(Msg::SignIn(finished(Err("bad app".into()))));
+        app.update(Msg::Response(Response {
+            id: *first,
+            event: Event::FolderOpened(Err(Error::Auth("bad app".into()))),
+        }));
+        let window = app.sign_in.as_ref().expect("the failure is shown");
+        assert_eq!(window.failure.as_deref(), Some("bad app"));
+        assert_eq!(window.prompt, None);
+
+        // Retrying closes the window and opens the folder again.
+        let effects = act(&mut app, Action::Retry);
+        let [Effect::Request(second, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
+        };
+        assert_eq!(app.sign_in, None);
+        assert_eq!(app.status, "Opening folder...");
+        app.update(Msg::Response(Response {
+            id: *second,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        assert_eq!(app.folder.as_ref().unwrap().name, "Inbox");
+    }
+
+    #[test]
+    fn enter_in_an_empty_index_retries_opening_the_folder() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        // Pressing Enter while the folder is still opening does nothing.
+        assert!(act(&mut app, Action::DisplayMessage).is_empty());
+        assert_eq!(app.status, "Opening folder...");
+        app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::FolderOpened(Err(Error::Network("offline".into()))),
+        }));
+        assert!(matches!(
+            act(&mut app, Action::DisplayMessage).as_slice(),
+            [Effect::Request(_, Request::OpenFolder(_))]
+        ));
+    }
+
+    #[test]
+    fn retrying_after_a_sign_in_resends_what_failed() {
+        let mut app = loaded(2);
+        // Opening the first message works, but saving it as read fails…
+        let effects = open(&mut app, 1);
+        let [Effect::Request(update, Request::UpdateFlags(..))] = effects.as_slice() else {
+            panic!("expected a flag update, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: *update,
+            event: Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
+        }));
+        // …and opening the second one fails too.
+        act(&mut app, Action::Exit);
+        act(&mut app, Action::NextEntry);
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, Request::FetchMessage(_))] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("expired".into()))),
+        }));
+        assert_eq!(app.menu(), Menu::Index);
+        app.update(Msg::SignIn(finished(Err("expired".into()))));
+
+        let effects = act(&mut app, Action::Retry);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Request(_, Request::UpdateFlags(first, _)),
+                    Effect::Request(_, Request::FetchMessage(second)),
+                ] if first.as_str() == "m0" && second.as_str() == "m1"
+            ),
+            "{effects:?}"
+        );
+        assert_eq!(app.menu(), Menu::Pager);
+    }
+
+    #[test]
+    fn retry_waits_for_the_failed_request_to_report_back() {
+        let (mut app, effects) = App::new(80, 23);
+        let [Effect::Request(first, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
+        };
+        // The sign-in failure arrives before the request's own failure, and
+        // the user retries straight away.
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(act(&mut app, Action::Retry).is_empty());
+        let effects = app.update(Msg::Response(Response {
+            id: *first,
+            event: Event::FolderOpened(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::OpenFolder(_))]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_successful_sign_in_keeps_an_error_already_reported() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        app.update(Msg::SignIn(browser_prompt()));
+        app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::FolderOpened(Err(Error::not_found("folder", "x"))),
+        }));
+        app.update(Msg::SignIn(finished(Ok(()))));
+        assert_eq!(app.status, "folder not found: x");
+    }
+
+    #[test]
+    fn retry_waits_for_every_pending_request() {
+        let (mut app, list) = loading_more(1);
+        // Opening a message fails while the next page is still loading.
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, _)] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(act(&mut app, Action::Retry).is_empty());
+        let effects = app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            effects.is_empty(),
+            "still waiting for the page: {effects:?}"
+        );
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Request(_, Request::ListMessages { .. }),
+                    Effect::Request(_, Request::FetchMessage(_)),
+                ]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn retry_resends_failures_at_once_and_waits_for_the_rest() {
+        let (mut app, list) = loading_more(1);
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, _)] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        // The fetch has failed; the page hasn't reported back yet.
+        app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("denied".into()))),
+        }));
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        let effects = act(&mut app, Action::Retry);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::FetchMessage(_))]
+            ),
+            "{effects:?}"
+        );
+        // The retried fetch asks the user to sign in again meanwhile.
+        app.update(Msg::SignIn(browser_prompt()));
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::ListMessages { .. })]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn the_sign_in_window_keeps_a_pending_move() {
+        let (mut app, second) = loading_more(1);
+        act(&mut app, Action::NextEntry);
+        app.update(Msg::SignIn(browser_prompt()));
+        act(&mut app, Action::OpenBrowser);
+        app.update(Msg::SignIn(finished(Ok(()))));
+        let mut more = summaries(2);
+        more.remove(0);
+        deliver_last_page(&mut app, second, more);
+        assert_eq!(app.selected, 1, "moved on once the page arrived");
+    }
+
+    #[test]
+    fn closing_a_failed_sign_in_drops_waiting_retries() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        app.retry_after.insert(RequestId(1));
+        act(&mut app, Action::Exit);
+        assert!(app.retry_after.is_empty());
+    }
+
+    #[test]
+    fn a_closed_failure_window_stays_closed_until_the_user_acts() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(finished(Err("unavailable".into()))));
+        act(&mut app, Action::Exit);
+        // A late failure from a request that was already waiting.
+        app.update(Msg::SignIn(finished(Err("unavailable".into()))));
+        assert_eq!(app.sign_in, None);
+        // Once the user does something else, failures show again.
+        act(&mut app, Action::NextEntry);
+        app.update(Msg::SignIn(finished(Err("unavailable".into()))));
+        assert!(app.sign_in.is_some());
+    }
+
+    #[test]
+    fn a_cancelled_sign_in_stays_quiet_after_other_keys() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        act(&mut app, Action::Exit);
+        // A key before the cancellation is reported.
+        act(&mut app, Action::NextEntry);
+        app.update(Msg::SignIn(finished(Err("sign-in cancelled".into()))));
+        assert_eq!(app.sign_in, None);
+        // A later failure is shown.
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(app.sign_in.is_some());
+    }
+
+    #[test]
+    fn retrying_while_quitting_waits_only_for_saves() {
+        let (mut app, list) = loading_more(1);
+        let effects = open(&mut app, 1);
+        let [Effect::Request(update, _)] = effects.as_slice() else {
+            panic!("expected a flag update, got {effects:?}");
+        };
+        act(&mut app, Action::Exit);
+        act(&mut app, Action::Quit);
+        assert!(app.quit);
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        act(&mut app, Action::Retry);
+        assert!(!app.retry_after.contains(&list), "listing isn't waited for");
+        let effects = app.update(Msg::Response(Response {
+            id: *update,
+            event: Event::FlagsUpdated(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::UpdateFlags(..))]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_is_retried_under_a_new_sign_in_window() {
+        let mut app = loaded(1);
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, _)] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        act(&mut app, Action::Retry);
+        // Another sign-in starts before the fetch reports its failure.
+        app.update(Msg::SignIn(browser_prompt()));
+        let effects = app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::FetchMessage(_))]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_sign_in_offers_no_stale_link() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(act(&mut app, Action::OpenBrowser).is_empty());
+        assert!(act(&mut app, Action::CopyLink).is_empty());
+        let rows = app.sign_in.as_ref().unwrap().rows(80);
+        assert!(rows.iter().all(|(_, kind)| *kind != Row::Link), "{rows:?}");
+    }
+
+    #[test]
+    fn a_cancellation_too_late_is_forgotten() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        act(&mut app, Action::Exit);
+        assert_eq!(app.status, "Sign-in cancelled.");
+        app.update(Msg::SignIn(finished(Ok(()))));
+        assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn the_sign_in_window_scroll_follows_resizes() {
+        let (mut app, _) = App::new(40, 6);
+        let url = format!("https://login.example/authorize?{}", "x".repeat(400));
+        app.update(Msg::SignIn(SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        for _ in 0..30 {
+            act(&mut app, Action::NextLine);
+        }
+        let deep = app.sign_in.as_ref().unwrap().scroll;
+        assert!(deep > 0);
+        app.update(Msg::Resize {
+            width: 40,
+            height: 60,
+        });
+        assert_eq!(app.sign_in.as_ref().unwrap().scroll, 0, "it all fits now");
+    }
+
+    #[test]
+    fn a_failure_shows_in_a_scrolled_sign_in_window() {
+        let (mut app, _) = App::new(40, 6);
+        let url = format!("https://login.example/authorize?{}", "x".repeat(400));
+        app.update(Msg::SignIn(SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        for _ in 0..30 {
+            act(&mut app, Action::NextLine);
+        }
+        assert!(app.sign_in.as_ref().unwrap().scroll > 0);
+        app.update(Msg::SignIn(finished(Err("expired".into()))));
+        let window = app.sign_in.as_ref().unwrap();
+        let room = (app.body_height + CHROME_ROWS).saturating_sub(3);
+        assert!(window.scroll <= window.rows(app.width).len().saturating_sub(room));
     }
 }

@@ -1,6 +1,7 @@
 //! [`GraphAuthenticator`]: the [`Authenticator`] port for Microsoft Graph.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{AccessToken, Authenticator, Result};
@@ -26,6 +27,10 @@ pub struct GraphAuthenticator<S, P> {
     store: Arc<S>,
     prompter: P,
     state: Mutex<State>,
+    /// How many interactive sign-ins have ended. Read before waiting for
+    /// `state`, it tells whether a caller was already waiting when a
+    /// sign-in ended.
+    sign_ins: AtomicU64,
 }
 
 #[derive(Default)]
@@ -40,6 +45,9 @@ struct State {
     /// check succeeds, but keeping them avoids asking the user to sign in
     /// again.
     unconfirmed: Option<Unconfirmed>,
+    /// The last interactive sign-in, by its number (see
+    /// [`GraphAuthenticator::sign_ins`]), if it failed or was cancelled.
+    failed_sign_in: Option<(u64, mett_core::Error)>,
 }
 
 struct Unconfirmed {
@@ -93,6 +101,7 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
             store,
             prompter,
             state: Mutex::new(State::default()),
+            sign_ins: AtomicU64::new(0),
         }
     }
 
@@ -170,7 +179,20 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         tokens: Tokens,
         stored: Option<&str>,
     ) -> Result<AccessToken> {
-        match self.check_identity(&tokens).await {
+        let identity = self.check_identity(&tokens).await;
+        self.settle(state, tokens, stored, identity).await
+    }
+
+    /// Acts on the outcome of checking which user `tokens` belong to (see
+    /// [`Self::confirm`]).
+    async fn settle(
+        &self,
+        state: &mut State,
+        tokens: Tokens,
+        stored: Option<&str>,
+        identity: Identity,
+    ) -> Result<AccessToken> {
+        match identity {
             Identity::Confirmed => {
                 let token = self.keep(state, tokens).await?;
                 // The check may have outlasted a short-lived token. The
@@ -218,9 +240,40 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
+    /// Signs in interactively, unless the user cancels. The caller tells
+    /// the prompter how it ended.
+    ///
+    /// The user can cancel until the sign-in has been confirmed to be for
+    /// this account, which covers all the waiting. Neither step changes any
+    /// state, so cancelling leaves nothing behind. Keeping the confirmed
+    /// tokens is not interrupted, so that a cancellation can't leave them
+    /// half stored.
     async fn sign_in_and_confirm(&self, state: &mut State) -> Result<AccessToken> {
-        let tokens = self.sign_in().await?;
-        self.confirm(state, tokens, None).await
+        let checked = tokio::select! {
+            // A sign-in confirmed just as the user cancels is kept: it is
+            // done, and dropping it would only make them sign in again.
+            biased;
+            checked = async {
+                let tokens = self.sign_in().await?;
+                let identity = self.check_identity(&tokens).await;
+                Ok::<_, mett_core::Error>((tokens, identity))
+            } => Some(checked),
+            () = self.prompter.cancelled() => None,
+        };
+        match checked {
+            None => Err(mett_core::Error::Auth("sign-in cancelled".into())),
+            Some(Err(e)) => Err(e),
+            Some(Ok((tokens, identity))) => self.settle(state, tokens, None, identity).await,
+        }
+    }
+
+    /// Records that confirming an interactive sign-in failed again, as a
+    /// sign-in attempt of its own: requests that were waiting meanwhile
+    /// share its failure rather than trying once more each.
+    fn sign_in_failed(&self, state: &mut State, error: &mett_core::Error) {
+        let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
+        state.failed_sign_in = Some((number, error.clone()));
+        self.prompter.finished(Err(error));
     }
 
     /// Removes `token` from the store if it is still the stored one, and
@@ -274,6 +327,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
     }
 
     async fn access_token(&self) -> Result<AccessToken> {
+        let arrived = self.sign_ins.load(Ordering::SeqCst);
         let mut state = self.state.lock().await;
 
         let now = Utc::now();
@@ -289,12 +343,27 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             return Ok(token);
         }
 
+        // Callers that were waiting while a sign-in failed or was cancelled
+        // share its outcome, rather than asking the user again straight
+        // away or retrying it behind the user's back (which would settle
+        // the sign-in while the request that started it stays failed).
+        // Only a later request, such as the user retrying, tries again.
+        if let Some((number, error)) = &state.failed_sign_in
+            && *number > arrived
+        {
+            return Err(error.clone());
+        }
+
         // Retry confirming a previous sign-in before asking for a new one.
         // Breaking out of this block continues with the normal refresh path.
         'unconfirmed: {
             let Some(Unconfirmed { mut tokens, stored }) = state.unconfirmed.take() else {
                 break 'unconfirmed;
             };
+            // Tokens not from the store come from an interactive sign-in,
+            // which was reported as failed when they couldn't be confirmed.
+            // Report how confirming them again goes, too.
+            let interactive = stored.is_none();
             if tokens.access.expires_within(TimeDelta::zero(), now) {
                 // The access token expired before the user could be
                 // confirmed: get a fresh one with the sign-in's refresh token
@@ -319,14 +388,31 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                     }
                     Err(e) => {
                         state.unconfirmed = Some(Unconfirmed { tokens, stored });
-                        return Err(e.into());
+                        let e = mett_core::Error::from(e);
+                        if interactive {
+                            self.sign_in_failed(&mut state, &e);
+                        }
+                        return Err(e);
                     }
                 }
             }
             let token = match self.confirm(&mut state, tokens, stored.as_deref()).await {
                 Ok(token) => token,
-                Err(e) => return state.unexpired_access().ok_or(e),
+                Err(e) => {
+                    if let Some(token) = state.unexpired_access() {
+                        return Ok(token);
+                    }
+                    if interactive {
+                        self.sign_in_failed(&mut state, &e);
+                    }
+                    return Err(e);
+                }
             };
+            if interactive {
+                state.failed_sign_in = None;
+                self.sign_ins.fetch_add(1, Ordering::SeqCst);
+                self.prompter.finished(Ok(()));
+            }
             // The check may have taken a while; if the token is no longer
             // usable, continue with the confirmed refresh token below.
             if state.usable(&token, Utc::now()) {
@@ -374,7 +460,13 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             }
         }
 
-        self.sign_in_and_confirm(&mut state).await
+        let result = self.sign_in_and_confirm(&mut state).await;
+        let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
+        state.failed_sign_in = result.as_ref().err().map(|e| (number, e.clone()));
+        // Only now tell the user: a retry they start from here on counts
+        // as a new request, not one that was waiting for this sign-in.
+        self.prompter.finished(result.as_ref().map(|_| ()));
+        result
     }
 }
 

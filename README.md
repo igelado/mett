@@ -30,8 +30,10 @@ management are still to come.
    set msgraph_client_id = <your app's client ID>
    ```
 
-3. Run mett. The first time, it opens your browser to sign in (use
-   `set msgraph_auth_flow = device-code` over SSH):
+3. Run mett. The first time, it opens your browser to sign in and shows the
+   sign-in link in a window, in case the browser doesn't open (use
+   `set msgraph_auth_flow = device-code` over SSH, and mett shows a code to
+   enter instead):
 
    ```sh
    cargo run -p mett-tui
