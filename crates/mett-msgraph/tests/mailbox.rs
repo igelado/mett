@@ -2444,6 +2444,59 @@ async fn more_lost_uploads_than_copies_are_not_sent_unsure() {
 }
 
 #[tokio::test]
+async fn a_lost_upload_stays_unsure_over_later_attempts() {
+    // The upload's answer is lost.
+    let (server, store, mut message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
+    // The next attempt lists it (maybe), uploads the file again (n2), and
+    // loses the send's answer.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+            ],
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    assert!(store.send(&message).await.is_err());
+    // The user takes the file off: n1 may still be the lost upload.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+                { "id": "n2", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    message.attachments.clear();
+    let e = store.send(&message).await.unwrap_err();
+    assert!(e.to_string().contains("check it in Drafts"), "{e}");
+}
+
+#[tokio::test]
 async fn an_upload_whose_answer_was_lost_is_not_guessed_among_look_alikes() {
     let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
     // n1 and o1 both look like it: neither is taken off.

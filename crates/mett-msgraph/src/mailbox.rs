@@ -75,6 +75,10 @@ struct Upload {
     content_type: String,
     /// What it held, to tell a file put in its place since.
     digest: [u8; 32],
+    /// The attachments the draft had before it was made: one whose answer
+    /// was lost may be any other of its name and type, however many
+    /// attempts later.
+    prior: Vec<String>,
 }
 
 /// A file's contents, to tell two apart.
@@ -85,13 +89,13 @@ fn digest(data: &[u8]) -> [u8; 32] {
 
 impl Upload {
     /// Whether `attachment` is this upload. One whose answer was lost is
-    /// matched by name and type, among attachments not in `base` (what
-    /// the draft had of its own): Graph's `size` counts more than the
-    /// file's bytes, so it can't be compared.
-    fn is(&self, attachment: &Attachment, base: &[String]) -> bool {
+    /// matched by name and type, among attachments the draft didn't have
+    /// before it: Graph's `size` counts more than the file's bytes, so it
+    /// can't be compared.
+    fn is(&self, attachment: &Attachment) -> bool {
         match &self.id {
             Some(uploaded) => *uploaded == attachment.id.as_str(),
-            None => !base.contains(&attachment.id.to_string()) && self.looks_like(attachment),
+            None => !self.prior.contains(&attachment.id.to_string()) && self.looks_like(attachment),
         }
     }
 
@@ -1085,7 +1089,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         // so that nothing added elsewhere meanwhile comes off), but what
         // is to come off.
         let base = if recalled {
-            match self.recalled_base(draft, &present, base.as_deref().unwrap_or_default()) {
+            match self.recalled_base(draft, &present) {
                 Ok(recalled) => recalled,
                 Err(e) => return Err(self.give_up(draft, id, base, e).await),
             }
@@ -1121,6 +1125,7 @@ impl<A: Authenticator> GraphMailStore<A> {
                         name: file.name.clone(),
                         content_type: file.content_type.clone(),
                         digest: digest(&file.data),
+                        prior: present.iter().map(|a| a.id.to_string()).collect(),
                     });
             }
             match self.attach(&id, file).await {
@@ -1296,8 +1301,7 @@ impl<A: Authenticator> GraphMailStore<A> {
     }
 
     /// The base for [`Self::attach_all`] of the recalled `draft`, which
-    /// has the attachments `present` (and had `before`, before an earlier
-    /// attempt): all of them, but those of its own the user took off and
+    /// has the attachments `present`: all of them, but those of its own the user took off and
     /// mett's uploads of earlier attempts, which come off. Others, even
     /// ones added elsewhere since, stay.
     ///
@@ -1307,12 +1311,7 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// to go, it is attached again (it may then go twice). If the user took
     /// it off (or put another file in its place), sending it could send
     /// what they didn't want: that fails, for them to look in Outlook.
-    fn recalled_base(
-        &self,
-        draft: &Draft,
-        present: &[Attachment],
-        before: &[String],
-    ) -> Result<Vec<String>> {
+    fn recalled_base(&self, draft: &Draft, present: &[Attachment]) -> Result<Vec<String>> {
         let key = (draft.origin.clone(), draft.attempt);
         let uploads = self
             .uploads
@@ -1347,7 +1346,7 @@ impl<A: Authenticator> GraphMailStore<A> {
                 .filter(|u| u.id.is_none() && same(&u.name, &u.content_type, &u.digest))
                 .count();
             let still_wanted = wanted >= lost;
-            let unsure = present.iter().any(|a| !known(a) && upload.is(a, before));
+            let unsure = present.iter().any(|a| !known(a) && upload.is(a));
             if !still_wanted && unsure {
                 return Err(Error::Backend(format!(
                     "can't tell whether {} (taken off) is still on the message: \
