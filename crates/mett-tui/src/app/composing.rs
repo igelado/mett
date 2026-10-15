@@ -169,7 +169,7 @@ impl App {
             return self.reply_when_ready(kind, message);
         }
         let Some(summary) = self.messages.get(self.selected) else {
-            self.status = "No messages.".into();
+            self.fail("No messages.");
             return Vec::new();
         };
         let id = summary.id.clone();
@@ -544,7 +544,7 @@ impl App {
             Question::Include => self.composing_mut().include = answer,
             Question::AbortNoSubject if answer => return self.abort("No subject, aborting."),
             Question::AbortSendNoSubject if answer => {
-                self.status = "No subject specified.".into();
+                self.fail("No subject specified.");
                 return Vec::new();
             }
             Question::AbortSendNoSubject => return self.send_or_ask_copy(),
@@ -685,14 +685,14 @@ impl App {
             return Vec::new();
         };
         if compose.delivery.is_some() {
-            self.status = "Please wait: the message is still being sent or postponed.".into();
+            self.fail("Please wait: the message is still being sent or postponed.");
             return Vec::new();
         }
         let draft = compose.draft.clone();
         match action {
             Action::SendMessage => {
                 if !draft.has_recipients() {
-                    self.status = "No recipients are specified!".into();
+                    self.fail("No recipients are specified!");
                     return Vec::new();
                 }
                 // As in mutt, a subject left out is checked again when

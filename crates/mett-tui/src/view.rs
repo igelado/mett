@@ -523,6 +523,9 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         Vec::new()
     };
     let colors = &app.display.colors;
+    // `color body` matches, found once for each line on screen.
+    let mut matches: std::collections::HashMap<usize, Vec<(Range<usize>, Style)>> =
+        std::collections::HashMap::new();
     let visible: Vec<Line> = rows
         .iter()
         .map(|(row, (line, range))| {
@@ -541,10 +544,18 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
                 }
             };
             if body {
-                for rule in &colors.body {
-                    for found in rule.regex.find_iter(text) {
-                        mark(found.start(), found.end(), style.patch(rule.style));
-                    }
+                for (found, rule) in matches.entry(*line).or_insert_with(|| {
+                    colors
+                        .body
+                        .iter()
+                        .flat_map(|rule| {
+                            rule.regex
+                                .find_iter(text)
+                                .map(move |m| (m.range(), rule.style))
+                        })
+                        .collect()
+                }) {
+                    mark(found.start, found.end, style.patch(*rule));
                 }
             }
             for (_, found) in found.iter().filter(|(r, _)| r == row) {

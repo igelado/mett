@@ -771,7 +771,7 @@ impl App {
         // A question on the message line takes typed keys only: a macro's
         // function can't open another screen or question over it.
         if self.input.is_some() && menu != Menu::SignIn {
-            self.status = "Not available in a prompt.".into();
+            self.fail("Not available in a prompt.");
             return Vec::new();
         }
         // Any new action in a menu replaces a pending move, and a reply or
@@ -1223,7 +1223,7 @@ impl App {
     /// Opens the pager on the selected message.
     fn open_selected(&mut self) -> Vec<Effect> {
         let Some(summary) = self.messages.get(self.selected) else {
-            self.status = "No messages.".into();
+            self.fail("No messages.");
             return Vec::new();
         };
         let id = summary.id.clone();

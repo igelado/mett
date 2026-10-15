@@ -65,7 +65,10 @@ fn expand_chars(chars: &[char], values: &dyn Expandos, width: usize) -> String {
                     continue;
                 };
                 let part = if values.is_set(code) { then } else { otherwise };
-                out.push_str(&expand_chars(part, values, width));
+                // In what is left of the line, so that a fill in it lines
+                // up with the edge.
+                let left = width.saturating_sub(out.width());
+                out.push_str(&expand_chars(part, values, left));
                 i = next;
             }
             fill @ ('>' | '*' | '|') => {
@@ -330,6 +333,8 @@ mod tests {
         // Conditionals inside conditionals, and expandos with `?` or `&`.
         assert_eq!(x("%?C?<%?z?z&no z?>&none?."), "<no z>.");
         assert_eq!(x("%?C?%{a?b&c}&none?"), "date(a?b&c)");
+        // A fill in a conditional fills the rest of the line.
+        assert_eq!(x("ab%?C?c%>-%C?"), format!("abc{}7", "-".repeat(26)));
         // Not a conditional: taken as written.
         assert_eq!(x("%?"), "%?");
     }

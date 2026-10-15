@@ -247,7 +247,7 @@ impl App {
         pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
         let count = pager.lines.len();
         if count == 0 {
-            self.status = "Not found.".into();
+            self.fail("Not found.");
             return;
         }
         // After the last match, or from the line at the top of the screen.

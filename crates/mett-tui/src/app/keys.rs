@@ -117,7 +117,7 @@ impl App {
             self.strokes.clear();
             self.sign_in_strokes.clear();
             self.played = 0;
-            self.status = "Macro loop detected: stopped.".into();
+            self.fail("Macro loop detected: stopped.");
             // The screen was drawn before; show why the keys stopped.
             self.redraw = true;
             return None;
@@ -209,23 +209,23 @@ impl App {
         // The folder list would arrive under the help screen, which
         // can't take it.
         if self.browser_request().is_some() {
-            self.status = "Listing folders; wait a moment.".into();
+            self.fail("Listing folders; wait a moment.");
             return Vec::new();
         }
         // The message would arrive under the help screen; a retry after
         // a failed sign-in looks for it on top.
         if matches!(self.screen(), Screen::Pager(p) if p.message.is_none()) {
-            self.status = "Loading message; wait a moment.".into();
+            self.fail("Loading message; wait a moment.");
             return Vec::new();
         }
         // A delivery's sign-in retry looks for its compose menu on top.
         if self.delivering() {
-            self.status = "Sending message; wait a moment.".into();
+            self.fail("Sending message; wait a moment.");
             return Vec::new();
         }
         // Opening another folder starts it afresh, without the help.
         if self.switching.is_some() {
-            self.status = "Opening folder; wait a moment.".into();
+            self.fail("Opening folder; wait a moment.");
             return Vec::new();
         }
         let menu = self.menu();
