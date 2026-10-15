@@ -9,6 +9,16 @@ use super::{App, Effect, Screen};
 use crate::action::Action;
 use crate::sort::{self, Method, Sort};
 
+/// What tells a thread apart, whichever message starts it: its
+/// conversation (which all its messages share), or for a message on its
+/// own, the message.
+fn thread_key(message: &MessageSummary, root: &MessageId) -> String {
+    match &message.thread {
+        Some(thread) => format!("conversation {}", thread.conversation),
+        None => format!("message {root}"),
+    }
+}
+
 /// How the index is ordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ordering {
@@ -41,6 +51,9 @@ pub struct Threaded {
     pub same_subject: bool,
     /// The thread's first message.
     pub root: MessageId,
+    /// What tells the thread apart, whichever message starts it: its
+    /// conversation, or its only message.
+    pub key: String,
     /// For a collapsed thread's first message, how many messages are
     /// folded under it.
     pub folded: usize,
@@ -82,7 +95,8 @@ impl App {
         for node in nodes {
             let message = slots[node.index].take().expect("each message once");
             let root = ids[node.root].clone();
-            let fold = threaded && node.depth > 0 && self.collapsed.contains(&root);
+            let key = thread_key(&message, &root);
+            let fold = threaded && node.depth > 0 && self.collapsed.contains(&key);
             if threaded {
                 self.threads.insert(
                     message.id.clone(),
@@ -90,6 +104,7 @@ impl App {
                         tree: node.tree,
                         same_subject: node.same_subject,
                         root: root.clone(),
+                        key,
                         folded: 0,
                     },
                 );
@@ -136,6 +151,15 @@ impl App {
         }
     }
 
+    /// Where the thread after the selected message starts, if it is
+    /// listed.
+    pub(super) fn next_thread_root(&self) -> Option<usize> {
+        (self.selected + 1..self.messages.len()).find(|&i| {
+            let id = &self.messages[i].id;
+            self.threads.get(id).is_none_or(|t| &t.root == id)
+        })
+    }
+
     /// Handles the thread actions of the index and the pager. Returns
     /// `None` for other actions.
     pub(super) fn on_thread_action(&mut self, action: Action) -> Option<Vec<Effect>> {
@@ -166,8 +190,12 @@ impl App {
             .unwrap_or(self.selected);
         match action {
             Action::NextThread => {
-                match (self.selected + 1..self.messages.len()).find(|&i| is_root(self, i)) {
+                match self.next_thread_root() {
                     Some(next) => self.selected = next,
+                    // The next thread may be on a page still to come.
+                    None if self.more_to_list() => {
+                        return Some(self.wait_for(super::Target::NextThread));
+                    }
                     None => {
                         self.fail("You are on the last thread.");
                         return Some(Vec::new());
@@ -182,9 +210,13 @@ impl App {
                 }
             },
             Action::CollapseThread => {
-                let root = self.messages[start].id.clone();
-                if !self.collapsed.remove(&root) {
-                    self.collapsed.insert(root);
+                let root = &self.messages[start].id;
+                let key = self
+                    .threads
+                    .get(root)
+                    .map_or_else(|| format!("message {root}"), |t| t.key.clone());
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
                 }
                 self.selected = start;
                 self.arrange();
@@ -192,13 +224,13 @@ impl App {
             }
             _ => {
                 // Collapses every thread, or if they all are, opens them.
-                let roots: Vec<MessageId> = self
+                let roots: Vec<String> = self
                     .threads
                     .iter()
                     .filter(|(id, t)| *id != &t.root)
-                    .map(|(_, t)| t.root.clone())
+                    .map(|(_, t)| t.key.clone())
                     .collect();
-                let all_collapsed = roots.iter().all(|root| self.collapsed.contains(root));
+                let all_collapsed = roots.iter().all(|key| self.collapsed.contains(key));
                 if all_collapsed {
                     self.collapsed.clear();
                 } else {
@@ -353,6 +385,85 @@ mod tests {
         assert_eq!(shown(&app), ["b0 (1)"]);
         app.set_limit("all");
         assert_eq!(shown(&app), ["a0 (2)", "b0 (1)"]);
+    }
+
+    /// An app sorted by threads whose first page is `first`, with more to
+    /// come; returns the request for the next page.
+    fn paged(first: Vec<MessageSummary>) -> (App, crate::worker::RequestId) {
+        let settings = Settings {
+            ordering: Ordering {
+                sort: Sort::parse("threads", true).unwrap(),
+                ..Ordering::default()
+            },
+            ..Settings::default()
+        };
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let (mut app, effects) = App::open(80, 24, inbox, settings);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: first,
+                next: Some(mett_core::PageCursor::new("in next")),
+            })),
+        }));
+        let Effect::Request(next, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        (app, next)
+    }
+
+    fn page(app: &mut App, id: crate::worker::RequestId, messages: Vec<MessageSummary>) {
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages,
+                next: None,
+            })),
+        }));
+    }
+
+    #[test]
+    fn a_collapsed_thread_stays_collapsed_when_its_start_is_listed() {
+        let (mut app, next) = paged(vec![
+            message("a2", 4, "a", &[0, 2]),
+            message("a1", 2, "a", &[0, 1]),
+        ]);
+        act(&mut app, Action::CollapseThread);
+        assert_eq!(shown(&app), ["a1 (1)"]);
+        page(&mut app, next, vec![message("a0", 1, "a", &[0])]);
+        assert_eq!(shown(&app), ["a0 (2)"]);
+    }
+
+    #[test]
+    fn the_next_thread_may_be_on_a_page_to_come() {
+        let (mut app, next) = paged(vec![
+            message("a1", 4, "a", &[0, 1]),
+            message("a0", 3, "a", &[0]),
+        ]);
+        act(&mut app, Action::NextThread);
+        assert_ne!(app.status, "You are on the last thread.");
+        // (A later page normally has older mail; this thread sorts after.)
+        page(&mut app, next, vec![message("b0", 9, "b", &[0])]);
+        assert_eq!(app.messages[app.selected].id.as_str(), "b0");
+    }
+
+    #[test]
+    fn a_limit_keeps_a_visible_reply_selected() {
+        let mut app = app();
+        act(&mut app, Action::NextEntry);
+        assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+        app.set_limit("~s a");
+        assert_eq!(app.messages[app.selected].id.as_str(), "a1");
     }
 
     #[test]

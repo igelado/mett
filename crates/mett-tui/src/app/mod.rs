@@ -45,6 +45,8 @@ enum Target {
     Entry(usize),
     /// The last message of the folder.
     Last,
+    /// The next thread after the selected message.
+    NextThread,
 }
 
 /// Rows used by the help line, the status bar and the message line.
@@ -430,7 +432,7 @@ pub struct App {
     /// Where each message is in its thread, when the index shows threads.
     threads: HashMap<MessageId, Threaded>,
     /// The first messages of the collapsed threads.
-    collapsed: HashSet<MessageId>,
+    collapsed: HashSet<String>,
     /// Whether the limit showed each message it was applied to, kept
     /// across listings so that they show the same messages.
     limited: HashMap<MessageId, bool>,
@@ -1963,6 +1965,15 @@ impl App {
         let last = self.messages.len().saturating_sub(1);
         let loading = self.listing.is_some();
         let selected = match target {
+            Target::NextThread => match self.next_thread_root() {
+                Some(next) => next,
+                None if loading => return Vec::new(),
+                None => {
+                    self.pending = None;
+                    self.fail("You are on the last thread.");
+                    return Vec::new();
+                }
+            },
             // Loaded (the index may still be empty, with a limit hiding
             // all the messages loaded so far).
             Target::Entry(entry) if entry < self.messages.len() => entry,

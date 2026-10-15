@@ -364,9 +364,10 @@ impl App {
     /// Selects the message `id` if it is shown (or the collapsed thread
     /// it is in), or the first one.
     fn limit_index_to(&mut self, id: Option<&mett_core::MessageId>) {
-        let id = id.map(|id| self.thread_of(id).map_or(id, |t| &t.root).clone());
         let shown = |id: &mett_core::MessageId| self.messages.iter().position(|m| &m.id == id);
-        self.selected = id.and_then(|id| shown(&id)).unwrap_or(0);
+        self.selected = id
+            .and_then(|id| shown(id).or_else(|| self.thread_of(id).and_then(|t| shown(&t.root))))
+            .unwrap_or(0);
     }
 
     /// Adds newly listed messages to the index, or aside if the index is

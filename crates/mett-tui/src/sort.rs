@@ -278,10 +278,16 @@ fn threads(
     }
     // Threads in order: by their first message, or with `last-`, their
     // latest.
+    // The latest by date, whichever way the threads are then ordered.
     let latest = |tree: &(usize, HashMap<usize, Vec<usize>>)| {
         std::iter::once(tree.0)
             .chain(tree.1.values().flatten().copied())
-            .max_by(|a, b| compare(a, b))
+            .max_by(|a, b| {
+                messages[*a]
+                    .received
+                    .cmp(&messages[*b].received)
+                    .then_with(|| position(&messages[*a].id).cmp(&position(&messages[*b].id)))
+            })
             .expect("a thread has a message")
     };
     let representative: Vec<usize> = trees
@@ -444,6 +450,13 @@ mod tests {
             arranged(&messages, "reverse-threads", "date")[..3],
             ["u", "other", "root"]
         );
+        // `last-` goes by the latest message whichever way it sorts: the
+        // thread whose latest is newest first.
+        assert_eq!(
+            arranged(&messages, "threads", "last-reverse-date")[..2],
+            ["root".to_owned(), "|->lost".to_owned()]
+        );
+        assert_eq!(arranged(&messages, "threads", "last-date")[0], "other");
     }
 
     #[test]
