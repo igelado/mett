@@ -374,13 +374,12 @@ fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     store: Arc<S>,
     session: Session,
 ) -> ExitCode {
-    // `init` also restores the terminal if mett panics.
     remove_viewed_before();
+    // `init` also restores the terminal if mett panics.
     let terminal = ratatui::init();
     let result = runtime.block_on(run(terminal, store, session));
     ratatui::restore();
     wait_for_saves();
-    remove_viewed();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -879,12 +878,9 @@ fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     };
-    // Taken away when mett exits (the viewer may still need it until
-    // then), or now if it can't be opened.
-    VIEWED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((dir.clone(), std::time::Instant::now()));
+    // Taken away by a later run of mett, once old (a viewer it was given
+    // to may still need it after mett exits), or now if it can't be
+    // opened.
     let path = dir.join(name);
     let opened = std::fs::write(&path, data).and_then(|()| open::that_detached(&path));
     if opened.is_err() {
@@ -893,27 +889,9 @@ fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
     opened
 }
 
-/// The directories of attachments opened for viewing, and when.
-static VIEWED: std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Instant)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// How long a viewer may take to open its file: one opened since is left
-/// for the next run of mett to take away.
-const VIEWER_START: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How old a copy left behind by an earlier run has to be to be taken
-/// away.
-const VIEWED_LEFT: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// Removes the copies of attachments opened for viewing, but those just
-/// opened, which their viewers may not have loaded yet.
-fn remove_viewed() {
-    for (dir, opened) in VIEWED.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
-        if opened.elapsed() >= VIEWER_START {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
+/// How old a copy of an attachment given to a viewer has to be to be
+/// taken away: mett can't tell when the viewer is done with it.
+const VIEWED_LEFT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// How long another mett may keep a viewer's copy, where mett can't tell
 /// whether it still runs.
