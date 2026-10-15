@@ -266,6 +266,11 @@ impl App {
                         composing.draft.cc = cc;
                     }
                 }
+                // Once the address questions are done, give up on a
+                // message without recipients, as mutt does.
+                Step::Subject | Step::Edit if !composing.draft.has_recipients() => {
+                    return self.abort("No recipients were specified.");
+                }
                 Step::To | Step::Cc | Step::Bcc | Step::Subject => {
                     let question = match step {
                         Step::To => Question::To,
@@ -399,14 +404,10 @@ impl App {
                         return Vec::new();
                     }
                 };
-                let empty = list.is_empty();
                 match question {
                     Question::To => draft.to = list,
                     Question::Cc => draft.cc = list,
                     _ => draft.bcc = list,
-                }
-                if setting_up && question == Question::To && empty {
-                    return self.abort("No recipients were specified.");
                 }
             }
             _ => {
@@ -980,11 +981,18 @@ mod tests {
         key(&mut app, KeyCode::Esc);
         assert_eq!(app.input, None);
         assert_eq!(app.screen(), &Screen::Index);
-        // An empty To: gives up too, as in mutt.
+        // No recipients at all gives up too, as in mutt.
         act(&mut app, Action::Mail);
         answer(&mut app, "");
         assert_eq!(app.status, "No recipients were specified.");
         assert_eq!(app.input, None);
+        // But a Cc is enough.
+        app.settings.askcc = true;
+        act(&mut app, Action::Mail);
+        answer(&mut app, "");
+        assert_eq!(prompt(&app), "Cc: ");
+        answer(&mut app, "carol@x.org");
+        assert_eq!(prompt(&app), "Subject: ");
     }
 
     #[test]
@@ -1190,5 +1198,45 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn retry_resends_a_delivery_and_failed_saves_together() {
+        let mut app = app(settings());
+        // Reading the message fails to mark it read…
+        let (fetch, _) = request(&act(&mut app, Action::DisplayMessage));
+        let effects = app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(original())),
+        }));
+        let (flags, _) = request(&effects);
+        app.update(Msg::Response(Response {
+            id: flags,
+            event: Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
+        }));
+        // …and replying fails to send, for the same reason.
+        app.settings.include = Quad::No;
+        app.settings.fast_reply = true;
+        act(&mut app, Action::Reply);
+        app.update(Msg::Edited(Ok("text".into())));
+        let (send, _) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        app.update(Msg::Response(Response {
+            id: send,
+            event: Event::Sent(Err(Error::Auth("expired".into()))),
+        }));
+        let effects = act(&mut app, Action::Retry);
+        let requests: Vec<_> = effects
+            .iter()
+            .map(|e| match e {
+                Effect::Request(_, Request::Send(_)) => "send",
+                Effect::Request(_, Request::UpdateFlags(..)) => "flags",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(requests, ["send", "flags"]);
     }
 }

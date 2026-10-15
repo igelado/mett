@@ -603,21 +603,16 @@ impl App {
         if self.quit {
             return self.retry_saves();
         }
-        let delivery = self.retry_delivery();
-        if !delivery.is_empty() {
-            return delivery;
-        }
-        let compose = self.retry_compose_fetch();
-        if !compose.is_empty() {
-            return compose;
-        }
+        // Everything that failed is retried, not just the first thing.
+        let mut effects = self.retry_delivery();
+        effects.extend(self.retry_compose_fetch());
         if self.folder.is_none() {
             if self.opening.is_none() {
-                return self.open_folder();
+                effects.extend(self.open_folder());
             }
-            return Vec::new();
+            return effects;
         }
-        let mut effects = self.retry_listing();
+        effects.extend(self.retry_listing());
         effects.extend(self.retry_saves());
         // Open the message that failed to open, if it is still the one
         // selected. (Opening another message forgets the failure.) The
