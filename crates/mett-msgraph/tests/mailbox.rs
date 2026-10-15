@@ -185,18 +185,18 @@ async fn lists_messages_changed_since_a_time() {
 }
 
 #[tokio::test]
-async fn finds_when_the_newest_unread_message_arrived() {
+async fn finds_when_unread_mail_last_changed() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
         .and(query_param(
             "$filter",
-            "receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
+            "lastModifiedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
         ))
-        .and(query_param("$orderby", "receivedDateTime desc"))
+        .and(query_param("$orderby", "lastModifiedDateTime desc"))
         .and(query_param("$top", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "value": [{ "receivedDateTime": "2024-05-01T10:00:00Z" }],
+            "value": [{ "lastModifiedDateTime": "2024-05-01T10:00:00Z" }],
         })))
         .mount(&server)
         .await;

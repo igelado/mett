@@ -536,8 +536,12 @@ pub struct App {
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
-    /// The request reading the mailboxes' counts.
-    checking: Option<RequestId>,
+    /// The request reading the mailboxes' counts, and the folder open
+    /// when it was sent.
+    checking: Option<(RequestId, Option<mett_core::FolderId>)>,
+    /// The mailboxes are to be checked again once that request is done:
+    /// a folder was opened meanwhile.
+    recheck: bool,
 }
 
 impl App {
@@ -643,6 +647,7 @@ impl App {
             poll_timer: 0,
             known_before_refresh: None,
             checking: None,
+            recheck: false,
         };
         let effects = app.open_folder();
         (app, effects)
@@ -1242,10 +1247,9 @@ impl App {
                 self.poll_paused = false;
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
-                self.visited();
                 let mut effects = self.list(Page::first(self.page_size));
-                // Then other folders' new mail, and checking for more.
-                effects.extend(self.check_mailboxes());
+                // Then the mailboxes' new mail, and checking for more.
+                effects.extend(self.visited());
                 effects.extend(self.arm_poll());
                 // Before the user can reply: their own addresses, so that a
                 // reply to their own mail goes to its recipients (the

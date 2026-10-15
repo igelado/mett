@@ -124,7 +124,7 @@ pub enum Event {
 pub struct Checked {
     /// The folder, with its counts.
     pub folder: Folder,
-    /// When its newest unread message arrived, if it has any.
+    /// When its unread mail last arrived or changed, if it has any.
     pub newest_unread: Option<DateTime<Utc>>,
 }
 

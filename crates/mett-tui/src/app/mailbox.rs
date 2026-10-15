@@ -652,8 +652,9 @@ impl App {
                 self.previous = Some(std::mem::replace(&mut self.path, path));
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
-                self.visited();
-                self.list(Page::first(self.page_size))
+                let mut effects = self.list(Page::first(self.page_size));
+                effects.extend(self.visited());
+                effects
             }
             Err(e) => {
                 // Without a sign-in, the sign-in window's Retry opens it.

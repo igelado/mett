@@ -175,7 +175,6 @@ impl MailStore for MemoryStore {
         Ok(state.with_counts(folder))
     }
 
-    /// Messages arrive when they are dated.
     async fn newest_unread(&self, folder: &FolderId) -> Result<Option<DateTime<Utc>>> {
         let state = self.state();
         state.folder(folder)?;
@@ -183,7 +182,7 @@ impl MailStore for MemoryStore {
             .messages
             .iter()
             .filter(|m| &m.summary.folder == folder && !m.summary.flags.read)
-            .map(|m| m.summary.received)
+            .filter_map(|m| state.modified.get(&m.summary.id).copied())
             .max())
     }
 
