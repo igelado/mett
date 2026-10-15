@@ -340,7 +340,8 @@ impl App {
         push_problems.reverse();
         problems.extend(push_problems);
         self.status = problems.join("; ");
-        Vec::new()
+        // Checking for new mail may have been turned on.
+        self.arm_poll()
     }
 }
 

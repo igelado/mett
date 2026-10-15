@@ -315,10 +315,14 @@ impl App {
             }
         };
         let selected = self.messages.get(self.selected).map(|m| m.id.clone());
-        // Start from the whole folder, in the order it was listed.
+        // Start from the whole folder, in the order it was listed: newest
+        // first, with mail that arrived since in its place.
         let mut all = std::mem::take(&mut self.messages);
         all.append(&mut self.hidden);
-        all.sort_by_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
+        all.sort_by_key(|m| {
+            let position = self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
+            (std::cmp::Reverse(m.received), position)
+        });
         self.messages = all;
         self.limit = None;
         self.limited.clear();
@@ -372,18 +376,12 @@ impl App {
             let next = self.positions.len();
             self.positions.entry(message.id.clone()).or_insert(next);
         }
-        let Some(limit) = &self.limit else {
+        if self.limit.is_none() {
             self.messages.extend(messages);
             return;
-        };
+        }
         for message in messages {
-            let shown = self.limited.get(&message.id).copied().unwrap_or_else(|| {
-                limit.pattern.matches(&Candidate {
-                    summary: &message,
-                    deleted: self.deleted.contains(&message.id),
-                })
-            });
-            if shown {
+            if self.limit_shows(&message) {
                 self.messages.push(message);
             } else {
                 self.hidden.push(message);
@@ -393,6 +391,20 @@ impl App {
         if !self.messages.is_empty() && self.status == NO_MATCHES {
             self.status.clear();
         }
+    }
+
+    /// Whether the limit, if any, shows `message`: as it did before the
+    /// folder was listed again, or if it matches.
+    pub(super) fn limit_shows(&self, message: &MessageSummary) -> bool {
+        let Some(limit) = &self.limit else {
+            return true;
+        };
+        self.limited.get(&message.id).copied().unwrap_or_else(|| {
+            limit.pattern.matches(&Candidate {
+                summary: message,
+                deleted: self.deleted.contains(&message.id),
+            })
+        })
     }
 
     /// The number of messages in the folder, shown or not.

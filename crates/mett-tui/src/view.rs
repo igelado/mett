@@ -163,6 +163,11 @@ fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
         frame.render_widget(Paragraph::new(text), area);
         return "---mett: Folders---".into();
     }
+    let title = if browser.mailboxes {
+        "Mailboxes"
+    } else {
+        "Folders"
+    };
     let height = usize::from(area.height).max(1);
     let first = browser.selected / height * height;
     let width = usize::from(area.width);
@@ -173,15 +178,16 @@ fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
         .skip(first)
         .take(height)
         .map(|(i, entry)| {
-            let folder = &entry.folder;
-            let new = if folder.unread_count > 0 { 'N' } else { ' ' };
+            let new = if entry.new { 'N' } else { ' ' };
+            let counts = match entry.counts {
+                Some((unread, total)) => format!("{unread:>5}/{total:<6}"),
+                None => " ".repeat(12),
+            };
             let line = format!(
-                "{:>4} {new} {:>5}/{:<6} {}{}",
+                "{:>4} {new} {counts} {}{}",
                 i + 1,
-                folder.unread_count,
-                folder.total_count,
                 "  ".repeat(entry.depth),
-                folder.name
+                entry.name
             );
             let line = Line::raw(truncate(&line, width));
             if i == browser.selected {
@@ -192,7 +198,7 @@ fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
-    format!("---mett: Folders [{}]---", browser.entries.len())
+    format!("---mett: {title} [{}]---", browser.entries.len())
 }
 
 /// Draws a question on the message line, with the cursor where the answer
@@ -461,7 +467,12 @@ fn index_status(app: &App) -> String {
         ),
         None => (app.messages.len().to_string(), String::new()),
     };
-    format!("-*-mett: {folder} [Msgs:{count} New:{new}{deleted}]{limit}{incomplete}---")
+    // Mailboxes with new mail, as mutt's `%b`.
+    let incoming = match app.mailboxes_with_new_mail() {
+        0 => String::new(),
+        n => format!(" Inc:{n}"),
+    };
+    format!("-*-mett: {folder} [Msgs:{count} New:{new}{deleted}{incoming}]{limit}{incomplete}---")
 }
 
 /// Draws the pager body and returns its status line.

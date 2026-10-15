@@ -196,6 +196,14 @@ keeps the store up to date with Graph delta queries.
 - **Mitigation:** the first iteration may use online-only access behind the
   same `MailStore` port, adding the cache once the core flows work. The
   server is always treated as the source of truth.
+- **Until then:** new mail is found by polling. A timer (`Effect::Later`)
+  has the app list the newest page of the open folder again and merge it
+  into the index: new messages join where their date puts them, messages
+  within the page's dates that are missing from it have gone, and the
+  others take in changes made elsewhere. Changes mett made while that page
+  was on its way are laid over it, as for a listing. A page that is all
+  new mail lists the folder again. The `mailboxes` are checked by reading
+  their counts.
 
 ### 5.6 State machine for menus
 

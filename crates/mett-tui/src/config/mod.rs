@@ -47,7 +47,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "ignore",
     "index-format-hook",
     "lists",
-    "mailboxes",
     "mailto_allow",
     "mbox-hook",
     "message-hook",
@@ -76,7 +75,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "unhook",
     "unignore",
     "unlists",
-    "unmailboxes",
     "unmailto_allow",
     "unmime_lookup",
     "unmy_hdr",
@@ -112,6 +110,22 @@ pub enum KeyCommand {
     },
 }
 
+/// A mailbox from the `mailboxes` command, checked for new mail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mailbox {
+    /// The mailbox, with mutt's `=`, `+`, `!`, `>` and `<` shortcuts
+    /// expanded as they stood when the command ran, as mutt does.
+    pub path: String,
+    /// What to call it (`-label`), instead of its path.
+    pub label: Option<String>,
+    /// Whether to say when new mail arrives in it (`-notify`, the
+    /// default, or `-nonotify`).
+    pub notify: bool,
+    /// Whether to check it for new mail at all (`-poll`, the default, or
+    /// `-nopoll`).
+    pub poll: bool,
+}
+
 /// The loaded configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -123,6 +137,8 @@ pub struct Config {
     pub errors: Vec<String>,
     /// `alternates`: regular expressions for the user's other addresses.
     alternates: Vec<String>,
+    /// `mailboxes`, in the order given.
+    mailboxes: Vec<Mailbox>,
     /// `bind` and `macro` commands not yet taken by the key bindings.
     key_commands: Vec<KeyCommand>,
     /// Keys to play, from `push` and `exec`, in mutt's notation.
@@ -158,6 +174,7 @@ impl Config {
             user: HashMap::new(),
             errors: Vec::new(),
             alternates: Vec::new(),
+            mailboxes: Vec::new(),
             key_commands: Vec::new(),
             pushed: Vec::new(),
             warnings: Vec::new(),
@@ -220,6 +237,11 @@ impl Config {
     /// The user's other addresses, as regular expressions (`alternates`).
     pub fn alternates(&self) -> &[String] {
         &self.alternates
+    }
+
+    /// The mailboxes to check for new mail (`mailboxes`).
+    pub fn mailboxes(&self) -> &[Mailbox] {
+        &self.mailboxes
     }
 
     /// The `bind` and `macro` commands read since the last call.
@@ -300,6 +322,19 @@ impl Config {
             user.into_iter()
                 .map(|(name, value)| format!("set {name}={}", Value::Str(value.clone()))),
         );
+        lines.extend(self.mailboxes.iter().map(|mailbox| {
+            let mut line = "mailboxes".to_owned();
+            if let Some(label) = &mailbox.label {
+                line.push_str(&format!(" -label {}", Value::Str(label.clone())));
+            }
+            if !mailbox.notify {
+                line.push_str(" -nonotify");
+            }
+            if !mailbox.poll {
+                line.push_str(" -nopoll");
+            }
+            format!("{line} {}", Value::Str(mailbox.path.clone()))
+        }));
         lines
     }
 
@@ -369,6 +404,16 @@ impl Config {
                             self.alternates.retain(|a| *a != regex);
                         }
                     }
+                }),
+                "mailboxes" => self.add_mailboxes(args),
+                "unmailboxes" => self.each(args, |c, path| {
+                    if path == "*" {
+                        c.mailboxes.clear();
+                    } else {
+                        let path = c.expand_mailbox(path);
+                        c.mailboxes.retain(|m| m.path != path);
+                    }
+                    Ok(())
                 }),
                 "bind" => match args {
                     [menus, key, function] => self.bind(menus, key, function),
@@ -441,6 +486,68 @@ impl Config {
             }
         }
         Ok(patterns)
+    }
+
+    /// `mailboxes [-label NAME | -nolabel] [-notify | -nonotify] [-poll |
+    /// -nopoll] MAILBOX ...`: the options go with the next mailbox. Adding
+    /// a mailbox again changes its options, but keeps its place.
+    fn add_mailboxes(&mut self, args: &[Word]) -> Result<(), String> {
+        let mut words = args.iter();
+        let (mut label, mut notify, mut poll) = (None, None, None);
+        while let Some(word) = words.next() {
+            let word = self.expand(word)?;
+            match word.as_str() {
+                "-label" => {
+                    let name = words.next().ok_or("mailboxes: -label needs a name")?;
+                    label = Some(Some(self.expand(name)?));
+                }
+                "-nolabel" => label = Some(None),
+                "-notify" => notify = Some(true),
+                "-nonotify" => notify = Some(false),
+                "-poll" => poll = Some(true),
+                "-nopoll" => poll = Some(false),
+                _ => {
+                    let path = self.expand_mailbox(&word);
+                    let mailbox = match self.mailboxes.iter_mut().find(|m| m.path == path) {
+                        Some(mailbox) => mailbox,
+                        None => {
+                            self.mailboxes.push(Mailbox {
+                                path,
+                                label: None,
+                                notify: true,
+                                poll: true,
+                            });
+                            self.mailboxes.last_mut().expect("just added")
+                        }
+                    };
+                    if let Some(label) = label.take() {
+                        mailbox.label = label;
+                    }
+                    if let Some(notify) = notify.take() {
+                        mailbox.notify = notify;
+                    }
+                    if let Some(poll) = poll.take() {
+                        mailbox.poll = poll;
+                    }
+                }
+            }
+        }
+        if label.is_some() || notify.is_some() || poll.is_some() {
+            return Err("mailboxes: options must come before a mailbox".into());
+        }
+        Ok(())
+    }
+
+    /// A mailbox path with mutt's `=`, `+`, `!`, `>` and `<` shortcuts
+    /// expanded with the current settings.
+    fn expand_mailbox(&self, path: &str) -> String {
+        let path = match path.trim() {
+            "!" => self.string("spoolfile"),
+            ">" => self.string("mbox"),
+            "<" => self.string("record"),
+            _ => path.trim(),
+        };
+        mailbox::expand_shortcut(path, self.string("folder"))
     }
 
     fn bind(&mut self, menus: &Word, key: &Word, function: &Word) -> Result<(), String> {
@@ -1051,6 +1158,39 @@ mod tests {
         // The dump reads back to the same settings.
         let again = load(&dump.join("\n"));
         assert_eq!(again.dump(), dump);
+    }
+
+    #[test]
+    fn keeps_mailboxes_with_their_options() {
+        let mut config = load(
+            "set folder=msgraph://a@b.c/ spoolfile==@inbox\n\
+             mailboxes ! -label Work -nonotify =Work =Work/Old\n\
+             mailboxes -nopoll =Work +Lists\n\
+             set folder=msgraph://a@b.c/Elsewhere\n\
+             unmailboxes =Work/Old\n",
+        );
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        let mailboxes: Vec<_> = config
+            .mailboxes()
+            .iter()
+            .map(|m| (m.path.as_str(), m.label.as_deref(), m.notify, m.poll))
+            .collect();
+        // `=Work/Old` now means a folder below Elsewhere: it stays.
+        assert_eq!(
+            mailboxes,
+            [
+                ("msgraph://a@b.c/@inbox", None, true, true),
+                ("msgraph://a@b.c/Work", Some("Work"), false, false),
+                ("msgraph://a@b.c/Work/Old", None, true, true),
+                ("msgraph://a@b.c/Lists", None, true, true),
+            ]
+        );
+        // The dump reads back to the same mailboxes.
+        let again = load(&config.dump().join("\n"));
+        assert_eq!(again.mailboxes(), config.mailboxes());
+        assert!(config.run_line("mailboxes -label x").is_err());
+        assert_eq!(config.run_line("unmailboxes *"), Ok(vec![]));
+        assert!(config.mailboxes().is_empty());
     }
 
     #[test]

@@ -19,7 +19,9 @@ Architecture (`docs/DESIGN.md` §5.2):
 So far it can browse a mailbox (the message index, the pager, and the
 folder browser), mark, flag, purge, move and copy messages, and write
 mail: new messages, replies, group replies and forwards, which are sent or
-postponed from mutt's compose menu. It opens the Office365 folder set in
+postponed from mutt's compose menu. It checks for new mail every
+`msgraph_sync_interval` seconds, in the open folder and in the folders
+named by `mailboxes`. It opens the Office365 folder set in
 `spoolfile`, signing in when needed (`account.rs`); `--demo` opens a
 built-in sample mailbox instead.
 
@@ -54,8 +56,9 @@ set msgraph_client_id = <your app's client ID>
 ```
 
 So far `set`, `unset`, `toggle`, `reset`, `source`, `alternates` (the
-user's other addresses, for replies), `bind`, `macro`, `push` and `exec`
-are supported, with mutt's quoting, `$` expansion, backticks and `my_`
+user's other addresses, for replies), `mailboxes` and `unmailboxes` (with
+`-label`, `-notify`/`-nonotify` and `-poll`/`-nopoll`), `bind`, `macro`,
+`push` and `exec` are supported, with mutt's quoting, `$` expansion, backticks and `my_`
 variables. `bind` and `macro` take mutt's menus (`generic`, `index`,
 `pager`, `compose`, `browser`) plus mett's `signin` and `help`, and mutt's
 key notation (`\Cx`, `^x`, `\e`, `<PageDown>`, `<F1>`; `^M`, `^I` and
@@ -95,6 +98,14 @@ and `d` then `$` it. With `set trash = =@deleteditems` it lands in
 Deleted Items; without `trash` it is deleted for good. `F` and `N` should
 show up in Outlook as the flag and the unread state.
 
+To test new mail, add `mailboxes =@inbox =Work` (any other folder) and
+start mett with `set msgraph_sync_interval=15`. Send yourself a message:
+within a check or two it joins the index with `New mail in this
+mailbox.`. Move a message into `Work` from Outlook: the status line says
+`New mail in =Work.`, the status bar counts it in `Inc:`, and `c` offers
+`=Work`. Reading or deleting a recent message in Outlook shows up in mett
+at the next check too.
+
 To test sending, send yourself a message (`m`, your own address), then
 reply to it (`r`) and forward it (`f`) to yourself. In Outlook, check that
 the reply is threaded under the original, the forward keeps any
@@ -127,9 +138,9 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 |------|------|
 | Index | `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
-| Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size` take effect when mett starts again). |
-| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `s`/`C`: move or copy to another folder. `c`: open another folder. `y`: the folder browser. |
-| Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
+| Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size` and `msgraph_sync_interval` take effect when mett starts again). |
+| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
+| Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. `Tab`: switch between the `mailboxes` (listed first, if there are any) and every folder. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
 | Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. |
 | Questions | Type the answer and press `Enter`; `Esc` or `^G` gives up. The usual line-editing keys work (`^A`, `^E`, `^U`, `^K`, `^W`, arrows). Yes/no questions take `y`, `n`, or `Enter` for the suggested answer. |
 | Sign-in window | `o`: open the sign-in page in a browser. `c`: copy the link (or the device code) to the clipboard, in terminals that support OSC 52 (in tmux, `set -g set-clipboard on`). `q`/`Esc`: cancel, or close after a failure. `Enter`: try again after a failure. `j`/`k` or arrows: scroll, when the terminal is too small to show it all. |

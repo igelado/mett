@@ -137,6 +137,28 @@ async fn finds_well_known_folders_and_labels_them() {
 }
 
 #[tokio::test]
+async fn reads_a_folder_s_counts_by_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/msgfolderroot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "root-id" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/other-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(folder("other-id", "Projects")))
+        .mount(&server)
+        .await;
+    let folder = store(&server)
+        .folder(&FolderId::new("other-id"))
+        .await
+        .unwrap();
+    assert_eq!(folder.name, "Projects");
+    assert_eq!(folder.parent, None, "top-level folders have no parent");
+    assert_eq!((folder.unread_count, folder.total_count), (2, 5));
+}
+
+#[tokio::test]
 async fn does_not_cache_roles_after_a_failed_lookup() {
     let server = MockServer::start().await;
     mount_roles_with(&server, 503).await;

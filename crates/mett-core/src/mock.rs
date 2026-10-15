@@ -156,6 +156,12 @@ impl MailStore for MemoryStore {
         Ok(state.folders.iter().map(|f| state.with_counts(f)).collect())
     }
 
+    async fn folder(&self, id: &FolderId) -> Result<Folder> {
+        let state = self.state();
+        let folder = state.folder(id)?;
+        Ok(state.with_counts(folder))
+    }
+
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
         let state = self.state();
         state

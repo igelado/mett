@@ -418,6 +418,25 @@ impl App {
                     self.input = None;
                     return self.open_browser(Choose::Answer(question, typed));
                 }
+                // Space on an empty line, or on a mailbox offered, offers
+                // the next one with new mail, as in mutt.
+                let typed = editor.text();
+                let offered = typed.is_empty() || self.mailboxes.iter().any(|m| m.text == typed);
+                if question == Question::OpenMailbox
+                    && key.code == KeyCode::Char(' ')
+                    && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+                    && offered
+                    && let Some(next) = self.next_new_mailbox(Some(&typed))
+                {
+                    let next = next.text.clone();
+                    if let Some(Input::Line { editor, .. }) = &mut self.input {
+                        *editor = LineEditor::new(&next);
+                    }
+                    return Vec::new();
+                }
+                let Some(Input::Line { editor, .. }) = &mut self.input else {
+                    return Vec::new();
+                };
                 match editor.key(key) {
                     Outcome::Editing => Vec::new(),
                     Outcome::Done(text) => {

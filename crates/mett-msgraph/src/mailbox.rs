@@ -410,6 +410,25 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         Ok(folders)
     }
 
+    async fn folder(&self, id: &FolderId) -> Result<Folder> {
+        // The roles, if a folder listing looked them up, tell a well-known
+        // folder; only the root is needed otherwise, to tell a top-level
+        // folder.
+        let cached = self.roles.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let roles = match cached {
+            Some(roles) => roles,
+            None => Arc::new(Roles {
+                root: self.root().await?,
+                well_known: HashMap::new(),
+            }),
+        };
+        let url = self.url(&["me", "mailFolders", id.as_str()]);
+        let folder: GraphFolder = self
+            .json(self.request(Method::GET, url), About::folder(id.as_str()))
+            .await?;
+        Ok(roles.folder(folder))
+    }
+
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
         // Only the root is needed here, so other well-known folders failing
         // to resolve can't get in the way.

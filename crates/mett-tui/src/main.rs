@@ -264,8 +264,40 @@ fn settings_keeping(
         }
         _ => return Err("msgraph_page_size must be a positive number".into()),
     };
+    let sync_interval = match config.get("msgraph_sync_interval") {
+        Some(config::Value::Number(0)) => None,
+        Some(config::Value::Number(n)) if *n > 0 => {
+            Some(std::time::Duration::from_secs(n.unsigned_abs()))
+        }
+        _ => return Err("msgraph_sync_interval must be 0 (off) or a number of seconds".into()),
+    };
+    let folder = config.string("folder");
+    let mailboxes = config
+        .mailboxes()
+        .iter()
+        .map(|mailbox| {
+            let path = config::mailbox::folder_path(&mailbox.path, folder, account)
+                .map_err(|e| format!("mailboxes: {e}"))?;
+            // As mutt shows it: relative to `folder`, with `=`.
+            let text = match mailbox.path.strip_prefix(folder) {
+                Some(rest) if !folder.is_empty() && !rest.is_empty() => {
+                    format!("={}", rest.trim_start_matches('/'))
+                }
+                _ => mailbox.path.clone(),
+            };
+            Ok(app::MailboxEntry {
+                name: mailbox.label.clone().unwrap_or_else(|| text.clone()),
+                text,
+                path,
+                notify: mailbox.notify,
+                poll: mailbox.poll,
+            })
+        })
+        .collect::<Result<_, String>>()?;
     Ok(Settings {
         page_size,
+        mailboxes,
+        sync_interval,
         compose,
         account: account.clone(),
         folder: config.string("folder").to_owned(),
@@ -687,7 +719,10 @@ fn run_command(
         warnings.extend(
             changed
                 .iter()
-                .filter(|name| name.starts_with("msgraph_") && **name != "msgraph_page_size")
+                .filter(|name| {
+                    name.starts_with("msgraph_")
+                        && !["msgraph_page_size", "msgraph_sync_interval"].contains(*name)
+                })
                 .map(|name| format!("{name}: takes effect when mett starts again")),
         );
     }

@@ -77,6 +77,10 @@ pub trait MailStore: Send + Sync {
     /// Lists all folders in the mailbox.
     fn list_folders(&self) -> impl Future<Output = Result<Vec<Folder>>> + Send;
 
+    /// Returns a folder by its identifier, with fresh counts: polling for
+    /// new mail reads these.
+    fn folder(&self, id: &FolderId) -> impl Future<Output = Result<Folder>> + Send;
+
     /// Returns the folder with a well-known role, such as the Inbox.
     fn well_known_folder(
         &self,

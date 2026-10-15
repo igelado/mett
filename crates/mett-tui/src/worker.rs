@@ -67,6 +67,10 @@ pub enum Request {
     DiscardKept(Draft),
     /// Find the mailbox owner's own addresses.
     OwnAddresses,
+    /// Read the counts of the folders at these paths, to tell which have
+    /// new mail: by ID, where the folder was found before, or else by
+    /// path.
+    CheckMailboxes(Vec<(FolderPath, Option<FolderId>)>),
 }
 
 /// The outcome of a [`Request`].
@@ -97,6 +101,9 @@ pub enum Event {
     KeptDiscarded(Result<()>),
     /// Outcome of [`Request::OwnAddresses`].
     OwnAddresses(Result<Vec<String>>),
+    /// Outcome of [`Request::CheckMailboxes`]: each folder, or why it
+    /// couldn't be read.
+    MailboxesChecked(Vec<(FolderPath, Result<Folder>)>),
 }
 
 /// How each message of a move or copy fared: its new ID (or the copy's),
@@ -151,6 +158,22 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
         Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
         Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
+        Request::CheckMailboxes(mailboxes) => {
+            let mut checked = Vec::new();
+            for (path, id) in mailboxes {
+                let found = match id {
+                    // A folder deleted (or moved away) since is looked for
+                    // by its path again.
+                    Some(id) => match store.folder(&id).await {
+                        Err(Error::NotFound { .. }) => resolve(store, &path).await,
+                        found => found,
+                    },
+                    None => resolve(store, &path).await,
+                };
+                checked.push((path, found));
+            }
+            Event::MailboxesChecked(checked)
+        }
     }
 }
 
@@ -301,6 +324,37 @@ mod tests {
             Err(Error::NotFound { kind: "folder", .. })
         ));
         assert!(resolve(&store, &FolderPath::Root).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn checks_mailboxes_by_id_or_path() {
+        let store = tree().with_message(mock::message("m1", "arc", "one", DateTime::UNIX_EPOCH));
+        let archive = FolderPath::Named(vec!["Archive".into()]);
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let missing = FolderPath::Named(vec!["nowhere".into()]);
+        let Event::MailboxesChecked(checked) = serve(
+            &store,
+            Request::CheckMailboxes(vec![
+                (archive.clone(), Some(FolderId::new("arc"))),
+                // A folder that is gone is looked for by path again.
+                (inbox.clone(), Some(FolderId::new("gone"))),
+                (missing.clone(), None),
+            ]),
+        )
+        .await
+        else {
+            panic!("expected MailboxesChecked");
+        };
+        let found: Vec<_> = checked
+            .iter()
+            .map(|(path, folder)| {
+                let folder = folder.as_ref().ok();
+                (path, folder.map(|f| (f.id.as_str(), f.unread_count)))
+            })
+            .collect();
+        assert_eq!(found[0], (&archive, Some(("arc", 1))));
+        assert_eq!(found[1], (&inbox, Some(("in", 0))));
+        assert!(matches!(checked[2].1, Err(Error::NotFound { .. })));
     }
 
     #[tokio::test]
