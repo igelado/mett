@@ -230,6 +230,8 @@ impl App {
             // Attachments being listed, or one fetched to show or save.
             || self.attachments_request().is_some()
             || self.query_request().is_some()
+            // A postponed message being looked for.
+            || self.recall.is_some()
             || self.fetching.is_some()
             // A file being read or saved.
             || self.file_wait.is_some()
@@ -867,6 +869,7 @@ mod tests {
             selected: 0,
             left_draft: false,
             kept_draft: false,
+            kept: Vec::new(),
         }));
         app.update(Msg::Action(Action::Help));
         assert!(matches!(app.screen(), Screen::Compose(_)));

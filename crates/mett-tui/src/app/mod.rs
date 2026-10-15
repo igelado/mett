@@ -11,6 +11,7 @@ mod keys;
 mod mailbox;
 mod newmail;
 mod query;
+mod recall;
 mod search;
 mod threads;
 
@@ -28,6 +29,7 @@ pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
 pub use self::newmail::MailboxEntry;
 pub use self::query::{QueryMenu, QuerySettings};
+pub use self::recall::PostponedMenu;
 pub use self::search::{Limit, highlighted};
 pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
@@ -228,6 +230,9 @@ pub enum Timer {
     /// List Sent Items again, if it is open: Graph files the copy of a
     /// sent message a moment after accepting it.
     RelistSentItems,
+    /// List Drafts again, if it is open: Graph takes a sent draft out of it
+    /// a moment after accepting it.
+    RelistDrafts,
     /// Check for new mail, if this is still the timer for it (it counts
     /// the changes of interval).
     Poll(u64),
@@ -254,6 +259,8 @@ pub enum Screen {
     Text(TextView),
     /// Addresses to choose from: aliases, or a query's results.
     Query(QueryMenu),
+    /// Postponed messages to choose from.
+    Postponed(PostponedMenu),
 }
 
 /// Pager state.
@@ -465,6 +472,10 @@ pub struct App {
     /// The reply or forward whose message couldn't be fetched for want of
     /// a sign-in, to start again on Retry.
     compose_unfetched: Option<(MessageId, Kind)>,
+    /// A recall of a postponed message on its way (`R`).
+    recall: Option<recall::Recall>,
+    /// A recall failed for want of a sign-in: Retry starts it again.
+    unrecalled: bool,
     /// How to write messages.
     settings: crate::compose::Settings,
     /// The open folder gained a message while a pager was open: list it
@@ -725,6 +736,8 @@ impl App {
             composing: None,
             compose_fetch: None,
             compose_unfetched: None,
+            recall: None,
+            unrecalled: false,
             settings: settings.compose,
             relist_on_return: false,
             reselect: None,
@@ -838,6 +851,7 @@ impl App {
             Screen::Help(_) => Menu::Help,
             Screen::Attachments(_) => Menu::Attach,
             Screen::Query(_) => Menu::Query,
+            Screen::Postponed(_) => Menu::Postpone,
             // Read like a message.
             Screen::Text(_) => Menu::Pager,
         }
@@ -887,9 +901,13 @@ impl App {
                 Vec::new()
             }
             Msg::Appended(result) => self.on_appended(result),
-            Msg::Timer(Timer::RelistSentItems) => {
+            Msg::Timer(timer @ (Timer::RelistSentItems | Timer::RelistDrafts)) => {
+                let folder = match timer {
+                    Timer::RelistDrafts => mett_core::WellKnownFolder::Drafts,
+                    _ => mett_core::WellKnownFolder::SentItems,
+                };
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
-                if open == Some(mett_core::WellKnownFolder::SentItems) {
+                if open == Some(folder) {
                     if self.screen() == &Screen::Index {
                         return self.refresh();
                     }
@@ -978,6 +996,7 @@ impl App {
             Menu::Pager => self.on_pager_action(action),
             Menu::Attach => self.on_attach_action(action),
             Menu::Query => self.on_query_action(action),
+            Menu::Postpone => self.on_postponed_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
             Menu::Compose => self.on_compose_action(action),
             Menu::Browser => self.on_browser_action(action),
@@ -1058,6 +1077,8 @@ impl App {
                 // Nor restart, on a later Retry, a reply or forward whose
                 // message couldn't be fetched.
                 self.compose_unfetched = None;
+                // Nor a recall.
+                self.unrecalled = false;
                 // The user gave up: don't let a retry that was waiting
                 // start another sign-in.
                 self.retry_after.clear();
@@ -1146,6 +1167,7 @@ impl App {
             .chain(self.switching.as_ref().map(|(id, _)| *id))
             .chain(self.attachments_request())
             .chain(self.fetching.as_ref().map(|f| f.request))
+            .chain(self.recall_request())
             .collect()
     }
 
@@ -1190,6 +1212,7 @@ impl App {
         let mut effects = self.retry_delivery();
         effects.extend(self.retry_discards());
         effects.extend(self.retry_compose_fetch());
+        effects.extend(self.retry_recall());
         effects.extend(self.retry_saves());
         effects.extend(self.retry_transfers());
         effects.extend(self.retry_switch());
@@ -1319,6 +1342,7 @@ impl App {
             Action::ViewAttachments => return self.view_attachments(),
             Action::Query => self.ask_query(),
             Action::CreateAlias => return self.create_alias(),
+            Action::RecallMessage => return self.recall_message(),
             _ => {}
         }
         Vec::new()
@@ -1371,6 +1395,7 @@ impl App {
             Action::ViewAttachments => return self.view_attachments(),
             Action::Query => self.ask_query(),
             Action::CreateAlias => return self.create_alias(),
+            Action::RecallMessage => return self.recall_message(),
             _ => {}
         }
         Vec::new()
@@ -1451,6 +1476,19 @@ impl App {
 
     fn handle_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
+            // A recall's steps.
+            Event::FolderOpened(result) if self.recall_request() == Some(id) => {
+                return self.on_recall_opened(result);
+            }
+            Event::MessagesListed(result) if self.recall_request() == Some(id) => {
+                return self.on_recall_listed(result);
+            }
+            Event::MessageFetched(result) if self.recall_request() == Some(id) => {
+                return self.on_recall_fetched(result);
+            }
+            Event::AttachmentsListed(result) if self.recall_request() == Some(id) => {
+                return self.on_recall_attachments(result);
+            }
             Event::FolderOpened(result)
                 if self
                     .switching
@@ -2216,7 +2254,8 @@ impl App {
             | Screen::Help(_)
             | Screen::Attachments(_)
             | Screen::Text(_)
-            | Screen::Query(_) => Vec::new(),
+            | Screen::Query(_)
+            | Screen::Postponed(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()

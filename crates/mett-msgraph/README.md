@@ -14,7 +14,8 @@ against Microsoft Graph:
   out with `sendMail`, while replies and forwards are created with
   `createReply` or `createForward`, filled in and sent, so that Outlook
   threads them and forwards keep their attachments. Postponed messages are
-  saved as drafts in the Drafts folder.
+  saved as drafts in the Drafts folder; a recalled one is updated in place
+  and sent as itself, and is never deleted when an attempt fails.
 
 The configuration it implements (`msgraph_*` variables) is described in
 [docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md) §4.

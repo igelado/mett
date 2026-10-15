@@ -19,7 +19,7 @@ Architecture (`docs/DESIGN.md` §5.2):
 So far it can browse a mailbox (the message index, the pager, and the
 folder browser), mark, flag, purge, move and copy messages, and write
 mail: new messages, replies, group replies and forwards, which are sent or
-postponed from mutt's compose menu. It checks for new mail every
+postponed from mutt's compose menu, and recalled (`R`) once postponed. It checks for new mail every
 `msgraph_sync_interval` seconds, in the open folder and in the folders
 named by `mailboxes`. It opens the Office365 folder set in
 `spoolfile`, signing in when needed (`account.rs`); `--demo` opens a
@@ -197,9 +197,10 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 | Index | `Esc v`/`Esc V`: collapse or open the thread, or all of them (with `sort=threads`). `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
 | Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size`, `msgraph_sync_interval` and `msgraph_query_directory` take effect when mett starts again). |
-| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `v`: the message's attachments. `Q`: look up addresses, to write to one. `a`: save the sender as an alias. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
+| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `v`: the message's attachments. `Q`: look up addresses, to write to one. `a`: save the sender as an alias. `R`: recall a postponed message (from Drafts; a menu if there are several). `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
 | Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. `Tab`: switch between the `mailboxes` (listed first, if there are any) and every folder. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
 | Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. `a`: attach a file. `D`: take the selected file off. `j`/`k`: select a part. |
+| Postponed messages | `Enter`/`Space`: recall the message. `j`/`k`, `z`/`Z`, `=`/`*`: move. `q`: back. |
 | Query | `Enter`/`Space`/`m`: choose the address (after `Q`, write to it). `j`/`k`, `z`/`Z`, `=`/`*`: move. `q`: back. |
 | Attachments | `Enter`/`m`: view (text in mett; other files open in the program your system has for them, from a private copy that a later run of mett removes after a day). `s`: save to a file (asks before replacing one). `j`/`k`, `z`/`Z`: move. `q`: back. While a file is read (to attach) or saved, keys wait for it; `^G` gives up waiting. |
 | Questions | Type the answer and press `Enter`; `Esc` or `^G` gives up. The usual line-editing keys work (`^A`, `^E`, `^U`, `^K`, `^W`, arrows). Yes/no questions take `y`, `n`, or `Enter` for the suggested answer. In `To:`, `Cc:` and `Bcc:`, `Tab` completes an alias and `^T` looks up the addresses. |
@@ -227,6 +228,9 @@ Check that:
 - `v` on a message with attachments (`+`) lists them; `Enter` on
   `notes.txt` shows it, and `s` saves it. In the compose menu, `a` attaches
   a file and `D` takes it off again.
+- `P` in the compose menu postpones a message to Drafts; `R` brings it
+  back into the compose menu (with two postponed, it asks which), and `y`
+  sends that same draft: it leaves Drafts, and Sent Items has it.
 - `a` on a message saves its sender as an alias, which `m` then completes
   with `Tab` in `To:`; `^T` there (or `Q`) finds people in the directory.
 - The pager's status bar shows `(all)`, a percentage, or `(end)` as you

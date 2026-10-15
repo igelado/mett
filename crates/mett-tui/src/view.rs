@@ -17,8 +17,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
 use crate::app::{
-    App, AttachMenu, Browser, Compose, Help, Input, Pager, QueryMenu, Row, Screen, SignIn,
-    TextView, highlighted,
+    App, AttachMenu, Browser, Compose, Help, Input, Pager, PostponedMenu, QueryMenu, Row, Screen,
+    SignIn, TextView, highlighted,
 };
 use crate::color::Colors;
 use crate::expando::{self, Display, Entry, Status};
@@ -100,6 +100,15 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
         ],
     ),
     (
+        Menu::Postpone,
+        &[
+            (Action::Exit, "Exit"),
+            (Action::DisplayMessage, "Select"),
+            (Action::NextEntry, "Next"),
+            (Action::PreviousEntry, "Prev"),
+        ],
+    ),
+    (
         Menu::SignIn,
         &[
             (Action::Exit, "Close"),
@@ -153,6 +162,7 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         Screen::Attachments(menu) => render_attachments(menu, colors, frame, body),
         Screen::Text(view) => render_text(view, frame, body),
         Screen::Query(menu) => render_query(menu, colors, frame, body),
+        Screen::Postponed(menu) => render_postponed(menu, colors, frame, body),
     };
     frame.render_widget(Paragraph::new(status_line).style(colors.status), status);
     match &app.input {
@@ -309,6 +319,16 @@ fn render_compose(compose: &Compose, colors: &Colors, frame: &mut Frame, area: R
             parts.len() + 1
         ));
     }
+    // A recalled message's own.
+    for kept in &compose.kept {
+        parts.push(format!(
+            "- A     {} {}  [{}, {}]",
+            parts.len() + 1,
+            kept.name,
+            kept.content_type,
+            format_size(usize::try_from(kept.size).unwrap_or(usize::MAX))
+        ));
+    }
     for file in &draft.attachments {
         parts.push(format!(
             "- A     {} {}  [{}, {}]",
@@ -418,6 +438,46 @@ fn render_query(menu: &QueryMenu, colors: &Colors, frame: &mut Frame, area: Rect
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
     format!("---mett: {} [{}]---", menu.title, menu.entries.len())
+}
+
+/// Draws the postponed messages to choose from and returns its status
+/// line: when each was written, to whom, and its subject.
+fn render_postponed(
+    menu: &PostponedMenu,
+    colors: &Colors,
+    frame: &mut Frame,
+    area: Rect,
+) -> String {
+    let height = usize::from(area.height).max(1);
+    let first = menu.selected / height * height;
+    let width = usize::from(area.width);
+    let lines: Vec<Line> = menu
+        .entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, message)| {
+            let to = message.to.first().map_or_else(String::new, |a| {
+                a.name.clone().unwrap_or_else(|| a.email.clone())
+            });
+            let when = message
+                .received
+                .with_timezone(&chrono::Local)
+                .format("%b %d");
+            let line = Line::raw(truncate(
+                &format!("{:>4} {when} {:<20.20} {}", i + 1, to, message.subject),
+                width,
+            ));
+            if i == menu.selected {
+                line.style(colors.indicator)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    format!("---mett: Postponed Messages [{}]---", menu.entries.len())
 }
 
 /// Draws text on its own screen and returns its status line.

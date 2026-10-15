@@ -159,8 +159,10 @@ pub struct Compose {
     /// The backend kept a draft from the last attempt, which the next one
     /// goes on from.
     pub(super) kept_draft: bool,
+    /// A recalled postponed message's attachments that stay with it.
+    pub kept: Vec<mett_core::Attachment>,
     /// The selected part: its text, the forwarded attachments if there
-    /// are any, then the attached files.
+    /// are any, the recalled message's, then the attached files.
     pub selected: usize,
 }
 
@@ -175,13 +177,14 @@ impl Compose {
             forwarded_attachments,
             left_draft: false,
             kept_draft: false,
+            kept: Vec::new(),
             selected: 0,
         }
     }
 
     /// How many parts the message has.
     pub fn parts(&self) -> usize {
-        1 + usize::from(self.forwarded_attachments) + self.draft.attachments.len()
+        1 + usize::from(self.forwarded_attachments) + self.kept.len() + self.draft.attachments.len()
     }
 }
 
@@ -868,6 +871,10 @@ impl App {
         compose.unauthorized = None;
         compose.kept_draft = kept;
         let saved_copy = compose.draft.save_copy;
+        let recalled = match &compose.draft.origin {
+            Some(DraftOrigin::Recalled(id)) => Some(id.clone()),
+            _ => None,
+        };
         match result {
             Ok(()) => {
                 self.screens.remove(position);
@@ -884,16 +891,31 @@ impl App {
                     _ if saved_copy => Some(WellKnownFolder::SentItems),
                     _ => None,
                 };
+                // A pager showing a recalled message closes: once sent, it
+                // has left Drafts; postponed again, it no longer reads as
+                // the pager shows it.
+                if let Some(id) = &recalled {
+                    self.screens.retain(
+                        |screen| !matches!(screen, Screen::Pager(pager) if &pager.id == id),
+                    );
+                }
+                // Once sent, it has left Drafts.
+                let left = recalled
+                    .filter(|_| delivery != Some(Delivery::Postpone))
+                    .map(|_| WellKnownFolder::Drafts);
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
-                if landed_in.is_some() && open == landed_in {
-                    // Graph files the sent copy a moment after accepting
-                    // the message: look again a little later too.
+                if open.is_some() && (open == landed_in || open == left) {
+                    // Graph files the sent copy (and takes the sent draft
+                    // out of Drafts) a moment after accepting the message:
+                    // look again a little later too.
                     let mut effects = Vec::new();
-                    if landed_in == Some(WellKnownFolder::SentItems) {
+                    if open == Some(WellKnownFolder::SentItems) {
                         effects.push(Effect::Later(
                             SENT_COPY_DELAY,
                             super::Timer::RelistSentItems,
                         ));
+                    } else if open == left {
+                        effects.push(Effect::Later(SENT_COPY_DELAY, super::Timer::RelistDrafts));
                     }
                     // Not under a pager, whose message and position would
                     // no longer match the index: once back in the index.

@@ -213,7 +213,12 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   (`saveToSentItems=true`) instead of uploading a second one. Any other
   `record` value is honoured with an explicit save.
 - **Postponing:** `postponed` pointing at `@drafts` stores drafts as server
-  drafts, so they are visible in Outlook.
+  drafts, so they are visible in Outlook. Recalling one (`R`) lists the
+  drafts there (drafts only); the one chosen is updated in place when it
+  is postponed again, and sent as itself (its attachments go with it
+  unless taken off with `D`, and Graph keeps a copy in Sent Items). It is
+  never deleted after a failed attempt: it is the user's. One deleted or
+  sent elsewhere meanwhile isn't sent again.
 - **Attachments** go with a new message in the request that sends it when
   that request (attachments in base64, and the text) stays under 3.5 MB,
   as Graph takes requests of up to 4 MB. Larger ones, and those of replies and forwards, go
@@ -232,9 +237,9 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   tell which draft it made, and says one may be left in Drafts.)
 
 *Implemented so far:* mail is sent through the account of `spoolfile`, and
-a copy is kept in its Sent Items when `copy` allows. `record` and
-`postponed` are not used yet: postponed messages always go to the
-account's Drafts folder.
+a copy is kept in its Sent Items when `copy` allows. `record` is not used
+yet, and `postponed` only as described above: messages are postponed to,
+and recalled from, the account's Drafts folder.
 
 ## 6. New meanings for existing mutt concepts
 
