@@ -401,7 +401,7 @@ mod tests {
         assert!(settings.me.contains(&"other@x.org".to_owned()));
 
         let settings = Settings::from_config(
-            &config("set realname='Me Myself'\nalternates '^me@x\\.org$' other\n"),
+            &config("set realname='Me Myself'\nalternates '^me@x\\.org$' -group work other\n"),
             &account,
         )
         .unwrap();

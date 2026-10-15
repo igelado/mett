@@ -258,22 +258,25 @@ impl Config {
                 "unset" => self.each(args, |c, name| c.unset(name)),
                 "toggle" => self.each(args, |c, name| c.toggle(name)),
                 "reset" => self.each(args, |c, name| c.reset_named(name)),
-                "alternates" => self.each(args, |c, regex| {
-                    regex::Regex::new(regex).map_err(|e| {
-                        format!("alternates: bad regular expression {regex:?}: {e}")
-                    })?;
-                    if !c.alternates.iter().any(|a| a == regex) {
-                        c.alternates.push(regex.to_owned());
+                "alternates" => self.patterns(args).and_then(|regexes| {
+                    for regex in regexes {
+                        regex::Regex::new(&regex).map_err(|e| {
+                            format!("alternates: bad regular expression {regex:?}: {e}")
+                        })?;
+                        if !self.alternates.contains(&regex) {
+                            self.alternates.push(regex);
+                        }
                     }
                     Ok(())
                 }),
-                "unalternates" => self.each(args, |c, regex| {
-                    if regex == "*" {
-                        c.alternates.clear();
-                    } else {
-                        c.alternates.retain(|a| a != regex);
+                "unalternates" => self.patterns(args).map(|regexes| {
+                    for regex in regexes {
+                        if regex == "*" {
+                            self.alternates.clear();
+                        } else {
+                            self.alternates.retain(|a| *a != regex);
+                        }
                     }
-                    Ok(())
                 }),
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
@@ -311,6 +314,22 @@ impl Config {
     }
 
     /// Expands a word now, with the values set so far.
+    /// The expanded patterns of `alternates`-like commands, leaving out
+    /// `-group NAME` (mett has no address groups yet).
+    fn patterns(&self, args: &[Word]) -> Result<Vec<String>, String> {
+        let mut patterns = Vec::new();
+        let mut words = args.iter();
+        while let Some(word) = words.next() {
+            let word = self.expand(word)?;
+            if word == "-group" {
+                words.next();
+            } else {
+                patterns.push(word);
+            }
+        }
+        Ok(patterns)
+    }
+
     fn expand(&self, word: &Word) -> Result<String, String> {
         word.expand(&Expand { config: self })
     }
