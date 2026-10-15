@@ -265,13 +265,12 @@ impl Colors {
             .take_while(|word| attribute(word).is_some())
             .count();
         let (attrs, rest) = rest.split_at(attributes);
-        // A pattern written as several words, unquoted, is one.
-        let joined;
+        // As in mutt, the pattern is one word: quoted, if it has spaces.
         let (fg, bg, expression) = match (rest, object.matches()) {
             ([fg, bg], false) => (fg, bg, None),
-            ([fg, bg, expression @ ..], true) if !expression.is_empty() => {
-                joined = expression.join(" ");
-                (fg, bg, Some(joined.as_str()))
+            ([fg, bg, expression], true) => (fg, bg, Some(expression.as_str())),
+            ([_, _, _, _, ..], true) => {
+                return Err("color: too many arguments (quote a pattern with spaces)".into());
             }
             (_, false) => {
                 return Err("color: expected an object, then a foreground and a background".into());
@@ -306,8 +305,9 @@ impl Colors {
         let style = with_attribute(Style::new(), attr);
         match (rest, object.matches()) {
             ([], false) => self.set(object, style, None),
-            (expression, true) if !expression.is_empty() => {
-                self.set(object, style, Some(&expression.join(" ")))
+            ([expression], true) => self.set(object, style, Some(expression)),
+            ([_, _, ..], true) => {
+                Err("mono: too many arguments (quote a pattern with spaces)".into())
             }
             _ => Err("mono: expected an object, an attribute and maybe an expression".into()),
         }
@@ -379,10 +379,7 @@ impl Colors {
             return Err(format!("uncolor: {}: expected * or an expression", args[0]).into());
         }
         let all = expressions.iter().any(|e| e == "*");
-        // Each expression, or all of them as one, as `color` joins one
-        // written unquoted.
-        let joined = expressions.join(" ");
-        let keep = |text: &String| !all && !expressions.contains(text) && *text != joined;
+        let keep = |text: &String| !all && !expressions.contains(text);
         match object {
             Object::Index => self.index.retain(|rule| keep(&rule.text)),
             Object::Header => self.header.retain(|rule| keep(&rule.text)),
@@ -559,10 +556,9 @@ mod tests {
         colors
             .color(&words("header yellow default ^subject:"))
             .unwrap();
-        // An unquoted pattern of several words.
-        colors
-            .color(&words("index red default ~f alice@x.org"))
-            .unwrap();
+        // A quoted pattern of several words.
+        let quoted = ["index", "red", "default", "~f alice@x.org"].map(String::from);
+        colors.color(&quoted).unwrap();
         assert_eq!(colors.index.last().unwrap().text, "~f alice@x.org");
         colors.index.pop();
         assert_eq!(colors.header_style("Subject: hi").fg, Some(Color::Yellow));
@@ -624,11 +620,20 @@ mod tests {
         colors.color(&words("index red default ~F")).unwrap();
         colors.uncolor(&words("index ~N")).unwrap();
         assert_eq!(colors.index.len(), 1);
-        // Written unquoted, as it was given.
-        colors
-            .color(&words("index red default ~f alice@x.org"))
-            .unwrap();
+        // A pattern with spaces is quoted, as in mutt; each word to
+        // `uncolor` is a pattern of its own.
+        assert!(
+            colors
+                .color(&words("index red default ~f alice@x.org"))
+                .is_err()
+        );
+        let quoted = ["index", "red", "default", "~f alice@x.org"].map(String::from);
+        colors.color(&quoted).unwrap();
         colors.uncolor(&words("index ~f alice@x.org")).unwrap();
+        assert_eq!(colors.index.len(), 2);
+        colors
+            .uncolor(&["index".into(), "~f alice@x.org".into()])
+            .unwrap();
         assert_eq!(colors.index.len(), 1);
         colors.uncolor(&words("index *")).unwrap();
         colors.uncolor(&words("status")).unwrap();

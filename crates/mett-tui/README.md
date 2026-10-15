@@ -84,7 +84,8 @@ time; `date_format` is used by `%d` and `%D`). The expandos mett knows:
 Expandos mett can't fill yet (such as sizes and line counts) are empty, so
 `%?l?...?` conditionals take their `else` part.
 
-`color OBJECT [ATTRIBUTE ...] FOREGROUND BACKGROUND [EXPRESSION]` sets the
+`color OBJECT [ATTRIBUTE ...] FOREGROUND BACKGROUND [EXPRESSION]` (an
+expression with spaces quoted, as in mutt) sets the
 colors of `normal`, `indicator`, `status` (and the help line), `error`,
 `message`, `prompt`, `search`, `hdrdefault`, `quoted` to `quoted9` (by
 `quote_regex`), `signature` and `attachment`; `index` takes a pattern (the
