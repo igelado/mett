@@ -1194,6 +1194,12 @@ mod tests {
             Event::FolderOpened(Ok(folder("in", "Inbox", 0))),
         );
         assert!(!effects.iter().any(|e| matches!(e, Effect::Later(..))));
+        // Nor a check of the mailboxes.
+        assert!(
+            !requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+        );
     }
 
     #[test]

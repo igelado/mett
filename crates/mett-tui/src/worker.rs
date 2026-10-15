@@ -209,6 +209,8 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
         Request::CheckMailboxes(mailboxes) => {
             let mut checked = Vec::new();
+            // The folder tree, listed once for every path that needs it.
+            let mut listed = None;
             for (path, id) in mailboxes {
                 let found = match id {
                     // A folder deleted (or moved away) since is looked for
@@ -216,15 +218,17 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
                     // So is one renamed or moved since (another may be at
                     // its path now).
                     Some(id) => match store.folder(&id).await {
-                        Err(Error::NotFound { .. }) => resolve(store, &path).await,
+                        Err(Error::NotFound { .. }) => {
+                            resolve_listed(store, &path, &mut listed).await
+                        }
                         Ok(folder) => match at_path(store, &path, &folder).await {
                             Ok(true) => Ok(folder),
-                            Ok(false) => resolve(store, &path).await,
+                            Ok(false) => resolve_listed(store, &path, &mut listed).await,
                             Err(e) => Err(e),
                         },
                         found => found,
                     },
-                    None => resolve(store, &path).await,
+                    None => resolve_listed(store, &path, &mut listed).await,
                 };
                 let found = match found {
                     Ok(folder) => store
@@ -348,6 +352,16 @@ async fn at_path<S: MailStore>(store: &S, path: &FolderPath, folder: &Folder) ->
 /// Finds the folder at `path`: a well-known folder, possibly followed by
 /// names of folders below it, or names from the top of the mailbox.
 async fn resolve<S: MailStore>(store: &S, path: &FolderPath) -> Result<Folder> {
+    resolve_listed(store, path, &mut None).await
+}
+
+/// [`resolve`], listing the folders (if it must) into `listed`, or using
+/// those listed there already: checking several mailboxes lists them once.
+async fn resolve_listed<S: MailStore>(
+    store: &S,
+    path: &FolderPath,
+    listed: &mut Option<Vec<Folder>>,
+) -> Result<Folder> {
     match path {
         FolderPath::Root => Err(Error::Backend(
             "the mailbox itself isn't a folder; choose one, such as @inbox".into(),
@@ -357,9 +371,9 @@ async fn resolve<S: MailStore>(store: &S, path: &FolderPath) -> Result<Folder> {
             if rest.is_empty() {
                 return Ok(start);
             }
-            descend(store, Some(start), rest).await
+            descend(store, Some(start), rest, listed).await
         }
-        FolderPath::Named(names) => descend(store, None, names).await,
+        FolderPath::Named(names) => descend(store, None, names, listed).await,
     }
 }
 
@@ -370,8 +384,12 @@ async fn descend<S: MailStore>(
     store: &S,
     start: Option<Folder>,
     names: &[String],
+    listed: &mut Option<Vec<Folder>>,
 ) -> Result<Folder> {
-    let folders = store.list_folders().await?;
+    if listed.is_none() {
+        *listed = Some(store.list_folders().await?);
+    }
+    let folders = listed.as_deref().unwrap_or_default();
     let mut current = start;
     for name in names {
         let parent = current.as_ref().map(|f| &f.id);

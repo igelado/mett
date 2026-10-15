@@ -1255,8 +1255,11 @@ impl App {
                 self.folder = Some(folder);
                 self.visited();
                 let mut effects = self.list(Page::first(self.page_size));
-                // Then the mailboxes' new mail, and checking for more.
-                effects.extend(self.check_mailboxes());
+                // Then the mailboxes' new mail, and checking for more,
+                // unless checking is off.
+                if self.sync_interval.is_some() {
+                    effects.extend(self.check_mailboxes());
+                }
                 effects.extend(self.arm_poll());
                 // Before the user can reply: their own addresses, so that a
                 // reply to their own mail goes to its recipients (the
