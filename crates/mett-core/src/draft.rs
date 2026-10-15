@@ -1,5 +1,6 @@
 //! Messages being written: what mett sends or saves as a draft.
 
+use crate::attachment::OutgoingAttachment;
 use crate::ids::MessageId;
 use crate::message::Address;
 
@@ -29,6 +30,8 @@ pub struct Draft {
     pub subject: String,
     /// The body, as plain text.
     pub body: String,
+    /// Files attached to it.
+    pub attachments: Vec<OutgoingAttachment>,
     /// The message this one replies to or forwards.
     pub origin: Option<DraftOrigin>,
     /// Whether to keep a copy in the sent-items folder (mutt's `copy`).

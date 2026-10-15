@@ -9,10 +9,11 @@ use std::future::Future;
 
 use chrono::{DateTime, TimeDelta, Utc};
 
+use crate::attachment::Attachment;
 use crate::draft::Draft;
 use crate::error::Result;
 use crate::folder::{Folder, WellKnownFolder};
-use crate::ids::{FolderId, MessageId, PageCursor};
+use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor};
 use crate::message::{FlagsUpdate, Message, MessageSummary};
 
 /// How many unread messages [`MailStore::recent_unread`] returns at most.
@@ -122,6 +123,20 @@ pub trait MailStore: Send + Sync {
 
     /// Fetches a full message, including its body.
     fn fetch_message(&self, id: &MessageId) -> impl Future<Output = Result<Message>> + Send;
+
+    /// Lists a message's attachments.
+    fn list_attachments(
+        &self,
+        message: &MessageId,
+    ) -> impl Future<Output = Result<Vec<Attachment>>> + Send;
+
+    /// Fetches an attachment's content: a file's bytes, or an attached
+    /// message as MIME.
+    fn fetch_attachment(
+        &self,
+        message: &MessageId,
+        attachment: &AttachmentId,
+    ) -> impl Future<Output = Result<Vec<u8>>> + Send;
 
     /// Changes a message's flags.
     fn update_flags(

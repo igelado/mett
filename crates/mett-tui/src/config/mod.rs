@@ -190,6 +190,11 @@ impl Config {
         config
     }
 
+    /// The home directory, for `~` in file names.
+    pub fn home(&self) -> Option<&str> {
+        self.home.as_deref()
+    }
+
     /// The value of a known variable.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(name)

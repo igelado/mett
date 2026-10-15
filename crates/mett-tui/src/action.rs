@@ -86,6 +86,11 @@ actions! {
     PreviousThread => "previous-thread", "Move to the previous thread";
     CollapseThread => "collapse-thread", "Collapse or uncollapse the current thread";
     CollapseAll => "collapse-all", "Collapse or uncollapse every thread";
+    ViewAttachments => "view-attachments", "Show the message's attachments";
+    ViewAttach => "view-attach", "View the attachment";
+    SaveEntry => "save-entry", "Save the attachment to a file";
+    AttachFile => "attach-file", "Attach a file to the message";
+    DetachFile => "detach-file", "Take the attached file off the message";
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";

@@ -85,6 +85,12 @@ pub enum Question {
     Limit,
     /// A mettrc command (`:`).
     Command,
+    /// A file to attach (`a` in the compose menu).
+    AttachFile,
+    /// The file to save an attachment to (`s` in the attachment menu).
+    SaveAttachment,
+    /// Whether to replace a file that is there.
+    Overwrite,
 }
 
 impl Question {
@@ -143,6 +149,16 @@ pub struct Compose {
     /// A failed attempt to send or postpone it may have left a server
     /// draft behind, to delete if the user gives up on it.
     pub(super) left_draft: bool,
+    /// The selected part: its text, the forwarded attachments if there
+    /// are any, then the attached files.
+    pub selected: usize,
+}
+
+impl Compose {
+    /// How many parts the message has.
+    pub fn parts(&self) -> usize {
+        1 + usize::from(self.forwarded_attachments) + self.draft.attachments.len()
+    }
 }
 
 /// What happens to a finished message.
@@ -482,7 +498,11 @@ impl App {
                 self.unbrowsed = None;
                 self.question_message = None;
             }
-            Question::Search | Question::Limit | Question::Command => {}
+            Question::Search | Question::Limit | Question::Command | Question::AttachFile => {}
+            Question::SaveAttachment => {}
+            Question::Overwrite => {
+                self.unsaved = None;
+            }
             _ => self.composing = None,
         }
         Vec::new()
@@ -497,6 +517,12 @@ impl App {
         }
         if question == Question::Command {
             return self.answer_command(text);
+        }
+        if question == Question::AttachFile {
+            return self.answer_attach_file(text);
+        }
+        if question == Question::SaveAttachment {
+            return self.answer_save_attachment(text);
         }
         let setting_up = self.composing.is_some();
         let Some(draft) = self.draft_mut() else {
@@ -571,6 +597,7 @@ impl App {
                 return self.deliver(Delivery::Send);
             }
             Question::Purge => return self.answer_purge(answer),
+            Question::Overwrite => return self.answer_overwrite(answer),
             Question::AbortNoSubject
             | Question::To
             | Question::Cc
@@ -581,7 +608,9 @@ impl App {
             | Question::CopyTo
             | Question::Search
             | Question::Limit
-            | Question::Command => {}
+            | Question::Command
+            | Question::AttachFile
+            | Question::SaveAttachment => {}
         }
         self.advance()
     }
@@ -676,6 +705,7 @@ impl App {
                 unauthorized: None,
                 forwarded_attachments,
                 left_draft: false,
+                selected: 0,
             }));
         }
         Vec::new()
@@ -727,6 +757,17 @@ impl App {
                 };
                 let current = field(&draft, question);
                 self.ask_line(question, &current);
+            }
+            Action::AttachFile => self.ask_attach_file(),
+            Action::DetachFile => self.detach_file(),
+            Action::NextEntry | Action::PreviousEntry => {
+                if let Some(Screen::Compose(compose)) = self.screens.last_mut() {
+                    compose.selected = if action == Action::NextEntry {
+                        (compose.selected + 1).min(compose.parts() - 1)
+                    } else {
+                        compose.selected.saturating_sub(1)
+                    };
+                }
             }
             _ => {}
         }

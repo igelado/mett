@@ -110,7 +110,26 @@ pub fn mailbox() -> MemoryStore {
                 ),
             }
         };
+        let attached = message.summary.has_attachments;
         store = store.with_message(message);
+        // Something to look at with `v`.
+        if attached {
+            let id = format!("demo-{i}");
+            store = store
+                .with_attachment(
+                    &id,
+                    "notes.txt",
+                    "text/plain",
+                    format!("Notes for sample message {i}.\n\nA text attachment opens in mett.\n")
+                        .as_bytes(),
+                )
+                .with_attachment(
+                    &id,
+                    "figures.csv",
+                    "text/csv",
+                    b"month,count\nJan,3\nFeb,5\n",
+                );
+        }
     }
     store
 }

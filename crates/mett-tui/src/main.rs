@@ -324,6 +324,7 @@ fn settings_keeping(
         ascii: config.flag("ascii_chars"),
     };
     Ok(Settings {
+        home: config.home().map(str::to_owned),
         page_size,
         mailboxes,
         display,
@@ -427,6 +428,19 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     let mut deferred = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
 
     while !app.quit {
+        // What effects done at once answered goes to the app first.
+        while !deferred.msgs.is_empty() {
+            for msg in std::mem::take(&mut deferred.msgs) {
+                let effects = app.update(msg);
+                deferred.absorb(dispatch(
+                    &mut app,
+                    &request_tx,
+                    &timer_tx,
+                    cancel.as_ref(),
+                    effects,
+                ));
+            }
+        }
         // The editor runs between messages, with the terminal handed over.
         commands.queue.extend(deferred.commands.drain(..));
         while let Some(text) = deferred.edit.take() {
@@ -671,6 +685,8 @@ struct Deferred {
     edit: Option<String>,
     /// `:` commands, which need the configuration.
     commands: Vec<String>,
+    /// What effects done at once answered, for the app.
+    msgs: Vec<Msg>,
 }
 
 impl Deferred {
@@ -679,7 +695,49 @@ impl Deferred {
             self.edit = other.edit;
         }
         self.commands.extend(other.commands);
+        self.msgs.extend(other.msgs);
     }
+}
+
+/// Writes `data` to `path`; a file there is replaced only if `overwrite`.
+fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::FileOutcome {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    match options
+        .open(&path)
+        .and_then(|mut file| file.write_all(&data))
+    {
+        Ok(()) => app::FileOutcome::Done(path),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            app::FileOutcome::Exists(path, data)
+        }
+        Err(e) => app::FileOutcome::Failed(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Writes an attachment to a directory of its own, readable only by the
+/// user, and opens it with the program the system has for it.
+fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
+    static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mett-{}-{n}", std::process::id()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir)?;
+    let path = dir.join(name);
+    std::fs::write(&path, data)?;
+    open::that_detached(&path)
 }
 
 /// The configuration that `:` commands change.
@@ -821,6 +879,22 @@ fn dispatch(
                 }
             }
             Effect::Edit(text) => deferred.edit = Some(text),
+            Effect::SaveFile {
+                path,
+                data,
+                overwrite,
+            } => deferred
+                .msgs
+                .push(app::Msg::FileSaved(save_file(path, data, overwrite))),
+            Effect::OpenFile { name, data } => {
+                if let Err(e) = open_file(&name, &data) {
+                    app.status = format!("Could not open {name}: {e}");
+                }
+            }
+            Effect::ReadFile(path) => {
+                let read = std::fs::read(&path).map_err(|e| e.to_string());
+                deferred.msgs.push(app::Msg::FileRead(path, read));
+            }
             Effect::Command(command) => deferred.commands.push(command),
             Effect::Later(after, timer) => {
                 let timers = timers.clone();
@@ -1047,6 +1121,26 @@ mod tests {
             "set signature=/nonexistent/mett/other",
         );
         assert!(reset.settings.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_a_file_replaces_one_there_only_when_asked() {
+        let dir = std::env::temp_dir().join(format!("mett-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            save_file(path.clone(), b"one".to_vec(), false),
+            app::FileOutcome::Done(path.clone())
+        );
+        assert_eq!(
+            save_file(path.clone(), b"two".to_vec(), false),
+            app::FileOutcome::Exists(path.clone(), b"two".to_vec())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        save_file(path.clone(), b"two".to_vec(), true);
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

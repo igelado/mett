@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{
-    AccessToken, Address, Authenticator, BodyKind, Draft, DraftOrigin, Error, FlagsUpdate,
-    FolderId, MailSender, MailStore, MessageId, Page, PageCursor, WellKnownFolder,
+    AccessToken, Address, AttachmentKind, Authenticator, BodyKind, Draft, DraftOrigin, Error,
+    FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page, PageCursor,
+    WellKnownFolder,
 };
 use mett_msgraph::{AuthSettings, GraphMailStore};
 use serde_json::{Value, json};
 use url::Url;
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Hands out a fixed token.
@@ -1516,4 +1517,139 @@ async fn finds_the_users_own_addresses() {
             "alice@contoso.com",
         ]
     );
+}
+
+#[tokio::test]
+async fn lists_and_fetches_attachments() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "id": "a1", "name": "notes.txt", "contentType": "text/plain",
+                    "size": 5, "isInline": false,
+                },
+                {
+                    "@odata.type": "#microsoft.graph.itemAttachment",
+                    "id": "a2", "name": "Fwd", "size": 900,
+                },
+                {
+                    "@odata.type": "#microsoft.graph.referenceAttachment",
+                    "id": "a3", "name": "link", "contentType": null, "size": 0,
+                },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments/a1/$value"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let list = store.list_attachments(&MessageId::new("m1")).await.unwrap();
+    let kinds: Vec<_> = list
+        .iter()
+        .map(|a| (a.name.as_str(), a.content_type.as_str(), a.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("notes.txt", "text/plain", AttachmentKind::File),
+            ("Fwd", "message/rfc822", AttachmentKind::Item),
+            ("link", "application/octet-stream", AttachmentKind::Link),
+        ]
+    );
+    let data = store
+        .fetch_attachment(&MessageId::new("m1"), &list[0].id)
+        .await
+        .unwrap();
+    assert_eq!(data, b"hello");
+}
+
+fn attached(name: &str, size: usize) -> OutgoingAttachment {
+    OutgoingAttachment {
+        name: name.into(),
+        content_type: "application/octet-stream".into(),
+        data: vec![7; size],
+    }
+}
+
+#[tokio::test]
+async fn sends_small_attachments_with_the_message() {
+    let server = MockServer::start().await;
+    let mut message = draft_json();
+    message["attachments"] = json!([{
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": "a.bin",
+        "contentType": "application/octet-stream",
+        "contentBytes": "BwcH",
+    }]);
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/sendMail"))
+        .and(body_json(
+            json!({ "message": message, "saveToSentItems": true }),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut draft = draft(None);
+    draft.attachments.push(attached("a.bin", 3));
+    store(&server).send(&draft).await.unwrap();
+}
+
+#[tokio::test]
+async fn uploads_large_attachments_without_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "uploadUrl": format!("{}/upload/session", server.uri()),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The upload URL carries its own authorisation.
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(418))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .and(header("content-range", "bytes 3276800-3999999/4000000"))
+        .respond_with(ResponseTemplate::new(201).insert_header(
+            "Location",
+            "https://x/api/v2.0/Users('u')/Messages('d1')/Attachments('att')",
+        ))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut draft = draft(None);
+    draft.attachments.push(attached("big.bin", 4_000_000));
+    store(&server).send(&draft).await.unwrap();
 }

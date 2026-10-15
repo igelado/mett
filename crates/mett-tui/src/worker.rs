@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId,
-    MessagePage, Page, Result,
+    Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
+    Message, MessageId, MessagePage, Page, Result,
 };
 use tokio::sync::mpsc;
 
@@ -47,6 +47,10 @@ pub enum Request {
     FetchMessage(MessageId),
     /// Change a message's flags.
     UpdateFlags(MessageId, FlagsUpdate),
+    /// List a message's attachments.
+    ListAttachments(MessageId),
+    /// Fetch an attachment's content.
+    FetchAttachment(MessageId, AttachmentId),
     /// List every folder in the mailbox.
     ListFolders,
     /// Move or copy messages to the folder at a path.
@@ -108,6 +112,10 @@ pub enum Event {
     MessageFetched(Result<Message>),
     /// Outcome of [`Request::UpdateFlags`].
     FlagsUpdated(Result<()>),
+    /// Outcome of [`Request::ListAttachments`].
+    AttachmentsListed(Result<Vec<Attachment>>),
+    /// Outcome of [`Request::FetchAttachment`].
+    AttachmentFetched(Result<Vec<u8>>),
     /// Outcome of [`Request::ListFolders`].
     FoldersListed(Result<Vec<Folder>>),
     /// Outcome of [`Request::Transfer`]: the folder could not be found, or
@@ -204,6 +212,10 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             }))
         }
         Request::FetchMessage(id) => Event::MessageFetched(store.fetch_message(&id).await),
+        Request::ListAttachments(id) => Event::AttachmentsListed(store.list_attachments(&id).await),
+        Request::FetchAttachment(id, attachment) => {
+            Event::AttachmentFetched(store.fetch_attachment(&id, &attachment).await)
+        }
         Request::UpdateFlags(id, update) => {
             Event::FlagsUpdated(store.update_flags(&id, update).await)
         }

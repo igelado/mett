@@ -26,6 +26,8 @@ pub(super) enum Transfer {
 }
 
 /// A change to the mailbox, made in its turn (see [`App::write`]).
+// Few changes wait at a time, so their size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Write {
     /// A message's flags.

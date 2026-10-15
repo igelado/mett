@@ -838,6 +838,7 @@ mod tests {
             )),
             unauthorized: None,
             forwarded_attachments: false,
+            selected: 0,
             left_draft: false,
         }));
         app.update(Msg::Action(Action::Help));

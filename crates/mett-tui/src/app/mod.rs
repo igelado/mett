@@ -5,6 +5,7 @@
 //! to a [`Msg`]; side effects come back as [`Effect`]s for the main loop to
 //! carry out. This keeps the UI logic testable without a terminal.
 
+mod attachments;
 mod composing;
 mod keys;
 mod mailbox;
@@ -18,6 +19,7 @@ use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, Messa
 use mett_msgraph::SignInPrompt;
 use ratatui::crossterm::event::KeyEvent;
 
+pub use self::attachments::{AttachMenu, FileOutcome, TextView};
 use self::composing::Composing;
 pub use self::composing::{Compose, Input};
 pub use self::keys::{Help, Reconfigured};
@@ -86,6 +88,8 @@ pub struct Settings {
     /// How often to check for new mail (`msgraph_sync_interval`), or
     /// `None` not to.
     pub sync_interval: Option<std::time::Duration>,
+    /// The home directory, for `~` in file names.
+    pub home: Option<String>,
 }
 
 /// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
@@ -115,6 +119,7 @@ impl Default for Settings {
             display: crate::expando::Display::default(),
             ordering: Ordering::default(),
             sync_interval: None,
+            home: None,
         }
     }
 }
@@ -137,6 +142,10 @@ pub enum Msg {
     Configured(Reconfigured),
     /// The editor finished: the edited text, or why it failed.
     Edited(Result<String, String>),
+    /// A file was saved, or not.
+    FileSaved(FileOutcome),
+    /// A file was read, or not.
+    FileRead(std::path::PathBuf, Result<Vec<u8>, String>),
     /// A timer the app set went off.
     Timer(Timer),
     /// The terminal was resized.
@@ -161,6 +170,25 @@ pub enum Effect {
     CancelSignIn,
     /// Put the text on the clipboard, through the terminal.
     Copy(String),
+    /// Write a file, then send back [`Msg::FileSaved`]. A file that exists
+    /// is replaced only if `overwrite`.
+    SaveFile {
+        /// Where.
+        path: std::path::PathBuf,
+        /// What.
+        data: Vec<u8>,
+        /// Whether to replace a file there.
+        overwrite: bool,
+    },
+    /// Open a file (an attachment) in the program the system has for it.
+    OpenFile {
+        /// Its name.
+        name: String,
+        /// Its content.
+        data: Vec<u8>,
+    },
+    /// Read a file, then send back [`Msg::FileRead`].
+    ReadFile(std::path::PathBuf),
     /// Edit the text in the user's editor, then send back
     /// [`Msg::Edited`].
     Edit(String),
@@ -196,6 +224,10 @@ pub enum Screen {
     Browser(Browser),
     /// The key bindings of a menu.
     Help(Help),
+    /// A message's attachments.
+    Attachments(AttachMenu),
+    /// Text on its own, such as a text attachment.
+    Text(TextView),
 }
 
 /// Pager state.
@@ -561,6 +593,13 @@ pub struct App {
     last_draft: u64,
     /// How many messages to request per page.
     page_size: u32,
+    /// The attachment being fetched, and what for.
+    fetching: Option<attachments::Fetching>,
+    /// A file not saved because one was there, waiting for the user to say
+    /// whether to replace it.
+    unsaved: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// See [`Settings::home`].
+    home: Option<String>,
     /// See [`Settings::mailboxes`].
     mailboxes: Vec<MailboxEntry>,
     /// What is known of each mailbox's new mail.
@@ -697,6 +736,9 @@ impl App {
             next_request: 0,
             last_draft: 0,
             page_size: settings.page_size,
+            fetching: None,
+            unsaved: None,
+            home: settings.home,
             mailboxes: settings.mailboxes,
             mailbox_state: HashMap::new(),
             sync_interval: settings.sync_interval,
@@ -735,6 +777,9 @@ impl App {
             Screen::Compose(_) => Menu::Compose,
             Screen::Browser(_) => Menu::Browser,
             Screen::Help(_) => Menu::Help,
+            Screen::Attachments(_) => Menu::Attach,
+            // Read like a message.
+            Screen::Text(_) => Menu::Pager,
         }
     }
 
@@ -775,6 +820,8 @@ impl App {
             Msg::Key(key) => self.on_key_press(key),
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
+            Msg::FileSaved(outcome) => self.on_file_saved(outcome),
+            Msg::FileRead(path, result) => self.on_file_read(path, result),
             Msg::Timer(Timer::RelistSentItems) => {
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
                 if open == Some(mett_core::WellKnownFolder::SentItems) {
@@ -856,7 +903,9 @@ impl App {
         }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
+            Menu::Pager if matches!(self.screen(), Screen::Text(_)) => self.on_text_action(action),
             Menu::Pager => self.on_pager_action(action),
+            Menu::Attach => self.on_attach_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
             Menu::Compose => self.on_compose_action(action),
             Menu::Browser => self.on_browser_action(action),
@@ -1192,6 +1241,7 @@ impl App {
             Action::Reply => return self.start_compose(Kind::Reply),
             Action::GroupReply => return self.start_compose(Kind::GroupReply),
             Action::Forward => return self.start_compose(Kind::Forward),
+            Action::ViewAttachments => return self.view_attachments(),
             _ => {}
         }
         Vec::new()
@@ -1241,6 +1291,7 @@ impl App {
             Action::Reply => return self.start_compose(Kind::Reply),
             Action::GroupReply => return self.start_compose(Kind::GroupReply),
             Action::Forward => return self.start_compose(Kind::Forward),
+            Action::ViewAttachments => return self.view_attachments(),
             _ => {}
         }
         Vec::new()
@@ -1415,6 +1466,8 @@ impl App {
             }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::FoldersListed(result) => return self.on_folders_listed(id, result),
+            Event::AttachmentsListed(result) => return self.on_attachments_listed(id, result),
+            Event::AttachmentFetched(result) => return self.on_attachment_fetched(id, result),
             Event::MailboxesChecked(checked) => return self.on_mailboxes_checked(id, checked),
             Event::StillThere(result) => return self.on_still_there(id, result),
             Event::Transferred(result) => {
@@ -1869,6 +1922,7 @@ impl App {
 
     pub(super) fn apply_settings(&mut self, settings: Settings) {
         self.page_size = settings.page_size;
+        self.home = settings.home;
         self.alternates = compile_alternates(&settings.compose.alternates);
         self.settings = settings.compose;
         // The configuration doesn't know what the mailbox told.
@@ -2064,7 +2118,12 @@ impl App {
         self.selected = selected;
         // The screen, not the menu: the sign-in window may be over it.
         match self.screen() {
-            Screen::Index | Screen::Compose(_) | Screen::Browser(_) | Screen::Help(_) => Vec::new(),
+            Screen::Index
+            | Screen::Compose(_)
+            | Screen::Browser(_)
+            | Screen::Help(_)
+            | Screen::Attachments(_)
+            | Screen::Text(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()
