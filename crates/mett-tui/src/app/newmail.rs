@@ -312,13 +312,7 @@ impl App {
         self.overlay_wanted_flags(&mut fresh);
         self.overlay_wanted_flags(&mut changes);
         let complete = newest.next.is_none();
-        let known: HashSet<MessageId> = self
-            .messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
-            .map(|m| m.id.clone())
-            .collect();
+        let known: HashSet<MessageId> = self.folder_messages().map(|m| m.id.clone()).collect();
         // A message in both lists comes as it was last changed.
         let mut arrived: Vec<MessageSummary> = Vec::new();
         for message in fresh.iter().chain(&changes) {
@@ -380,10 +374,7 @@ impl App {
         // One missing that is as old as the page's last may be on the next
         // page, or gone: asked about.
         let tied: Vec<MessageId> = self
-            .messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
+            .folder_messages()
             .filter(|m| !listed.contains(&m.id) && !covered(m))
             .filter(|m| (if m.draft { oldest_draft } else { oldest_sent }) == Some(m.received))
             .filter(|m| !self.transferring(&m.id))
@@ -402,10 +393,7 @@ impl App {
             effects.push(request);
         }
         let gone: HashSet<MessageId> = self
-            .messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
+            .folder_messages()
             .filter(|m| !listed.contains(&m.id))
             .filter(|m| covered(m))
             // Moves and purges on their way take it out themselves.
@@ -500,12 +488,7 @@ impl App {
     fn insert_arrived(&mut self, message: MessageSummary) {
         let position =
             |m: &MessageSummary| self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
-        let mut order: Vec<&MessageSummary> = self
-            .messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
-            .collect();
+        let mut order: Vec<&MessageSummary> = self.folder_messages().collect();
         order.sort_by_key(|m| position(m));
         // Among the messages like it (drafts are a group of their own):
         // before the first older one, or after the last of them.
@@ -552,10 +535,7 @@ impl App {
             return;
         };
         let arrived = self
-            .messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
+            .folder_messages()
             .any(|m| !m.flags.read && !known.contains(&m.id));
         if arrived {
             self.announce(NEW_MAIL);

@@ -1301,7 +1301,7 @@ impl App {
             return Some(effects);
         }
         let effects = match action {
-            Action::Quit => self.quit(),
+            Action::Quit => self.leave_folder(AfterPurge::Quit),
             Action::Mail => self.start_compose(Kind::New),
             Action::Reply => self.start_compose(Kind::Reply),
             Action::GroupReply => self.start_compose(Kind::GroupReply),
@@ -1987,11 +1987,7 @@ impl App {
     /// The summary of a message in the folder, shown or hidden by the
     /// limit.
     fn summary(&self, id: &MessageId) -> Option<&MessageSummary> {
-        self.messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
-            .find(|s| &s.id == id)
+        self.folder_messages().find(|s| &s.id == id)
     }
 
     /// The summary of a message in the folder, to change.

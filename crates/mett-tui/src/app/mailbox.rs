@@ -182,7 +182,7 @@ impl App {
         }
         let effects = match action {
             Action::DeleteMessage | Action::UndeleteMessage => {
-                let Some(id) = self.acted_on() else {
+                let Some(id) = selected else {
                     self.fail("No messages.");
                     return Some(Vec::new());
                 };
@@ -199,18 +199,16 @@ impl App {
                 }
             }
             Action::FlagMessage | Action::ToggleNew => {
-                let Some(flags) = self
-                    .acted_on()
-                    .and_then(|id| self.summary(&id).map(|summary| (id, summary.flags)))
+                let Some((id, flags)) =
+                    selected.and_then(|id| self.summary(&id).map(|summary| (id, summary.flags)))
                 else {
                     self.fail("No messages.");
                     return Some(Vec::new());
                 };
-                let (id, flags) = flags;
                 let update = if action == Action::FlagMessage {
                     FlagsUpdate {
                         flagged: Some(!flags.flagged),
-                        read: None,
+                        ..Default::default()
                     }
                 } else {
                     // Chosen while the message loads: showing it won't
@@ -223,7 +221,7 @@ impl App {
                     }
                     FlagsUpdate {
                         read: Some(!flags.read),
-                        flagged: None,
+                        ..Default::default()
                     }
                 };
                 self.update_flags(id, update)
@@ -241,7 +239,7 @@ impl App {
                 };
                 // The answer is for this message, whatever the index shows
                 // by then.
-                self.question_message = self.acted_on();
+                self.question_message = selected;
                 self.ask_mailbox(question, "");
                 Vec::new()
             }
@@ -349,37 +347,26 @@ impl App {
                     return Vec::new();
                 };
                 let copy = question == Question::CopyTo;
-                let transfer = if copy { Transfer::Copy } else { Transfer::Save };
-                self.status = if copy {
-                    "Copying message...".into()
+                let (transfer, status) = if copy {
+                    (Transfer::Copy, "Copying message...")
                 } else {
-                    "Saving message...".into()
+                    (Transfer::Save, "Saving message...")
                 };
-                self.write(Write::Transfer(
-                    transfer,
-                    Request::Transfer {
-                        ids: vec![id],
-                        to: path,
-                        copy,
-                    },
-                ))
+                self.status = status.into();
+                let request = Request::Transfer {
+                    ids: vec![id],
+                    to: path,
+                    copy,
+                };
+                self.write(Write::Transfer(transfer, request))
             }
             _ => Vec::new(),
         }
     }
 
-    /// Quits, purging deleted messages first if the user wants to.
-    pub(super) fn quit(&mut self) -> Vec<Effect> {
-        if self.deleted.is_empty() {
-            self.quit = true;
-            return Vec::new();
-        }
-        self.purge(Some(AfterPurge::Quit))
-    }
-
-    /// Opens another folder, purging this one's deleted messages first if
-    /// the user wants to.
-    fn leave_folder(&mut self, then: AfterPurge) -> Vec<Effect> {
+    /// Quits or opens another folder, purging this one's deleted messages
+    /// first if the user wants to.
+    pub(super) fn leave_folder(&mut self, then: AfterPurge) -> Vec<Effect> {
         if self.deleted.is_empty() {
             return self.after_purge(then);
         }
@@ -457,28 +444,18 @@ impl App {
         // Doing it again takes the place of a retry after a sign-in, which
         // would do it twice.
         if let Write::Transfer(transfer, request) = &write {
-            let ids = transfer_ids(request);
+            let (ids, to) = (transfer_ids(request), destination(request));
             let folder_ids = &self.folder_ids;
             for (failed, retry) in &mut self.failed_transfers {
-                let same = match (request, &*retry) {
-                    (
-                        Request::Transfer { to, copy, .. },
-                        Request::Transfer {
-                            to: failed_to,
-                            copy: failed_copy,
-                            ..
-                        },
-                        // Moved again, anywhere: the earlier move is moot.
-                    ) => copy == failed_copy && (!copy || same_folder(folder_ids, to, failed_to)),
-                    (Request::Purge { .. }, Request::Purge { .. }) => true,
-                    _ => false,
-                };
+                // Moved again, anywhere (or purged again): the earlier one
+                // is moot.
+                let same = *transfer != Transfer::Copy
+                    || same_destination(folder_ids, destination(retry), to);
                 if failed == transfer && same {
-                    transfer_ids_mut_vec(retry).retain(|id| !ids.contains(id));
+                    transfer_ids_mut(retry).retain(|id| !ids.contains(id));
                 }
             }
-            self.failed_transfers
-                .retain(|(_, retry)| !transfer_ids(retry).is_empty());
+            self.prune_retries();
         }
         self.writes.push_back(write);
         self.write_next()
@@ -581,17 +558,22 @@ impl App {
         let mut emptied = false;
         for (transfer, retry) in &mut self.failed_transfers {
             if *transfer == Transfer::Purge {
-                let ids = transfer_ids_mut_vec(retry);
+                let ids = transfer_ids_mut(retry);
                 let before = ids.len();
                 ids.retain(|other| other != id);
                 emptied |= before > 0 && ids.is_empty();
             }
         }
-        self.failed_transfers
-            .retain(|(_, retry)| !transfer_ids(retry).is_empty());
+        self.prune_retries();
         if emptied && !self.purging() {
             self.then = None;
         }
+    }
+
+    /// Forgets the retries left with no messages.
+    fn prune_retries(&mut self) {
+        self.failed_transfers
+            .retain(|(_, retry)| !transfer_ids(retry).is_empty());
     }
 
     /// Cancels a purge question: nothing is purged, now or by a retry,
@@ -669,10 +651,9 @@ impl App {
 
     /// Opens again the folder whose opening failed for want of a sign-in.
     pub(super) fn retry_switch(&mut self) -> Vec<Effect> {
-        match self.unswitched.take() {
-            Some(path) => self.change_folder(path),
-            None => Vec::new(),
-        }
+        self.unswitched
+            .take()
+            .map_or_else(Vec::new, |path| self.change_folder(path))
     }
 
     /// Forgets the open folder's index. Moves, copies and saves that are
@@ -719,33 +700,27 @@ impl App {
                 *id = (*new).clone();
             }
         };
+        let follow = |transfer: Transfer, request: &mut Request| {
+            let ids = transfer_ids_mut(request);
+            if transfer == Transfer::Purge {
+                // Moved away, so not to be purged from here.
+                ids.retain(|id| !renamed.contains_key(id));
+            } else {
+                ids.iter_mut().for_each(rename);
+            }
+        };
         for write in &mut self.writes {
             match write {
                 Write::Flags(id, _) => rename(id),
-                // Moved away, so not to be purged from here.
-                Write::Transfer(Transfer::Purge, Request::Purge { ids, .. }) => {
-                    ids.retain(|id| !renamed.contains_key(id));
-                }
-                Write::Transfer(_, request) => {
-                    transfer_ids_mut(request).iter_mut().for_each(rename)
-                }
+                Write::Transfer(transfer, request) => follow(*transfer, request),
             }
         }
         for (transfer, request) in &mut self.failed_transfers {
-            if *transfer == Transfer::Purge {
-                if let Request::Purge { ids, .. } = request {
-                    ids.retain(|id| !renamed.contains_key(id));
-                }
-            } else {
-                transfer_ids_mut(request).iter_mut().for_each(rename);
-            }
+            follow(*transfer, request);
         }
-        self.failed_transfers
-            .retain(|(_, request)| !transfer_ids(request).is_empty());
+        self.prune_retries();
         for (old, new) in moved {
-            if let Some(failure) = self.save_failures.remove(old) {
-                self.save_failures.insert(new.clone(), failure);
-            }
+            rekey(&mut self.save_failures, old, new);
             // Moved away, it is no longer to be purged from here.
             self.transfer_failures
                 .remove(&(old.clone(), Transfer::Purge, None));
@@ -762,12 +737,8 @@ impl App {
                         .insert((new.clone(), transfer, to), failure);
                 }
             }
-            if let Some(flags) = self.mailbox_flags.remove(old) {
-                self.mailbox_flags.insert(new.clone(), flags);
-            }
-            if let Some(flags) = self.wanted_flags.remove(old) {
-                self.wanted_flags.insert(new.clone(), flags);
-            }
+            rekey(&mut self.mailbox_flags, old, new);
+            rekey(&mut self.wanted_flags, old, new);
         }
     }
 
@@ -804,7 +775,7 @@ impl App {
                 let to = destination(&request);
                 for id in transfer_ids(&request) {
                     self.transfer_failures
-                        .insert((id.clone(), transfer, to.clone()), e.to_string());
+                        .insert((id.clone(), transfer, to.cloned()), e.to_string());
                 }
                 // A purge to retry after a sign-in still quits or leaves
                 // once it is done; one that failed otherwise doesn't.
@@ -843,7 +814,7 @@ impl App {
         resolved: Option<FolderId>,
     ) -> Vec<Effect> {
         let total = results.len();
-        let to = destination(&request);
+        let to = destination(&request).cloned();
         let mut done = HashSet::new();
         let mut failure: Option<Error> = None;
         let mut unauthorized = Vec::new();
@@ -874,68 +845,57 @@ impl App {
             for id in &done {
                 self.mailbox_flags.remove(id);
                 self.wanted_flags.remove(id);
-                // Nothing left to save, or to retry.
+                // Nothing left to save, or to retry (see below).
                 self.save_failures.remove(id);
             }
-            for (_, retry) in &mut self.failed_transfers {
-                transfer_ids_mut_vec(retry).retain(|id| !done.contains(id));
-            }
-            self.failed_transfers
-                .retain(|(_, retry)| !transfer_ids(retry).is_empty());
         }
         // Moved into the open folder, the messages come back with new IDs
         // when it is listed again; the old ones are gone.
         if transfer != Transfer::Copy {
             self.remove_messages(&done);
         }
-        // What failed for want of a sign-in can be retried from the sign-in
-        // window.
-        let unauthorized_count = unauthorized.len();
         // Once to retry each: an earlier retry of the same thing to the
         // same folder (perhaps by another name) is this one.
         if let (Some(path), Some(folder)) = (&to, &resolved) {
             self.folder_ids.insert(path.clone(), folder.clone());
         }
-        if transfer != Transfer::Purge {
-            let folder_ids = &self.folder_ids;
-            for (failed, retry) in &mut self.failed_transfers {
-                let same = destination(retry)
-                    .zip(to.as_ref())
-                    .is_some_and(|(earlier, now)| same_folder(folder_ids, &earlier, now));
-                if *failed == transfer && same {
-                    transfer_ids_mut_vec(retry).retain(|id| !unauthorized.contains(id));
-                }
-            }
-            self.failed_transfers
-                .retain(|(_, retry)| !transfer_ids(retry).is_empty());
-        }
-        if !unauthorized.is_empty() {
-            self.failed_transfers
-                .push((transfer, with_ids(request, unauthorized)));
-        }
         // Only the same operation to the same place succeeding clears a
         // failure: a copy doesn't make up for a failed move, nor a copy to
         // one folder for a copy to another. The same folder may go by
         // another name (`=Archive`, `=@archive`, the browser's).
-        let same_place = |place: &Option<FolderPath>| {
-            *place == to
+        let same_place = |place: Option<&FolderPath>| {
+            place == to.as_ref()
                 || place
-                    .as_ref()
                     .zip(resolved.as_ref())
                     .is_some_and(|(path, folder)| self.folder_ids.get(path) == Some(folder))
         };
         self.transfer_failures.retain(|(id, failed, place), _| {
-            !(done.contains(id) && *failed == transfer && same_place(place))
+            !(done.contains(id) && *failed == transfer && same_place(place.as_ref()))
         });
-        // Nor is it to be done again after a sign-in.
+        // Nor is it to be done again after a sign-in: purged, by anything;
+        // moved or copied, by the same to the same place. Neither is what
+        // fails for want of a sign-in once more, which is retried now.
+        let folder_ids = &self.folder_ids;
         for (failed, retry) in &mut self.failed_transfers {
-            if *failed == transfer && transfer != Transfer::Purge && same_place(&destination(retry))
-            {
-                transfer_ids_mut_vec(retry).retain(|id| !done.contains(id));
+            if transfer == Transfer::Purge {
+                transfer_ids_mut(retry).retain(|id| !done.contains(id));
+            } else if *failed == transfer {
+                let place = destination(retry);
+                let again = same_destination(folder_ids, place, to.as_ref());
+                let done_there = same_place(place);
+                transfer_ids_mut(retry).retain(|id| {
+                    !((again && unauthorized.contains(id)) || (done_there && done.contains(id)))
+                });
             }
         }
-        self.failed_transfers
-            .retain(|(_, retry)| !transfer_ids(retry).is_empty());
+        self.prune_retries();
+        // What failed for want of a sign-in can be retried from the sign-in
+        // window.
+        let unauthorized_count = unauthorized.len();
+        if !unauthorized.is_empty() {
+            self.failed_transfers
+                .push((transfer, with_ids(request, unauthorized)));
+        }
         if let Some(e) = failure {
             // Whatever failed stays where it was, still marked; don't go
             // on as if the purge had worked (unless all of it is to retry
@@ -1002,22 +962,19 @@ impl App {
         // before it (or the top), not from the end it can no longer find.
         if let Some(Target::After(anchor, steps)) = &self.pending
             && gone.contains(anchor)
+            && let Some(at) = self.entry_of(anchor)
         {
-            let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
-            let at = shown(anchor).or_else(|| self.thread_of(anchor).and_then(|t| shown(&t.root)));
-            if let Some(at) = at {
-                let steps = *steps;
-                self.pending = Some(
-                    match self.messages[..=at]
-                        .iter()
-                        .rev()
-                        .find(|m| !gone.contains(&m.id))
-                    {
-                        Some(kept) => Target::After(kept.id.clone(), steps),
-                        None => Target::Entry(steps - 1),
-                    },
-                );
-            }
+            let steps = *steps;
+            self.pending = Some(
+                match self.messages[..=at]
+                    .iter()
+                    .rev()
+                    .find(|m| !gone.contains(&m.id))
+                {
+                    Some(kept) => Target::After(kept.id.clone(), steps),
+                    None => Target::Entry(steps - 1),
+                },
+            );
         }
         // A selected collapsed thread whose first message goes stays
         // selected, by what is left of it.
@@ -1063,19 +1020,24 @@ impl App {
         // As in mutt, the mailboxes come first, if there are any; the
         // browser can switch to every folder.
         if !self.mailboxes.is_empty() {
-            let entries = self.mailbox_entries();
             let open = self.mailboxes.iter().position(|m| m.path == self.path);
-            self.screens.push(Screen::Browser(Browser {
-                entries,
-                selected: open.unwrap_or(0),
-                listing: None,
-                purpose,
-                mailboxes: true,
-            }));
-            // With fresh counts.
-            return self.check_mailboxes();
+            return self.mailbox_browser(purpose, open.unwrap_or(0));
         }
         self.list_folders_in_browser(purpose)
+    }
+
+    /// Opens the browser on the mailboxes, at entry `selected`.
+    fn mailbox_browser(&mut self, purpose: Choose, selected: usize) -> Vec<Effect> {
+        let entries = self.mailbox_entries();
+        self.screens.push(Screen::Browser(Browser {
+            entries,
+            selected,
+            listing: None,
+            purpose,
+            mailboxes: true,
+        }));
+        // With fresh counts.
+        self.check_mailboxes()
     }
 
     /// Opens the browser on every folder.
@@ -1096,23 +1058,18 @@ impl App {
         let Some(Screen::Browser(browser)) = self.screens.last() else {
             return Vec::new();
         };
-        if browser.mailboxes {
-            let purpose = browser.purpose.clone();
-            self.screens.pop();
-            return self.list_folders_in_browser(purpose);
-        }
-        if self.mailboxes.is_empty() {
+        let mailboxes = browser.mailboxes;
+        if !mailboxes && self.mailboxes.is_empty() {
             self.fail("No mailboxes are defined.");
             return Vec::new();
         }
-        let entries = self.mailbox_entries();
-        if let Some(Screen::Browser(browser)) = self.screens.last_mut() {
-            browser.entries = entries;
-            browser.selected = 0;
-            browser.listing = None;
-            browser.mailboxes = true;
+        let purpose = browser.purpose.clone();
+        self.screens.pop();
+        if mailboxes {
+            self.list_folders_in_browser(purpose)
+        } else {
+            self.mailbox_browser(purpose, 0)
         }
-        self.check_mailboxes()
     }
 
     /// Opens again the browser whose folders couldn't be listed for want of
@@ -1155,13 +1112,11 @@ impl App {
                 browser.entries = tree(folders);
                 // Start on the open folder, if it is there.
                 let open = self.folder.as_ref().map(|f| &f.id);
-                if let Some(Screen::Browser(browser)) = self.screens.last_mut() {
-                    browser.selected = browser
-                        .entries
-                        .iter()
-                        .position(|e| e.id.as_ref() == open)
-                        .unwrap_or(0);
-                }
+                browser.selected = browser
+                    .entries
+                    .iter()
+                    .position(|e| e.id.as_ref() == open)
+                    .unwrap_or(0);
             }
             Err(e) => {
                 // Without a sign-in, the sign-in window's Retry opens the
@@ -1247,15 +1202,7 @@ fn transfer_ids(request: &Request) -> &[MessageId] {
 }
 
 /// The messages a move, copy or purge is for, to change.
-fn transfer_ids_mut(request: &mut Request) -> &mut [MessageId] {
-    match request {
-        Request::Transfer { ids, .. } | Request::Purge { ids, .. } => ids,
-        _ => &mut [],
-    }
-}
-
-/// The messages a move, copy or purge is for, to add or remove some.
-fn transfer_ids_mut_vec(request: &mut Request) -> &mut Vec<MessageId> {
+fn transfer_ids_mut(request: &mut Request) -> &mut Vec<MessageId> {
     match request {
         Request::Transfer { ids, .. } | Request::Purge { ids, .. } => ids,
         other => unreachable!("not a transfer: {other:?}"),
@@ -1263,10 +1210,26 @@ fn transfer_ids_mut_vec(request: &mut Request) -> &mut Vec<MessageId> {
 }
 
 /// Where a move or copy goes; a purge has no destination of its own.
-fn destination(request: &Request) -> Option<FolderPath> {
+fn destination(request: &Request) -> Option<&FolderPath> {
     match request {
-        Request::Transfer { to, .. } => Some(to.clone()),
+        Request::Transfer { to, .. } => Some(to),
         _ => None,
+    }
+}
+
+/// Whether two moves or copies go to the same folder.
+fn same_destination(
+    folder_ids: &HashMap<FolderPath, FolderId>,
+    a: Option<&FolderPath>,
+    b: Option<&FolderPath>,
+) -> bool {
+    a.zip(b).is_some_and(|(a, b)| same_folder(folder_ids, a, b))
+}
+
+/// Moves `map`'s entry for `old` to `new`.
+fn rekey<V>(map: &mut HashMap<MessageId, V>, old: &MessageId, new: &MessageId) {
+    if let Some(value) = map.remove(old) {
+        map.insert(new.clone(), value);
     }
 }
 
