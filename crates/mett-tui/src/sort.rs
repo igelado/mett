@@ -266,20 +266,37 @@ fn threads(
             .filter(|&i| parent_of(i).is_none())
             .collect();
         // The thread starts at the orphan nearest the conversation's start,
-        // or else the earliest.
-        let root = *orphans
+        // or else the earliest. One without a place in the conversation
+        // (no conversation index) goes by its date: it starts the thread
+        // if it is older than that.
+        let earlier = |a: usize, b: usize| {
+            messages[a]
+                .received
+                .cmp(&messages[b].received)
+                .then_with(|| position(&messages[a].id).cmp(&position(&messages[b].id)))
+        };
+        let placed = orphans
             .iter()
-            .min_by(|a, b| {
-                let depth = |i: usize| match path(i).len() {
-                    0 => usize::MAX,
-                    n => n,
-                };
-                depth(**a)
-                    .cmp(&depth(**b))
-                    .then_with(|| messages[**a].received.cmp(&messages[**b].received))
-                    .then_with(|| position(&messages[**a].id).cmp(&position(&messages[**b].id)))
-            })
-            .expect("a conversation has a message without a parent among its own");
+            .copied()
+            .filter(|&i| !path(i).is_empty())
+            .min_by(|&a, &b| {
+                path(a)
+                    .len()
+                    .cmp(&path(b).len())
+                    .then_with(|| earlier(a, b))
+            });
+        let unplaced = orphans
+            .iter()
+            .copied()
+            .filter(|&i| path(i).is_empty())
+            .min_by(|&a, &b| earlier(a, b));
+        let root = match (placed, unplaced) {
+            (Some(placed), Some(unplaced)) if earlier(unplaced, placed).is_lt() => unplaced,
+            (Some(root), _) | (None, Some(root)) => root,
+            (None, None) => {
+                unreachable!("a conversation has a message without a parent among its own")
+            }
+        };
         let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
         for &i in group {
             if i == root {
@@ -436,6 +453,22 @@ mod tests {
         );
         assert_eq!(base_subject("Re: FW:  re:Lunch"), "Lunch");
         assert_eq!(sort.name(), "reverse-last-date-received");
+    }
+
+    #[test]
+    fn a_start_without_a_conversation_index_goes_by_its_date() {
+        // s has no place in the conversation, but came first.
+        let messages = vec![
+            message("r", 2, Some(("c", &[0, 1]))),
+            message("s", 1, Some(("c", &[]))),
+        ];
+        assert_eq!(arranged(&messages, "threads", "date"), ["s", "`->r"]);
+        // A later one doesn't.
+        let messages = vec![
+            message("r", 2, Some(("c", &[0, 1]))),
+            message("s", 3, Some(("c", &[]))),
+        ];
+        assert_eq!(arranged(&messages, "threads", "date"), ["r", "`->s"]);
     }
 
     #[test]

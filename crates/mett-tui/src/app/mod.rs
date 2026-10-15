@@ -437,6 +437,9 @@ pub struct App {
     pub ordering: Ordering,
     /// Where each message is in its thread, when the index shows threads.
     threads: HashMap<MessageId, Threaded>,
+    /// How many messages the threads were last built from: while a large
+    /// folder is listed, they are built again only as it doubles.
+    threaded_count: usize,
     /// The first messages of the collapsed threads.
     collapsed: HashSet<String>,
     /// Whether the limit showed each message it was applied to, kept
@@ -641,6 +644,7 @@ impl App {
             folded: Vec::new(),
             ordering: settings.ordering,
             threads: HashMap::new(),
+            threaded_count: 0,
             collapsed: HashSet::new(),
             limited: HashMap::new(),
             positions: HashMap::new(),
@@ -1340,7 +1344,7 @@ impl App {
                     let mut messages = page.messages;
                     messages.retain(|m| !self.removed_while_listing.contains(&m.id));
                     self.overlay_wanted_flags(&mut messages);
-                    self.add_listed(messages);
+                    self.add_listed(messages, page.next.is_none());
                     self.see_index();
                     self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
@@ -1372,6 +1376,8 @@ impl App {
                     self.listing = None;
                     self.known_before_refresh = None;
                     self.unlisted = self.listing_page.take();
+                    // What was listed is threaded, while the rest waits.
+                    self.thread_listed();
                     // Pages asked for again come after the saves.
                     self.saved_flags.clear();
                     self.removed_while_listing.clear();

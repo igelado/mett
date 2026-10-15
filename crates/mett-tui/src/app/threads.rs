@@ -103,6 +103,7 @@ impl App {
             )
         };
         let threaded = self.threaded();
+        self.threaded_count = all.len();
         let ids: Vec<MessageId> = all.iter().map(|m| m.id.clone()).collect();
         let mut slots: Vec<Option<MessageSummary>> = all.into_iter().map(Some).collect();
         let mut folded_under: HashMap<MessageId, usize> = HashMap::new();
@@ -157,11 +158,17 @@ impl App {
 
     /// Puts newly listed messages in the index. Without threads, they are
     /// sorted and merged in, rather than the whole index sorted again at
-    /// every page.
-    pub(super) fn arrange_listed(&mut self, mut listed: Vec<MessageSummary>) {
+    /// every page. With threads, they go at the end until the threads are
+    /// built again: once the index has doubled since they last were, and
+    /// once the folder is listed (`last`), so that a large folder isn't
+    /// threaded again at every page.
+    pub(super) fn arrange_listed(&mut self, mut listed: Vec<MessageSummary>, last: bool) {
         if self.threaded() {
             self.messages.extend(listed);
-            self.arrange();
+            let count = self.messages.len() + self.folded.len();
+            if last || count >= self.threaded_count.saturating_mul(2) {
+                self.arrange();
+            }
             return;
         }
         let (sort, aux) = (self.ordering.sort, self.ordering.aux);
@@ -188,6 +195,13 @@ impl App {
         self.messages = merged;
         if let Some(at) = selected.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
             self.selected = at;
+        }
+    }
+
+    /// Threads the messages listed so far, if some aren't yet.
+    pub(super) fn thread_listed(&mut self) {
+        if self.threaded() && self.messages.len() + self.folded.len() != self.threaded_count {
+            self.arrange();
         }
     }
 
@@ -607,6 +621,28 @@ mod tests {
         assert_eq!(ids, ["x1", "x2", "x3", "x4", "x5"]);
         // Still on x4.
         assert_eq!(app.selected, 3);
+    }
+
+    #[test]
+    fn threads_are_built_as_the_index_doubles_and_once_it_is_listed() {
+        let (mut app, next) = paged(vec![
+            message("a2", 4, "a", &[0, 2]),
+            message("a1", 2, "a", &[0, 1]),
+        ]);
+        let effects = app.update(Msg::Response(Response {
+            id: next,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![message("b0", 3, "b", &[0])],
+                next: Some(mett_core::PageCursor::new("in more")),
+            })),
+        }));
+        // Three of the two threaded so far: listed, not threaded yet.
+        assert!(app.thread_of(&MessageId::new("b0")).is_none());
+        let Effect::Request(more, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        page(&mut app, more, vec![message("a0", 1, "a", &[0])]);
+        assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0"]);
     }
 
     #[test]

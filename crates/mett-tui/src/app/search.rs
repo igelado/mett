@@ -429,7 +429,7 @@ impl App {
 
     /// Adds newly listed messages to the index, or aside if the index is
     /// limited and they don't match.
-    pub(super) fn add_listed(&mut self, messages: Vec<MessageSummary>) {
+    pub(super) fn add_listed(&mut self, messages: Vec<MessageSummary>, last: bool) {
         for message in &messages {
             let next = self.positions.len();
             self.positions.entry(message.id.clone()).or_insert(next);
@@ -446,7 +446,7 @@ impl App {
                 self.hidden.push(message);
             }
         }
-        self.arrange_listed(shown);
+        self.arrange_listed(shown, last);
         if first {
             self.selected = 0;
         }
