@@ -291,9 +291,13 @@ fn threads(
         std::iter::once(tree.0)
             .chain(tree.1.values().flatten().copied())
             .max_by(|a, b| {
-                messages[*a]
-                    .received
-                    .cmp(&messages[*b].received)
+                // By the date `sort_aux` goes by.
+                let at = |m: &MessageSummary| match aux.method {
+                    Method::Received => m.delivered.unwrap_or(m.received),
+                    _ => m.received,
+                };
+                at(messages[*a])
+                    .cmp(&at(messages[*b]))
                     .then_with(|| position(&messages[*a].id).cmp(&position(&messages[*b].id)))
             })
             .expect("a thread has a message")
@@ -483,6 +487,14 @@ mod tests {
             ["root".to_owned(), "|->lost".to_owned()]
         );
         assert_eq!(arranged(&messages, "threads", "last-date")[0], "other");
+        // By when mail was received, with `last-date-received`: "other"
+        // was received last.
+        let mut received = messages.clone();
+        received[5].delivered = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(99));
+        assert_eq!(
+            arranged(&received, "reverse-threads", "last-date-received")[0],
+            "other"
+        );
         // The same with `last-threads`.
         assert_eq!(arranged(&messages, "last-threads", "date")[0], "other");
     }
