@@ -393,6 +393,17 @@ impl App {
 
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        let mut effects = self.handle(msg);
+        // The open folder gained messages while another screen was up:
+        // list it again once the index is back.
+        if self.relist_on_return && self.screen() == &Screen::Index {
+            self.relist_on_return = false;
+            effects.extend(self.relist());
+        }
+        effects
+    }
+
+    fn handle(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
@@ -708,10 +719,6 @@ impl App {
             Action::Quit => self.quit = true,
             Action::Exit => {
                 self.screens.pop();
-                if self.relist_on_return && self.screen() == &Screen::Index {
-                    self.relist_on_return = false;
-                    return self.relist();
-                }
             }
             // As in mutt, j and k in the pager show the next or previous
             // message.

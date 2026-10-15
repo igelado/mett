@@ -1336,4 +1336,28 @@ mod tests {
         // The pager has the message now: the reply starts from it.
         assert_eq!(prompt(&app), "Include message in reply?");
     }
+
+    #[test]
+    fn a_relist_due_while_composing_happens_on_leaving() {
+        let mut app = app(compose::Settings {
+            postpone: Quad::No,
+            ..settings()
+        });
+        app.folder = Some(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
+        ));
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        // The timer from an earlier send goes off in the compose menu.
+        assert!(
+            app.update(Msg::Timer(crate::app::Timer::RelistSentItems))
+                .is_empty()
+        );
+        let effects = act(&mut app, Action::Exit);
+        assert!(matches!(request(&effects).1, Request::ListMessages { .. }));
+    }
 }

@@ -241,8 +241,13 @@ pub fn forwarded(message: &Message) -> String {
         "----- Forwarded message from {} -----\n\n",
         from.as_deref().unwrap_or("unknown sender")
     );
-    // The pager's headers, then the body.
-    for line in text::pager_lines(message) {
+    // The pager's headers, but never the blind recipients, then the
+    // body.
+    let lines = text::header_lines(message, false)
+        .into_iter()
+        .chain([String::new()])
+        .chain(text::body_lines(&message.body));
+    for line in lines {
         out.push_str(&line);
         out.push('\n');
     }
@@ -538,6 +543,18 @@ mod tests {
         message.bcc.clear();
         let (to, _) = reply_recipients(&message, true, false, &settings());
         assert_eq!(to, [Address::new("me@contoso.com")]);
+    }
+
+    #[test]
+    fn forwards_never_show_blind_recipients() {
+        let mut message = message();
+        message.bcc = vec![Address::new("secret@x.org")];
+        assert!(!forwarded(&message).contains("secret@x.org"));
+        assert!(
+            text::pager_lines(&message)
+                .iter()
+                .any(|l| l.contains("secret@x.org"))
+        );
     }
 
     #[test]
