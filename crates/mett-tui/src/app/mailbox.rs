@@ -631,6 +631,7 @@ impl App {
     pub(super) fn change_folder(&mut self, path: FolderPath) -> Vec<Effect> {
         // A recall on its way gives way to the folder the user wants.
         self.recall = None;
+        self.unrecalled = false;
         if self.folder.is_none() {
             self.reset_folder();
             self.path = path;

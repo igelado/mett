@@ -1077,6 +1077,8 @@ impl App {
                 // Nor restart, on a later Retry, a reply or forward whose
                 // message couldn't be fetched.
                 self.compose_unfetched = None;
+                // Nor a recall.
+                self.unrecalled = false;
                 // The user gave up: don't let a retry that was waiting
                 // start another sign-in.
                 self.retry_after.clear();

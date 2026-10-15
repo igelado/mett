@@ -683,7 +683,15 @@ mod tests {
             Event::FolderOpened(Err(Error::Auth("expired".into()))),
         );
         assert_eq!(app.recall, None);
-        let (_, request) = sent(&app.retry_recall());
+        let (open, request) = sent(&app.retry_recall());
         assert!(matches!(request, Request::OpenFolder(_)));
+        // Given up by a change of folder: not started again.
+        respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Err(Error::Auth("expired".into()))),
+        );
+        app.change_folder(FolderPath::WellKnown(WellKnownFolder::SentItems, vec![]));
+        assert!(app.retry_recall().is_empty());
     }
 }
