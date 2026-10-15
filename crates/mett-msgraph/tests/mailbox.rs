@@ -194,9 +194,9 @@ async fn finds_when_unread_mail_last_changed() {
             "lastModifiedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
         ))
         .and(query_param("$orderby", "lastModifiedDateTime desc"))
-        .and(query_param("$top", "1"))
+        .and(query_param("$top", "10"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "value": [{ "lastModifiedDateTime": "2024-05-01T10:00:00Z" }],
+            "value": [{ "id": "m9", "lastModifiedDateTime": "2024-05-01T10:00:00Z" }],
         })))
         .mount(&server)
         .await;
@@ -206,20 +206,18 @@ async fn finds_when_unread_mail_last_changed() {
         .mount(&server)
         .await;
     let store = store(&server);
-    let newest = store
-        .newest_unread(&FolderId::new("inbox-id"))
+    let recent = store
+        .recent_unread(&FolderId::new("inbox-id"))
         .await
         .unwrap();
-    assert_eq!(
-        newest.map(|t| t.to_rfc3339()),
-        Some("2024-05-01T10:00:00+00:00".to_owned())
-    );
-    assert_eq!(
+    assert_eq!(recent[0].0, MessageId::new("m9"));
+    assert_eq!(recent[0].1.to_rfc3339(), "2024-05-01T10:00:00+00:00");
+    assert!(
         store
-            .newest_unread(&FolderId::new("empty-id"))
+            .recent_unread(&FolderId::new("empty-id"))
             .await
-            .unwrap(),
-        None
+            .unwrap()
+            .is_empty()
     );
 }
 

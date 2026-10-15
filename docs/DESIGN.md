@@ -207,12 +207,13 @@ keeps the store up to date with Graph delta queries.
   computer and the server may differ. Changes mett made while that page
   was on its way are laid over it, as for a listing. A page that is all
   new mail lists the folder again. The `mailboxes` are checked by reading
-  their counts and when their unread mail last arrived or changed
-  (`MailStore::newest_unread`): a mailbox has new mail when unread mail
-  arrived after the user last had it open, which reading mail can't
-  disturb, unlike comparing counts. What the user saw is the unread mail
-  that reached the index (by its last-modified time) while the folder was
-  open.
+  their counts and their unread messages that arrived or changed last
+  (`MailStore::recent_unread`): a mailbox has new mail when one of those
+  is a message the user hasn't seen, newer than what they have, which
+  reading mail can't disturb, unlike comparing counts. What the user saw
+  is the unread mail that reached the index while the folder was open (and
+  the changes they made to it), kept by folder so that it counts for any
+  path naming the folder.
 
 ### 5.6 State machine for menus
 

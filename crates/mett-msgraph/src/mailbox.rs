@@ -12,7 +12,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags,
     FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, Result, WellKnownFolder,
+    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, WellKnownFolder,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -429,18 +429,19 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         Ok(roles.folder(folder))
     }
 
-    async fn newest_unread(&self, folder: &FolderId) -> Result<Option<DateTime<Utc>>> {
+    async fn recent_unread(&self, folder: &FolderId) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
         // A message moved in keeps when it was received; when it was
         // last modified tells.
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Modified {
+            id: String,
             last_modified_date_time: String,
         }
         let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
         url.query_pairs_mut()
-            .append_pair("$top", "1")
-            .append_pair("$select", "lastModifiedDateTime")
+            .append_pair("$top", &RECENT_UNREAD.to_string())
+            .append_pair("$select", "id,lastModifiedDateTime")
             // Graph wants the sorted property filtered too, first.
             .append_pair(
                 "$filter",
@@ -455,13 +456,12 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .await?;
         page.value
             .into_iter()
-            .next()
             .map(|m| {
-                DateTime::parse_from_rfc3339(&m.last_modified_date_time)
-                    .map(|t| t.with_timezone(&Utc))
-                    .map_err(|e| Error::Backend(format!("invalid lastModifiedDateTime: {e}")))
+                let at = DateTime::parse_from_rfc3339(&m.last_modified_date_time)
+                    .map_err(|e| Error::Backend(format!("invalid lastModifiedDateTime: {e}")))?;
+                Ok((MessageId::new(m.id), at.with_timezone(&Utc)))
             })
-            .transpose()
+            .collect()
     }
 
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {

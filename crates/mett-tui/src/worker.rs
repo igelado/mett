@@ -126,8 +126,8 @@ pub enum Event {
 pub struct Checked {
     /// The folder, with its counts.
     pub folder: Folder,
-    /// When its unread mail last arrived or changed, if it has any.
-    pub newest_unread: Option<DateTime<Utc>>,
+    /// Its unread messages that arrived or changed last, and when.
+    pub recent: Vec<(MessageId, DateTime<Utc>)>,
 }
 
 /// What a check of a folder for new mail found.
@@ -227,15 +227,10 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
                     None => resolve(store, &path).await,
                 };
                 let found = match found {
-                    Ok(folder) => {
-                        store
-                            .newest_unread(&folder.id)
-                            .await
-                            .map(|newest_unread| Checked {
-                                folder,
-                                newest_unread,
-                            })
-                    }
+                    Ok(folder) => store
+                        .recent_unread(&folder.id)
+                        .await
+                        .map(|recent| Checked { folder, recent }),
                     Err(e) => Err(e),
                 };
                 checked.push((path, found));

@@ -538,6 +538,8 @@ pub struct App {
     known_before_refresh: Option<HashSet<MessageId>>,
     /// The request reading the mailboxes' counts.
     checking: Option<RequestId>,
+    /// The unread mail the user has seen, by folder.
+    seen: newmail::SeenByFolder,
     /// How many times the user retried after a failed sign-in: background
     /// checks made before the last retry don't hold off checking.
     poll_epoch: u64,
@@ -648,6 +650,7 @@ impl App {
             poll_timer: 0,
             known_before_refresh: None,
             checking: None,
+            seen: HashMap::new(),
             poll_epoch: 0,
             listed_at: None,
         };
@@ -1633,6 +1636,9 @@ impl App {
         update: FlagsUpdate,
         result: mett_core::Result<()>,
     ) -> Vec<Effect> {
+        if result.is_ok() {
+            self.changed_here(&message);
+        }
         // Sent for a message mett has no flags for (its folder wasn't
         // open): only the fields it changed are known.
         let Some(mut mailbox) = self.mailbox_flags.get(&message).copied() else {
