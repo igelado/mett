@@ -1210,11 +1210,11 @@ async fn requests_waiting_on_a_cancelled_sign_in_do_not_prompt_again() {
 async fn reports_a_sign_in_confirmed_later_as_finished() {
     let server = MockServer::start().await;
     device_sign_in(&server, "a1").await;
-    // Graph can't confirm the user at first.
+    // Graph can't confirm the user at first, nor when retrying.
     Mock::given(method("GET"))
         .and(path("/v1.0/me"))
         .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
+        .up_to_n_times(2)
         .with_priority(1)
         .mount(&server)
         .await;
@@ -1228,6 +1228,7 @@ async fn reports_a_sign_in_confirmed_later_as_finished() {
         outcomes.clone(),
     );
     assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
-    assert_eq!(*outcomes.0.lock().unwrap(), [false, true]);
+    assert_eq!(*outcomes.0.lock().unwrap(), [false, false, true]);
 }

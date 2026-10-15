@@ -339,6 +339,10 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             let Some(Unconfirmed { mut tokens, stored }) = state.unconfirmed.take() else {
                 break 'unconfirmed;
             };
+            // Tokens not from the store come from an interactive sign-in,
+            // which was reported as failed when they couldn't be confirmed.
+            // Report how confirming them again goes, too.
+            let interactive = stored.is_none();
             if tokens.access.expires_within(TimeDelta::zero(), now) {
                 // The access token expired before the user could be
                 // confirmed: get a fresh one with the sign-in's refresh token
@@ -363,18 +367,27 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                     }
                     Err(e) => {
                         state.unconfirmed = Some(Unconfirmed { tokens, stored });
-                        return Err(e.into());
+                        let e = mett_core::Error::from(e);
+                        if interactive {
+                            self.prompter.finished(Err(&e));
+                        }
+                        return Err(e);
                     }
                 }
             }
             let token = match self.confirm(&mut state, tokens, stored.as_deref()).await {
                 Ok(token) => token,
-                Err(e) => return state.unexpired_access().ok_or(e),
+                Err(e) => {
+                    if let Some(token) = state.unexpired_access() {
+                        return Ok(token);
+                    }
+                    if interactive {
+                        self.prompter.finished(Err(&e));
+                    }
+                    return Err(e);
+                }
             };
-            // Tokens not from the store come from an interactive sign-in,
-            // which was reported as failed when it couldn't be confirmed:
-            // report that it succeeded after all.
-            if stored.is_none() {
+            if interactive {
                 state.failed_sign_in = None;
                 self.prompter.finished(Ok(()));
             }

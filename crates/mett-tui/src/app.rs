@@ -322,7 +322,6 @@ impl App {
         match event {
             SignInEvent::Prompt { account, prompt } => {
                 self.sign_in_cancelled = false;
-                self.retry_after.clear();
                 let effects = match &prompt {
                     // The browser flow needs the browser: open it straight
                     // away. The device code flow is for when there is none.
@@ -1653,6 +1652,8 @@ mod tests {
             ),
             "{effects:?}"
         );
+        // The retried fetch asks the user to sign in again meanwhile.
+        app.update(Msg::SignIn(browser_prompt()));
         let effects = app.update(Msg::Response(Response {
             id: list,
             event: Event::MessagesListed(Err(Error::Auth("denied".into()))),
