@@ -50,6 +50,8 @@ enum Target {
     Last,
     /// The next thread after the selected message.
     NextThread,
+    /// The thread before the selected message's.
+    PreviousThread,
 }
 
 /// Rows used by the help line, the status bar and the message line.
@@ -1990,13 +1992,21 @@ impl App {
         };
         let loading = self.listing.is_some();
         // The next thread needs the threads of what was listed.
-        if target == Target::NextThread {
+        if matches!(target, Target::NextThread | Target::PreviousThread) {
             self.thread_listed();
         }
         let last = self.messages.len().saturating_sub(1);
         let selected = match target {
             // A later page may bring a thread that goes in between.
-            Target::NextThread if loading => return Vec::new(),
+            Target::NextThread | Target::PreviousThread if loading => return Vec::new(),
+            Target::PreviousThread => match self.previous_thread_root() {
+                Some(previous) => previous,
+                None => {
+                    self.pending = None;
+                    self.fail("You are on the first thread.");
+                    return Vec::new();
+                }
+            },
             Target::NextThread => match self.next_thread_root() {
                 Some(next) => next,
                 None => {

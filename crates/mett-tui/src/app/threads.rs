@@ -237,6 +237,20 @@ impl App {
         })
     }
 
+    /// Where the thread before the selected message's starts, if any.
+    pub(super) fn previous_thread_root(&self) -> Option<usize> {
+        let selected = &self.messages.get(self.selected)?.id;
+        let start = self
+            .threads
+            .get(selected)
+            .and_then(|t| self.messages.iter().position(|m| m.id == t.root))
+            .unwrap_or(self.selected);
+        (0..start).rev().find(|&i| {
+            let id = &self.messages[i].id;
+            self.threads.get(id).is_none_or(|t| &t.root == id)
+        })
+    }
+
     /// Handles the thread actions of the index and the pager. Returns
     /// `None` for other actions.
     pub(super) fn on_thread_action(&mut self, action: Action) -> Option<Vec<Effect>> {
@@ -269,10 +283,6 @@ impl App {
             self.fail("No messages.");
             return Some(Vec::new());
         };
-        let is_root = |app: &App, i: usize| {
-            let id = &app.messages[i].id;
-            app.threads.get(id).is_none_or(|t| &t.root == id)
-        };
         // The start of the selected message's thread.
         let start = self
             .threads
@@ -294,13 +304,19 @@ impl App {
                     }
                 }
             }
-            Action::PreviousThread => match (0..start).rev().find(|&i| is_root(self, i)) {
-                Some(previous) => self.selected = previous,
-                None => {
-                    self.fail("You are on the first thread.");
-                    return Some(Vec::new());
+            Action::PreviousThread => {
+                // An older page may bring a thread that goes before it.
+                if self.more_to_list() {
+                    return Some(self.wait_for(super::Target::PreviousThread));
                 }
-            },
+                match self.previous_thread_root() {
+                    Some(previous) => self.selected = previous,
+                    None => {
+                        self.fail("You are on the first thread.");
+                        return Some(Vec::new());
+                    }
+                }
+            }
             Action::CollapseThread => {
                 let root = &self.messages[start].id;
                 let key = self
