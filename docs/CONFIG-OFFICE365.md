@@ -8,7 +8,9 @@ through the spoolfile's account and postpones it to that account's Drafts
 (§5.2, without `record` and `postponed`). Folders of that account can be
 opened, browsed, and used to save or copy messages, and purged messages go
 to `trash` (§6). The open folder and the `mailboxes` of that account are
-checked for new mail every `msgraph_sync_interval` seconds (§4.4).
+checked for new mail every `msgraph_sync_interval` seconds (§4.4). The
+index, pager and status bar follow `index_format`, `pager_format` and
+`status_format`, and `color` and `mono` set the colors.
 Everything else is still a proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc

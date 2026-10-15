@@ -8,10 +8,13 @@
 mod account;
 mod action;
 mod app;
+mod color;
 mod compose;
 mod config;
 mod demo;
 mod editor;
+mod expando;
+mod format;
 mod keymap;
 mod lineedit;
 mod pattern;
@@ -300,9 +303,20 @@ fn settings_keeping(
             })
         })
         .collect::<Result<_, String>>()?;
+    let quote =
+        regex::Regex::new(config.string("quote_regex")).map_err(|e| format!("quote_regex: {e}"))?;
+    let display = expando::Display {
+        index_format: config.string("index_format").to_owned(),
+        pager_format: config.string("pager_format").to_owned(),
+        status_format: config.string("status_format").to_owned(),
+        date_format: config.string("date_format").to_owned(),
+        quote,
+        colors: config.colors().clone(),
+    };
     Ok(Settings {
         page_size,
         mailboxes,
+        display,
         sync_interval,
         compose,
         account: account.clone(),

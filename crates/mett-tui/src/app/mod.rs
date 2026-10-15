@@ -70,6 +70,8 @@ pub struct Settings {
     pub shortcuts: Shortcuts,
     /// The folders to check for new mail (`mailboxes`).
     pub mailboxes: Vec<MailboxEntry>,
+    /// How the screen is drawn.
+    pub display: crate::expando::Display,
     /// How often to check for new mail (`msgraph_sync_interval`), or
     /// `None` not to.
     pub sync_interval: Option<std::time::Duration>,
@@ -99,6 +101,7 @@ impl Default for Settings {
             resolve: true,
             shortcuts: Shortcuts::default(),
             mailboxes: Vec::new(),
+            display: crate::expando::Display::default(),
             sync_interval: None,
         }
     }
@@ -344,6 +347,8 @@ pub struct App {
     pub sign_in: Option<SignIn>,
     /// The key bindings, which `:bind` and `:macro` change.
     pub keymap: Keymap,
+    /// How the screen is drawn: formats and colors.
+    pub display: crate::expando::Display,
     /// The last error reported on the message line, so that the view can
     /// tell it from other messages.
     pub error: Option<String>,
@@ -579,6 +584,7 @@ impl App {
             quit: false,
             sign_in: None,
             keymap: Keymap::mutt_defaults(),
+            display: settings.display,
             error: None,
             strokes: VecDeque::new(),
             sign_in_strokes: VecDeque::new(),
@@ -1792,6 +1798,7 @@ impl App {
         self.delete = settings.delete;
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
+        self.display = settings.display;
         self.apply_mailboxes(settings.mailboxes, settings.sync_interval);
     }
 
@@ -1989,6 +1996,11 @@ impl App {
     pub(super) fn fail(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.error = Some(self.status.clone());
+    }
+
+    /// Whether the user sent mail from `address`.
+    pub fn is_me(&self, address: &mett_core::Address) -> bool {
+        self.settings.is_me(address)
     }
 }
 

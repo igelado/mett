@@ -53,6 +53,7 @@ pub fn header_lines(message: &Message, bcc: bool) -> Vec<String> {
 }
 
 /// Wraps every line to `width` terminal cells.
+#[cfg(test)]
 pub fn wrap_all(lines: &[String], width: usize) -> Vec<String> {
     lines.iter().flat_map(|line| wrap(line, width)).collect()
 }
@@ -130,14 +131,6 @@ pub fn truncate(text: &str, width: usize) -> String {
         out.push_str(g);
         used += w;
     }
-    out
-}
-
-/// Truncates or pads `text` to exactly `width` terminal cells.
-pub fn fit(text: &str, width: usize) -> String {
-    let mut out = truncate(text, width);
-    let used = out.width();
-    out.extend(std::iter::repeat_n(' ', width - used));
     out
 }
 
@@ -301,9 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn fits_text_in_cells() {
-        assert_eq!(fit("Alice", 7), "Alice  ");
-        assert_eq!(fit("日本語", 5), "日本 ");
+    fn truncates_text_to_cells() {
         assert_eq!(truncate("Alice Example", 5), "Alice");
         assert_eq!(truncate("a👩‍💻b", 2), "a");
         assert_eq!(truncate("a👩‍💻b", 3), "a👩‍💻");

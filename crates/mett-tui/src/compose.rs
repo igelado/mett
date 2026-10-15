@@ -138,7 +138,7 @@ impl Settings {
         })
     }
 
-    fn is_me(&self, address: &Address) -> bool {
+    pub fn is_me(&self, address: &Address) -> bool {
         let email = address.email.to_lowercase();
         self.me.contains(&email)
             || self.alternates.iter().any(|alternate| {
