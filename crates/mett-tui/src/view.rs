@@ -145,7 +145,7 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
     if let Some(window) = &app.sign_in {
         let [_, below_help] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
-        return render_sign_in(window, keymap, frame, below_help);
+        return render_sign_in(window, keymap, colors.normal, frame, below_help);
     }
     None
 }
@@ -308,6 +308,7 @@ fn format_size(bytes: usize) -> String {
 fn render_sign_in(
     window: &SignIn,
     keymap: &Keymap,
+    normal: Style,
     frame: &mut Frame,
     area: Rect,
 ) -> Option<Overlay> {
@@ -353,7 +354,7 @@ fn render_sign_in(
         .areas(area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(visible).block(
+        Paragraph::new(visible).style(normal).block(
             Block::new()
                 .borders(Borders::TOP | Borders::BOTTOM)
                 .title(title),
@@ -930,6 +931,25 @@ mod tests {
         // Marked for deletion from the pager (the only message, so it stays).
         app.update(Msg::Action(Action::DeleteMessage));
         assert_eq!(screen(&app)[6], pager_status("D  "));
+    }
+
+    #[test]
+    fn the_sign_in_window_takes_the_normal_colors() {
+        use ratatui::style::Color;
+        let mut app = app(2);
+        colored(&mut app, &["color normal white blue"]);
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::EnterCode {
+                verification_uri: "https://microsoft.com/devicelogin".into(),
+                user_code: "ABCD-EFGH".into(),
+                message: String::new(),
+            },
+        }));
+        let buffer = styles(&app);
+        let lines = screen(&app);
+        let code = lines.iter().position(|l| l.contains("ABCD-EFGH")).unwrap();
+        assert_eq!(buffer[(0, u16::try_from(code).unwrap())].bg, Color::Blue);
     }
 
     #[test]
