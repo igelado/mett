@@ -375,6 +375,7 @@ fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     session: Session,
 ) -> ExitCode {
     // `init` also restores the terminal if mett panics.
+    remove_viewed_before();
     let terminal = ratatui::init();
     let result = runtime.block_on(run(terminal, store, session));
     ratatui::restore();
@@ -411,6 +412,9 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
 
     let (input, mut input_rx) = Input::start();
     let (timer_tx, mut timer_rx) = mpsc::unbounded_channel();
+    // What reading, saving and opening files (on threads of their own)
+    // has to say.
+    let (file_tx, mut file_rx) = mpsc::unbounded_channel();
 
     // `:` commands run on their own thread, one at a time: `source` and
     // backticks may take a while, and the UI doesn't wait for them.
@@ -426,7 +430,14 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     // Played once the folder is listed, so that `push <last-entry>` has
     // somewhere to go.
     app.push_after_load(pushed);
-    let mut deferred = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+    let mut deferred = dispatch(
+        &mut app,
+        &request_tx,
+        &timer_tx,
+        &file_tx,
+        cancel.as_ref(),
+        effects,
+    );
 
     while !app.quit {
         // What effects done at once answered goes to the app first.
@@ -437,6 +448,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     &mut app,
                     &request_tx,
                     &timer_tx,
+                    &file_tx,
                     cancel.as_ref(),
                     effects,
                 ));
@@ -457,6 +469,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 &mut app,
                 &request_tx,
                 &timer_tx,
+                &file_tx,
                 cancel.as_ref(),
                 effects,
             ));
@@ -507,6 +520,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 Some(response) = response_rx.recv() => Msg::Response(response),
                 Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
                 Some(timer) = timer_rx.recv() => Msg::Timer(timer),
+                Some(msg) = file_rx.recv() => msg,
                 done = async { running.as_mut().expect("checked").await }, if running.is_some() => {
                     running = None;
                     let (configuration, reconfigured) =
@@ -528,6 +542,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             &mut app,
             &request_tx,
             &timer_tx,
+            &file_tx,
             cancel.as_ref(),
             effects,
         ));
@@ -549,7 +564,14 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             continue;
         }
         let effects = app.update(Msg::SignIn(event));
-        dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+        dispatch(
+            &mut app,
+            &request_tx,
+            &timer_tx,
+            &file_tx,
+            cancel.as_ref(),
+            effects,
+        );
     }
     let unsaved = !app.save_failures().is_empty();
     if app.saving() || (unsaved && app.sign_in.is_some()) {
@@ -561,12 +583,26 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             // save can be retried even after nothing is left pending.
             while let Ok(event) = sign_in_rx.try_recv() {
                 let effects = app.update(Msg::SignIn(event));
-                dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+                dispatch(
+                    &mut app,
+                    &request_tx,
+                    &timer_tx,
+                    &file_tx,
+                    cancel.as_ref(),
+                    effects,
+                );
             }
             // A macro run in the sign-in window plays there.
             while let Some(msg) = app.next_sign_in_stroke() {
                 let effects = app.update(msg);
-                dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+                dispatch(
+                    &mut app,
+                    &request_tx,
+                    &timer_tx,
+                    &file_tx,
+                    cancel.as_ref(),
+                    effects,
+                );
             }
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
@@ -618,7 +654,14 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
             // Nothing is edited, nor configured, any more.
-            let _ = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+            let _ = dispatch(
+                &mut app,
+                &request_tx,
+                &timer_tx,
+                &file_tx,
+                cancel.as_ref(),
+                effects,
+            );
             // The wait starts again once the user is done signing in.
             if window_was_open || app.sign_in.is_some() {
                 deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
@@ -784,7 +827,7 @@ fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
     VIEWED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(dir.clone());
+        .push((dir.clone(), std::time::Instant::now()));
     let path = dir.join(name);
     let opened = std::fs::write(&path, data).and_then(|()| open::that_detached(&path));
     if opened.is_err() {
@@ -793,13 +836,58 @@ fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
     opened
 }
 
-/// The directories of attachments opened for viewing.
-static VIEWED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// The directories of attachments opened for viewing, and when.
+static VIEWED: std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
 
-/// Removes the copies of attachments opened for viewing.
+/// How long a viewer may take to open its file: one opened since is left
+/// for the next run of mett to take away.
+const VIEWER_START: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How old a copy left behind by an earlier run has to be to be taken
+/// away.
+const VIEWED_LEFT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Removes the copies of attachments opened for viewing, but those just
+/// opened, which their viewers may not have loaded yet.
 fn remove_viewed() {
-    for dir in VIEWED.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
-        let _ = std::fs::remove_dir_all(dir);
+    for (dir, opened) in VIEWED.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        if opened.elapsed() >= VIEWER_START {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Removes the copies of attachments that earlier runs left for their
+/// viewers, once they are old (named `mett-PID-NANOS-N`, by when).
+fn remove_viewed_before() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("mett-")) else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.split('-').collect();
+        let [pid, started, count] = parts.as_slice() else {
+            continue;
+        };
+        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let Ok(started) = started.parse::<u128>() else {
+            continue;
+        };
+        if numeric(pid)
+            && numeric(count)
+            && now.saturating_sub(started) > VIEWED_LEFT.as_nanos()
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 
@@ -914,6 +1002,7 @@ fn dispatch(
     app: &mut App,
     requests: &mpsc::UnboundedSender<(RequestId, Request)>,
     timers: &mpsc::UnboundedSender<app::Timer>,
+    files: &mpsc::UnboundedSender<app::Msg>,
     cancel: Option<&CancelHandle>,
     effects: Vec<Effect>,
 ) -> Deferred {
@@ -942,21 +1031,32 @@ fn dispatch(
                 }
             }
             Effect::Edit(text) => deferred.edit = Some(text),
+            // Files are read and written on threads of their own: a slow
+            // disk (or a FIFO) doesn't hold up the screen, nor quitting.
             Effect::SaveFile {
                 path,
                 data,
                 overwrite,
-            } => deferred
-                .msgs
-                .push(app::Msg::FileSaved(save_file(path, data, overwrite))),
+            } => {
+                let files = files.clone();
+                std::thread::spawn(move || {
+                    let _ = files.send(app::Msg::FileSaved(save_file(path, data, overwrite)));
+                });
+            }
             Effect::OpenFile { name, data } => {
-                if let Err(e) = open_file(&name, &data) {
-                    app.status = format!("Could not open {name}: {e}");
-                }
+                let files = files.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = open_file(&name, &data) {
+                        let _ = files.send(app::Msg::Failed(format!("Could not open {name}: {e}")));
+                    }
+                });
             }
             Effect::ReadFile(path) => {
-                let read = std::fs::read(&path).map_err(|e| e.to_string());
-                deferred.msgs.push(app::Msg::FileRead(path, read));
+                let files = files.clone();
+                std::thread::spawn(move || {
+                    let read = std::fs::read(&path).map_err(|e| e.to_string());
+                    let _ = files.send(app::Msg::FileRead(path, read));
+                });
             }
             Effect::Command(command) => deferred.commands.push(command),
             Effect::Later(after, timer) => {

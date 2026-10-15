@@ -146,6 +146,8 @@ pub enum Msg {
     FileSaved(FileOutcome),
     /// A file was read, or not.
     FileRead(std::path::PathBuf, Result<Vec<u8>, String>),
+    /// Something done apart from the app failed (opening a file, say).
+    Failed(String),
     /// A timer the app set went off.
     Timer(Timer),
     /// The terminal was resized.
@@ -595,6 +597,8 @@ pub struct App {
     page_size: u32,
     /// The attachment being fetched, and what for.
     fetching: Option<attachments::Fetching>,
+    /// How many files to attach are being read.
+    reading: usize,
     /// A file not saved because one was there, waiting for the user to say
     /// whether to replace it.
     unsaved: Option<(std::path::PathBuf, Vec<u8>)>,
@@ -737,6 +741,7 @@ impl App {
             last_draft: 0,
             page_size: settings.page_size,
             fetching: None,
+            reading: 0,
             unsaved: None,
             home: settings.home,
             mailboxes: settings.mailboxes,
@@ -822,6 +827,10 @@ impl App {
             Msg::Edited(result) => self.on_edited(result),
             Msg::FileSaved(outcome) => self.on_file_saved(outcome),
             Msg::FileRead(path, result) => self.on_file_read(path, result),
+            Msg::Failed(why) => {
+                self.fail(why);
+                Vec::new()
+            }
             Msg::Timer(Timer::RelistSentItems) => {
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
                 if open == Some(mett_core::WellKnownFolder::SentItems) {

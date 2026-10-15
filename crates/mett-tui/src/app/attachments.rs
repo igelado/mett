@@ -363,6 +363,7 @@ impl App {
         }
         let path = PathBuf::from(expand_home(path, self.home.as_deref()));
         self.status = "Attaching...".into();
+        self.reading += 1;
         vec![Effect::ReadFile(path)]
     }
 
@@ -372,6 +373,7 @@ impl App {
         path: PathBuf,
         result: Result<Vec<u8>, String>,
     ) -> Vec<Effect> {
+        self.reading = self.reading.saturating_sub(1);
         if self.status == "Attaching..." {
             self.status.clear();
         }
@@ -736,6 +738,9 @@ mod tests {
         let effects = app.answer_attach_file("~/report.pdf".into());
         let path = PathBuf::from("/home/alice/report.pdf");
         assert_eq!(effects, [Effect::ReadFile(path.clone())]);
+        // Not sent without it.
+        assert!(act(&mut app, Action::SendMessage).is_empty());
+        assert_eq!(app.status, "Please wait: a file is still being attached.");
         app.update(Msg::FileRead(path, Ok(b"%PDF".to_vec())));
         let Screen::Compose(compose) = app.screen() else {
             panic!("expected the compose menu");

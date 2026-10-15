@@ -216,6 +216,8 @@ impl App {
             // Attachments being listed, or one fetched to show or save.
             || self.attachments_request().is_some()
             || self.fetching.is_some()
+            // A file being attached.
+            || self.reading > 0
             || self.delivering()
             // A move or purge decides what the next keys act on (and the
             // mailbox refuses to touch a message on its way).
