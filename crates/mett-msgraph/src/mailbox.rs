@@ -525,8 +525,18 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         let sent = self
             .send(self.request(Method::POST, url), About::message(id.as_str()))
             .await;
-        if sent.is_err() {
-            self.discard(&id).await;
+        match &sent {
+            // The response was lost or Graph failed: the message may have
+            // gone out anyway. Keep the draft, so nothing is lost if it
+            // didn't, and say so.
+            Err(Error::Network(e)) => {
+                return Err(Error::Network(format!(
+                    "{e}; if it wasn't sent, it is in Drafts"
+                )));
+            }
+            // Graph refused it: it wasn't sent.
+            Err(_) => self.discard(&id).await,
+            Ok(_) => {}
         }
         sent.map(drop)
     }

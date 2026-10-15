@@ -257,6 +257,9 @@ pub struct App {
     composing: Option<Composing>,
     /// The request fetching a message to reply to or forward.
     compose_fetch: Option<(RequestId, Kind)>,
+    /// The reply or forward whose message couldn't be fetched for want of
+    /// a sign-in, to start again on Retry.
+    compose_unfetched: Option<(MessageId, Kind)>,
     /// How to write messages.
     settings: crate::compose::Settings,
     /// The open folder gained a message while a pager was open: list it
@@ -327,6 +330,7 @@ impl App {
             input: None,
             composing: None,
             compose_fetch: None,
+            compose_unfetched: None,
             settings: settings.compose,
             relist_on_return: false,
             path,
@@ -565,6 +569,7 @@ impl App {
             .chain(fetching)
             .chain(self.flag_updates.keys().copied())
             .chain(self.delivery_request())
+            .chain(self.compose_fetch.map(|(id, _)| id))
             .collect()
     }
 
@@ -601,6 +606,10 @@ impl App {
         let delivery = self.retry_delivery();
         if !delivery.is_empty() {
             return delivery;
+        }
+        let compose = self.retry_compose_fetch();
+        if !compose.is_empty() {
+            return compose;
         }
         if self.folder.is_none() {
             if self.opening.is_none() {

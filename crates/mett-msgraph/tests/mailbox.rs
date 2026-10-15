@@ -969,3 +969,32 @@ async fn saves_drafts() {
         MessageId::new("reply")
     );
 }
+
+#[tokio::test]
+async fn keeps_the_server_draft_when_the_send_outcome_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store(&server).send(&reply).await.unwrap_err();
+    assert!(matches!(err, Error::Network(m) if m.contains("in Drafts")));
+}

@@ -249,7 +249,13 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     while !app.quit {
         // The editor runs between messages, with the terminal handed over.
         while let Some(text) = edit.take() {
-            let result = input.suspended(&mut terminal, || editor.edit(&text))?;
+            let result = input.suspended(&mut terminal, &mut input_rx, || editor.edit(&text))?;
+            // The terminal may have been resized meanwhile.
+            let size = terminal.size()?;
+            app.update(Msg::Resize {
+                width: size.width,
+                height: size.height,
+            });
             let effects = app.update(Msg::Edited(result));
             edit = dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
         }
@@ -520,9 +526,14 @@ impl Input {
 
     /// Runs `f` with the terminal restored to normal and input reading
     /// paused, then takes the terminal back.
+    ///
+    /// Input that arrived before the pause is dropped: keys typed ahead
+    /// while the editor was starting are not meant for mett (a stray `y`
+    /// could send the message).
     fn suspended<T>(
         &self,
         terminal: &mut DefaultTerminal,
+        events: &mut InputEvents,
         f: impl FnOnce() -> T,
     ) -> std::io::Result<T> {
         let (paused, acknowledged) = std::sync::mpsc::channel();
@@ -539,6 +550,7 @@ impl Input {
                 // The thread is between reads once it answers.
                 let _ = acknowledged.recv();
             }
+            while events.try_recv().is_ok() {}
             ratatui::restore();
             let result = f();
             drop(resume);

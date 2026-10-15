@@ -151,10 +151,31 @@ impl App {
         match result {
             Ok(message) => self.begin(kind, Some(message)),
             Err(e) => {
+                // Without a sign-in, the sign-in window's Retry starts the
+                // reply or forward again.
+                if matches!(e, mett_core::Error::Auth(_)) {
+                    self.compose_unfetched = self
+                        .messages
+                        .get(self.selected)
+                        .map(|m| (m.id.clone(), kind));
+                }
                 self.report(e);
                 Vec::new()
             }
         }
+    }
+
+    /// Starts again a reply or forward whose message couldn't be fetched
+    /// for want of a sign-in, if its message is still the one selected.
+    pub(super) fn retry_compose_fetch(&mut self) -> Vec<Effect> {
+        let Some((id, kind)) = self.compose_unfetched.take() else {
+            return Vec::new();
+        };
+        let selected = self.messages.get(self.selected).map(|m| &m.id);
+        if selected == Some(&id) && self.screen() == &Screen::Index {
+            return self.start_compose(kind);
+        }
+        Vec::new()
     }
 
     fn begin(&mut self, kind: Kind, original: Option<Message>) -> Vec<Effect> {
@@ -586,6 +607,7 @@ impl App {
         };
         let delivery = compose.delivery.take().map(|(_, d)| d);
         compose.unauthorized = None;
+        let saved_copy = compose.draft.save_copy;
         match result {
             Ok(()) => {
                 self.screens.remove(position);
@@ -595,11 +617,15 @@ impl App {
                 }
                 .into();
                 // The message landed in the open folder: list it again.
+                // (A sent message lands in Sent Items only if a copy was
+                // kept.)
                 let landed_in = match delivery {
-                    Some(Delivery::Postpone) => WellKnownFolder::Drafts,
-                    _ => WellKnownFolder::SentItems,
+                    Some(Delivery::Postpone) => Some(WellKnownFolder::Drafts),
+                    _ if saved_copy => Some(WellKnownFolder::SentItems),
+                    _ => None,
                 };
-                if self.folder.as_ref().and_then(|f| f.well_known) == Some(landed_in) {
+                let open = self.folder.as_ref().and_then(|f| f.well_known);
+                if landed_in.is_some() && open == landed_in {
                     // Not under a pager, whose message and position would
                     // no longer match the index: once back in the index.
                     if self.screen() == &Screen::Index {
@@ -612,7 +638,14 @@ impl App {
                 if matches!(e, mett_core::Error::Auth(_)) {
                     compose.unauthorized = delivery;
                 }
-                self.report(e);
+                // A lost response doesn't mean the message wasn't sent.
+                if delivery == Some(Delivery::Send) && matches!(e, mett_core::Error::Network(_)) {
+                    self.status = format!(
+                        "The message may have been sent ({e}). Check Sent Items before sending it again."
+                    );
+                } else {
+                    self.report(e);
+                }
             }
         }
         Vec::new()
@@ -811,10 +844,10 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("offline".into()))),
+            event: Event::Sent(Err(Error::Backend("bad recipient".into()))),
         }));
         assert_eq!(compose(&app).delivery, None);
-        assert_eq!(app.status, "network error: offline");
+        assert_eq!(app.status, "backend error: bad recipient");
     }
 
     #[test]
@@ -1098,5 +1131,64 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         let effects = act(&mut app, Action::Exit);
         assert!(matches!(request(&effects).1, Request::ListMessages { .. }));
+    }
+
+    #[test]
+    fn a_reply_whose_message_needed_a_sign_in_starts_again_on_retry() {
+        let mut app = app(settings());
+        let (fetch, _) = request(&act(&mut app, Action::Reply));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Err(Error::Auth("expired".into()))),
+        }));
+        let (_, again) = request(&act(&mut app, Action::Retry));
+        assert_eq!(again, Request::FetchMessage("m1".into()));
+    }
+
+    #[test]
+    fn a_lost_send_response_may_have_sent_the_message() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Network("timed out".into()))),
+        }));
+        assert!(
+            app.status.starts_with("The message may have been sent"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn sending_without_a_copy_leaves_sent_items_alone() {
+        let mut app = app(compose::Settings {
+            copy: Quad::No,
+            ..settings()
+        });
+        app.folder = Some(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
+        ));
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        let effects = app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Ok(())),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(app.messages.len(), 1);
     }
 }
