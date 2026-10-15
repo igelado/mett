@@ -36,6 +36,9 @@ pub fn pager_lines(message: &Message) -> Vec<String> {
     if !message.cc.is_empty() {
         lines.push(format!("Cc: {}", addresses(&message.cc)));
     }
+    if !message.bcc.is_empty() {
+        lines.push(format!("Bcc: {}", addresses(&message.bcc)));
+    }
     lines.push(format!("Subject: {}", summary.subject));
     lines.push(String::new());
     lines.extend(body_lines(&message.body));

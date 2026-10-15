@@ -14,6 +14,10 @@ use crate::config::Quad;
 use crate::lineedit::{LineEditor, Outcome};
 use crate::worker::{Request, RequestId};
 
+/// How long after sending Sent Items is listed again, to catch a copy
+/// that Graph filed late.
+const SENT_COPY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A question on the message line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
@@ -172,10 +176,14 @@ impl App {
             return Vec::new();
         };
         let selected = self.messages.get(self.selected).map(|m| &m.id);
-        if selected == Some(&id) && self.screen() == &Screen::Index {
-            return self.start_compose(kind);
+        if selected != Some(&id) {
+            return Vec::new();
         }
-        Vec::new()
+        match self.screen() {
+            Screen::Index | Screen::Pager(_) => self.start_compose(kind),
+            // Back on the index or pager, the user can start it again.
+            _ => Vec::new(),
+        }
     }
 
     fn begin(&mut self, kind: Kind, original: Option<Message>) -> Vec<Effect> {
@@ -627,12 +635,23 @@ impl App {
                 };
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
                 if landed_in.is_some() && open == landed_in {
+                    // Graph files the sent copy a moment after accepting
+                    // the message: look again a little later too.
+                    let mut effects = Vec::new();
+                    if landed_in == Some(WellKnownFolder::SentItems) {
+                        effects.push(Effect::Later(
+                            SENT_COPY_DELAY,
+                            super::Timer::RelistSentItems,
+                        ));
+                    }
                     // Not under a pager, whose message and position would
                     // no longer match the index: once back in the index.
                     if self.screen() == &Screen::Index {
-                        return self.relist();
+                        effects.extend(self.relist());
+                    } else {
+                        self.relist_on_return = true;
                     }
-                    self.relist_on_return = true;
+                    return effects;
                 }
             }
             Err(e) => {
@@ -1094,9 +1113,18 @@ mod tests {
             event: Event::Sent(Ok(())),
         }));
         assert!(
-            matches!(request(&effects).1, Request::ListMessages { .. }),
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Later(_, crate::app::Timer::RelistSentItems),
+                    Effect::Request(_, Request::ListMessages { .. }),
+                ]
+            ),
             "{effects:?}"
         );
+        // And again when the timer goes off.
+        let effects = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
+        assert!(matches!(request(&effects).1, Request::ListMessages { .. }));
         assert!(app.messages.is_empty());
     }
 
@@ -1142,7 +1170,10 @@ mod tests {
             id,
             event: Event::Sent(Ok(())),
         }));
-        assert!(effects.is_empty(), "not under the pager");
+        assert!(
+            matches!(effects.as_slice(), [Effect::Later(..)]),
+            "no listing under the pager: {effects:?}"
+        );
         assert_eq!(app.messages.len(), 1);
         let effects = act(&mut app, Action::Exit);
         assert!(matches!(request(&effects).1, Request::ListMessages { .. }));
@@ -1282,5 +1313,27 @@ mod tests {
             event: Event::Sent(Err(Error::Network("timed out".into()))),
         }));
         assert!(app.status.contains("without a copy"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_reply_that_needed_a_sign_in_is_retried_from_the_pager() {
+        let mut app = app(settings());
+        let (pager_fetch, _) = request(&act(&mut app, Action::DisplayMessage));
+        let (reply_fetch, _) = request(&act(&mut app, Action::Reply));
+        app.update(Msg::Response(Response {
+            id: pager_fetch,
+            event: Event::MessageFetched(Ok(original())),
+        }));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        app.update(Msg::Response(Response {
+            id: reply_fetch,
+            event: Event::MessageFetched(Err(Error::Auth("expired".into()))),
+        }));
+        act(&mut app, Action::Retry);
+        // The pager has the message now: the reply starts from it.
+        assert_eq!(prompt(&app), "Include message in reply?");
     }
 }

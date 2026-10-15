@@ -72,6 +72,8 @@ pub enum Msg {
     Key(KeyEvent),
     /// The editor finished: the edited text, or why it failed.
     Edited(Result<String, String>),
+    /// A timer the app set went off.
+    Timer(Timer),
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -95,6 +97,16 @@ pub enum Effect {
     /// Edit the text in the user's editor, then send back
     /// [`Msg::Edited`].
     Edit(String),
+    /// Send back [`Msg::Timer`] after a while.
+    Later(std::time::Duration, Timer),
+}
+
+/// Something the app does after a while.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Timer {
+    /// List Sent Items again, if it is open: Graph files the copy of a
+    /// sent message a moment after accepting it.
+    RelistSentItems,
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -387,6 +399,16 @@ impl App {
             Msg::SignIn(event) => self.on_sign_in(event),
             Msg::Key(key) => self.on_key(key),
             Msg::Edited(result) => self.on_edited(result),
+            Msg::Timer(Timer::RelistSentItems) => {
+                let open = self.folder.as_ref().and_then(|f| f.well_known);
+                if open == Some(mett_core::WellKnownFolder::SentItems) {
+                    if self.screen() == &Screen::Index {
+                        return self.relist();
+                    }
+                    self.relist_on_return = true;
+                }
+                Vec::new()
+            }
             Msg::Resize { width, height } => {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);

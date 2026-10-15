@@ -425,7 +425,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         let mut url = self.url(&["me", "messages", id.as_str()]);
         url.query_pairs_mut().append_pair(
             "$select",
-            &format!("{SUMMARY_FIELDS},ccRecipients,replyTo,internetMessageId,body"),
+            &format!("{SUMMARY_FIELDS},ccRecipients,bccRecipients,replyTo,internetMessageId,body"),
         );
         let request = self
             .request(Method::GET, url)
@@ -794,6 +794,8 @@ struct GraphMessage {
     #[serde(default)]
     cc_recipients: Vec<Recipient>,
     #[serde(default)]
+    bcc_recipients: Vec<Recipient>,
+    #[serde(default)]
     reply_to: Vec<Recipient>,
     /// Missing, or a placeholder, for unsent drafts.
     sent_date_time: Option<String>,
@@ -853,6 +855,7 @@ impl GraphMessage {
         Ok(Message {
             summary,
             cc: rest.cc.into_iter().map(Recipient::into_address).collect(),
+            bcc: rest.bcc.into_iter().map(Recipient::into_address).collect(),
             reply_to: rest
                 .reply_to
                 .into_iter()
@@ -908,6 +911,7 @@ impl GraphMessage {
         };
         let rest = Rest {
             cc: self.cc_recipients,
+            bcc: self.bcc_recipients,
             reply_to: self.reply_to,
             internet_message_id: self.internet_message_id,
             body: self.body,
@@ -919,6 +923,7 @@ impl GraphMessage {
 /// The parts of a [`GraphMessage`] that only a full [`Message`] needs.
 struct Rest {
     cc: Vec<Recipient>,
+    bcc: Vec<Recipient>,
     reply_to: Vec<Recipient>,
     internet_message_id: Option<String>,
     body: Option<ItemBody>,

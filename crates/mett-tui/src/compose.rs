@@ -291,17 +291,22 @@ pub fn reply_recipients(
     let from_me = summary.from.as_ref().is_some_and(|a| settings.is_me(a));
     if from_me && to.iter().all(|a| settings.is_me(a)) {
         // Leave the user out too (unless `metoo`): to the other To:
-        // recipients, else the Cc: ones, else back to the user.
+        // recipients, else the Cc: ones, else the Bcc: ones (a sent copy
+        // has them), else back to the user.
         let others = |list: &[Address]| -> Vec<Address> {
             list.iter()
                 .filter(|a| settings.metoo || !settings.is_me(a))
                 .cloned()
                 .collect()
         };
-        to = [others(&summary.to), others(&message.cc)]
-            .into_iter()
-            .find(|list| !list.is_empty())
-            .unwrap_or_else(|| summary.to.clone());
+        to = [
+            others(&summary.to),
+            others(&message.cc),
+            others(&message.bcc),
+        ]
+        .into_iter()
+        .find(|list| !list.is_empty())
+        .unwrap_or_else(|| summary.to.clone());
     }
     let mut cc = Vec::new();
     if group {
@@ -524,8 +529,13 @@ mod tests {
         message.summary.to = vec![Address::new("me@contoso.com")];
         let (to, _) = reply_recipients(&message, true, false, &settings());
         assert_eq!(to[0].email, "dave@x.org");
-        // A note to self goes back to self.
+        // Sent only to Bcc recipients: to them.
         message.cc.clear();
+        message.bcc = vec![Address::new("eve@x.org")];
+        let (to, _) = reply_recipients(&message, true, false, &settings());
+        assert_eq!(to, [Address::new("eve@x.org")]);
+        // A note to self goes back to self.
+        message.bcc.clear();
         let (to, _) = reply_recipients(&message, true, false, &settings());
         assert_eq!(to, [Address::new("me@contoso.com")]);
     }

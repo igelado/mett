@@ -122,6 +122,7 @@ impl State {
                 has_attachments: false,
             },
             cc: draft.cc.clone(),
+            bcc: draft.bcc.clone(),
             reply_to: Vec::new(),
             internet_message_id: None,
             body: Body {
@@ -282,6 +283,7 @@ pub fn message(id: &str, folder: &str, subject: &str, received: DateTime<Utc>) -
             has_attachments: false,
         },
         cc: Vec::new(),
+        bcc: Vec::new(),
         reply_to: Vec::new(),
         internet_message_id: None,
         body: Body {

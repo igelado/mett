@@ -222,6 +222,8 @@ pub struct Message {
     pub summary: MessageSummary,
     /// The `Cc:` recipients.
     pub cc: Vec<Address>,
+    /// The `Bcc:` recipients, which only the sender's copy has.
+    pub bcc: Vec<Address>,
     /// The `Reply-To:` addresses, if the sender asked for replies to go
     /// elsewhere.
     pub reply_to: Vec<Address>,

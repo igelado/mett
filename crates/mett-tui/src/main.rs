@@ -241,10 +241,11 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     tokio::spawn(worker::run(store, request_rx, response_tx));
 
     let (input, mut input_rx) = Input::start();
+    let (timer_tx, mut timer_rx) = mpsc::unbounded_channel();
 
     let size = terminal.size()?;
     let (mut app, effects) = App::open(size.width, size.height, folder, settings);
-    let mut edit = dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+    let mut edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
 
     while !app.quit {
         // The editor runs between messages, with the terminal handed over.
@@ -257,7 +258,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 height: size.height,
             });
             let effects = app.update(Msg::Edited(result));
-            edit = dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+            edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
         }
         draw(&mut terminal, &app, &keymap)?;
         let msg = tokio::select! {
@@ -286,6 +287,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             },
             Some(response) = response_rx.recv() => Msg::Response(response),
             Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
+            Some(timer) = timer_rx.recv() => Msg::Timer(timer),
             else => break,
         };
         if matches!(msg, Msg::Action(_)) {
@@ -293,7 +295,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             app.status.clear();
         }
         let effects = app.update(msg);
-        edit = dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+        edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
     }
 
     // Give pending changes (such as marking a message read) a moment to
@@ -312,7 +314,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             continue;
         }
         let effects = app.update(Msg::SignIn(event));
-        dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+        dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
     }
     let unsaved = !app.save_failures().is_empty();
     if app.saving() || (unsaved && app.sign_in.is_some()) {
@@ -324,7 +326,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             // save can be retried even after nothing is left pending.
             while let Ok(event) = sign_in_rx.try_recv() {
                 let effects = app.update(Msg::SignIn(event));
-                dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+                dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
             }
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
@@ -376,7 +378,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
             // Nothing is edited any more.
-            let _ = dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+            let _ = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
             // The wait starts again once the user is done signing in.
             if window_was_open || app.sign_in.is_some() {
                 deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
@@ -442,6 +444,7 @@ const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 fn dispatch(
     app: &mut App,
     requests: &mpsc::UnboundedSender<(RequestId, Request)>,
+    timers: &mpsc::UnboundedSender<app::Timer>,
     cancel: Option<&CancelHandle>,
     effects: Vec<Effect>,
 ) -> Option<String> {
@@ -470,6 +473,14 @@ fn dispatch(
                 }
             }
             Effect::Edit(text) => edit = Some(text),
+            Effect::Later(after, timer) => {
+                let timers = timers.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    // The app may have quit; nothing to do then.
+                    let _ = timers.send(timer);
+                });
+            }
         }
     }
     edit
