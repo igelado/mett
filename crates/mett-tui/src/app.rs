@@ -896,6 +896,11 @@ impl App {
     }
 
     fn report(&mut self, error: Error) {
+        // A request the user's cancelled sign-in held up: they know.
+        if matches!(&error, Error::Auth(m) if m == "sign-in cancelled") {
+            self.status = "Sign-in cancelled.".into();
+            return;
+        }
         self.status = error.to_string();
     }
 }
@@ -1556,6 +1561,13 @@ mod tests {
         assert!(app.retry_after.is_empty());
         app.update(Msg::SignIn(finished(Err("sign-in cancelled".into()))));
         assert_eq!(app.sign_in, None);
+        assert_eq!(app.status, "Sign-in cancelled.");
+        // The request it held up says the same, in the same words.
+        let opening = app.opening.unwrap();
+        app.update(Msg::Response(Response {
+            id: opening,
+            event: Event::FolderOpened(Err(Error::Auth("sign-in cancelled".into()))),
+        }));
         assert_eq!(app.status, "Sign-in cancelled.");
     }
 

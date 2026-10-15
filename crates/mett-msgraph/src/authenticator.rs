@@ -267,6 +267,15 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
+    /// Records that confirming an interactive sign-in failed again, as a
+    /// sign-in attempt of its own: requests that were waiting meanwhile
+    /// share its failure rather than trying once more each.
+    fn sign_in_failed(&self, state: &mut State, error: &mett_core::Error) {
+        let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
+        state.failed_sign_in = Some((number, error.clone()));
+        self.prompter.finished(Err(error));
+    }
+
     /// Removes `token` from the store if it is still the stored one, and
     /// returns the stored token otherwise.
     async fn clear_if_stored(&self, token: &str) -> Result<Option<String>> {
@@ -381,7 +390,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                         state.unconfirmed = Some(Unconfirmed { tokens, stored });
                         let e = mett_core::Error::from(e);
                         if interactive {
-                            self.prompter.finished(Err(&e));
+                            self.sign_in_failed(&mut state, &e);
                         }
                         return Err(e);
                     }
@@ -394,13 +403,14 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                         return Ok(token);
                     }
                     if interactive {
-                        self.prompter.finished(Err(&e));
+                        self.sign_in_failed(&mut state, &e);
                     }
                     return Err(e);
                 }
             };
             if interactive {
                 state.failed_sign_in = None;
+                self.sign_ins.fetch_add(1, Ordering::SeqCst);
                 self.prompter.finished(Ok(()));
             }
             // The check may have taken a while; if the token is no longer
