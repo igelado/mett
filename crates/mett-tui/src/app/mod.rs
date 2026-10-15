@@ -279,6 +279,10 @@ pub struct App {
     /// The open folder gained a message while a pager was open: list it
     /// again once back in the index.
     relist_on_return: bool,
+    /// The message selected before the folder was listed again in the
+    /// background, and where it was: the selection goes back to it (or
+    /// near where it was, if it is gone) as the listing comes in.
+    reselect: Option<(MessageId, usize)>,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -349,6 +353,7 @@ impl App {
             compose_unfetched: None,
             settings: settings.compose,
             relist_on_return: false,
+            reselect: None,
             path,
             opening: None,
             width: usize::from(width),
@@ -403,7 +408,7 @@ impl App {
         // list it again once the index is back.
         if self.relist_on_return && self.screen() == &Screen::Index {
             self.relist_on_return = false;
-            effects.extend(self.relist());
+            effects.extend(self.refresh());
         }
         effects
     }
@@ -419,7 +424,7 @@ impl App {
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
                 if open == Some(mett_core::WellKnownFolder::SentItems) {
                     if self.screen() == &Screen::Index {
-                        return self.relist();
+                        return self.refresh();
                     }
                     self.relist_on_return = true;
                 }
@@ -447,6 +452,7 @@ impl App {
         // move anywhere, so leave them.
         if self.menu() != Menu::SignIn {
             self.pending = None;
+            self.reselect = None;
             self.compose_fetch = None;
             // What the user does next may need a sign-in that fails; show
             // that.
@@ -816,6 +822,7 @@ impl App {
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
                     self.messages.extend(page.messages);
+                    self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
                         // Keep loading until the whole folder is listed.
@@ -834,6 +841,7 @@ impl App {
                 }
                 Err(e) => {
                     self.pending = None;
+                    self.reselect = None;
                     self.listing = None;
                     self.unlisted = self.listing_page.take();
                     self.report(e);
@@ -942,11 +950,41 @@ impl App {
     /// Lists the open folder again from the start, to show messages that
     /// arrived in it.
     fn relist(&mut self) -> Vec<Effect> {
+        self.reselect = None;
         self.messages.clear();
         self.selected = 0;
         self.pending = None;
         self.unlisted = None;
         self.list(Page::first(self.page_size))
+    }
+
+    /// Lists the open folder again in the background, staying on the
+    /// selected message.
+    fn refresh(&mut self) -> Vec<Effect> {
+        let selected = self
+            .messages
+            .get(self.selected)
+            .map(|m| (m.id.clone(), self.selected));
+        let effects = self.relist();
+        self.reselect = selected;
+        effects
+    }
+
+    /// Selects again the message selected before a [`Self::refresh`], once
+    /// it is listed; if it is gone by the end of the folder, the one now
+    /// where it was.
+    fn reselect(&mut self, done: bool) {
+        let Some((id, at)) = &self.reselect else {
+            return;
+        };
+        if let Some(found) = self.messages.iter().position(|m| &m.id == id) {
+            self.selected = found;
+        } else if done {
+            self.selected = (*at).min(self.messages.len().saturating_sub(1));
+        } else {
+            return;
+        }
+        self.reselect = None;
     }
 
     /// Lists `page` of the open folder.

@@ -133,7 +133,26 @@ impl<A: Authenticator> GraphMailStore<A> {
         request: RequestBuilder,
         about: About<'_>,
     ) -> Result<(reqwest::Response, AccessToken)> {
-        let token = self.auth.access_token().await?;
+        self.send_with(request, about, |e| e).await
+    }
+
+    /// Sends a request that hands a message over to be sent. Failing
+    /// before the request is made (say, getting a token) leaves the message
+    /// unsent, which [`Error::NotSent`] says; only a lost response to the
+    /// request itself leaves it in doubt.
+    async fn hand_over(&self, request: RequestBuilder, about: About<'_>) -> Result<()> {
+        self.send_with(request, about, unsent).await.map(drop)
+    }
+
+    /// Like [`Self::send_with_token`], passing errors from before the
+    /// request is made (or after Graph refused it) through `before`.
+    async fn send_with(
+        &self,
+        request: RequestBuilder,
+        about: About<'_>,
+        before: fn(Error) -> Error,
+    ) -> Result<(reqwest::Response, AccessToken)> {
+        let token = self.auth.access_token().await.map_err(before)?;
         // Kept for a retry; JSON bodies can always be cloned.
         let retry = request.try_clone();
         let response = Self::attempt(request, &token).await?;
@@ -143,7 +162,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         // Graph rejected a token that hadn't expired (it may have been
         // revoked): get a new one and try once more.
         self.auth.token_rejected(&token).await;
-        let fresh = self.auth.access_token().await?;
+        let fresh = self.auth.access_token().await.map_err(before)?;
         match retry {
             Some(retry) if fresh != token => {
                 let response = Self::attempt(retry, &fresh).await?;
@@ -519,22 +538,18 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
                 "saveToSentItems": draft.save_copy,
             });
             return self
-                .send(self.request(Method::POST, url).json(&body), About::MAILBOX)
-                .await
-                .map(drop);
+                .hand_over(self.request(Method::POST, url).json(&body), About::MAILBOX)
+                .await;
         };
         // Replies and forwards go through a server draft, so that Graph
         // threads them under the original and keeps a forwarded message's
         // attachments. Sending a draft always keeps a copy in Sent Items.
         // Failing before the send request leaves nothing sent, whatever
         // became of the draft.
-        let id = self.answer(origin, draft).await.map_err(|e| match e {
-            Error::Network(e) => Error::NotSent(format!("network error: {e}")),
-            e => e,
-        })?;
+        let id = self.answer(origin, draft).await.map_err(unsent)?;
         let url = self.url(&["me", "messages", id.as_str(), "send"]);
         let sent = self
-            .send(self.request(Method::POST, url), About::message(id.as_str()))
+            .hand_over(self.request(Method::POST, url), About::message(id.as_str()))
             .await;
         match &sent {
             // The response was lost or Graph failed: the message may have
@@ -642,6 +657,14 @@ impl<A: Authenticator> GraphMailStore<A> {
             )
             .await;
         matches!(deleted, Ok(_) | Err(Error::NotFound { .. }))
+    }
+}
+
+/// A network failure before a message was handed over: it wasn't sent.
+fn unsent(e: Error) -> Error {
+    match e {
+        Error::Network(e) => Error::NotSent(format!("network error: {e}")),
+        e => e,
     }
 }
 

@@ -1184,6 +1184,40 @@ mod tests {
     }
 
     #[test]
+    fn the_later_sent_items_relist_keeps_the_selection() {
+        let mut app = app(settings());
+        app.folder = Some(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
+        ));
+        let listed = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| mock::message(id, "sent", "s", DateTime::UNIX_EPOCH).summary)
+                .collect::<Vec<_>>()
+        };
+        app.messages = listed(&["a", "b", "c"]);
+        app.selected = 1;
+        let relisted = |app: &mut App, ids: &[&str]| {
+            let effects = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
+            let (id, _) = request(&effects);
+            app.update(Msg::Response(Response {
+                id,
+                event: Event::MessagesListed(Ok(MessagePage {
+                    messages: listed(ids),
+                    next: None,
+                })),
+            }));
+        };
+        // The new copy comes first: still on b.
+        relisted(&mut app, &["new", "a", "b", "c"]);
+        assert_eq!(app.messages[app.selected].id.as_str(), "b");
+        // b is gone: the message now where it was.
+        relisted(&mut app, &["new", "a", "c"]);
+        assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    }
+
+    #[test]
     fn a_send_that_needed_a_sign_in_is_retried() {
         let mut app = app(settings());
         act(&mut app, Action::Mail);

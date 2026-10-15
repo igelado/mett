@@ -1204,3 +1204,32 @@ async fn a_draft_that_cannot_be_deleted_is_kept_for_the_next_attempt() {
     // Trying again updates that draft rather than making another.
     store.save_draft(&reply).await.unwrap_err();
 }
+
+/// An authenticator that can't reach the identity platform.
+struct OfflineAuth;
+
+impl Authenticator for OfflineAuth {
+    async fn access_token(&self) -> mett_core::Result<AccessToken> {
+        Err(Error::Network("identity platform unreachable".into()))
+    }
+}
+
+#[tokio::test]
+async fn failing_to_get_a_token_leaves_mail_unsent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let settings = AuthSettings {
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(OfflineAuth));
+    let err = store.send(&draft(None)).await.unwrap_err();
+    assert!(matches!(err, Error::NotSent(_)), "{err:?}");
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store.send(&reply).await.unwrap_err();
+    assert!(matches!(err, Error::NotSent(_)), "{err:?}");
+}
