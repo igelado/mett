@@ -533,6 +533,9 @@ pub struct App {
     poll_since: Option<chrono::DateTime<chrono::Utc>>,
     /// Which timer for checks counts.
     poll_timer: u64,
+    /// The messages in the index before a check had it listed again, to
+    /// tell what arrived.
+    known_before_refresh: Option<HashSet<MessageId>>,
     /// The request reading the mailboxes' counts.
     checking: Option<RequestId>,
 }
@@ -638,6 +641,7 @@ impl App {
             polling: None,
             poll_since: None,
             poll_timer: 0,
+            known_before_refresh: None,
             checking: None,
         };
         let effects = app.open_folder();
@@ -1274,6 +1278,7 @@ impl App {
                         self.removed_while_listing.clear();
                         self.forget_missing_marks();
                         self.loaded();
+                        self.relisted();
                         // Clear the "Loading" message, but not an error that
                         // was reported while the folder was loading.
                         if self.status.starts_with("Loading ") {
@@ -1289,6 +1294,7 @@ impl App {
                     self.pending = None;
                     self.reselect = None;
                     self.listing = None;
+                    self.known_before_refresh = None;
                     self.unlisted = self.listing_page.take();
                     // Pages asked for again come after the saves.
                     self.saved_flags.clear();

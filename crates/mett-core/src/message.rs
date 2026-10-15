@@ -195,6 +195,8 @@ pub struct MessageSummary {
     pub flags: Flags,
     /// Whether the message has attachments.
     pub has_attachments: bool,
+    /// Whether it is an unsent draft, dated when it was created.
+    pub draft: bool,
 }
 
 /// The format of a message body.

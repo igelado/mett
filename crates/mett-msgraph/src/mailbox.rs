@@ -1138,6 +1138,7 @@ impl GraphMessage {
                 flagged: self.flag.is_some_and(|f| f.flag_status == "flagged"),
             },
             has_attachments: self.has_attachments,
+            draft: self.is_draft,
         };
         let rest = Rest {
             cc: self.cc_recipients,

@@ -243,18 +243,23 @@ impl App {
             if unread {
                 self.status = NEW_MAIL.into();
             }
-            return self.refresh();
+            let effects = self.refresh();
+            // New mail may be on pages not seen yet: the listing tells.
+            self.known_before_refresh = Some(known);
+            return effects;
         }
-        // What the page covers: the whole folder, or the messages newer
-        // than its last one (one as old may be on the next page).
-        let oldest = fresh.last().map(|m| m.received);
+        // What the page covers: the whole folder, or the messages sent
+        // after its last one (one as old may be on the next page). The page
+        // is sorted by when messages were sent, which unsent drafts don't
+        // have: where they are says nothing.
+        let oldest = fresh.iter().rev().find(|m| !m.draft).map(|m| m.received);
         let listed: HashSet<&MessageId> = fresh.iter().map(|m| &m.id).collect();
         let gone: HashSet<MessageId> = self
             .messages
             .iter()
             .chain(&self.hidden)
             .filter(|m| !listed.contains(&m.id))
-            .filter(|m| complete || oldest.is_some_and(|oldest| m.received > oldest))
+            .filter(|m| complete || (!m.draft && oldest.is_some_and(|oldest| m.received > oldest)))
             // Moves and purges on their way take it out themselves.
             .filter(|m| !self.transferring(&m.id))
             .map(|m| m.id.clone())
@@ -287,22 +292,58 @@ impl App {
         Vec::new()
     }
 
-    /// Adds a message that arrived to the index, where its date puts it,
-    /// or aside if the index is limited and it doesn't match.
+    /// Adds a message that arrived to the index, where its date puts it
+    /// in the folder's order, or aside if the index is limited and it
+    /// doesn't match.
     fn insert_arrived(&mut self, message: MessageSummary) {
-        let next = self.positions.len();
-        self.positions.entry(message.id.clone()).or_insert(next);
+        let position =
+            |m: &MessageSummary| self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
+        let mut order: Vec<&MessageSummary> = self.messages.iter().chain(&self.hidden).collect();
+        order.sort_by_key(|m| position(m));
+        // Before the first message sent before it (drafts, dated
+        // otherwise, don't say).
+        let at = order
+            .iter()
+            .find(|m| !m.draft && m.received < message.received)
+            .map(|m| position(m));
+        let at = match at {
+            Some(at) => {
+                // Those after it move down one.
+                for later in self.positions.values_mut().filter(|p| **p >= at) {
+                    *later += 1;
+                }
+                at
+            }
+            None => self.positions.values().max().map_or(0, |last| last + 1),
+        };
+        self.positions.insert(message.id.clone(), at);
         let list = if self.limit_shows(&message) {
             &mut self.messages
         } else {
             &mut self.hidden
         };
-        // Newest first, after messages as old.
-        let at = list
+        let positions = &self.positions;
+        let index = list
             .iter()
-            .position(|m| m.received < message.received)
-            .unwrap_or(list.len());
-        list.insert(at, message);
+            .filter(|m| positions.get(&m.id).is_some_and(|p| *p < at))
+            .count();
+        list.insert(index, message);
+    }
+
+    /// The folder was listed again because a check found more than it
+    /// could take in: says if mail arrived meanwhile.
+    pub(super) fn relisted(&mut self) {
+        let Some(known) = self.known_before_refresh.take() else {
+            return;
+        };
+        let arrived = self
+            .messages
+            .iter()
+            .chain(&self.hidden)
+            .any(|m| !m.flags.read && !known.contains(&m.id));
+        if arrived {
+            self.status = NEW_MAIL.into();
+        }
     }
 
     /// Takes in the mailboxes' counts.
@@ -675,6 +716,92 @@ mod tests {
         respond(&mut app, id, Event::FolderPolled(Ok(polled)));
         assert_eq!(ids(&app), ["m1", "m0"]);
         assert!(app.status.is_empty());
+    }
+
+    #[test]
+    fn a_draft_beyond_the_newest_page_stays() {
+        let (mut app, _) = app();
+        let id = poll(&mut app);
+        // A draft created after m1 was sent, but listed after the sent
+        // mail, as Graph sorts unsent drafts.
+        let mut draft = summary("d", 5);
+        draft.draft = true;
+        app.messages.push(draft);
+        let newest = MessagePage {
+            messages: vec![summary("m2", 2), summary("m1", 1)],
+            next: Some(mett_core::PageCursor::new("in next")),
+        };
+        let polled = Polled {
+            newest,
+            changed: page(Vec::new()),
+        };
+        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        assert_eq!(ids(&app), ["m2", "m1", "m0", "d"]);
+    }
+
+    #[test]
+    fn mail_found_by_listing_again_is_announced() {
+        let (mut app, _) = app();
+        let id = poll(&mut app);
+        let changed = MessagePage {
+            messages: vec![summary("m1", 1)],
+            next: Some(mett_core::PageCursor::new("in more")),
+        };
+        let polled = Polled {
+            newest: page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
+            changed,
+        };
+        let effects = respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        assert!(app.status.is_empty(), "nothing new seen yet");
+        let (list, _) = requests(&effects)[0].clone();
+        respond(
+            &mut app,
+            list,
+            Event::MessagesListed(Ok(page(vec![
+                summary("m2", 2),
+                summary("m1", 1),
+                summary("m0", 0),
+                summary("old", -9),
+            ]))),
+        );
+        assert_eq!(app.status, NEW_MAIL);
+    }
+
+    #[test]
+    fn lifting_a_limit_keeps_new_mail_in_place() {
+        let (mut app, _) = app();
+        // Listed out of date order, as drafts can be.
+        let mut draft = summary("d", 9);
+        draft.draft = true;
+        app.messages.push(draft.clone());
+        app.positions.insert(draft.id.clone(), 3);
+        app.update(Msg::Action(Action::Limit));
+        for c in "~s m2".chars() {
+            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+        }
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        assert_eq!(ids(&app), ["m2"]);
+        let id = poll(&mut app);
+        let newest = MessagePage {
+            messages: vec![summary("m3", 3), summary("m2", 2), summary("m1", 1)],
+            next: Some(mett_core::PageCursor::new("in next")),
+        };
+        let polled = Polled {
+            newest,
+            changed: page(Vec::new()),
+        };
+        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        app.update(Msg::Action(Action::Limit));
+        // The question starts with the limit in force.
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        )));
+        for c in "all".chars() {
+            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+        }
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        assert_eq!(ids(&app), ["m3", "m2", "m1", "m0", "d"]);
     }
 
     #[test]

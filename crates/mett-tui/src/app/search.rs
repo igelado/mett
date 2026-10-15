@@ -315,14 +315,11 @@ impl App {
             }
         };
         let selected = self.messages.get(self.selected).map(|m| m.id.clone());
-        // Start from the whole folder, in the order it was listed: newest
-        // first, with mail that arrived since in its place.
+        // Start from the whole folder, in the order it was listed (with
+        // mail that arrived since in its place).
         let mut all = std::mem::take(&mut self.messages);
         all.append(&mut self.hidden);
-        all.sort_by_key(|m| {
-            let position = self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
-            (std::cmp::Reverse(m.received), position)
-        });
+        all.sort_by_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
         self.messages = all;
         self.limit = None;
         self.limited.clear();
