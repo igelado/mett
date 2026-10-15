@@ -417,6 +417,13 @@ mod tests {
         app.selected = 1;
         app.new_search("~s special");
         assert_eq!(app.messages[app.selected].id.as_str(), "a2");
+        // When the start of the thread matches too, the thread opens, and
+        // `n` goes on to its other matches.
+        act(&mut app, Action::CollapseAll);
+        app.selected = 1;
+        app.new_search("~s a");
+        assert_eq!(shown(&app)[0], "a0");
+        assert!(shown(&app).len() > 2);
         assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0 (1)"]);
     }
 
@@ -498,6 +505,43 @@ mod tests {
         // (A later page normally has older mail; this thread sorts after.)
         page(&mut app, next, vec![message("b0", 9, "b", &[0])]);
         assert_eq!(app.messages[app.selected].id.as_str(), "b0");
+    }
+
+    #[test]
+    fn a_pending_next_entry_goes_after_its_message_whatever_comes_before() {
+        let settings = Settings {
+            ordering: Ordering {
+                sort: Sort::parse("subject", true).unwrap(),
+                ..Ordering::default()
+            },
+            ..Settings::default()
+        };
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let (mut app, effects) = App::open(80, 24, inbox, settings);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![named("b")],
+                next: Some(mett_core::PageCursor::new("in next")),
+            })),
+        }));
+        let Effect::Request(next, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        act(&mut app, Action::NextEntry);
+        page(&mut app, next, vec![named("a"), named("c")]);
+        assert_eq!(app.messages[app.selected].id.as_str(), "c");
     }
 
     #[test]

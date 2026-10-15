@@ -193,8 +193,9 @@ impl App {
                 };
                 let id = self.search_match(&pattern, i).expect("found above");
                 self.selected = i;
-                // Found folded into a collapsed thread: the thread opens.
-                if self.messages[i].id != id {
+                // A collapsed thread with matches folded into it opens, so
+                // that `n` goes on to them.
+                if self.folded_match(&pattern, i).is_some() {
                     self.uncollapse_to(&id);
                 }
             }
@@ -310,13 +311,25 @@ impl App {
         if matches(entry) {
             return Some(entry.id.clone());
         }
+        self.folded_match(pattern, i)
+    }
+
+    /// The first message folded under entry `i` (into its collapsed
+    /// thread) that matches `pattern`.
+    fn folded_match(&self, pattern: &Pattern, i: usize) -> Option<mett_core::MessageId> {
+        let entry = &self.messages[i];
         if self.thread_of(&entry.id).is_none_or(|t| t.folded == 0) {
             return None;
         }
         self.folded
             .iter()
             .filter(|m| self.thread_of(&m.id).is_some_and(|t| t.root == entry.id))
-            .find(|m| matches(m))
+            .find(|m| {
+                pattern.matches(&Candidate {
+                    summary: m,
+                    deleted: self.deleted.contains(&m.id),
+                })
+            })
             .map(|m| m.id.clone())
     }
 

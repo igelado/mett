@@ -39,10 +39,13 @@ use crate::worker::{Event, Request, RequestId, Response};
 pub const PAGE_SIZE: u32 = 100;
 
 /// Where a pending move goes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Target {
     /// The entry at this position.
     Entry(usize),
+    /// The entry this many after a message: the index's order may change
+    /// as pages come (with `sort`), and the message stays where it goes.
+    After(MessageId, usize),
     /// The last message of the folder.
     Last,
     /// The next thread after the selected message.
@@ -1150,7 +1153,11 @@ impl App {
                 let target = self.selected + page;
                 self.selected = target.min(last);
                 if target > last && self.more_to_list() {
-                    return self.wait_for(Target::Entry(target));
+                    let target = match self.messages.get(last) {
+                        Some(message) => Target::After(message.id.clone(), target - last),
+                        None => Target::Entry(target),
+                    };
+                    return self.wait_for(target);
                 }
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
@@ -1941,10 +1948,9 @@ impl App {
     /// The entry after the selected one, or the first if the index shows
     /// none yet (a limit may hide all the messages loaded so far).
     fn next_entry(&self) -> Target {
-        if self.messages.is_empty() {
-            Target::Entry(0)
-        } else {
-            Target::Entry(self.selected + 1)
+        match self.messages.get(self.selected) {
+            Some(message) => Target::After(message.id.clone(), 1),
+            None => Target::Entry(0),
         }
     }
 
@@ -1961,7 +1967,7 @@ impl App {
     /// message once the folder is fully loaded; the last-message target
     /// follows the end of the index until loading finishes.
     fn apply_pending(&mut self) -> Vec<Effect> {
-        let Some(target) = self.pending else {
+        let Some(target) = self.pending.clone() else {
             return Vec::new();
         };
         let last = self.messages.len().saturating_sub(1);
@@ -1976,6 +1982,14 @@ impl App {
                     return Vec::new();
                 }
             },
+            Target::After(message, steps) => {
+                let from = self.messages.iter().position(|m| m.id == message);
+                match from.map(|from| from + steps) {
+                    Some(entry) if entry < self.messages.len() => entry,
+                    _ if loading => return Vec::new(),
+                    _ => last,
+                }
+            }
             // Loaded (the index may still be empty, with a limit hiding
             // all the messages loaded so far).
             Target::Entry(entry) if entry < self.messages.len() => entry,
