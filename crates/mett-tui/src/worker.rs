@@ -648,7 +648,7 @@ async fn at_path<S: MailStore>(store: &S, path: &FolderPath, folder: &Folder) ->
     };
     let mut current = folder.clone();
     for (i, name) in names.iter().enumerate().rev() {
-        if !FolderPath::Named(vec![name.clone()]).names(&current.name) {
+        if !crate::config::mailbox::same_name(name, &current.name) {
             return Ok(false);
         }
         if i > 0 {

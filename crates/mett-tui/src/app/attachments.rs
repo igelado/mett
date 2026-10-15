@@ -9,6 +9,7 @@ use mett_core::{Attachment, AttachmentKind, MessageId, OutgoingAttachment};
 use super::composing::{Input, Question};
 use super::{App, Effect, Screen, effect_id};
 use crate::action::Action;
+use crate::config::expand_home;
 use crate::text;
 use crate::worker::{Request, RequestId};
 
@@ -609,16 +610,6 @@ fn file_name(attachment: &Attachment) -> String {
             format!("{name}.{extension}")
         }
         (name, _) => name.to_owned(),
-    }
-}
-
-/// Expands a leading `~` to the home directory.
-fn expand_home(path: &str, home: Option<&str>) -> String {
-    match (path.strip_prefix('~'), home) {
-        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-            format!("{home}{rest}")
-        }
-        _ => path.to_owned(),
     }
 }
 

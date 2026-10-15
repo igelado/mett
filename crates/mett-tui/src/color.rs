@@ -284,10 +284,7 @@ impl Colors {
                 );
             }
         };
-        let mut style = Style::new().fg(color(fg)?.0).bg(color(bg)?.0);
-        if color(fg)?.1 {
-            style = style.add_modifier(Modifier::BOLD);
-        }
+        let mut style = Style::new().fg(color(fg)?).bg(color(bg)?);
         for attr in attrs {
             style = with_attribute(style, attr);
         }
@@ -466,8 +463,9 @@ pub fn mono_terminal(env: &dyn Fn(&str) -> Option<String>) -> bool {
         || matches!(term.as_str(), "vt100" | "vt102" | "vt220")
 }
 
-/// A color by name, and whether it is a `bright` one (bold, in mutt).
-fn color(name: &str) -> Result<(Color, bool), String> {
+/// A color by name; a `bright` one is the brighter of its color (rather
+/// than bold, as in mutt).
+fn color(name: &str) -> Result<Color, String> {
     let lower = name.to_ascii_lowercase();
     let (base, bright) = match lower.strip_prefix("bright") {
         Some(base) => (base, true),
@@ -494,8 +492,11 @@ fn color(name: &str) -> Result<(Color, bool), String> {
             },
         },
     };
+    if !bright {
+        return Ok(color);
+    }
     // The bright colors of the first eight.
-    let brighter = match color {
+    Ok(match color {
         Color::Black => Color::DarkGray,
         Color::Red => Color::LightRed,
         Color::Green => Color::LightGreen,
@@ -505,11 +506,6 @@ fn color(name: &str) -> Result<(Color, bool), String> {
         Color::Cyan => Color::LightCyan,
         Color::Gray => Color::White,
         other => other,
-    };
-    Ok(if bright {
-        (brighter, false)
-    } else {
-        (color, false)
     })
 }
 

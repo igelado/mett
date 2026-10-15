@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
 use lexer::{Command, Expander, Lexer, Word};
-pub use vars::{Kind, Quad, VARS, Value};
+pub use vars::{Kind, Quad, VARS, Value, expand_home};
 
 /// How deeply `source` may nest, to stop loops.
 const MAX_SOURCE_DEPTH: usize = 16;
@@ -713,11 +713,7 @@ impl Config {
         let mut result = Ok(());
         for name in names {
             let outcome = self.expand(name).and_then(|name| f(self, &name));
-            if let Err(e) = outcome
-                && result.is_ok()
-            {
-                result = Err(e);
-            }
+            result = result.and(outcome);
         }
         result
     }
@@ -746,11 +742,7 @@ impl Config {
             } else {
                 self.expand(arg).and_then(|arg| self.set_flag(&arg))
             };
-            if let Err(e) = outcome
-                && result.is_ok()
-            {
-                result = Err(e);
-            }
+            result = result.and(outcome);
         }
         result
     }
@@ -768,13 +760,11 @@ impl Config {
         } else {
             match vars::find(arg) {
                 Some(var) if var.kind == Kind::Bool => {
-                    self.values.insert(var.name, Value::Bool(true));
-                    self.assigned.insert(var.name);
+                    self.store(var.name, Value::Bool(true));
                     Ok(())
                 }
                 Some(var) if var.kind == Kind::Quad => {
-                    self.values.insert(var.name, Value::Quad(Quad::Yes));
-                    self.assigned.insert(var.name);
+                    self.store(var.name, Value::Quad(Quad::Yes));
                     Ok(())
                 }
                 Some(var) => Err(format!("{}: needs a value", var.name)),
@@ -816,9 +806,14 @@ impl Config {
         };
         let value = self.expand(value)?;
         let value = vars::parse(var, &value, self.home.as_deref())?;
-        self.values.insert(var.name, value);
-        self.assigned.insert(var.name);
+        self.store(var.name, value);
         Ok(())
+    }
+
+    /// Sets the variable `name` to `value`, as the user did.
+    fn store(&mut self, name: &'static str, value: Value) {
+        self.values.insert(name, value);
+        self.assigned.insert(name);
     }
 
     fn unset(&mut self, name: &str) -> Result<(), String> {
@@ -835,8 +830,7 @@ impl Config {
             Kind::Number => Value::Number(0),
             Kind::String | Kind::Path => Value::Str(String::new()),
         };
-        self.values.insert(var.name, value);
-        self.assigned.insert(var.name);
+        self.store(var.name, value);
         Ok(())
     }
 
@@ -844,14 +838,12 @@ impl Config {
         match vars::find(name) {
             Some(var) if var.kind == Kind::Bool => {
                 let current = self.values.get(var.name) == Some(&Value::Bool(true));
-                self.values.insert(var.name, Value::Bool(!current));
-                self.assigned.insert(var.name);
+                self.store(var.name, Value::Bool(!current));
                 Ok(())
             }
             Some(var) if var.kind == Kind::Quad => {
                 let current = self.quad(var.name);
-                self.values.insert(var.name, Value::Quad(current.toggled()));
-                self.assigned.insert(var.name);
+                self.store(var.name, Value::Quad(current.toggled()));
                 Ok(())
             }
             Some(var) => Err(format!(
@@ -912,13 +904,7 @@ impl Config {
     /// A `source` path: `~` is the home directory, and a relative path is
     /// relative to the file that sources it.
     fn resolve_source(&self, path: &str, from: &Path) -> PathBuf {
-        let expanded = match (path.strip_prefix('~'), &self.home) {
-            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
-                format!("{home}{rest}")
-            }
-            _ => path.to_owned(),
-        };
-        let path = PathBuf::from(expanded);
+        let path = PathBuf::from(expand_home(path, self.home.as_deref()));
         if path.is_absolute() {
             path
         } else {
@@ -975,8 +961,6 @@ pub struct Files {
     pub no_system: bool,
 }
 
-/// The files to read, in order (`docs/CONFIG-OFFICE365.md` §1): the system
-/// file, then the first user file found.
 /// Where a user without a mettrc gets one, when mett writes to it
 /// (`alias_file`): `$XDG_CONFIG_HOME/mett/mettrc`, or
 /// `~/.config/mett/mettrc`.
@@ -992,6 +976,8 @@ pub fn new_user_file(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> 
         .map(|c| c.join("mett/mettrc"))
 }
 
+/// The files to read, in order (`docs/CONFIG-OFFICE365.md` §1): the system
+/// file, then the first user file found.
 pub fn locate(files: &Files, env: &dyn Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let system = PathBuf::from("/etc/mettrc");
@@ -1003,14 +989,10 @@ pub fn locate(files: &Files, env: &dyn Fn(&str) -> Option<OsString>) -> Vec<Path
         return found;
     }
     let home = env("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
-    let config_home = env("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| home.as_ref().map(|h| h.join(".config")));
     let candidates = [
         home.as_ref().map(|h| h.join(".mettrc")),
-        home.as_ref().map(|h| h.join(".mett/mettrc")),
-        config_home.map(|c| c.join("mett/mettrc")),
+        home.map(|h| h.join(".mett/mettrc")),
+        new_user_file(env),
     ];
     if let Some(user) = candidates.into_iter().flatten().find(|p| p.is_file()) {
         found.push(user);

@@ -93,23 +93,15 @@ fn expand_chars(chars: &[char], values: &dyn Expandos, width: usize) -> String {
                     break;
                 };
                 i += 1;
-                let arg = match code {
-                    '{' | '[' | '(' => {
-                        let close = match code {
-                            '{' => '}',
-                            '[' => ']',
-                            _ => ')',
-                        };
-                        let end = chars[i..]
-                            .iter()
-                            .position(|&c| c == close)
-                            .map_or(chars.len(), |n| i + n);
-                        let arg: String = chars[i..end].iter().collect();
-                        i = (end + 1).min(chars.len());
-                        Some(arg)
-                    }
-                    _ => None,
-                };
+                let arg = closing(code).map(|close| {
+                    let end = chars[i..]
+                        .iter()
+                        .position(|&c| c == close)
+                        .map_or(chars.len(), |n| i + n);
+                    let arg: String = chars[i..end].iter().collect();
+                    i = (end + 1).min(chars.len());
+                    arg
+                });
                 let value = values.expando(code, arg.as_deref());
                 // Padding takes no more than what is left of the line.
                 let left = width.saturating_sub(out.width());
@@ -164,12 +156,11 @@ fn skip_expando(chars: &[char], start: usize) -> usize {
         Some('>' | '*' | '|') => (start + 2).min(chars.len()),
         Some(_) => {
             let (_, code) = spec(chars, start);
-            let close = match chars.get(code) {
-                Some('{') => '}',
-                Some('[') => ']',
-                Some('(') => ')',
-                Some(_) => return code + 1,
-                None => return code,
+            let Some(&c) = chars.get(code) else {
+                return code;
+            };
+            let Some(close) = closing(c) else {
+                return code + 1;
             };
             chars[code..]
                 .iter()
@@ -222,6 +213,17 @@ struct Spec {
     zero: bool,
     min: usize,
     max: Option<usize>,
+}
+
+/// The bracket closing `c`, if it opens an expando's argument (`%{...}`,
+/// `%[...]`, `%(...)`).
+fn closing(c: char) -> Option<char> {
+    match c {
+        '{' => Some('}'),
+        '[' => Some(']'),
+        '(' => Some(')'),
+        _ => None,
+    }
 }
 
 /// Reads an expando's spec from `start`, and where its code is.

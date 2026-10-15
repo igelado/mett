@@ -101,6 +101,11 @@ impl Sort {
         position: &dyn Fn(&MessageId) -> usize,
     ) -> Ordering {
         let order = primary(self.method, a, b).then_with(|| position(&a.id).cmp(&position(&b.id)));
+        self.directed(order)
+    }
+
+    /// `order`, the other way round for `reverse-`.
+    fn directed(self, order: Ordering) -> Ordering {
         if self.reverse { order.reverse() } else { order }
     }
 }
@@ -201,8 +206,7 @@ pub fn compare(
     if sort.method == Method::Unsorted {
         return sort.compare(a, b, position);
     }
-    let first = primary(sort.method, a, b);
-    let first = if sort.reverse { first.reverse() } else { first };
+    let first = sort.directed(primary(sort.method, a, b));
     first.then_with(|| aux.compare(a, b, position))
 }
 
@@ -340,14 +344,7 @@ fn threads(
         })
         .collect();
     let mut order: Vec<usize> = (0..trees.len()).collect();
-    order.sort_by(|&a, &b| {
-        let by_aux = compare(&representative[a], &representative[b]);
-        if sort.reverse {
-            by_aux.reverse()
-        } else {
-            by_aux
-        }
-    });
+    order.sort_by(|&a, &b| sort.directed(compare(&representative[a], &representative[b])));
     let (branch, last, line, arrow) = if ascii {
         ("|-", "`-", "| ", ">")
     } else {
