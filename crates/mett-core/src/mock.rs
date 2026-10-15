@@ -220,6 +220,17 @@ impl MailStore for MemoryStore {
         Ok(new_id)
     }
 
+    async fn copy_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
+        let mut state = self.state();
+        state.folder(to)?;
+        let mut copy = state.message_mut(id)?.clone();
+        copy.summary.id = state.fresh_id(id);
+        copy.summary.folder = to.clone();
+        let new_id = copy.summary.id.clone();
+        state.messages.push(copy);
+        Ok(new_id)
+    }
+
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         let mut state = self.state();
         let before = state.messages.len();
@@ -323,6 +334,26 @@ mod tests {
 
     fn subjects(page: &MessagePage) -> Vec<&str> {
         page.messages.iter().map(|m| m.subject.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn copies_messages() {
+        let store = store();
+        let copy = store
+            .copy_message(&MessageId::new("m1"), &FolderId::new("arc"))
+            .await
+            .unwrap();
+        assert_ne!(copy, MessageId::new("m1"));
+        let archive = store
+            .list_messages(&FolderId::new("arc"), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&archive), ["first"]);
+        let inbox = store
+            .list_messages(&FolderId::new("in"), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(inbox.messages.len(), 3, "the original stays");
     }
 
     #[tokio::test]

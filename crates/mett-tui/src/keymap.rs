@@ -18,6 +18,8 @@ pub enum Menu {
     SignIn,
     /// The compose menu.
     Compose,
+    /// The folder browser.
+    Browser,
 }
 
 /// A key press, normalised so that bindings compare reliably: Shift is
@@ -103,6 +105,19 @@ impl Keymap {
         use KeyCode::{Backspace, Down, End, Enter, Esc, Home, Left, PageDown, PageUp, Right, Up};
         let mut keymap = Self::default();
 
+        // Mailbox operations, in both the index and the pager.
+        let mailbox: &[(Key, Action)] = &[
+            (Key::char('d'), DeleteMessage),
+            (Key::char('u'), UndeleteMessage),
+            (Key::char('$'), SyncMailbox),
+            (Key::char('F'), FlagMessage),
+            (Key::char('N'), ToggleNew),
+            (Key::char('s'), SaveMessage),
+            (Key::char('C'), CopyMessage),
+            (Key::char('c'), ChangeFolder),
+            (Key::char('y'), BrowseMailboxes),
+        ];
+
         let index: &[(Key, Action)] = &[
             (Key::char('q'), Quit),
             (Key::char('j'), NextEntry),
@@ -126,7 +141,7 @@ impl Keymap {
             (Key::char('g'), GroupReply),
             (Key::char('f'), Forward),
         ];
-        for (key, action) in index {
+        for (key, action) in index.iter().chain(mailbox) {
             keymap.bind(Menu::Index, *key, *action);
         }
 
@@ -148,7 +163,7 @@ impl Keymap {
             (Key::char('g'), GroupReply),
             (Key::char('f'), Forward),
         ];
-        for (key, action) in pager {
+        for (key, action) in pager.iter().chain(mailbox) {
             keymap.bind(Menu::Pager, *key, *action);
         }
 
@@ -179,6 +194,28 @@ impl Keymap {
         ];
         for (key, action) in compose {
             keymap.bind(Menu::Compose, *key, *action);
+        }
+
+        let browser: &[(Key, Action)] = &[
+            (Key::char('q'), Exit),
+            (Key::new(Esc), Exit),
+            (Key::char('j'), NextEntry),
+            (Key::new(Down), NextEntry),
+            (Key::char('k'), PreviousEntry),
+            (Key::new(Up), PreviousEntry),
+            (Key::char('='), FirstEntry),
+            (Key::new(Home), FirstEntry),
+            (Key::char('*'), LastEntry),
+            (Key::new(End), LastEntry),
+            (Key::char('z'), NextPage),
+            (Key::new(PageDown), NextPage),
+            (Key::char('Z'), PreviousPage),
+            (Key::new(PageUp), PreviousPage),
+            (Key::new(Enter), DisplayMessage),
+            (Key::char(' '), DisplayMessage),
+        ];
+        for (key, action) in browser {
+            keymap.bind(Menu::Browser, *key, *action);
         }
 
         keymap

@@ -376,7 +376,7 @@ async fn updates_flags_with_a_patch() {
 }
 
 #[tokio::test]
-async fn moves_and_permanently_deletes_messages() {
+async fn moves_copies_and_permanently_deletes_messages() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1.0/me/messages/m1/move"))
@@ -391,12 +391,25 @@ async fn moves_and_permanently_deletes_messages() {
         .mount(&server)
         .await;
 
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/m1-moved/copy"))
+        .and(body_json(json!({ "destinationId": "inbox-id" })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "m1-copy" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
     let store = store(&server);
     let moved = store
         .move_message(&MessageId::new("m1"), &FolderId::new("archive-id"))
         .await
         .unwrap();
     assert_eq!(moved, MessageId::new("m1-moved"));
+    let copy = store
+        .copy_message(&moved, &FolderId::new("inbox-id"))
+        .await
+        .unwrap();
+    assert_eq!(copy, MessageId::new("m1-copy"));
     store.delete_message(&moved).await.unwrap();
 }
 

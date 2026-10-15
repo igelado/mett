@@ -16,7 +16,7 @@ pub struct MailboxUrl {
 }
 
 /// Where a folder is in the mailbox.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FolderPath {
     /// The mailbox root (`msgraph://<account>/`).
     Root,
@@ -92,6 +92,57 @@ impl fmt::Display for MailboxUrl {
             }
             FolderPath::Named(names) => f.write_str(&names.join("/")),
         }
+    }
+}
+
+/// The folder of `account` that the user typed as `text`: a `msgraph://`
+/// URL for that account, mutt's `=` or `+` shortcut (relative to
+/// `folder`), or a path below the mailbox root (`Inbox/Projects` or
+/// `@archive`).
+/// The folder `text` names, with mutt's `!`, `>` and `<` shortcuts for
+/// `$spoolfile`, `$mbox` and `$record` (given as set, possibly empty).
+pub fn configured_path(
+    text: &str,
+    folder: &str,
+    account: &AccountId,
+    spoolfile: &str,
+    mbox: &str,
+    record: &str,
+) -> Result<FolderPath, MailboxError> {
+    let (name, set) = match text.trim() {
+        "!" => ("spoolfile", spoolfile),
+        ">" => ("mbox", mbox),
+        "<" => ("record", record),
+        _ => return folder_path(text, folder, account),
+    };
+    if set.is_empty() {
+        return Err(MailboxError(format!("{name} is not set")));
+    }
+    folder_path(set, folder, account).map_err(|e| MailboxError(format!("{name}: {e}")))
+}
+
+pub fn folder_path(
+    text: &str,
+    folder: &str,
+    account: &AccountId,
+) -> Result<FolderPath, MailboxError> {
+    let expanded = expand_shortcut(text.trim(), folder);
+    let url = if expanded.starts_with(SCHEME) {
+        let url = MailboxUrl::parse(&expanded)?;
+        if !url.account.as_str().eq_ignore_ascii_case(account.as_str()) {
+            return Err(MailboxError(format!(
+                "{expanded}: mett can only use folders of {account}"
+            )));
+        }
+        url
+    } else {
+        MailboxUrl::parse(&format!("{SCHEME}{account}/{expanded}"))?
+    };
+    match url.folder {
+        FolderPath::Root => Err(MailboxError(format!(
+            "{text}: the mailbox itself isn't a folder"
+        ))),
+        folder => Ok(folder),
     }
 }
 
@@ -183,6 +234,28 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_folder_the_user_typed() {
+        let account = AccountId::new("alice@contoso.com");
+        let folder = "msgraph://alice@contoso.com/";
+        let path = |text| folder_path(text, folder, &account);
+        assert_eq!(
+            path("=@archive"),
+            Ok(FolderPath::WellKnown(WellKnownFolder::Archive, vec![]))
+        );
+        assert_eq!(
+            path("Inbox/Projects"),
+            Ok(FolderPath::Named(vec!["Inbox".into(), "Projects".into()]))
+        );
+        assert_eq!(
+            path("msgraph://ALICE@contoso.com/@inbox"),
+            Ok(FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]))
+        );
+        assert!(path("msgraph://bob@contoso.com/@inbox").is_err());
+        assert!(path("=").is_err());
+        assert!(path("@nonsense").is_err());
+    }
+
+    #[test]
     fn expands_folder_shortcuts() {
         let folder = "msgraph://alice@contoso.com/";
         assert_eq!(
@@ -194,5 +267,34 @@ mod tests {
             "msgraph://alice@contoso.com/Projects"
         );
         assert_eq!(expand_shortcut("/var/mail/a", folder), "/var/mail/a");
+    }
+
+    #[test]
+    fn configured_paths_take_mutts_shortcuts() {
+        let account = AccountId::new("alice@contoso.com");
+        let folder = "msgraph://alice@contoso.com/";
+        let path = |text: &str| {
+            configured_path(
+                text,
+                folder,
+                &account,
+                "msgraph://alice@contoso.com/@inbox",
+                "",
+                "=@sentitems",
+            )
+        };
+        assert_eq!(
+            path("!"),
+            Ok(FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]))
+        );
+        assert_eq!(
+            path("<"),
+            Ok(FolderPath::WellKnown(WellKnownFolder::SentItems, vec![]))
+        );
+        assert_eq!(path(">"), Err(MailboxError("mbox is not set".into())));
+        assert_eq!(
+            path("=Archive"),
+            Ok(FolderPath::Named(vec!["Archive".into()]))
+        );
     }
 }

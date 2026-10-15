@@ -72,6 +72,15 @@ actions! {
     EditCc => "edit-cc", "Edit the Cc: list";
     EditBcc => "edit-bcc", "Edit the Bcc: list";
     EditSubject => "edit-subject", "Edit the subject";
+    DeleteMessage => "delete-message", "Mark the message for deletion";
+    UndeleteMessage => "undelete-message", "Unmark the message for deletion";
+    SyncMailbox => "sync-mailbox", "Purge the messages marked for deletion";
+    FlagMessage => "flag-message", "Toggle the message's follow-up flag";
+    ToggleNew => "toggle-new", "Toggle whether the message is new";
+    SaveMessage => "save-message", "Move the message to another folder";
+    CopyMessage => "copy-message", "Copy the message to another folder";
+    ChangeFolder => "change-folder", "Open another folder";
+    BrowseMailboxes => "browse-mailboxes", "Choose a folder from a list";
 }
 
 #[cfg(test)]

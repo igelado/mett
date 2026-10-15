@@ -36,6 +36,28 @@ pub enum Request {
     FetchMessage(MessageId),
     /// Change a message's flags.
     UpdateFlags(MessageId, FlagsUpdate),
+    /// List every folder in the mailbox.
+    ListFolders,
+    /// Move or copy messages to the folder at a path.
+    Transfer {
+        /// The messages.
+        ids: Vec<MessageId>,
+        /// Where they go.
+        to: FolderPath,
+        /// Copy them rather than move them.
+        copy: bool,
+    },
+    /// Purge messages marked for deletion from the folder `from`: move
+    /// them to the trash folder, or delete them for good without one, or
+    /// in the trash itself (as mutt does).
+    Purge {
+        /// The messages.
+        ids: Vec<MessageId>,
+        /// The folder they are in.
+        from: FolderId,
+        /// The trash folder, if any.
+        trash: Option<FolderPath>,
+    },
     /// Send a message.
     Send(Draft),
     /// Save a message in the drafts folder.
@@ -58,6 +80,15 @@ pub enum Event {
     MessageFetched(Result<Message>),
     /// Outcome of [`Request::UpdateFlags`].
     FlagsUpdated(Result<()>),
+    /// Outcome of [`Request::ListFolders`].
+    FoldersListed(Result<Vec<Folder>>),
+    /// Outcome of [`Request::Transfer`]: the folder could not be found, or
+    /// the folder and, for each message, its new ID (or the copy's) or why
+    /// it failed.
+    Transferred(Result<(FolderId, Moved)>),
+    /// Outcome of [`Request::Purge`]: the trash folder could not be found,
+    /// or for each message, whether it was purged.
+    Purged(Result<Vec<(MessageId, Result<()>)>>),
     /// Outcome of [`Request::Send`].
     Sent(Result<()>),
     /// Outcome of [`Request::SaveDraft`].
@@ -67,6 +98,10 @@ pub enum Event {
     /// Outcome of [`Request::OwnAddresses`].
     OwnAddresses(Result<Vec<String>>),
 }
+
+/// How each message of a move or copy fared: its new ID (or the copy's),
+/// or why it failed.
+pub type Moved = Vec<(MessageId, Result<MessageId>)>;
 
 /// An [`Event`] for the request with `id`.
 #[derive(Debug)]
@@ -105,11 +140,64 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::UpdateFlags(id, update) => {
             Event::FlagsUpdated(store.update_flags(&id, update).await)
         }
+        Request::ListFolders => Event::FoldersListed(store.list_folders().await),
+        Request::Transfer { ids, to, copy } => {
+            Event::Transferred(transfer(store, &ids, &to, copy).await)
+        }
+        Request::Purge { ids, from, trash } => {
+            Event::Purged(purge(store, &ids, &from, trash.as_ref()).await)
+        }
         Request::Send(draft) => Event::Sent(store.send(&draft).await),
         Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
         Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
         Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
     }
+}
+
+/// Purges `ids` from the folder `from` (see [`Request::Purge`]), one at a
+/// time, so that a failure only affects its own message.
+async fn purge<S: MailStore>(
+    store: &S,
+    ids: &[MessageId],
+    from: &FolderId,
+    trash: Option<&FolderPath>,
+) -> Result<Vec<(MessageId, Result<()>)>> {
+    // The trash may be named differently from how the open folder was
+    // opened (`=Deleted Items` and `@deleteditems`): compare the folders.
+    let trash = match trash {
+        Some(path) => Some(resolve(store, path).await?).filter(|t| &t.id != from),
+        None => None,
+    };
+    let mut results = Vec::new();
+    for id in ids {
+        let result = match &trash {
+            Some(trash) => store.move_message(id, &trash.id).await.map(drop),
+            None => store.delete_message(id).await,
+        };
+        results.push((id.clone(), result));
+    }
+    Ok(results)
+}
+
+/// Moves or copies `ids` to the folder at `to`, one at a time, so that a
+/// failure only affects its own message.
+async fn transfer<S: MailStore>(
+    store: &S,
+    ids: &[MessageId],
+    to: &FolderPath,
+    copy: bool,
+) -> Result<(FolderId, Moved)> {
+    let folder = resolve(store, to).await?;
+    let mut results = Vec::new();
+    for id in ids {
+        let result = if copy {
+            store.copy_message(id, &folder.id).await
+        } else {
+            store.move_message(id, &folder.id).await
+        };
+        results.push((id.clone(), result));
+    }
+    Ok((folder.id, results))
 }
 
 /// Finds the folder at `path`: a well-known folder, possibly followed by
@@ -213,6 +301,89 @@ mod tests {
             Err(Error::NotFound { kind: "folder", .. })
         ));
         assert!(resolve(&store, &FolderPath::Root).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn moves_and_copies_messages_and_lists_folders() {
+        let store = tree()
+            .with_message(mock::message("m1", "in", "one", DateTime::UNIX_EPOCH))
+            .with_message(mock::message("m2", "in", "two", DateTime::UNIX_EPOCH));
+        let archive = FolderPath::Named(vec!["archive".into()]);
+        let ids = vec![MessageId::new("m1"), MessageId::new("nope")];
+        let Event::Transferred(Ok((_, results))) = serve(
+            &store,
+            Request::Transfer {
+                ids,
+                to: archive.clone(),
+                copy: false,
+            },
+        )
+        .await
+        else {
+            panic!("expected Transferred");
+        };
+        assert!(results[0].1.is_ok());
+        assert!(matches!(results[1].1, Err(Error::NotFound { .. })));
+        let missing = FolderPath::Named(vec!["nowhere".into()]);
+        let event = serve(
+            &store,
+            Request::Transfer {
+                ids: vec![MessageId::new("m2")],
+                to: missing,
+                copy: true,
+            },
+        )
+        .await;
+        assert!(matches!(event, Event::Transferred(Err(_))));
+
+        let Event::FoldersListed(Ok(folders)) = serve(&store, Request::ListFolders).await else {
+            panic!("expected FoldersListed");
+        };
+        assert_eq!(folders.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn purges_to_the_trash_or_for_good() {
+        let store = tree()
+            .with_message(mock::message("m1", "in", "one", DateTime::UNIX_EPOCH))
+            .with_message(mock::message("a1", "arc", "old", DateTime::UNIX_EPOCH));
+        let count = |folder: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .list_messages(&FolderId::new(folder), Page::first(10))
+                    .await
+                    .unwrap()
+                    .messages
+                    .len()
+            }
+        };
+        let trash = Some(FolderPath::Named(vec!["Archive".into()]));
+        let purge = |id: &str, from: &str| Request::Purge {
+            ids: vec![MessageId::new(id)],
+            from: FolderId::new(from),
+            trash: trash.clone(),
+        };
+        let Event::Purged(Ok(results)) = serve(&store, purge("m1", "in")).await else {
+            panic!("expected Purged");
+        };
+        assert!(results[0].1.is_ok());
+        assert_eq!((count("in").await, count("arc").await), (0, 2), "moved");
+        // In the trash itself, however it is named, purging deletes.
+        let Event::Purged(Ok(results)) = serve(&store, purge("a1", "arc")).await else {
+            panic!("expected Purged");
+        };
+        assert!(results[0].1.is_ok());
+        assert_eq!(count("arc").await, 1, "deleted, not moved");
+        let missing = Request::Purge {
+            ids: vec![],
+            from: FolderId::new("in"),
+            trash: Some(FolderPath::Named(vec!["nowhere".into()])),
+        };
+        assert!(matches!(
+            serve(&store, missing).await,
+            Event::Purged(Err(_))
+        ));
     }
 
     #[tokio::test]

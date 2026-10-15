@@ -5,8 +5,9 @@ Status: **partly implemented.** mett reads mettrc files (§1) with `set`,
 in `spoolfile` (§3, without the Focused Inbox views), signing in with the
 §4.1–4.3 variables (except `msgraph_oauth_refresh_command`). It sends mail
 through the spoolfile's account and postpones it to that account's Drafts
-(§5.2, without `record` and `postponed`). Everything else is still a
-proposal.
+(§5.2, without `record` and `postponed`). Folders of that account can be
+opened, browsed, and used to save or copy messages, and purged messages go
+to `trash` (§6). Everything else is still a proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc
 format described in [MUTTRC.md](MUTTRC.md) and adds the minimum extensions

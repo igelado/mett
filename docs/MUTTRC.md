@@ -92,6 +92,8 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `postponed` | path | Where drafts are saved. |
 | | `mbox` | path | Where read mail is moved when `move` is set. |
 | | `trash` | path | Deleted mail is moved here instead of being purged. |
+| | `delete` | quadoption | Whether to purge messages marked for deletion (on `$`, or when leaving the folder). |
+| | `resolve` | boolean | Move to the next message after marking one (`d`, `u`). |
 | | `copy` | quadoption | Whether to save a copy of outgoing mail in `record`. |
 | IMAP | `imap_user`, `imap_login`, `imap_pass` | string | Credentials. |
 | | `imap_authenticators` | string | Colon-separated methods, for example `oauthbearer:xoauth2`. |
