@@ -48,6 +48,10 @@ pub struct GraphMailStore<A> {
     roles: Mutex<Option<Arc<Roles>>>,
     /// The hidden root folder's ID, once looked up on its own.
     root: Mutex<Option<Option<FolderId>>>,
+    /// Reply and forward drafts kept on the server after a send or update
+    /// whose outcome is unknown, by what they answer: sending or
+    /// postponing again updates the draft rather than making another.
+    kept: Mutex<HashMap<DraftOrigin, MessageId>>,
 }
 
 /// Which folders play special roles. Folder IDs don't change, so this is
@@ -98,6 +102,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             auth,
             roles: Mutex::new(None),
             root: Mutex::new(None),
+            kept: Mutex::new(HashMap::new()),
         }
     }
 
@@ -528,8 +533,9 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         match &sent {
             // The response was lost or Graph failed: the message may have
             // gone out anyway. Keep the draft, so nothing is lost if it
-            // didn't, and say so.
+            // didn't, and say so; sending again reuses it.
             Err(Error::Network(e)) => {
+                self.keep(origin, id);
                 return Err(Error::Network(format!(
                     "{e}; if it wasn't sent, it is in Drafts"
                 )));
@@ -550,6 +556,19 @@ impl<A: Authenticator> GraphMailStore<A> {
             DraftOrigin::Reply(id) => (id, "createReply"),
             DraftOrigin::Forward(id) => (id, "createForward"),
         };
+        // A draft kept after an earlier attempt gets the new content; if it
+        // is gone (it was sent after all, or deleted), a new one is made.
+        let kept = self.kept.lock().expect("lock").remove(origin);
+        if let Some(id) = kept {
+            match self.update_draft(&id, draft).await {
+                Ok(()) => return Ok(id),
+                Err(Error::NotFound { .. }) => {}
+                Err(e) => {
+                    self.keep(origin, id);
+                    return Err(e);
+                }
+            }
+        }
         let url = self.url(&["me", "messages", original.as_str(), action]);
         let created: IdOnly = self
             .json(
@@ -560,18 +579,36 @@ impl<A: Authenticator> GraphMailStore<A> {
         let id = MessageId::new(created.id);
         // Replace what Graph filled in (recipients, a quoted HTML body) with
         // what the user wrote.
-        let url = self.url(&["me", "messages", id.as_str()]);
-        let updated = self
-            .send(
-                self.request(Method::PATCH, url).json(&message_json(draft)),
-                About::message(id.as_str()),
-            )
-            .await;
-        if let Err(e) = updated {
-            self.discard(&id).await;
-            return Err(e);
+        match self.update_draft(&id, draft).await {
+            Ok(()) => Ok(id),
+            // The update may have been made: keep the draft, for the next
+            // attempt to update.
+            Err(e @ Error::Network(_)) => {
+                self.keep(origin, id);
+                Err(e)
+            }
+            Err(e) => {
+                self.discard(&id).await;
+                Err(e)
+            }
         }
-        Ok(id)
+    }
+
+    /// Gives a server draft `draft`'s content.
+    async fn update_draft(&self, id: &MessageId, draft: &Draft) -> Result<()> {
+        let url = self.url(&["me", "messages", id.as_str()]);
+        self.send(
+            self.request(Method::PATCH, url).json(&message_json(draft)),
+            About::message(id.as_str()),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// Remembers a server draft kept after an attempt whose outcome is
+    /// unknown.
+    fn keep(&self, origin: &DraftOrigin, id: MessageId) {
+        self.kept.lock().expect("lock").insert(origin.clone(), id);
     }
 
     /// Deletes a server draft that could not be completed, so it doesn't

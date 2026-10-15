@@ -6,7 +6,7 @@ use crate::message::Address;
 /// What a draft answers or passes on, if anything. Backends use it to
 /// thread a reply under the original, and to keep a forwarded message's
 /// attachments.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DraftOrigin {
     /// A reply to this message.
     Reply(MessageId),

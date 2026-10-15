@@ -212,7 +212,10 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
 - **Replies and forwards** go through a server draft (Graph's
   `createReply` or `createForward`), so that they thread under the original
   and forwards keep its attachments. Graph always keeps a copy of a sent
-  draft in Sent Items, so `copy` only applies to new messages.
+  draft in Sent Items, so `copy` only applies to new messages. When a send
+  or update of that draft has no clear outcome (the response was lost),
+  the draft is kept, and sending or postponing the message again updates
+  it rather than making another.
 
 *Implemented so far:* mail is sent through the account of `spoolfile`, and
 a copy is kept in its Sent Items when `copy` allows. `record` and

@@ -998,3 +998,106 @@ async fn keeps_the_server_draft_when_the_send_outcome_is_unknown() {
     let err = store(&server).send(&reply).await.unwrap_err();
     assert!(matches!(err, Error::Network(m) if m.contains("in Drafts")));
 }
+
+#[tokio::test]
+async fn postponing_after_an_unknown_send_outcome_reuses_the_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
+    assert_eq!(
+        store.save_draft(&reply).await.unwrap(),
+        MessageId::new("d1")
+    );
+}
+
+#[tokio::test]
+async fn keeps_the_server_draft_when_its_update_outcome_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createForward"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let forward = draft(Some(DraftOrigin::Forward(MessageId::new("orig"))));
+    let err = store.save_draft(&forward).await.unwrap_err();
+    assert!(matches!(err, Error::Network(_)), "{err:?}");
+    // Trying again updates the same draft.
+    store.save_draft(&forward).await.unwrap_err();
+}
+
+#[tokio::test]
+async fn a_kept_draft_that_is_gone_is_made_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "ErrorItemNotFound", "message": "gone" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
+    assert_eq!(
+        store.save_draft(&reply).await.unwrap(),
+        MessageId::new("d2")
+    );
+}
