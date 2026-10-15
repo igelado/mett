@@ -248,6 +248,14 @@ impl App {
     /// `resolve`: in the index, the next entry; in the pager, the next
     /// message.
     fn next_message(&mut self) -> Vec<Effect> {
+        // From the message acted on: the pager's may not be the one the
+        // index has selected.
+        if let Some(at) = self
+            .acted_on()
+            .and_then(|id| self.messages.iter().position(|m| m.id == id))
+        {
+            self.selected = at;
+        }
         if self.selected + 1 >= self.messages.len() {
             // The next message may still be loading: move there once it
             // arrives, as `j` does.
@@ -3398,5 +3406,23 @@ mod tests {
         act(&mut app, Action::DeleteMessage);
         assert!(app.is_deleted(&"m0".into()));
         assert!(!app.is_deleted(&"m1".into()));
+    }
+
+    #[test]
+    fn marking_in_the_pager_goes_on_from_its_message() {
+        let mut app = app(settings());
+        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
+        }));
+        // A background listing moves the index's selection meanwhile.
+        app.selected = 2;
+        let (_, request) = sent(&act(&mut app, Action::DeleteMessage));
+        assert_eq!(
+            request,
+            Request::FetchMessage("m1".into()),
+            "the one after m0"
+        );
     }
 }

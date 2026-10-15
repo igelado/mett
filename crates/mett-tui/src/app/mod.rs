@@ -595,8 +595,9 @@ impl App {
         // move anywhere, so leave them.
         if self.menu() != Menu::SignIn {
             self.pending = None;
-            // Moving through the index replaces going back to the message
-            // a background refresh left (other actions leave it be).
+            // Moving through the index, or opening a message, replaces
+            // going back to the message a background refresh left (other
+            // actions leave it be).
             let moving = matches!(
                 action,
                 Action::NextEntry
@@ -605,6 +606,8 @@ impl App {
                     | Action::LastEntry
                     | Action::NextPage
                     | Action::PreviousPage
+                    // Opening a message chooses it too.
+                    | Action::DisplayMessage
             );
             if moving && matches!(self.menu(), Menu::Index | Menu::Pager) {
                 self.reselect = None;
