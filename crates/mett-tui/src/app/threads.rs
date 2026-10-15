@@ -155,6 +155,42 @@ impl App {
         }
     }
 
+    /// Puts newly listed messages in the index. Without threads, they are
+    /// sorted and merged in, rather than the whole index sorted again at
+    /// every page.
+    pub(super) fn arrange_listed(&mut self, mut listed: Vec<MessageSummary>) {
+        if self.threaded() {
+            self.messages.extend(listed);
+            self.arrange();
+            return;
+        }
+        let (sort, aux) = (self.ordering.sort, self.ordering.aux);
+        let positions = &self.positions;
+        let position = |id: &MessageId| positions.get(id).copied().unwrap_or(usize::MAX);
+        let compare =
+            |a: &MessageSummary, b: &MessageSummary| sort::compare(a, b, sort, aux, &position);
+        listed.sort_by(compare);
+        let selected = self.messages.get(self.selected).map(|m| m.id.clone());
+        let old = std::mem::take(&mut self.messages);
+        let mut merged = Vec::with_capacity(old.len() + listed.len());
+        let (mut old, mut listed) = (old.into_iter().peekable(), listed.into_iter().peekable());
+        loop {
+            let next = match (old.peek(), listed.peek()) {
+                (Some(a), Some(b)) if compare(b, a).is_lt() => listed.next(),
+                (Some(_), _) => old.next(),
+                (None, _) => listed.next(),
+            };
+            match next {
+                Some(message) => merged.push(message),
+                None => break,
+            }
+        }
+        self.messages = merged;
+        if let Some(at) = selected.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
+            self.selected = at;
+        }
+    }
+
     /// Takes in a new order, if it changed.
     pub(super) fn apply_ordering(&mut self, ordering: Ordering) {
         if self.ordering != ordering {
@@ -545,6 +581,32 @@ mod tests {
                 next: None,
             })),
         }));
+    }
+
+    #[test]
+    fn pages_are_merged_into_a_sorted_index() {
+        let (mut app, next) = paged(vec![
+            message("x4", 4, "x", &[0]),
+            message("x2", 2, "x", &[0, 1]),
+        ]);
+        app.apply_ordering(Ordering {
+            sort: Sort::parse("date", true).unwrap(),
+            ..Ordering::default()
+        });
+        app.selected = 1;
+        page(
+            &mut app,
+            next,
+            vec![
+                message("x5", 5, "x", &[0, 2]),
+                message("x1", 1, "x", &[0, 3]),
+                message("x3", 3, "x", &[0, 4]),
+            ],
+        );
+        let ids: Vec<&str> = app.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["x1", "x2", "x3", "x4", "x5"]);
+        // Still on x4.
+        assert_eq!(app.selected, 3);
     }
 
     #[test]

@@ -172,17 +172,7 @@ pub fn arrange(
 ) -> Vec<Node> {
     if sort.method != Method::Threads {
         let mut order: Vec<usize> = (0..messages.len()).collect();
-        order.sort_by(|&a, &b| {
-            let (a, b) = (messages[a], messages[b]);
-            // Ties go to `sort_aux`, then to where they were listed; with
-            // `unsorted`, only where they were listed counts.
-            if sort.method == Method::Unsorted {
-                return sort.compare(a, b, position);
-            }
-            let first = primary(sort.method, a, b);
-            let first = if sort.reverse { first.reverse() } else { first };
-            first.then_with(|| aux.compare(a, b, position))
-        });
+        order.sort_by(|&a, &b| compare(messages[a], messages[b], sort, aux, position));
         return order
             .into_iter()
             .map(|index| Node {
@@ -195,6 +185,25 @@ pub fn arrange(
             .collect();
     }
     threads(messages, sort, aux, position, ascii)
+}
+
+/// How [`arrange`] orders two messages, when not by threads: by `sort`,
+/// with ties going to `sort_aux`, then to where they were listed (with
+/// `unsorted`, only where they were listed counts). No two messages are
+/// equal, so merging sorted lists gives what sorting them all would.
+pub fn compare(
+    a: &MessageSummary,
+    b: &MessageSummary,
+    sort: Sort,
+    aux: Sort,
+    position: &dyn Fn(&MessageId) -> usize,
+) -> Ordering {
+    if sort.method == Method::Unsorted {
+        return sort.compare(a, b, position);
+    }
+    let first = primary(sort.method, a, b);
+    let first = if sort.reverse { first.reverse() } else { first };
+    first.then_with(|| aux.compare(a, b, position))
 }
 
 /// [`arrange`] by threads.
