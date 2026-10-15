@@ -795,8 +795,8 @@ impl App {
                 return self.on_compose_fetched(kind, result);
             }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
-            Event::Sent(result) => self.on_delivered(id, result),
-            Event::DraftSaved(result) => self.on_delivered(id, result.map(drop)),
+            Event::Sent(result) => return self.on_delivered(id, result),
+            Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
             Event::FlagsUpdated(result) => {
                 let Some(message) = self.flag_updates.remove(&id) else {
                     return Vec::new();
@@ -831,22 +831,27 @@ impl App {
         result: mett_core::Result<Message>,
     ) -> Vec<Effect> {
         // Only the pager that asked for it cares; anything else is a stale
-        // response for a message the user already left.
-        let Some(Screen::Pager(pager)) = self.screens.last_mut() else {
+        // response for a message the user already left. The pager may be
+        // under the compose menu, if the user replied while it loaded.
+        let Some(position) = self
+            .screens
+            .iter()
+            .rposition(|s| matches!(s, Screen::Pager(p) if p.request == id))
+        else {
             return Vec::new();
         };
-        if pager.request != id {
-            return Vec::new();
-        }
         let message = match result {
             Ok(message) => message,
             Err(e) => {
-                let failed = pager.id.clone();
-                self.screens.pop();
-                self.unfetched = Some(failed);
+                if let Screen::Pager(pager) = self.screens.remove(position) {
+                    self.unfetched = Some(pager.id);
+                }
                 self.report(e);
                 return Vec::new();
             }
+        };
+        let Screen::Pager(pager) = &mut self.screens[position] else {
+            unreachable!("found above");
         };
         pager.lines = text::pager_lines(&message);
         pager.rows_width = None;
@@ -881,6 +886,16 @@ impl App {
     /// shows only the messages loaded so far.
     pub fn incomplete(&self) -> bool {
         self.unlisted.is_some()
+    }
+
+    /// Lists the open folder again from the start, to show messages that
+    /// arrived in it.
+    fn relist(&mut self) -> Vec<Effect> {
+        self.messages.clear();
+        self.selected = 0;
+        self.pending = None;
+        self.unlisted = None;
+        self.list(Page::first(self.page_size))
     }
 
     /// Lists `page` of the open folder.

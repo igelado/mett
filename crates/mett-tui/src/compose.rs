@@ -77,17 +77,20 @@ impl Settings {
     /// How to write messages, from the configuration. `account` is the
     /// signed-in user, whose address counts as the user's own.
     pub fn from_config(config: &Config, account: &AccountId) -> Result<Self, String> {
+        let realname = config.string("realname");
         let from = match config.string("from") {
-            "" => None,
-            from => {
-                let mut address = Address::parse(from).map_err(|e| format!("from: {e}"))?;
-                let realname = config.string("realname");
-                if address.name.is_none() && !realname.is_empty() {
-                    address.name = Some(realname.to_owned());
-                }
-                Some(address)
-            }
+            // Without `from`, the signed-in account is the sender; it still
+            // takes `realname`.
+            "" if realname.is_empty() => None,
+            "" => Some(Address::new(account.as_str())),
+            from => Some(Address::parse(from).map_err(|e| format!("from: {e}"))?),
         };
+        let from = from.map(|mut address| {
+            if address.name.is_none() && !realname.is_empty() {
+                address.name = Some(realname.to_owned());
+            }
+            address
+        });
         let mut me = vec![account.as_str().to_lowercase()];
         me.extend(from.iter().map(|a| a.email.to_lowercase()));
         // Without `use_from`, the address still counts as the user's own, but
@@ -385,6 +388,13 @@ mod tests {
             Settings::from_config(&config("set from=other@x.org nouse_from\n"), &account).unwrap();
         assert_eq!(settings.from, None);
         assert!(settings.me.contains(&"other@x.org".to_owned()));
+
+        let settings =
+            Settings::from_config(&config("set realname='Me Myself'\n"), &account).unwrap();
+        assert_eq!(
+            settings.from,
+            Some(Address::new("Me@Contoso.com").with_name("Me Myself"))
+        );
 
         assert!(Settings::from_config(&config("set from=nobody\n"), &account).is_err());
         assert!(Settings::from_config(&config("set signature='sig.sh|'\n"), &account).is_err());

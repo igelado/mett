@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use mett_core::{Address, Draft, DraftOrigin, Message};
+use mett_core::{Address, Draft, DraftOrigin, Message, WellKnownFolder};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, Effect, Screen, effect_id};
@@ -554,14 +554,18 @@ impl App {
     }
 
     /// Handles the outcome of sending or postponing a message.
-    pub(super) fn on_delivered(&mut self, id: RequestId, result: mett_core::Result<()>) {
+    pub(super) fn on_delivered(
+        &mut self,
+        id: RequestId,
+        result: mett_core::Result<()>,
+    ) -> Vec<Effect> {
         let Some(position) = self.screens.iter().position(|screen| {
             matches!(screen, Screen::Compose(Compose { delivery: Some((request, _)), .. }) if *request == id)
         }) else {
-            return;
+            return Vec::new();
         };
         let Screen::Compose(compose) = &mut self.screens[position] else {
-            return;
+            return Vec::new();
         };
         let delivery = compose.delivery.take().map(|(_, d)| d);
         match result {
@@ -572,9 +576,18 @@ impl App {
                     _ => "Mail sent.",
                 }
                 .into();
+                // The message landed in the open folder: list it again.
+                let landed_in = match delivery {
+                    Some(Delivery::Postpone) => WellKnownFolder::Drafts,
+                    _ => WellKnownFolder::SentItems,
+                };
+                if self.folder.as_ref().and_then(|f| f.well_known) == Some(landed_in) {
+                    return self.relist();
+                }
             }
             Err(e) => self.report(e),
         }
+        Vec::new()
     }
 
     /// Whether a message is being sent or postponed.
@@ -937,5 +950,55 @@ mod tests {
         act(&mut app, Action::EditMessage);
         app.update(Msg::Edited(Ok("second".into())));
         assert_eq!(compose(&app).draft.body, "second");
+    }
+
+    #[test]
+    fn a_pager_still_loading_under_the_compose_menu_finishes() {
+        let mut app = app(compose::Settings {
+            fast_reply: true,
+            include: Quad::No,
+            ..settings()
+        });
+        let (fetch, _) = request(&act(&mut app, Action::DisplayMessage));
+        // Reply before the pager's message arrives: it is fetched again.
+        let (reply_fetch, _) = request(&act(&mut app, Action::Reply));
+        app.update(Msg::Response(Response {
+            id: reply_fetch,
+            event: Event::MessageFetched(Ok(original())),
+        }));
+        app.update(Msg::Edited(Ok("text".into())));
+        assert_eq!(app.menu(), Menu::Compose);
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(original())),
+        }));
+        let Screen::Pager(pager) = &app.screens[1] else {
+            panic!("the pager is under the compose menu");
+        };
+        assert!(pager.message.is_some(), "and it has its message");
+    }
+
+    #[test]
+    fn sending_from_sent_items_lists_it_again() {
+        let mut app = app(settings());
+        app.folder = Some(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
+        ));
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        let effects = app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Ok(())),
+        }));
+        assert!(
+            matches!(request(&effects).1, Request::ListMessages { .. }),
+            "{effects:?}"
+        );
+        assert!(app.messages.is_empty());
     }
 }
