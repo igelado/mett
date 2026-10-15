@@ -407,8 +407,14 @@ impl App {
             Action::Exit | Action::Quit => {
                 self.screens.pop();
             }
-            Action::NextLine => view.scroll = (view.scroll + 1).min(last),
-            Action::PreviousLine => view.scroll = view.scroll.saturating_sub(1),
+            // There is no other message to go to: the pager's `j` and `k`
+            // scroll, and its first and last entry go to the top and end.
+            Action::NextLine | Action::NextEntry => view.scroll = (view.scroll + 1).min(last),
+            Action::PreviousLine | Action::PreviousEntry => {
+                view.scroll = view.scroll.saturating_sub(1);
+            }
+            Action::FirstEntry => view.scroll = 0,
+            Action::LastEntry => view.scroll = last,
             Action::NextPage => view.scroll = (view.scroll + page).min(last),
             Action::PreviousPage => view.scroll = view.scroll.saturating_sub(page),
             _ => {}
@@ -745,6 +751,32 @@ mod tests {
         assert!(
             matches!(request, Request::FetchAttachment(m, a) if m.as_str() == "m0" && a.as_str() == "a0")
         );
+    }
+
+    #[test]
+    fn the_pager_keys_scroll_a_text_attachment() {
+        let mut app = menu();
+        app.update(Msg::Resize {
+            width: 80,
+            height: 5,
+        });
+        app.screens.push(Screen::Text(TextView::new(
+            "notes".into(),
+            (0..10).map(|i| i.to_string()).collect(),
+            80,
+        )));
+        let scroll = |app: &App| match app.screen() {
+            Screen::Text(view) => view.scroll,
+            _ => panic!("expected the text"),
+        };
+        act(&mut app, Action::NextEntry);
+        assert_eq!(scroll(&app), 1);
+        act(&mut app, Action::LastEntry);
+        assert_eq!(scroll(&app), 8);
+        act(&mut app, Action::PreviousEntry);
+        assert_eq!(scroll(&app), 7);
+        act(&mut app, Action::FirstEntry);
+        assert_eq!(scroll(&app), 0);
     }
 
     #[test]
