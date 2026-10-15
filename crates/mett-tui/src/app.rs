@@ -205,9 +205,10 @@ pub struct App {
     pub quit: bool,
     /// The sign-in window, if it is open.
     pub sign_in: Option<SignIn>,
-    /// The user cancelled the sign-in in progress, so its failure needn't
-    /// be shown.
-    sign_in_cancelled: bool,
+    /// The user cancelled a sign-in or closed its failure window, so
+    /// failures that still arrive from it aren't shown again. Cleared by
+    /// the next prompt or the user's next action.
+    quiet_failures: bool,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -263,7 +264,7 @@ impl App {
             status: "Opening folder...".into(),
             quit: false,
             sign_in: None,
-            sign_in_cancelled: false,
+            quiet_failures: false,
             path,
             opening: None,
             width: usize::from(width),
@@ -334,6 +335,9 @@ impl App {
         // window's keys don't move anywhere, so leave it.
         if self.menu() != Menu::SignIn {
             self.pending = None;
+            // What the user does next may need a sign-in that fails; show
+            // that.
+            self.quiet_failures = false;
         }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
@@ -345,7 +349,7 @@ impl App {
     fn on_sign_in(&mut self, event: SignInEvent) -> Vec<Effect> {
         match event {
             SignInEvent::Prompt { account, prompt } => {
-                self.sign_in_cancelled = false;
+                self.quiet_failures = false;
                 let effects = match &prompt {
                     // The browser flow needs the browser: open it straight
                     // away. The device code flow is for when there is none.
@@ -366,13 +370,11 @@ impl App {
                 // Just close the window: the status line may already show
                 // how the request that needed the sign-in went.
                 self.sign_in = None;
-                self.sign_in_cancelled = false;
                 Vec::new()
             }
             SignInEvent::Finished {
                 outcome: Err(_), ..
-            } if self.sign_in_cancelled => {
-                self.sign_in_cancelled = false;
+            } if self.quiet_failures => {
                 self.sign_in = None;
                 Vec::new()
             }
@@ -401,13 +403,14 @@ impl App {
         match action {
             Action::Exit if failed => {
                 self.sign_in = None;
+                self.quiet_failures = true;
                 // The user gave up: don't let a retry that was waiting
                 // start another sign-in.
                 self.retry_after.clear();
             }
             Action::Exit => {
                 self.sign_in = None;
-                self.sign_in_cancelled = true;
+                self.quiet_failures = true;
                 // Don't let a retry that was waiting start another sign-in.
                 self.retry_after.clear();
                 self.status = "Sign-in cancelled.".into();
@@ -1735,5 +1738,19 @@ mod tests {
         app.retry_after.insert(RequestId(1));
         act(&mut app, Action::Exit);
         assert!(app.retry_after.is_empty());
+    }
+
+    #[test]
+    fn a_closed_failure_window_stays_closed_until_the_user_acts() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(finished(Err("unavailable".into()))));
+        act(&mut app, Action::Exit);
+        // A late failure from a request that was already waiting.
+        app.update(Msg::SignIn(finished(Err("unavailable".into()))));
+        assert_eq!(app.sign_in, None);
+        // Once the user does something else, failures show again.
+        act(&mut app, Action::NextEntry);
+        app.update(Msg::SignIn(finished(Err("unavailable".into()))));
+        assert!(app.sign_in.is_some());
     }
 }
