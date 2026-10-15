@@ -425,6 +425,7 @@ impl App {
         // would do it twice.
         if let Write::Transfer(transfer, request) = &write {
             let ids = transfer_ids(request);
+            let folder_ids = &self.folder_ids;
             for (failed, retry) in &mut self.failed_transfers {
                 let same = match (request, &*retry) {
                     (
@@ -435,7 +436,7 @@ impl App {
                             ..
                         },
                         // Moved again, anywhere: the earlier move is moot.
-                    ) => copy == failed_copy && (!copy || to == failed_to),
+                    ) => copy == failed_copy && (!copy || same_folder(folder_ids, to, failed_to)),
                     (Request::Purge { .. }, Request::Purge { .. }) => true,
                     _ => false,
                 };
@@ -838,6 +839,24 @@ impl App {
         // What failed for want of a sign-in can be retried from the sign-in
         // window.
         let unauthorized_count = unauthorized.len();
+        // Once to retry each: an earlier retry of the same thing to the
+        // same folder (perhaps by another name) is this one.
+        if let (Some(path), Some(folder)) = (&to, &resolved) {
+            self.folder_ids.insert(path.clone(), folder.clone());
+        }
+        if transfer != Transfer::Purge {
+            let folder_ids = &self.folder_ids;
+            for (failed, retry) in &mut self.failed_transfers {
+                let same = destination(retry)
+                    .zip(to.as_ref())
+                    .is_some_and(|(earlier, now)| same_folder(folder_ids, &earlier, now));
+                if *failed == transfer && same {
+                    transfer_ids_mut_vec(retry).retain(|id| !unauthorized.contains(id));
+                }
+            }
+            self.failed_transfers
+                .retain(|(_, retry)| !transfer_ids(retry).is_empty());
+        }
         if !unauthorized.is_empty() {
             self.failed_transfers
                 .push((transfer, with_ids(request, unauthorized)));
@@ -846,9 +865,6 @@ impl App {
         // failure: a copy doesn't make up for a failed move, nor a copy to
         // one folder for a copy to another. The same folder may go by
         // another name (`=Archive`, `=@archive`, the browser's).
-        if let (Some(path), Some(folder)) = (&to, &resolved) {
-            self.folder_ids.insert(path.clone(), folder.clone());
-        }
         let same_place = |place: &Option<FolderPath>| {
             *place == to
                 || place
@@ -1064,6 +1080,14 @@ impl App {
             }
         }
     }
+}
+
+/// Whether `a` and `b` name the same folder: as written, or as found.
+fn same_folder(folder_ids: &HashMap<FolderPath, FolderId>, a: &FolderPath, b: &FolderPath) -> bool {
+    a == b
+        || folder_ids
+            .get(a)
+            .is_some_and(|id| folder_ids.get(b) == Some(id))
 }
 
 /// The messages a move, copy or purge is for.
@@ -3314,5 +3338,30 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::Request(_, Request::Transfer { .. })))
         );
+    }
+
+    #[test]
+    fn copies_to_one_folder_by_two_names_are_retried_once() {
+        let mut app = app(settings());
+        signed_out(&mut app);
+        for name in ["=Archive", "=@archive"] {
+            app.sign_in = None;
+            app.selected = 0;
+            act(&mut app, Action::CopyMessage);
+            let (id, _) = sent(&answer(&mut app, name));
+            app.update(Msg::Response(Response {
+                id,
+                event: Event::Transferred(Ok((
+                    FolderId::new("arc"),
+                    vec![("m0".into(), Err(Error::Auth("expired".into())))],
+                ))),
+            }));
+        }
+        let copies = app
+            .retry()
+            .iter()
+            .filter(|e| matches!(e, Effect::Request(_, Request::Transfer { .. })))
+            .count();
+        assert_eq!(copies, 1);
     }
 }
