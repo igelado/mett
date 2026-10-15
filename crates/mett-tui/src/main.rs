@@ -279,19 +279,44 @@ async fn run<S: mett_core::MailStore + 'static>(
     // that couldn't be saved isn't lost silently.
     if app.saving() {
         app.status = "Saving changes...".into();
-        terminal.draw(|frame| view::render(&app, &keymap, frame))?;
-        let deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
+        let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
         while app.saving() {
-            match tokio::time::timeout_at(deadline, response_rx.recv()).await {
-                // Only save results matter now. Anything else (say, a late
-                // message fetch) could start new work that would never be
-                // sent.
-                Ok(Some(response)) => {
-                    if matches!(response.event, worker::Event::FlagsUpdated(_)) {
-                        app.update(Msg::Response(response));
+            terminal.draw(|frame| view::render(&app, &keymap, frame))?;
+            let msg = tokio::select! {
+                // Saving may need the user to sign in: the sign-in window
+                // still works, and only it takes keys.
+                event = input_rx.recv() => match event.transpose()? {
+                    None => break,
+                    Some(TermEvent::Key(key))
+                        if key.kind != KeyEventKind::Release && app.sign_in.is_some() =>
+                    {
+                        match keymap.lookup(app.menu(), Key::from(key)) {
+                            Some(action) => Msg::Action(action),
+                            None => continue,
+                        }
                     }
-                }
-                Ok(None) | Err(_) => break,
+                    Some(TermEvent::Resize(width, height)) => Msg::Resize { width, height },
+                    Some(_) => continue,
+                },
+                response = response_rx.recv() => match response {
+                    // Only save results matter now. Anything else (say, a
+                    // late message fetch) could start new work that would
+                    // never be sent.
+                    Some(response) if matches!(response.event, worker::Event::FlagsUpdated(_)) => {
+                        Msg::Response(response)
+                    }
+                    Some(_) => continue,
+                    None => break,
+                },
+                Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
+                // The user may take a while to sign in; the wait only
+                // counts while they don't have to.
+                () = tokio::time::sleep_until(deadline), if app.sign_in.is_none() => break,
+            };
+            let effects = app.update(msg);
+            dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+            if app.sign_in.is_some() {
+                deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
             }
         }
         if app.saving() {

@@ -379,6 +379,8 @@ impl App {
             Action::Exit => {
                 self.sign_in = None;
                 self.sign_in_cancelled = true;
+                // Don't let a retry that was waiting start another sign-in.
+                self.retry_after.clear();
                 self.status = "Sign-in cancelled.".into();
                 return vec![Effect::CancelSignIn];
             }
@@ -1464,8 +1466,10 @@ mod tests {
     fn cancelling_closes_the_window_without_reporting_a_failure() {
         let (mut app, _) = App::new(80, 23);
         app.update(Msg::SignIn(browser_prompt()));
+        app.retry_after.insert(RequestId(1));
         assert_eq!(act(&mut app, Action::Exit), [Effect::CancelSignIn]);
         assert_eq!(app.sign_in, None);
+        assert!(app.retry_after.is_empty());
         app.update(Msg::SignIn(finished(Err("sign-in cancelled".into()))));
         assert_eq!(app.sign_in, None);
         assert_eq!(app.status, "Sign-in cancelled.");
