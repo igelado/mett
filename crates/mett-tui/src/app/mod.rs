@@ -286,6 +286,9 @@ pub struct App {
     /// Requests deleting drafts of messages the user gave up on; quitting
     /// waits for them.
     discarding: HashSet<RequestId>,
+    /// Drafts of messages the user gave up on that couldn't be deleted,
+    /// reported on exit like changes that couldn't be saved.
+    left_drafts: Vec<String>,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -358,6 +361,7 @@ impl App {
             relist_on_return: false,
             reselect: None,
             discarding: HashSet::new(),
+            left_drafts: Vec::new(),
             path,
             opening: None,
             width: usize::from(width),
@@ -863,7 +867,9 @@ impl App {
             Event::KeptDiscarded(result) => {
                 self.discarding.remove(&id);
                 if let Err(e) = result {
-                    self.status = format!("A draft of the message is left in Drafts: {e}");
+                    let left = format!("A draft of the message is left in Drafts: {e}");
+                    self.left_drafts.push(left.clone());
+                    self.status = left;
                 }
             }
             Event::FlagsUpdated(result) => {
@@ -1063,7 +1069,12 @@ impl App {
 
     /// Changes that could not be saved, one per message.
     pub fn save_failures(&self) -> Vec<String> {
-        let mut failures: Vec<_> = self.save_failures.values().cloned().collect();
+        let mut failures: Vec<_> = self
+            .save_failures
+            .values()
+            .chain(&self.left_drafts)
+            .cloned()
+            .collect();
         failures.sort();
         failures
     }

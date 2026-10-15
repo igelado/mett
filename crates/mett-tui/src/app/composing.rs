@@ -686,8 +686,9 @@ impl App {
                     }
                     // Not under a pager, whose message and position would
                     // no longer match the index: once back in the index.
+                    // On the same message as before.
                     if self.screen() == &Screen::Index {
-                        effects.extend(self.relist());
+                        effects.extend(self.refresh());
                     } else {
                         self.relist_on_return = true;
                     }
@@ -1135,7 +1136,8 @@ mod tests {
         assert!(
             app.status
                 .starts_with("A draft of the message is left in Drafts")
-        );
+        ); // Reported on exit too: the status line goes with the terminal.
+        assert_eq!(app.save_failures().len(), 1);
     }
 
     #[test]
@@ -1266,6 +1268,47 @@ mod tests {
         // b is gone: the message now where it was.
         relisted(&mut app, &["new", "a", "c"]);
         assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    }
+
+    #[test]
+    fn sending_from_sent_items_keeps_the_selection() {
+        let mut app = app(settings());
+        app.folder = Some(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
+        ));
+        let listed = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| mock::message(id, "sent", "s", DateTime::UNIX_EPOCH).summary)
+                .collect::<Vec<_>>()
+        };
+        app.messages = listed(&["a", "b", "c"]);
+        app.selected = 1;
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        let effects = app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Ok(())),
+        }));
+        let list = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Request(id, Request::ListMessages { .. }) => Some(*id),
+                _ => None,
+            })
+            .expect("listed again");
+        app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: listed(&["new", "a", "b", "c"]),
+                next: None,
+            })),
+        }));
+        assert_eq!(app.messages[app.selected].id.as_str(), "b");
     }
 
     #[test]
