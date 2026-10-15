@@ -2,7 +2,7 @@
 //! macro's keys played one by one), the help screen, and mettrc commands
 //! typed at the `:` prompt.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::composing::{Input, Question};
 use super::{App, Effect, Msg, Screen, Settings};
@@ -73,6 +73,8 @@ impl App {
             .take()
             .is_some_and(|(at, when)| at == menu && when.elapsed() < ESCAPE_DELAY)
             && let KeyCode::Char(c) = event.code
+            // A key with Control (or Alt) of its own stays as it is.
+            && event.modifiers.difference(KeyModifiers::SHIFT).is_empty()
         {
             key = Key::alt(c);
         }
@@ -723,7 +725,6 @@ mod tests {
 
     #[test]
     fn back_tab_bindings_match_shift_tab() {
-        use ratatui::crossterm::event::KeyModifiers;
         let event = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
         assert_eq!(
             Key::from(event),

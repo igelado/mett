@@ -286,8 +286,12 @@ impl App {
         self.thread_listed();
         // In the pager, from the message it shows (the index may have been
         // listed again meanwhile).
+        // Folded into a collapsed thread since, from the thread.
         if let Some(Screen::Pager(pager)) = self.screens.last() {
-            match self.messages.iter().position(|m| m.id == pager.id) {
+            let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+            let at =
+                shown(&pager.id).or_else(|| self.thread_of(&pager.id).and_then(|t| shown(&t.root)));
+            match at {
                 Some(at) => self.selected = at,
                 None => {
                     self.fail("The folder is being listed again; wait a moment.");
@@ -551,6 +555,18 @@ mod tests {
         app.update(Msg::Key(KeyEvent::from(KeyCode::Char('v'))));
         // `v`, not `Esc v`: the thread isn't collapsed.
         assert_eq!(shown(&app)[0], "a0");
+    }
+
+    #[test]
+    fn escape_then_control_n_is_control_n() {
+        let mut app = app();
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+        )));
+        // The next thread, not Alt-n.
+        assert_eq!(app.messages[app.selected].id.as_str(), "b0");
     }
 
     #[test]
