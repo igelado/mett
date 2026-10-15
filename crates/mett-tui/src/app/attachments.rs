@@ -220,6 +220,11 @@ impl App {
             self.fail("It is a link to a file kept elsewhere; open it in Outlook.");
             return Vec::new();
         }
+        // One at a time: another would take its place.
+        if self.fetching.is_some() {
+            self.fail("Please wait: an attachment is still being fetched.");
+            return Vec::new();
+        }
         let request = self.request(Request::FetchAttachment(message, attachment.id.clone()));
         self.fetching = Some(Fetching {
             request: effect_id(&request),
@@ -264,11 +269,14 @@ impl App {
             self.status.clear();
         }
         match to {
-            Use::Save(path) => vec![Effect::SaveFile {
-                path,
-                data,
-                overwrite: false,
-            }],
+            Use::Save(path) => {
+                self.file_wait = Some(path.clone());
+                vec![Effect::SaveFile {
+                    path,
+                    data,
+                    overwrite: false,
+                }]
+            }
             Use::View => match shown_as_text(&attachment, &data) {
                 Some(lines) => {
                     self.screens.push(Screen::Text(TextView::new(
@@ -291,6 +299,16 @@ impl App {
     /// Takes in how saving a file went; one that exists may be
     /// overwritten.
     pub(super) fn on_file_saved(&mut self, outcome: FileOutcome) -> Vec<Effect> {
+        let path = match &outcome {
+            FileOutcome::Done(path)
+            | FileOutcome::Exists(path, _)
+            | FileOutcome::Failed(path, _) => path,
+        };
+        // One the user gave up waiting for is done with.
+        if self.file_wait.as_ref() != Some(path) {
+            return Vec::new();
+        }
+        self.file_wait = None;
         match outcome {
             FileOutcome::Done(path) => {
                 self.status = format!("Saved to {}.", path.display());
@@ -303,7 +321,7 @@ impl App {
                     question: Question::Overwrite,
                 });
             }
-            FileOutcome::Failed(e) => self.fail(e),
+            FileOutcome::Failed(_, e) => self.fail(e),
         }
         Vec::new()
     }
@@ -317,6 +335,7 @@ impl App {
             self.status = "Not saved.".into();
             return Vec::new();
         }
+        self.file_wait = Some(path.clone());
         vec![Effect::SaveFile {
             path,
             data,
@@ -363,7 +382,7 @@ impl App {
         }
         let path = PathBuf::from(expand_home(path, self.home.as_deref()));
         self.status = "Attaching...".into();
-        self.reading += 1;
+        self.file_wait = Some(path.clone());
         vec![Effect::ReadFile(path)]
     }
 
@@ -373,7 +392,11 @@ impl App {
         path: PathBuf,
         result: Result<Vec<u8>, String>,
     ) -> Vec<Effect> {
-        self.reading = self.reading.saturating_sub(1);
+        // One the user gave up waiting for is done with.
+        if self.file_wait.as_ref() != Some(&path) {
+            return Vec::new();
+        }
+        self.file_wait = None;
         if self.status == "Attaching..." {
             self.status.clear();
         }
@@ -431,8 +454,8 @@ pub enum FileOutcome {
     Done(PathBuf),
     /// The file exists; here is what was to go in it.
     Exists(PathBuf, Vec<u8>),
-    /// It failed.
-    Failed(String),
+    /// Saving there failed, and why.
+    Failed(PathBuf, String),
 }
 
 /// `data` as text, in the charset `content_type` declares; without one,
@@ -521,7 +544,7 @@ mod tests {
     }
     use chrono::DateTime;
     use mett_core::{AttachmentId, MessagePage, WellKnownFolder, mock};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
     use crate::app::{Msg, Settings};
@@ -738,9 +761,13 @@ mod tests {
         let effects = app.answer_attach_file("~/report.pdf".into());
         let path = PathBuf::from("/home/alice/report.pdf");
         assert_eq!(effects, [Effect::ReadFile(path.clone())]);
-        // Not sent without it.
-        assert!(act(&mut app, Action::SendMessage).is_empty());
-        assert_eq!(app.status, "Please wait: a file is still being attached.");
+        // Keys wait for it.
+        assert!(
+            app.update(Msg::Key(KeyEvent::from(KeyCode::Char('q'))))
+                .is_empty()
+        );
+        assert!(matches!(app.screen(), Screen::Compose(_)));
+        assert!(app.status.starts_with("Waiting for /home/alice/report.pdf"));
         app.update(Msg::FileRead(path, Ok(b"%PDF".to_vec())));
         let Screen::Compose(compose) = app.screen() else {
             panic!("expected the compose menu");
@@ -759,10 +786,23 @@ mod tests {
         };
         assert!(compose.draft.attachments.is_empty());
         // A file that can't be read is said.
+        app.answer_attach_file("/nope".into());
         app.update(Msg::FileRead(
             PathBuf::from("/nope"),
             Err("not found".into()),
         ));
         assert_eq!(app.status, "/nope: not found");
+        // One given up on (^G) is left out, when it comes after all.
+        app.answer_attach_file("/slow".into());
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(app.status, "Not waiting for /slow any more.");
+        app.update(Msg::FileRead(PathBuf::from("/slow"), Ok(b"x".to_vec())));
+        let Screen::Compose(compose) = app.screen() else {
+            panic!("expected the compose menu");
+        };
+        assert!(compose.draft.attachments.is_empty());
     }
 }

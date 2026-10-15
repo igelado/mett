@@ -731,11 +731,6 @@ impl App {
             self.fail("Please wait: the message is still being sent or postponed.");
             return Vec::new();
         }
-        // A file being attached goes with the message.
-        if self.reading > 0 && matches!(action, Action::SendMessage | Action::PostponeMessage) {
-            self.fail("Please wait: a file is still being attached.");
-            return Vec::new();
-        }
         // What the actions need of the message, without copying its
         // attachments.
         let draft = &compose.draft;

@@ -597,8 +597,9 @@ pub struct App {
     page_size: u32,
     /// The attachment being fetched, and what for.
     fetching: Option<attachments::Fetching>,
-    /// How many files to attach are being read.
-    reading: usize,
+    /// The file being read (to attach) or saved: keys wait for it, as in
+    /// mutt, but `^G` gives up on it.
+    file_wait: Option<std::path::PathBuf>,
     /// A file not saved because one was there, waiting for the user to say
     /// whether to replace it.
     unsaved: Option<(std::path::PathBuf, Vec<u8>)>,
@@ -741,7 +742,7 @@ impl App {
             last_draft: 0,
             page_size: settings.page_size,
             fetching: None,
-            reading: 0,
+            file_wait: None,
             unsaved: None,
             home: settings.home,
             mailboxes: settings.mailboxes,

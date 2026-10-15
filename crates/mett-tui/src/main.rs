@@ -379,6 +379,7 @@ fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     let terminal = ratatui::init();
     let result = runtime.block_on(run(terminal, store, session));
     ratatui::restore();
+    wait_for_saves();
     remove_viewed();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -743,6 +744,20 @@ impl Deferred {
     }
 }
 
+/// How many files are being saved: mett waits for them before exiting, so
+/// none is left half written.
+static SAVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Waits (a while) for the files being saved.
+fn wait_for_saves() {
+    let started = std::time::Instant::now();
+    while SAVING.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && started.elapsed() < std::time::Duration::from_secs(30)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Writes `data` to `path`; a file there is replaced only if `overwrite`,
 /// and only once the new one is written in full.
 fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::FileOutcome {
@@ -756,7 +771,10 @@ fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::F
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             app::FileOutcome::Exists(path, data)
         }
-        Err(e) => app::FileOutcome::Failed(format!("{}: {e}", path.display())),
+        Err(e) => {
+            let why = format!("{}: {e}", path.display());
+            app::FileOutcome::Failed(path, why)
+        }
     }
 }
 
@@ -1039,8 +1057,11 @@ fn dispatch(
                 overwrite,
             } => {
                 let files = files.clone();
+                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::spawn(move || {
-                    let _ = files.send(app::Msg::FileSaved(save_file(path, data, overwrite)));
+                    let saved = save_file(path, data, overwrite);
+                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = files.send(app::Msg::FileSaved(saved));
                 });
             }
             Effect::OpenFile { name, data } => {
@@ -1178,7 +1199,7 @@ mod tests {
 
     #[test]
     fn replacing_a_file_keeps_it_until_the_new_one_is_written() {
-        let dir = std::env::temp_dir().join(format!("mett-save-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mett-replace-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("notes.txt");
         std::fs::write(&path, "old").unwrap();
