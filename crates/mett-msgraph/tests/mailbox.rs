@@ -1524,6 +1524,10 @@ async fn lists_and_fetches_attachments() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1.0/me/messages/m1/attachments"))
+        .and(query_param(
+            "$expand",
+            "microsoft.graph.itemAttachment/item($select=id)",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 {
@@ -1538,6 +1542,11 @@ async fn lists_and_fetches_attachments() {
                 {
                     "@odata.type": "#microsoft.graph.referenceAttachment",
                     "id": "a3", "name": "link", "contentType": null, "size": 0,
+                },
+                {
+                    "@odata.type": "#microsoft.graph.itemAttachment",
+                    "id": "a4", "name": "Lunch", "size": 300,
+                    "item": { "@odata.type": "#microsoft.graph.event", "id": "e1" },
                 },
             ],
         })))
@@ -1560,6 +1569,7 @@ async fn lists_and_fetches_attachments() {
             ("notes.txt", "text/plain", AttachmentKind::File),
             ("Fwd", "message/rfc822", AttachmentKind::Item),
             ("link", "application/octet-stream", AttachmentKind::Link),
+            ("Lunch", "text/calendar", AttachmentKind::Item),
         ]
     );
     let data = store

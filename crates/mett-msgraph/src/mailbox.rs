@@ -647,7 +647,10 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     async fn list_attachments(&self, message: &MessageId) -> Result<Vec<Attachment>> {
         let mut url = self.url(&["me", "messages", message.as_str(), "attachments"]);
         url.query_pairs_mut()
-            .append_pair("$select", "id,name,contentType,size,isInline");
+            .append_pair("$select", "id,name,contentType,size,isInline")
+            // What an attached item is (a message, an event, a contact),
+            // when Graph gives no content type for it.
+            .append_pair("$expand", "microsoft.graph.itemAttachment/item($select=id)");
         let mut attachments = Vec::new();
         loop {
             let page: Collection<GraphAttachment> = self
@@ -1331,6 +1334,14 @@ struct GraphAttachment {
     size: u64,
     #[serde(default)]
     is_inline: bool,
+    /// The attached item, of an item attachment.
+    item: Option<AttachedItem>,
+}
+
+#[derive(Deserialize)]
+struct AttachedItem {
+    #[serde(rename = "@odata.type")]
+    odata_type: Option<String>,
 }
 
 impl GraphAttachment {
@@ -1343,9 +1354,19 @@ impl GraphAttachment {
         Attachment {
             id: AttachmentId::new(self.id),
             name: self.name.unwrap_or_default(),
-            content_type: self.content_type.unwrap_or_else(|| match kind {
-                AttachmentKind::Item => "message/rfc822".into(),
-                _ => "application/octet-stream".into(),
+            // An item comes as MIME (a message), iCalendar (an event) or a
+            // vCard (a contact).
+            content_type: self.content_type.unwrap_or_else(|| {
+                let item = self.item.and_then(|i| i.odata_type);
+                match (kind, item.as_deref()) {
+                    (AttachmentKind::Item, Some("#microsoft.graph.event")) => "text/calendar",
+                    (AttachmentKind::Item, Some("#microsoft.graph.contact")) => "text/vcard",
+                    (AttachmentKind::Item, Some("#microsoft.graph.message") | None) => {
+                        "message/rfc822"
+                    }
+                    _ => "application/octet-stream",
+                }
+                .into()
             }),
             size: self.size,
             inline: self.is_inline,

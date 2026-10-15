@@ -584,15 +584,19 @@ fn file_name(attachment: &Attachment) -> String {
         .next()
         .unwrap_or_default()
         .trim();
-    match name {
-        "" | "." | ".." => match attachment.kind {
-            AttachmentKind::Item => "message.eml".into(),
-            _ => "attachment".into(),
-        },
-        name if attachment.kind == AttachmentKind::Item && !name.contains('.') => {
-            format!("{name}.eml")
-        }
-        name => name.to_owned(),
+    // An attached item is named by its kind of content.
+    let extension = match attachment.content_type.as_str() {
+        "message/rfc822" => Some("eml"),
+        "text/calendar" => Some("ics"),
+        "text/vcard" => Some("vcf"),
+        _ => None,
+    }
+    .filter(|_| attachment.kind == AttachmentKind::Item);
+    match (name, extension) {
+        ("" | "." | "..", Some(extension)) => format!("item.{extension}"),
+        ("" | "." | "..", None) => "attachment".into(),
+        (name, Some(extension)) if !name.contains('.') => format!("{name}.{extension}"),
+        (name, _) => name.to_owned(),
     }
 }
 
