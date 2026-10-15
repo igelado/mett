@@ -145,6 +145,12 @@ mailbox.`. Move a message into `Work` from Outlook: the status line says
 `=Work`. Reading or deleting a recent message in Outlook shows up in mett
 at the next check too.
 
+To test attachments, send yourself a message with a small file and a large
+one (over 3 MB) attached with `a` in the compose menu, and check in
+Outlook that both arrived whole. On the received message, `v` lists them:
+`Enter` shows a text file in mett and opens others with your system's
+program, and `s` saves one.
+
 To test sending, send yourself a message (`m`, your own address), then
 reply to it (`r`) and forward it (`f`) to yourself. In Outlook, check that
 the reply is threaded under the original, the forward keeps any
@@ -178,9 +184,10 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 | Index | `Esc v`/`Esc V`: collapse or open the thread, or all of them (with `sort=threads`). `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
 | Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size` and `msgraph_sync_interval` take effect when mett starts again). |
-| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
+| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `v`: the message's attachments. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
 | Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. `Tab`: switch between the `mailboxes` (listed first, if there are any) and every folder. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
-| Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. |
+| Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. `a`: attach a file. `D`: take the selected file off. `j`/`k`: select a part. |
+| Attachments | `Enter`/`m`: view (text in mett; other files open in the program your system has for them, from a private copy that a later run of mett removes after a day). `s`: save to a file (asks before replacing one). `j`/`k`, `z`/`Z`: move. `q`: back. While a file is read (to attach) or saved, keys wait for it; `^G` gives up waiting. |
 | Questions | Type the answer and press `Enter`; `Esc` or `^G` gives up. The usual line-editing keys work (`^A`, `^E`, `^U`, `^K`, `^W`, arrows). Yes/no questions take `y`, `n`, or `Enter` for the suggested answer. |
 | Sign-in window | `o`: open the sign-in page in a browser. `c`: copy the link (or the device code) to the clipboard, in terminals that support OSC 52 (in tmux, `set -g set-clipboard on`). `q`/`Esc`: cancel, or close after a failure. `Enter`: try again after a failure. `j`/`k` or arrows: scroll, when the terminal is too small to show it all. |
 
@@ -203,6 +210,9 @@ Check that:
   `Esc v` folds a thread into its first message and `^N` moves to the next
   thread; `:set sort=reverse-threads sort_aux=last-date` puts the thread
   with the latest message first.
+- `v` on a message with attachments (`+`) lists them; `Enter` on
+  `notes.txt` shows it, and `s` saves it. In the compose menu, `a` attaches
+  a file and `D` takes it off again.
 - The pager's status bar shows `(all)`, a percentage, or `(end)` as you
   scroll.
 - Resizing the terminal keeps the layout intact.

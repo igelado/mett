@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId,
-    MessagePage, Page, Result,
+    Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
+    Message, MessageId, MessagePage, Page, Result,
 };
 use tokio::sync::mpsc;
 
@@ -47,6 +47,10 @@ pub enum Request {
     FetchMessage(MessageId),
     /// Change a message's flags.
     UpdateFlags(MessageId, FlagsUpdate),
+    /// List a message's attachments.
+    ListAttachments(MessageId),
+    /// Fetch an attachment's content.
+    FetchAttachment(MessageId, AttachmentId),
     /// List every folder in the mailbox.
     ListFolders,
     /// Move or copy messages to the folder at a path.
@@ -108,6 +112,10 @@ pub enum Event {
     MessageFetched(Result<Message>),
     /// Outcome of [`Request::UpdateFlags`].
     FlagsUpdated(Result<()>),
+    /// Outcome of [`Request::ListAttachments`].
+    AttachmentsListed(Result<Vec<Attachment>>),
+    /// Outcome of [`Request::FetchAttachment`].
+    AttachmentFetched(Result<Vec<u8>>),
     /// Outcome of [`Request::ListFolders`].
     FoldersListed(Result<Vec<Folder>>),
     /// Outcome of [`Request::Transfer`]: the folder could not be found, or
@@ -117,10 +125,11 @@ pub enum Event {
     /// Outcome of [`Request::Purge`]: the trash folder could not be found,
     /// or for each message, whether it was purged.
     Purged(Result<Vec<(MessageId, Result<()>)>>),
-    /// Outcome of [`Request::Send`].
-    Sent(Result<()>),
-    /// Outcome of [`Request::SaveDraft`].
-    DraftSaved(Result<MessageId>),
+    /// Outcome of [`Request::Send`], and whether a draft is kept for the
+    /// next attempt (see [`MailSender::keeps_draft`]).
+    Sent(Result<()>, bool),
+    /// Outcome of [`Request::SaveDraft`], and whether a draft is kept.
+    DraftSaved(Result<MessageId>, bool),
     /// Outcome of [`Request::DiscardKept`].
     KeptDiscarded(Result<()>),
     /// Outcome of [`Request::OwnAddresses`].
@@ -204,6 +213,10 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             }))
         }
         Request::FetchMessage(id) => Event::MessageFetched(store.fetch_message(&id).await),
+        Request::ListAttachments(id) => Event::AttachmentsListed(store.list_attachments(&id).await),
+        Request::FetchAttachment(id, attachment) => {
+            Event::AttachmentFetched(store.fetch_attachment(&id, &attachment).await)
+        }
         Request::UpdateFlags(id, update) => {
             Event::FlagsUpdated(store.update_flags(&id, update).await)
         }
@@ -214,8 +227,14 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::Purge { ids, from, trash } => {
             Event::Purged(purge(store, &ids, &from, trash.as_ref()).await)
         }
-        Request::Send(draft) => Event::Sent(store.send(&draft).await),
-        Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
+        Request::Send(draft) => {
+            let sent = store.send(&draft).await;
+            Event::Sent(sent, store.keeps_draft(&draft))
+        }
+        Request::SaveDraft(draft) => {
+            let saved = store.save_draft(&draft).await;
+            Event::DraftSaved(saved, store.keeps_draft(&draft))
+        }
         Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
         Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
         Request::StillThere { folder, ids } => {

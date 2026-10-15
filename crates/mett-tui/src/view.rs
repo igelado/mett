@@ -16,7 +16,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
-use crate::app::{App, Browser, Compose, Help, Input, Pager, Row, Screen, SignIn, highlighted};
+use crate::app::{
+    App, AttachMenu, Browser, Compose, Help, Input, Pager, Row, Screen, SignIn, TextView,
+    highlighted,
+};
 use crate::color::Colors;
 use crate::expando::{self, Display, Entry, Status};
 use crate::format;
@@ -73,6 +76,17 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
             (Action::EditSubject, "Subj"),
             (Action::EditMessage, "Edit"),
             (Action::PostponeMessage, "Postpone"),
+            (Action::AttachFile, "Attach"),
+        ],
+    ),
+    (
+        Menu::Attach,
+        &[
+            (Action::Exit, "Exit"),
+            (Action::SaveEntry, "Save"),
+            (Action::ViewAttach, "View"),
+            (Action::NextEntry, "Next"),
+            (Action::PreviousEntry, "Prev"),
         ],
     ),
     (
@@ -126,6 +140,8 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         Screen::Compose(compose) => render_compose(compose, colors, frame, body),
         Screen::Browser(browser) => render_browser(browser, colors, frame, body),
         Screen::Help(help) => render_help(app, help, frame, body),
+        Screen::Attachments(menu) => render_attachments(menu, colors, frame, body),
+        Screen::Text(view) => render_text(view, frame, body),
     };
     frame.render_widget(Paragraph::new(status_line).style(colors.status), status);
     match &app.input {
@@ -261,33 +277,130 @@ fn render_compose(compose: &Compose, colors: &Colors, frame: &mut Frame, area: R
         ("Subject", draft.subject.clone()),
     ];
     let width = usize::from(area.width);
-    let size = format_size(draft.body.len());
     let mut lines: Vec<Line> = headers
         .into_iter()
         .map(|(name, value)| Line::raw(truncate(&format!("{name:>8}: {value}"), width)))
         .collect();
     lines.push(Line::raw(""));
     lines.push(Line::raw("-- Attachments"));
-    lines.push(
-        Line::raw(truncate(
-            &format!("- I     1 <message text>  [text/plain, utf-8, {size}]"),
-            width,
-        ))
-        .style(colors.indicator),
-    );
-    let mut parts = 1;
+    // The parts, as mutt lists them: the text, what a forward carries
+    // along, and the attached files.
+    let mut parts = vec![format!(
+        "- I     1 <message text>  [text/plain, utf-8, {}]",
+        format_size(draft.body.len())
+    )];
     if compose.forwarded_attachments {
-        parts += 1;
-        lines.push(
-            Line::raw(truncate(
-                "- A     2 <the forwarded message's attachments>",
-                width,
-            ))
-            .style(colors.attachment),
-        );
+        parts.push(format!(
+            "- A     {} <the forwarded message's attachments>",
+            parts.len() + 1
+        ));
     }
+    for file in &draft.attachments {
+        parts.push(format!(
+            "- A     {} {}  [{}, {}]",
+            parts.len() + 1,
+            file.name,
+            file.content_type,
+            format_size(file.data.len())
+        ));
+    }
+    let count = parts.len();
+    // A page of parts at a time, with the selected one, when they don't
+    // all fit under the headers.
+    let room = usize::from(area.height).saturating_sub(lines.len()).max(1);
+    let first = compose.selected / room * room;
+    for (i, part) in parts.into_iter().enumerate().skip(first).take(room) {
+        let line = Line::raw(truncate(&part, width));
+        lines.push(if i == compose.selected {
+            line.style(colors.indicator)
+        } else if i > 0 {
+            line.style(colors.attachment)
+        } else {
+            line
+        });
+    }
+    let size = draft.body.len()
+        + draft
+            .attachments
+            .iter()
+            .map(|a| a.data.len())
+            .sum::<usize>();
     frame.render_widget(Paragraph::new(lines), area);
-    format!("-- mett: Compose  [Approx. msg size: {size}   Atts: {parts}]---")
+    format!(
+        "-- mett: Compose  [Approx. msg size: {}   Atts: {count}]---",
+        format_size(size)
+    )
+}
+
+/// Draws the attachment menu and returns its status line: each
+/// attachment, as mutt shows it, with its type and size.
+fn render_attachments(menu: &AttachMenu, colors: &Colors, frame: &mut Frame, area: Rect) -> String {
+    if menu.entries.is_empty() {
+        let text = if menu.listing() {
+            "Listing attachments..."
+        } else {
+            "No attachments."
+        };
+        frame.render_widget(Paragraph::new(text), area);
+        return "---mett: Attachments---".into();
+    }
+    let height = usize::from(area.height).max(1);
+    let first = menu.selected / height * height;
+    let width = usize::from(area.width);
+    let lines: Vec<Line> = menu
+        .entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, attachment)| {
+            let size = usize::try_from(attachment.size).unwrap_or(usize::MAX);
+            let kind = match attachment.kind {
+                mett_core::AttachmentKind::Link => " (link)",
+                _ => "",
+            };
+            let line = format!(
+                "{:>4} [{}, {}]  {}{kind}",
+                i + 1,
+                attachment.content_type,
+                format_size(size),
+                attachment.name
+            );
+            let line = Line::raw(truncate(&line, width));
+            if i == menu.selected {
+                line.style(colors.indicator)
+            } else {
+                line.style(colors.attachment)
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    format!("---mett: Attachments [{}]---", menu.entries.len())
+}
+
+/// Draws text on its own screen and returns its status line.
+fn render_text(view: &TextView, frame: &mut Frame, area: Rect) -> String {
+    let width = usize::from(area.width);
+    let height = usize::from(area.height);
+    // Wrapped by the app to the terminal's width; here only if the
+    // drawing area differs.
+    let rewrapped;
+    let rows = if view.rows_width == Some(width.max(1)) {
+        &view.rows
+    } else {
+        rewrapped = text::wrap_all(&view.lines, width.max(1));
+        &rewrapped
+    };
+    let top = view.scroll.min(rows.len().saturating_sub(height));
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(top)
+        .take(height)
+        .map(|row| Line::raw(row.as_str()))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    let position = expando::position(top, height, rows.len());
+    format!("---mett: {}   -- ({position})", view.title)
 }
 
 /// A size the way mutt shows it: `0.5K`, `12K`, `1.2M`.
@@ -873,6 +986,24 @@ mod tests {
     }
 
     #[test]
+    fn the_compose_menu_keeps_the_selected_part_in_view() {
+        let mut app = app(1);
+        let mut draft = mett_core::Draft::default();
+        for i in 0..6 {
+            draft.attachments.push(mett_core::OutgoingAttachment {
+                name: format!("file{i}.txt"),
+                content_type: "text/plain".into(),
+                data: Vec::new(),
+            });
+        }
+        let mut compose = crate::app::Compose::new(draft, false);
+        compose.selected = 6;
+        app.screens.push(Screen::Compose(compose));
+        let lines = sized_screen(&app, WIDTH, 12);
+        assert!(lines.iter().any(|l| l.contains("file5.txt")), "{lines:#?}");
+    }
+
+    #[test]
     fn draws_the_index_like_mutt() {
         let lines = screen(&app(2));
         assert_eq!(lines[0], "q:Quit  j:Next  k:Prev  <Enter>:Display");
@@ -1087,7 +1218,7 @@ mod tests {
         let lines = sized_screen(&app, WIDTH, 12);
         assert_eq!(
             sized_screen(&app, 80, 12)[0],
-            "y:Send  q:Abort  t:To  c:CC  b:Bcc  s:Subj  e:Edit  P:Postpone"
+            "y:Send  q:Abort  t:To  c:CC  b:Bcc  s:Subj  e:Edit  P:Postpone  a:Attach"
         );
         assert_eq!(lines[2], "      To: bob@x.org");
         assert_eq!(lines[5], " Subject:");

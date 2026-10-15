@@ -26,6 +26,8 @@ pub enum Menu {
     Browser,
     /// The help screen.
     Help,
+    /// The attachment menu.
+    Attach,
 }
 
 impl Menu {
@@ -39,6 +41,7 @@ impl Menu {
             Menu::Compose => "compose",
             Menu::Browser => "browser",
             Menu::Help => "help",
+            Menu::Attach => "attach",
         }
     }
 
@@ -52,6 +55,7 @@ impl Menu {
             Menu::Compose,
             Menu::Browser,
             Menu::Help,
+            Menu::Attach,
         ]
         .into_iter()
         .find(|m| m.name() == name)
@@ -338,6 +342,7 @@ impl Keymap {
             (Key::char('y'), BrowseMailboxes),
             (Key::char('/'), Search),
             (Key::char('n'), SearchNext),
+            (Key::char('v'), ViewAttachments),
             (Key::ctrl('n'), NextThread),
             (Key::ctrl('p'), PreviousThread),
         ];
@@ -427,6 +432,12 @@ impl Keymap {
             (Key::char('c'), EditCc),
             (Key::char('b'), EditBcc),
             (Key::char('s'), EditSubject),
+            (Key::char('a'), AttachFile),
+            (Key::char('D'), DetachFile),
+            (Key::char('j'), NextEntry),
+            (Key::new(Down), NextEntry),
+            (Key::char('k'), PreviousEntry),
+            (Key::new(Up), PreviousEntry),
         ];
         for (key, action) in compose {
             keymap.bind_action(Menu::Compose, *key, *action);
@@ -470,6 +481,29 @@ impl Keymap {
         ];
         for (key, action) in browser {
             keymap.bind_action(Menu::Browser, *key, *action);
+        }
+
+        let attach: &[(Key, Action)] = &[
+            (Key::char('q'), Exit),
+            (Key::new(Esc), Exit),
+            (Key::char('j'), NextEntry),
+            (Key::new(Down), NextEntry),
+            (Key::char('k'), PreviousEntry),
+            (Key::new(Up), PreviousEntry),
+            (Key::char('='), FirstEntry),
+            (Key::new(Home), FirstEntry),
+            (Key::char('*'), LastEntry),
+            (Key::new(End), LastEntry),
+            (Key::char('z'), NextPage),
+            (Key::new(PageDown), NextPage),
+            (Key::char('Z'), PreviousPage),
+            (Key::new(PageUp), PreviousPage),
+            (Key::new(Enter), ViewAttach),
+            (Key::char('m'), ViewAttach),
+            (Key::char('s'), SaveEntry),
+        ];
+        for (key, action) in attach {
+            keymap.bind_action(Menu::Attach, *key, *action);
         }
 
         keymap

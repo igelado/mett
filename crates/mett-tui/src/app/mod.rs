@@ -5,6 +5,7 @@
 //! to a [`Msg`]; side effects come back as [`Effect`]s for the main loop to
 //! carry out. This keeps the UI logic testable without a terminal.
 
+mod attachments;
 mod composing;
 mod keys;
 mod mailbox;
@@ -18,6 +19,7 @@ use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, Messa
 use mett_msgraph::SignInPrompt;
 use ratatui::crossterm::event::KeyEvent;
 
+pub use self::attachments::{AttachMenu, FileOp, FileOutcome, TextView};
 use self::composing::Composing;
 pub use self::composing::{Compose, Input};
 pub use self::keys::{Help, Reconfigured};
@@ -86,6 +88,8 @@ pub struct Settings {
     /// How often to check for new mail (`msgraph_sync_interval`), or
     /// `None` not to.
     pub sync_interval: Option<std::time::Duration>,
+    /// The home directory, for `~` in file names.
+    pub home: Option<String>,
 }
 
 /// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
@@ -115,6 +119,7 @@ impl Default for Settings {
             display: crate::expando::Display::default(),
             ordering: Ordering::default(),
             sync_interval: None,
+            home: None,
         }
     }
 }
@@ -137,6 +142,12 @@ pub enum Msg {
     Configured(Reconfigured),
     /// The editor finished: the edited text, or why it failed.
     Edited(Result<String, String>),
+    /// A file was saved, or not.
+    FileSaved(FileOp, FileOutcome),
+    /// A file was read, or not.
+    FileRead(FileOp, std::path::PathBuf, Result<Vec<u8>, String>),
+    /// Something done apart from the app failed (opening a file, say).
+    Failed(String),
     /// A timer the app set went off.
     Timer(Timer),
     /// The terminal was resized.
@@ -161,6 +172,27 @@ pub enum Effect {
     CancelSignIn,
     /// Put the text on the clipboard, through the terminal.
     Copy(String),
+    /// Write a file, then send back [`Msg::FileSaved`]. A file that exists
+    /// is replaced only if `overwrite`.
+    SaveFile {
+        /// Which saving it is.
+        op: FileOp,
+        /// Where.
+        path: std::path::PathBuf,
+        /// What.
+        data: Vec<u8>,
+        /// Whether to replace a file there.
+        overwrite: bool,
+    },
+    /// Open a file (an attachment) in the program the system has for it.
+    OpenFile {
+        /// Its name.
+        name: String,
+        /// Its content.
+        data: Vec<u8>,
+    },
+    /// Read a file, then send back [`Msg::FileRead`].
+    ReadFile(FileOp, std::path::PathBuf),
     /// Edit the text in the user's editor, then send back
     /// [`Msg::Edited`].
     Edit(String),
@@ -196,6 +228,10 @@ pub enum Screen {
     Browser(Browser),
     /// The key bindings of a menu.
     Help(Help),
+    /// A message's attachments.
+    Attachments(AttachMenu),
+    /// Text on its own, such as a text attachment.
+    Text(TextView),
 }
 
 /// Pager state.
@@ -561,6 +597,21 @@ pub struct App {
     last_draft: u64,
     /// How many messages to request per page.
     page_size: u32,
+    /// The attachment being fetched, and what for.
+    fetching: Option<attachments::Fetching>,
+    /// The attachment that failed to be fetched for want of a sign-in,
+    /// and what for: a retry fetches it again.
+    unfetched_attachment: Option<(MessageId, mett_core::Attachment, attachments::Use)>,
+    /// The file being read (to attach) or saved: keys wait for it, as in
+    /// mutt, but `^G` gives up on it.
+    file_wait: Option<(FileOp, std::path::PathBuf)>,
+    /// The last [`FileOp`] given.
+    last_file_op: u64,
+    /// A file not saved because one was there, waiting for the user to say
+    /// whether to replace it.
+    unsaved: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// See [`Settings::home`].
+    home: Option<String>,
     /// See [`Settings::mailboxes`].
     mailboxes: Vec<MailboxEntry>,
     /// What is known of each mailbox's new mail.
@@ -697,6 +748,12 @@ impl App {
             next_request: 0,
             last_draft: 0,
             page_size: settings.page_size,
+            fetching: None,
+            unfetched_attachment: None,
+            file_wait: None,
+            last_file_op: 0,
+            unsaved: None,
+            home: settings.home,
             mailboxes: settings.mailboxes,
             mailbox_state: HashMap::new(),
             sync_interval: settings.sync_interval,
@@ -735,6 +792,9 @@ impl App {
             Screen::Compose(_) => Menu::Compose,
             Screen::Browser(_) => Menu::Browser,
             Screen::Help(_) => Menu::Help,
+            Screen::Attachments(_) => Menu::Attach,
+            // Read like a message.
+            Screen::Text(_) => Menu::Pager,
         }
     }
 
@@ -775,6 +835,12 @@ impl App {
             Msg::Key(key) => self.on_key_press(key),
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
+            Msg::FileSaved(op, outcome) => self.on_file_saved(op, outcome),
+            Msg::FileRead(op, path, result) => self.on_file_read(op, path, result),
+            Msg::Failed(why) => {
+                self.fail(why);
+                Vec::new()
+            }
             Msg::Timer(Timer::RelistSentItems) => {
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
                 if open == Some(mett_core::WellKnownFolder::SentItems) {
@@ -856,7 +922,9 @@ impl App {
         }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
+            Menu::Pager if matches!(self.screen(), Screen::Text(_)) => self.on_text_action(action),
             Menu::Pager => self.on_pager_action(action),
+            Menu::Attach => self.on_attach_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
             Menu::Compose => self.on_compose_action(action),
             Menu::Browser => self.on_browser_action(action),
@@ -1023,6 +1091,8 @@ impl App {
             .chain(self.discarding.keys().copied())
             .chain(self.browser_request())
             .chain(self.switching.as_ref().map(|(id, _)| *id))
+            .chain(self.attachments_request())
+            .chain(self.fetching.as_ref().map(|f| f.request))
             .collect()
     }
 
@@ -1070,6 +1140,7 @@ impl App {
         effects.extend(self.retry_saves());
         effects.extend(self.retry_transfers());
         effects.extend(self.retry_switch());
+        effects.extend(self.retry_attachments());
         // The folders are listed whether or not one is open.
         effects.extend(self.retry_browser());
         if self.folder.is_none() {
@@ -1192,6 +1263,7 @@ impl App {
             Action::Reply => return self.start_compose(Kind::Reply),
             Action::GroupReply => return self.start_compose(Kind::GroupReply),
             Action::Forward => return self.start_compose(Kind::Forward),
+            Action::ViewAttachments => return self.view_attachments(),
             _ => {}
         }
         Vec::new()
@@ -1241,6 +1313,7 @@ impl App {
             Action::Reply => return self.start_compose(Kind::Reply),
             Action::GroupReply => return self.start_compose(Kind::GroupReply),
             Action::Forward => return self.start_compose(Kind::Forward),
+            Action::ViewAttachments => return self.view_attachments(),
             _ => {}
         }
         Vec::new()
@@ -1261,9 +1334,16 @@ impl App {
         // Pagers under other screens too: their rows (and search
         // highlights) must match the width they will be drawn at.
         for screen in &mut self.screens {
-            if let Screen::Pager(pager) = screen {
-                pager.layout(width);
-                pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+            match screen {
+                Screen::Pager(pager) => {
+                    pager.layout(width);
+                    pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+                }
+                Screen::Text(view) => {
+                    view.layout(width);
+                    view.scroll = view.scroll.min(view.rows.len().saturating_sub(height));
+                }
+                _ => {}
             }
         }
         // A taller help screen shows more lines, not empty space.
@@ -1415,6 +1495,8 @@ impl App {
             }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::FoldersListed(result) => return self.on_folders_listed(id, result),
+            Event::AttachmentsListed(result) => return self.on_attachments_listed(id, result),
+            Event::AttachmentFetched(result) => return self.on_attachment_fetched(id, result),
             Event::MailboxesChecked(checked) => return self.on_mailboxes_checked(id, checked),
             Event::StillThere(result) => return self.on_still_there(id, result),
             Event::Transferred(result) => {
@@ -1451,8 +1533,10 @@ impl App {
             Event::Purged(result) => {
                 return self.on_transferred(id, result.map(|results| (None, results)));
             }
-            Event::Sent(result) => return self.on_delivered(id, result),
-            Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
+            Event::Sent(result, kept) => return self.on_delivered(id, result, kept),
+            Event::DraftSaved(result, kept) => {
+                return self.on_delivered(id, result.map(drop), kept);
+            }
             // Without them, the configured ones do.
             Event::OwnAddresses(result) => {
                 if self.addresses_request == Some(id) {
@@ -1869,6 +1953,7 @@ impl App {
 
     pub(super) fn apply_settings(&mut self, settings: Settings) {
         self.page_size = settings.page_size;
+        self.home = settings.home;
         self.alternates = compile_alternates(&settings.compose.alternates);
         self.settings = settings.compose;
         // The configuration doesn't know what the mailbox told.
@@ -2064,7 +2149,12 @@ impl App {
         self.selected = selected;
         // The screen, not the menu: the sign-in window may be over it.
         match self.screen() {
-            Screen::Index | Screen::Compose(_) | Screen::Browser(_) | Screen::Help(_) => Vec::new(),
+            Screen::Index
+            | Screen::Compose(_)
+            | Screen::Browser(_)
+            | Screen::Help(_)
+            | Screen::Attachments(_)
+            | Screen::Text(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()

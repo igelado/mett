@@ -59,6 +59,10 @@ string_id!(
     MessageId
 );
 string_id!(
+    /// An attachment of a message.
+    AttachmentId
+);
+string_id!(
     /// An opaque cursor to the next page of a listing.
     PageCursor
 );

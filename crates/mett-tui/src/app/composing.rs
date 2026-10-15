@@ -85,6 +85,12 @@ pub enum Question {
     Limit,
     /// A mettrc command (`:`).
     Command,
+    /// A file to attach (`a` in the compose menu).
+    AttachFile,
+    /// The file to save an attachment to (`s` in the attachment menu).
+    SaveAttachment,
+    /// Whether to replace a file that is there.
+    Overwrite,
 }
 
 impl Question {
@@ -143,6 +149,33 @@ pub struct Compose {
     /// A failed attempt to send or postpone it may have left a server
     /// draft behind, to delete if the user gives up on it.
     pub(super) left_draft: bool,
+    /// The backend kept a draft from the last attempt, which the next one
+    /// goes on from.
+    pub(super) kept_draft: bool,
+    /// The selected part: its text, the forwarded attachments if there
+    /// are any, then the attached files.
+    pub selected: usize,
+}
+
+impl Compose {
+    /// The compose menu for `draft`, which carries a forwarded message's
+    /// attachments if `forwarded_attachments`.
+    pub fn new(draft: Draft, forwarded_attachments: bool) -> Self {
+        Self {
+            draft,
+            delivery: None,
+            unauthorized: None,
+            forwarded_attachments,
+            left_draft: false,
+            kept_draft: false,
+            selected: 0,
+        }
+    }
+
+    /// How many parts the message has.
+    pub fn parts(&self) -> usize {
+        1 + usize::from(self.forwarded_attachments) + self.draft.attachments.len()
+    }
 }
 
 /// What happens to a finished message.
@@ -482,7 +515,11 @@ impl App {
                 self.unbrowsed = None;
                 self.question_message = None;
             }
-            Question::Search | Question::Limit | Question::Command => {}
+            Question::Search | Question::Limit | Question::Command | Question::AttachFile => {}
+            Question::SaveAttachment => {}
+            Question::Overwrite => {
+                self.unsaved = None;
+            }
             _ => self.composing = None,
         }
         Vec::new()
@@ -497,6 +534,12 @@ impl App {
         }
         if question == Question::Command {
             return self.answer_command(text);
+        }
+        if question == Question::AttachFile {
+            return self.answer_attach_file(text);
+        }
+        if question == Question::SaveAttachment {
+            return self.answer_save_attachment(text);
         }
         let setting_up = self.composing.is_some();
         let Some(draft) = self.draft_mut() else {
@@ -571,6 +614,7 @@ impl App {
                 return self.deliver(Delivery::Send);
             }
             Question::Purge => return self.answer_purge(answer),
+            Question::Overwrite => return self.answer_overwrite(answer),
             Question::AbortNoSubject
             | Question::To
             | Question::Cc
@@ -581,19 +625,24 @@ impl App {
             | Question::CopyTo
             | Question::Search
             | Question::Limit
-            | Question::Command => {}
+            | Question::Command
+            | Question::AttachFile
+            | Question::SaveAttachment => {}
         }
         self.advance()
     }
 
     /// Sends the compose menu's message, asking first whether to keep a
-    /// copy (`copy`). Graph always keeps a copy of replies and forwards, so
-    /// `copy` only applies to new mail.
+    /// copy (`copy`). Graph always keeps a copy of what it sends through a
+    /// server draft (replies, forwards, messages with large attachments),
+    /// so `copy` only applies to other mail.
     fn send_or_ask_copy(&mut self) -> Vec<Effect> {
         let Some(Screen::Compose(compose)) = self.screens.last() else {
             return Vec::new();
         };
-        if compose.draft.origin.is_some() {
+        // A server draft kept from an earlier attempt is what is sent,
+        // even if the message would now go without one.
+        if mett_msgraph::needs_server_draft(&compose.draft) || compose.kept_draft {
             return self.answer(Question::Copy, true);
         }
         let prompt = "Save a copy of this message?".to_owned();
@@ -670,13 +719,10 @@ impl App {
                     .original
                     .as_ref()
                     .is_some_and(|m| m.summary.has_attachments);
-            self.screens.push(Screen::Compose(Compose {
-                draft: composing.draft,
-                delivery: None,
-                unauthorized: None,
+            self.screens.push(Screen::Compose(Compose::new(
+                composing.draft,
                 forwarded_attachments,
-                left_draft: false,
-            }));
+            )));
         }
         Vec::new()
     }
@@ -689,16 +735,19 @@ impl App {
             self.fail("Please wait: the message is still being sent or postponed.");
             return Vec::new();
         }
-        let draft = compose.draft.clone();
+        // What the actions need of the message, without copying its
+        // attachments.
+        let draft = &compose.draft;
+        let (recipients, subject) = (draft.has_recipients(), !draft.subject.is_empty());
         match action {
             Action::SendMessage => {
-                if !draft.has_recipients() {
+                if !recipients {
                     self.fail("No recipients are specified!");
                     return Vec::new();
                 }
                 // As in mutt, a subject left out is checked again when
                 // sending (it may have been cleared in the menu).
-                if draft.subject.is_empty() {
+                if !subject {
                     let prompt = "No subject, abort sending?".to_owned();
                     let quad = self.settings.abort_nosubject;
                     return match self.decide(quad, prompt, Question::AbortSendNoSubject) {
@@ -717,7 +766,7 @@ impl App {
                 }
             }
             Action::PostponeMessage => return self.deliver(Delivery::Postpone),
-            Action::EditMessage => return vec![Effect::Edit(draft.body)],
+            Action::EditMessage => return vec![Effect::Edit(draft.body.clone())],
             Action::EditTo | Action::EditCc | Action::EditBcc | Action::EditSubject => {
                 let question = match action {
                     Action::EditTo => Question::To,
@@ -725,8 +774,19 @@ impl App {
                     Action::EditBcc => Question::Bcc,
                     _ => Question::Subject,
                 };
-                let current = field(&draft, question);
+                let current = field(draft, question);
                 self.ask_line(question, &current);
+            }
+            Action::AttachFile => self.ask_attach_file(),
+            Action::DetachFile => self.detach_file(),
+            Action::NextEntry | Action::PreviousEntry => {
+                if let Some(Screen::Compose(compose)) = self.screens.last_mut() {
+                    compose.selected = if action == Action::NextEntry {
+                        (compose.selected + 1).min(compose.parts() - 1)
+                    } else {
+                        compose.selected.saturating_sub(1)
+                    };
+                }
             }
             _ => {}
         }
@@ -756,6 +816,7 @@ impl App {
         &mut self,
         id: RequestId,
         result: mett_core::Result<()>,
+        kept: bool,
     ) -> Vec<Effect> {
         let Some(position) = self.screens.iter().position(|screen| {
             matches!(screen, Screen::Compose(Compose { delivery: Some((request, _)), .. }) if *request == id)
@@ -767,6 +828,7 @@ impl App {
         };
         let delivery = compose.delivery.take().map(|(_, d)| d);
         compose.unauthorized = None;
+        compose.kept_draft = kept;
         let saved_copy = compose.draft.save_copy;
         match result {
             Ok(()) => {
@@ -810,8 +872,9 @@ impl App {
                 if matches!(e, mett_core::Error::Auth(_)) {
                     compose.unauthorized = delivery;
                 }
-                // Replies and forwards go through a server draft.
-                compose.left_draft |= compose.draft.origin.is_some();
+                // Replies, forwards and messages with large attachments go
+                // through a server draft, as does one the store kept.
+                compose.left_draft |= kept || mett_msgraph::needs_server_draft(&compose.draft);
                 // A lost response doesn't mean nothing happened.
                 let failure = match (delivery, &e) {
                     (Some(Delivery::Send), mett_core::Error::Network(_)) if saved_copy => format!(
@@ -1024,7 +1087,7 @@ mod tests {
 
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert_eq!(app.screen(), &Screen::Index);
         assert_eq!(app.status, "Mail sent.");
@@ -1041,7 +1104,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Backend("bad recipient".into()))),
+            event: Event::Sent(Err(Error::Backend("bad recipient".into())), false),
         }));
         assert_eq!(compose(&app).delivery, None);
         assert_eq!(app.status, "backend error: bad recipient");
@@ -1077,14 +1140,14 @@ mod tests {
         assert!(matches!(request(&effects).1, Request::Send(d) if d.save_copy));
         app.update(Msg::Response(Response {
             id: request(&effects).0,
-            event: Event::Sent(Err(Error::Network("offline".into()))),
+            event: Event::Sent(Err(Error::Network("offline".into())), false),
         }));
 
         let (id, request) = request(&act(&mut app, Action::PostponeMessage));
         assert!(matches!(request, Request::SaveDraft(d) if d.body == "Sure.\n"));
         app.update(Msg::Response(Response {
             id,
-            event: Event::DraftSaved(Ok("d1".into())),
+            event: Event::DraftSaved(Ok("d1".into()), false),
         }));
         assert_eq!(app.status, "Message postponed.");
         assert!(matches!(app.screen(), Screen::Pager(_)));
@@ -1240,7 +1303,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         act(&mut app, Action::Exit);
         let effects = key(&mut app, KeyCode::Char('n'));
@@ -1273,7 +1336,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         act(&mut app, Action::Exit);
         let (id, _) = request(&key(&mut app, KeyCode::Char('n')));
@@ -1309,7 +1372,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         act(&mut app, Action::Exit);
         let (discard, _) = request(&key(&mut app, KeyCode::Char('n')));
@@ -1410,7 +1473,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert!(
             matches!(
@@ -1489,7 +1552,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         let list = effects
             .iter()
@@ -1522,7 +1585,7 @@ mod tests {
         }));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Auth("expired".into()))),
+            event: Event::Sent(Err(Error::Auth("expired".into())), false),
         }));
         let (_, again) = request(&act(&mut app, Action::Retry));
         assert_eq!(again, sent);
@@ -1548,7 +1611,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert!(
             matches!(effects.as_slice(), [Effect::Later(..)]),
@@ -1609,7 +1672,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         assert!(
             app.status.starts_with("The message may have been sent"),
@@ -1628,7 +1691,10 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::NotSent("network error: timed out".into()))),
+            event: Event::Sent(
+                Err(Error::NotSent("network error: timed out".into())),
+                false,
+            ),
         }));
         assert_eq!(
             app.status,
@@ -1650,7 +1716,7 @@ mod tests {
             };
             app.update(Msg::Response(Response {
                 id,
-                event: Event::Sent(Err(Error::Network("timed out".into()))),
+                event: Event::Sent(Err(Error::Network("timed out".into())), false),
             }));
             // Sending the same message again is the same attempt.
             let (id, Request::Send(again)) = request(&act(&mut app, Action::SendMessage)) else {
@@ -1659,7 +1725,7 @@ mod tests {
             assert_eq!(again.attempt, sent.attempt);
             app.update(Msg::Response(Response {
                 id,
-                event: Event::Sent(Ok(())),
+                event: Event::Sent(Ok(()), false),
             }));
             attempts.push(sent.attempt);
         }
@@ -1684,10 +1750,39 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert!(effects.is_empty());
         assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_left_server_draft_is_sent_with_its_copy() {
+        let mut app = app(compose::Settings {
+            copy: Quad::No,
+            ..settings()
+        });
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        // A failed attempt that kept nothing leaves `copy` as it is…
+        let (id, sent) = request(&act(&mut app, Action::SendMessage));
+        assert!(matches!(sent, Request::Send(d) if !d.save_copy));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Auth("expired".into())), false),
+        }));
+        let (id, sent) = request(&act(&mut app, Action::SendMessage));
+        assert!(matches!(sent, Request::Send(d) if !d.save_copy));
+        // …but one that kept a server draft sends that, which Graph keeps
+        // a copy of.
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Network("timed out".into())), true),
+        }));
+        let (_, sent) = request(&act(&mut app, Action::SendMessage));
+        assert!(matches!(sent, Request::Send(d) if d.save_copy));
     }
 
     #[test]
@@ -1716,7 +1811,7 @@ mod tests {
         }));
         app.update(Msg::Response(Response {
             id: send,
-            event: Event::Sent(Err(Error::Auth("expired".into()))),
+            event: Event::Sent(Err(Error::Auth("expired".into())), false),
         }));
         let effects = act(&mut app, Action::Retry);
         let requests: Vec<_> = effects
@@ -1740,7 +1835,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::PostponeMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::DraftSaved(Err(Error::Network("timed out".into()))),
+            event: Event::DraftSaved(Err(Error::Network("timed out".into())), false),
         }));
         assert!(
             app.status.starts_with("The message may have been saved"),
@@ -1762,7 +1857,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         assert!(app.status.contains("without a copy"), "{}", app.status);
     }

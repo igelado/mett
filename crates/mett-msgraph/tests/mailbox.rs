@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{
-    AccessToken, Address, Authenticator, BodyKind, Draft, DraftOrigin, Error, FlagsUpdate,
-    FolderId, MailSender, MailStore, MessageId, Page, PageCursor, WellKnownFolder,
+    AccessToken, Address, AttachmentKind, Authenticator, BodyKind, Draft, DraftOrigin, Error,
+    FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page, PageCursor,
+    WellKnownFolder,
 };
 use mett_msgraph::{AuthSettings, GraphMailStore};
 use serde_json::{Value, json};
 use url::Url;
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Hands out a fixed token.
@@ -1516,4 +1517,379 @@ async fn finds_the_users_own_addresses() {
             "alice@contoso.com",
         ]
     );
+}
+
+#[tokio::test]
+async fn lists_and_fetches_attachments() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments"))
+        .and(query_param(
+            "$expand",
+            "microsoft.graph.itemAttachment/item($select=id)",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "id": "a1", "name": "notes.txt", "contentType": "text/plain",
+                    "size": 5, "isInline": false,
+                },
+                {
+                    "@odata.type": "#microsoft.graph.itemAttachment",
+                    "id": "a2", "name": "Fwd", "size": 900,
+                },
+                {
+                    "@odata.type": "#microsoft.graph.referenceAttachment",
+                    "id": "a3", "name": "link", "contentType": null, "size": 0,
+                },
+                {
+                    "@odata.type": "#microsoft.graph.itemAttachment",
+                    "id": "a4", "name": "Lunch", "size": 300,
+                    "item": { "@odata.type": "#microsoft.graph.event", "id": "e1" },
+                },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments/a1/$value"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let list = store.list_attachments(&MessageId::new("m1")).await.unwrap();
+    let kinds: Vec<_> = list
+        .iter()
+        .map(|a| (a.name.as_str(), a.content_type.as_str(), a.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("notes.txt", "text/plain", AttachmentKind::File),
+            ("Fwd", "message/rfc822", AttachmentKind::Item),
+            ("link", "application/octet-stream", AttachmentKind::Link),
+            ("Lunch", "text/calendar", AttachmentKind::Item),
+        ]
+    );
+    let data = store
+        .fetch_attachment(&MessageId::new("m1"), &list[0].id)
+        .await
+        .unwrap();
+    assert_eq!(data, b"hello");
+}
+
+fn attached(name: &str, size: usize) -> OutgoingAttachment {
+    OutgoingAttachment {
+        name: name.into(),
+        content_type: "application/octet-stream".into(),
+        data: vec![7; size],
+    }
+}
+
+#[tokio::test]
+async fn sends_small_attachments_with_the_message() {
+    let server = MockServer::start().await;
+    let mut message = draft_json();
+    message["attachments"] = json!([{
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": "a.bin",
+        "contentType": "application/octet-stream",
+        "contentBytes": "BwcH",
+    }]);
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/sendMail"))
+        .and(body_json(
+            json!({ "message": message, "saveToSentItems": true }),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut draft = draft(None);
+    draft.attachments.push(attached("a.bin", 3));
+    store(&server).send(&draft).await.unwrap();
+}
+
+#[tokio::test]
+async fn uploads_large_attachments_without_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "uploadUrl": format!("{}/upload/session", server.uri()),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The upload URL carries its own authorisation.
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(418))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .and(header("content-range", "bytes 3276800-3999999/4000000"))
+        .and(header("content-type", "application/octet-stream"))
+        .respond_with(ResponseTemplate::new(201).insert_header(
+            "Location",
+            "https://x/api/v2.0/Users('u')/Messages('d1')/Attachments('att')",
+        ))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut draft = draft(None);
+    draft.attachments.push(attached("big.bin", 4_000_000));
+    store(&server).send(&draft).await.unwrap();
+}
+
+#[tokio::test]
+async fn follows_every_page_of_attachments() {
+    let server = MockServer::start().await;
+    let next = format!(
+        "{}/v1.0/me/messages/m1/attachments?$skiptoken=2",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments"))
+        .and(query_param("$skiptoken", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a2", "name": "two", "size": 1 }],
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a1", "name": "one", "size": 1 }],
+            "@odata.nextLink": next,
+        })))
+        .mount(&server)
+        .await;
+    let names: Vec<String> = store(&server)
+        .list_attachments(&MessageId::new("m1"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
+    assert_eq!(names, ["one", "two"]);
+}
+
+#[tokio::test]
+async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createForward"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    // The forward carries the original's attachment along.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "carried", "name": "original.pdf", "size": 1 }],
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // The first upload's answer is lost: it was attached as "lost".
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let mut forward = draft(Some(DraftOrigin::Forward(MessageId::new("orig"))));
+    forward.attachments.push(attached("a.bin", 3));
+    let store = store(&server);
+    assert!(matches!(store.send(&forward).await, Err(Error::NotSent(_))));
+
+    // The retry finds it there, takes it off, and attaches the file again,
+    // leaving the forwarded one.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "carried", "name": "original.pdf", "size": 1 },
+                { "id": "lost", "name": "a.bin", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/lost"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "again" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store.send(&forward).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_retry_without_files_takes_off_those_attached_before() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "a1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The send's answer is lost.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let mut reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    reply.attachments.push(attached("a.bin", 3));
+    let store = store(&server);
+    assert!(store.send(&reply).await.is_err());
+
+    // The file is taken off the message: the retry takes it off the draft.
+    reply.attachments.clear();
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a1", "name": "a.bin", "size": 3 }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/a1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store.send(&reply).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_kept_draft_is_sent_once_its_large_files_are_taken_off() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The upload's outcome is unknown: the draft is kept.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let mut message = draft(None);
+    message.attachments.push(attached("big.bin", 4_000_000));
+    let store = store(&server);
+    assert!(store.send(&message).await.is_err());
+
+    // Small enough to go inline now, but the kept draft is what is sent.
+    message.attachments.clear();
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/sendMail"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+}
+
+#[test]
+fn escaped_text_counts_towards_the_request_size() {
+    let mut message = draft(None);
+    message.attachments.push(attached("a.bin", 1_000_000));
+    message.body = "\\".repeat(1_500_000);
+    assert!(mett_msgraph::needs_server_draft(&message));
+}
+
+#[test]
+fn a_long_body_counts_towards_the_request_size() {
+    let mut message = draft(None);
+    message.attachments.push(attached("a.bin", 2_400_000));
+    assert!(!mett_msgraph::needs_server_draft(&message));
+    message.body = "x".repeat(1_000_000);
+    assert!(mett_msgraph::needs_server_draft(&message));
 }

@@ -235,7 +235,10 @@ Questions on the message line (`To:`, `Postpone this message?`) are not
 screens: they sit over the current screen, as `App::input`, and take keys
 as typed rather than through the key bindings. Writing a message is a
 short sequence of such questions (`app/composing.rs`), then the external
-editor, then the compose screen. The editor is an `Effect`: the main loop
+editor, then the compose screen. Files are `Effect`s too
+(saving an attachment, reading one to attach, opening one in the program
+the system has for it): the main loop does them and sends back a `Msg`.
+The editor is an `Effect`: the main loop
 hands the terminal over to it, pausing the thread that reads input, and
 sends the edited text back as a `Msg`, so the app itself does no I/O.
 

@@ -4,14 +4,16 @@
 //! can be tested against [`MemoryStore`] without a network connection.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
+use crate::attachment::{Attachment, AttachmentKind};
 use crate::draft::{Draft, DraftOrigin};
 use crate::error::{Error, Result};
 use crate::folder::{Folder, WellKnownFolder};
-use crate::ids::{FolderId, MessageId, PageCursor};
+use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor};
 use crate::message::{Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary};
 use crate::ports::{MailSender, MailStore, MessagePage, Page};
 
@@ -29,6 +31,8 @@ struct State {
     messages: Vec<Message>,
     moves: u64,
     sent: Vec<Draft>,
+    /// Each message's attachments, with their content.
+    attachments: HashMap<MessageId, Vec<(Attachment, Vec<u8>)>>,
 }
 
 impl MemoryStore {
@@ -53,6 +57,35 @@ impl MemoryStore {
     pub fn deliver(&self, mut message: Message, modified: DateTime<Utc>) {
         message.summary.modified = Some(modified);
         self.state().messages.push(message);
+    }
+
+    /// Attaches a file to the message `message`.
+    pub fn with_attachment(
+        self,
+        message: &str,
+        name: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> Self {
+        let mut state = self.state();
+        let list = state
+            .attachments
+            .entry(MessageId::new(message))
+            .or_default();
+        let attachment = Attachment {
+            id: AttachmentId::new(format!("{message}-a{}", list.len())),
+            name: name.to_owned(),
+            content_type: content_type.to_owned(),
+            size: data.len() as u64,
+            inline: false,
+            kind: AttachmentKind::File,
+        };
+        list.push((attachment, data.to_vec()));
+        if let Ok(message) = state.message_mut(&MessageId::new(message)) {
+            message.summary.has_attachments = true;
+        }
+        drop(state);
+        self
     }
 
     /// The drafts sent so far, oldest first.
@@ -115,13 +148,29 @@ impl State {
         let id = self.fresh_id(&MessageId::new(which.as_str()));
         // A forward carries the original's attachments along, as Graph's
         // createForward does.
-        let has_attachments = match &draft.origin {
-            Some(DraftOrigin::Forward(original)) => self
-                .messages
-                .iter()
-                .any(|m| &m.summary.id == original && m.summary.has_attachments),
-            _ => false,
+        let mut attachments: Vec<(Attachment, Vec<u8>)> = match &draft.origin {
+            Some(DraftOrigin::Forward(original)) => {
+                self.attachments.get(original).cloned().unwrap_or_default()
+            }
+            _ => Vec::new(),
         };
+        let forwarded = matches!(&draft.origin, Some(DraftOrigin::Forward(original))
+            if self.messages.iter().any(|m| &m.summary.id == original && m.summary.has_attachments));
+        for file in &draft.attachments {
+            let attachment = Attachment {
+                id: AttachmentId::new(format!("{id}-a{}", attachments.len())),
+                name: file.name.clone(),
+                content_type: file.content_type.clone(),
+                size: file.data.len() as u64,
+                inline: false,
+                kind: AttachmentKind::File,
+            };
+            attachments.push((attachment, file.data.clone()));
+        }
+        let has_attachments = forwarded || !attachments.is_empty();
+        if !attachments.is_empty() {
+            self.attachments.insert(id.clone(), attachments);
+        }
         self.messages.push(Message {
             summary: MessageSummary {
                 id: id.clone(),
@@ -264,6 +313,30 @@ impl MailStore for MemoryStore {
         self.state().message_mut(id).map(|m| m.clone())
     }
 
+    async fn list_attachments(&self, message: &MessageId) -> Result<Vec<Attachment>> {
+        let mut state = self.state();
+        state.message_mut(message)?;
+        Ok(state
+            .attachments
+            .get(message)
+            .map(|list| list.iter().map(|(a, _)| a.clone()).collect())
+            .unwrap_or_default())
+    }
+
+    async fn fetch_attachment(
+        &self,
+        message: &MessageId,
+        attachment: &AttachmentId,
+    ) -> Result<Vec<u8>> {
+        let state = self.state();
+        state
+            .attachments
+            .get(message)
+            .and_then(|list| list.iter().find(|(a, _)| &a.id == attachment))
+            .map(|(_, data)| data.clone())
+            .ok_or_else(|| Error::not_found("attachment", attachment))
+    }
+
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
         let mut state = self.state();
         let summary = &mut state.message_mut(id)?.summary;
@@ -281,6 +354,9 @@ impl MailStore for MemoryStore {
         message.summary.id = new_id.clone();
         message.summary.folder = to.clone();
         message.summary.modified = Some(Utc::now());
+        if let Some(attachments) = state.attachments.remove(id) {
+            state.attachments.insert(new_id.clone(), attachments);
+        }
         Ok(new_id)
     }
 
@@ -291,6 +367,11 @@ impl MailStore for MemoryStore {
         copy.summary.id = state.fresh_id(id);
         copy.summary.folder = to.clone();
         copy.summary.modified = Some(Utc::now());
+        if let Some(attachments) = state.attachments.get(id).cloned() {
+            state
+                .attachments
+                .insert(copy.summary.id.clone(), attachments);
+        }
         let new_id = copy.summary.id.clone();
         state.messages.push(copy);
         Ok(new_id)
@@ -303,6 +384,7 @@ impl MailStore for MemoryStore {
         if state.messages.len() == before {
             return Err(Error::not_found("message", id));
         }
+        state.attachments.remove(id);
         Ok(())
     }
 
@@ -663,6 +745,27 @@ mod tests {
 
     fn mock_message_at(subject: &str, received: DateTime<Utc>) -> Message {
         message(subject, "in", subject, received)
+    }
+
+    #[tokio::test]
+    async fn keeps_attachments_with_their_messages() {
+        let store = store().with_attachment("m1", "a.txt", "text/plain", b"hello");
+        let list = store.list_attachments(&MessageId::new("m1")).await.unwrap();
+        assert_eq!(list[0].name, "a.txt");
+        assert_eq!(list[0].size, 5);
+        let moved = store
+            .move_message(&MessageId::new("m1"), &FolderId::new("arc"))
+            .await
+            .unwrap();
+        let data = store.fetch_attachment(&moved, &list[0].id).await.unwrap();
+        assert_eq!(data, b"hello");
+        assert!(
+            store
+                .list_attachments(&MessageId::new("m2"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -46,6 +46,19 @@ impl App {
     pub(super) fn on_key_press(&mut self, event: KeyEvent) -> Vec<Effect> {
         // Ctrl-J is a newline: it does what Enter does, unless bound.
         let ctrl_j = Key::from(event) == Key::ctrl('j');
+        // Keys wait for a file being read or saved; `^G` gives up on it.
+        if let Some((_, path)) = &self.file_wait
+            && self.sign_in.is_none()
+        {
+            let key = Key::from(event);
+            if key == Key::ctrl('g') || key == Key::new(KeyCode::Esc) {
+                self.status = format!("Not waiting for {} any more.", path.display());
+                self.file_wait = None;
+            } else {
+                self.status = format!("Waiting for {} (^G gives up)...", path.display());
+            }
+            return Vec::new();
+        }
         if self.input.is_some() && self.sign_in.is_none() {
             // A question took over: an Escape before it is forgotten.
             self.escape = None;
@@ -213,6 +226,11 @@ impl App {
             || self.listing.is_some()
             || loading_pager
             || self.browser_request().is_some()
+            // Attachments being listed, or one fetched to show or save.
+            || self.attachments_request().is_some()
+            || self.fetching.is_some()
+            // A file being read or saved.
+            || self.file_wait.is_some()
             || self.delivering()
             // A move or purge decides what the next keys act on (and the
             // mailbox refuses to touch a message on its way).
@@ -838,7 +856,9 @@ mod tests {
             )),
             unauthorized: None,
             forwarded_attachments: false,
+            selected: 0,
             left_draft: false,
+            kept_draft: false,
         }));
         app.update(Msg::Action(Action::Help));
         assert!(matches!(app.screen(), Screen::Compose(_)));

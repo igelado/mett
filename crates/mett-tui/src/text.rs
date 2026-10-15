@@ -53,7 +53,6 @@ pub fn header_lines(message: &Message, bcc: bool) -> Vec<String> {
 }
 
 /// Wraps every line to `width` terminal cells.
-#[cfg(test)]
 pub fn wrap_all(lines: &[String], width: usize) -> Vec<String> {
     lines.iter().flat_map(|line| wrap(line, width)).collect()
 }

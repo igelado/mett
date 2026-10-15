@@ -324,6 +324,7 @@ fn settings_keeping(
         ascii: config.flag("ascii_chars"),
     };
     Ok(Settings {
+        home: config.home().map(str::to_owned),
         page_size,
         mailboxes,
         display,
@@ -373,10 +374,12 @@ fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     store: Arc<S>,
     session: Session,
 ) -> ExitCode {
+    remove_viewed_before();
     // `init` also restores the terminal if mett panics.
     let terminal = ratatui::init();
     let result = runtime.block_on(run(terminal, store, session));
     ratatui::restore();
+    wait_for_saves();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -409,6 +412,9 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
 
     let (input, mut input_rx) = Input::start();
     let (timer_tx, mut timer_rx) = mpsc::unbounded_channel();
+    // What reading, saving and opening files (on threads of their own)
+    // has to say.
+    let (file_tx, mut file_rx) = mpsc::unbounded_channel();
 
     // `:` commands run on their own thread, one at a time: `source` and
     // backticks may take a while, and the UI doesn't wait for them.
@@ -424,9 +430,30 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     // Played once the folder is listed, so that `push <last-entry>` has
     // somewhere to go.
     app.push_after_load(pushed);
-    let mut deferred = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+    let mut deferred = dispatch(
+        &mut app,
+        &request_tx,
+        &timer_tx,
+        &file_tx,
+        cancel.as_ref(),
+        effects,
+    );
 
     while !app.quit {
+        // What effects done at once answered goes to the app first.
+        while !deferred.msgs.is_empty() {
+            for msg in std::mem::take(&mut deferred.msgs) {
+                let effects = app.update(msg);
+                deferred.absorb(dispatch(
+                    &mut app,
+                    &request_tx,
+                    &timer_tx,
+                    &file_tx,
+                    cancel.as_ref(),
+                    effects,
+                ));
+            }
+        }
         // The editor runs between messages, with the terminal handed over.
         commands.queue.extend(deferred.commands.drain(..));
         while let Some(text) = deferred.edit.take() {
@@ -442,6 +469,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 &mut app,
                 &request_tx,
                 &timer_tx,
+                &file_tx,
                 cancel.as_ref(),
                 effects,
             ));
@@ -492,6 +520,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 Some(response) = response_rx.recv() => Msg::Response(response),
                 Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
                 Some(timer) = timer_rx.recv() => Msg::Timer(timer),
+                Some(msg) = file_rx.recv() => msg,
                 done = async { running.as_mut().expect("checked").await }, if running.is_some() => {
                     running = None;
                     let (configuration, reconfigured) =
@@ -513,6 +542,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             &mut app,
             &request_tx,
             &timer_tx,
+            &file_tx,
             cancel.as_ref(),
             effects,
         ));
@@ -534,7 +564,14 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             continue;
         }
         let effects = app.update(Msg::SignIn(event));
-        dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+        dispatch(
+            &mut app,
+            &request_tx,
+            &timer_tx,
+            &file_tx,
+            cancel.as_ref(),
+            effects,
+        );
     }
     let unsaved = !app.save_failures().is_empty();
     if app.saving() || (unsaved && app.sign_in.is_some()) {
@@ -546,12 +583,26 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             // save can be retried even after nothing is left pending.
             while let Ok(event) = sign_in_rx.try_recv() {
                 let effects = app.update(Msg::SignIn(event));
-                dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+                dispatch(
+                    &mut app,
+                    &request_tx,
+                    &timer_tx,
+                    &file_tx,
+                    cancel.as_ref(),
+                    effects,
+                );
             }
             // A macro run in the sign-in window plays there.
             while let Some(msg) = app.next_sign_in_stroke() {
                 let effects = app.update(msg);
-                dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+                dispatch(
+                    &mut app,
+                    &request_tx,
+                    &timer_tx,
+                    &file_tx,
+                    cancel.as_ref(),
+                    effects,
+                );
             }
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
@@ -583,8 +634,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                         if matches!(
                             response.event,
                             worker::Event::FlagsUpdated(_)
-                                | worker::Event::Sent(_)
-                                | worker::Event::DraftSaved(_)
+                                | worker::Event::Sent(..)
+                                | worker::Event::DraftSaved(..)
                                 | worker::Event::KeptDiscarded(_)
                                 | worker::Event::Transferred(_)
                                 | worker::Event::Purged(_)
@@ -603,7 +654,14 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
             // Nothing is edited, nor configured, any more.
-            let _ = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+            let _ = dispatch(
+                &mut app,
+                &request_tx,
+                &timer_tx,
+                &file_tx,
+                cancel.as_ref(),
+                effects,
+            );
             // The wait starts again once the user is done signing in.
             if window_was_open || app.sign_in.is_some() {
                 deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
@@ -671,6 +729,8 @@ struct Deferred {
     edit: Option<String>,
     /// `:` commands, which need the configuration.
     commands: Vec<String>,
+    /// What effects done at once answered, for the app.
+    msgs: Vec<Msg>,
 }
 
 impl Deferred {
@@ -679,6 +739,212 @@ impl Deferred {
             self.edit = other.edit;
         }
         self.commands.extend(other.commands);
+        self.msgs.extend(other.msgs);
+    }
+}
+
+/// The largest file Office365 takes as an attachment.
+const MAX_ATTACHMENT: u64 = 150 * 1024 * 1024;
+
+/// Reads a file to attach, stopping past [`MAX_ATTACHMENT`]: one larger
+/// (or without end, such as `/dev/zero`) can't be sent.
+fn read_attachment(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut data = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_ATTACHMENT + 1).read_to_end(&mut data))
+        .map_err(|e| e.to_string())?;
+    if data.len() as u64 > MAX_ATTACHMENT {
+        return Err(format!(
+            "larger than {} MB, which Office365 doesn't take",
+            MAX_ATTACHMENT / 1024 / 1024
+        ));
+    }
+    Ok(data)
+}
+
+/// How many files are being saved, or written for a viewer and opened:
+/// mett waits for them before exiting, so none is left half written (nor
+/// a viewer without its file).
+static SAVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Waits (a while) for the files being saved.
+fn wait_for_saves() {
+    // However long it takes: cut short, a file would be left half written.
+    while SAVING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Writes `data` to `path`; a file there is replaced only if `overwrite`,
+/// and only once the new one is written in full.
+fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::FileOutcome {
+    let written = if overwrite {
+        replace_file(&path, &data)
+    } else {
+        write_new_file(&path, &data)
+    };
+    match written {
+        Ok(()) => app::FileOutcome::Done(path),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            app::FileOutcome::Exists(path, data)
+        }
+        Err(e) => {
+            let why = format!("{}: {e}", path.display());
+            app::FileOutcome::Failed(path, why)
+        }
+    }
+}
+
+/// Writes `data` to a new file at `path`, which is removed again if that
+/// fails partway.
+fn write_new_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    write_new(path, data, None)
+}
+
+/// [`write_new_file`], with `permissions` given to the file before
+/// anything is written to it (it is private until then).
+fn write_new(
+    path: &std::path::Path,
+    data: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if permissions.is_some() {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let written = permissions
+        .map_or(Ok(()), |permissions| file.set_permissions(permissions))
+        .and_then(|()| file.write_all(data));
+    written.inspect_err(|_| {
+        let _ = std::fs::remove_file(path);
+    })
+}
+
+/// Writes `data` beside `path`, then puts it in its place: a failure
+/// leaves the file there as it was.
+fn replace_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    // A link is followed: the file it names is what is replaced.
+    let resolved = std::fs::canonicalize(path)?;
+    let path = resolved.as_path();
+    static WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("not a file name"))?;
+    let count = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_file_name(format!(
+        ".{}.mett-{}-{count}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    // The file keeps its permissions, from the start: a private one is
+    // never readable by others meanwhile.
+    let permissions = std::fs::metadata(path)?.permissions();
+    write_new(&temporary, data, Some(permissions))?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
+}
+
+/// Writes an attachment to a directory of its own, readable only by the
+/// user, and opens it with the program the system has for it.
+fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
+    static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    // A name no earlier run left behind: the process, the time, and a
+    // count, tried again if taken all the same.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = loop {
+        let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mett-{}-{started}-{n}", std::process::id()));
+        match builder.create(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    // Taken away by a later run of mett, once old (a viewer it was given
+    // to may still need it after mett exits), or now if it can't be
+    // opened.
+    let path = dir.join(name);
+    let opened = std::fs::write(&path, data).and_then(|()| open::that_detached(&path));
+    if opened.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    opened
+}
+
+/// How old a copy of an attachment given to a viewer has to be to be
+/// taken away: mett can't tell when the viewer is done with it.
+const VIEWED_LEFT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// How long another mett may keep a viewer's copy, where mett can't tell
+/// whether it still runs.
+const VIEWED_KEPT: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Whether process `pid`, which made a copy `age` ago, may still be
+/// running (another mett, whose viewers still use their copies). Without
+/// `/proc` to tell, one made in the last week may be.
+fn running(pid: &str, age: std::time::Duration) -> bool {
+    let proc = std::path::Path::new("/proc");
+    if proc.is_dir() {
+        proc.join(pid).exists()
+    } else {
+        age < VIEWED_KEPT
+    }
+}
+
+/// Removes the copies of attachments that earlier runs left for their
+/// viewers, once they are old (named `mett-PID-NANOS-N`, by when).
+fn remove_viewed_before() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("mett-")) else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.split('-').collect();
+        let [pid, started, count] = parts.as_slice() else {
+            continue;
+        };
+        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let Ok(started) = started.parse::<u128>() else {
+            continue;
+        };
+        if numeric(pid)
+            && numeric(count)
+            && now.saturating_sub(started) > VIEWED_LEFT.as_nanos()
+            && !running(
+                pid,
+                std::time::Duration::from_nanos(
+                    u64::try_from(now.saturating_sub(started)).unwrap_or(u64::MAX),
+                ),
+            )
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 
@@ -793,6 +1059,7 @@ fn dispatch(
     app: &mut App,
     requests: &mpsc::UnboundedSender<(RequestId, Request)>,
     timers: &mpsc::UnboundedSender<app::Timer>,
+    files: &mpsc::UnboundedSender<app::Msg>,
     cancel: Option<&CancelHandle>,
     effects: Vec<Effect>,
 ) -> Deferred {
@@ -821,6 +1088,40 @@ fn dispatch(
                 }
             }
             Effect::Edit(text) => deferred.edit = Some(text),
+            // Files are read and written on threads of their own: a slow
+            // disk (or a FIFO) doesn't hold up the screen, nor quitting.
+            Effect::SaveFile {
+                op,
+                path,
+                data,
+                overwrite,
+            } => {
+                let files = files.clone();
+                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let saved = save_file(path, data, overwrite);
+                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = files.send(app::Msg::FileSaved(op, saved));
+                });
+            }
+            Effect::OpenFile { name, data } => {
+                let files = files.clone();
+                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let opened = open_file(&name, &data);
+                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Err(e) = opened {
+                        let _ = files.send(app::Msg::Failed(format!("Could not open {name}: {e}")));
+                    }
+                });
+            }
+            Effect::ReadFile(op, path) => {
+                let files = files.clone();
+                std::thread::spawn(move || {
+                    let read = read_attachment(&path);
+                    let _ = files.send(app::Msg::FileRead(op, path, read));
+                });
+            }
             Effect::Command(command) => deferred.commands.push(command),
             Effect::Later(after, timer) => {
                 let timers = timers.clone();
@@ -938,6 +1239,51 @@ fn discard_pending_input() {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn attachments_stop_at_what_office365_takes() {
+        let read = read_attachment(std::path::Path::new("/dev/zero"));
+        assert!(read.is_err_and(|e| e.contains("150 MB")));
+    }
+
+    #[test]
+    fn replacing_a_file_keeps_it_until_the_new_one_is_written() {
+        let dir = std::env::temp_dir().join(format!("mett-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "old").unwrap();
+        assert!(matches!(
+            save_file(path.clone(), b"new".to_vec(), false),
+            app::FileOutcome::Exists(..)
+        ));
+        assert!(matches!(
+            save_file(path.clone(), b"new".to_vec(), true),
+            app::FileOutcome::Done(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            save_file(path.clone(), b"newer".to_vec(), true);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Through a link, the file it names is replaced, and the link stays.
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.txt");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            save_file(link.clone(), b"linked".to_vec(), true);
+            assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "linked");
+            std::fs::remove_file(&link).unwrap();
+        }
+        // Nothing left beside it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use super::*;
 
     #[test]
@@ -1047,6 +1393,26 @@ mod tests {
             "set signature=/nonexistent/mett/other",
         );
         assert!(reset.settings.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn saving_a_file_replaces_one_there_only_when_asked() {
+        let dir = std::env::temp_dir().join(format!("mett-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            save_file(path.clone(), b"one".to_vec(), false),
+            app::FileOutcome::Done(path.clone())
+        );
+        assert_eq!(
+            save_file(path.clone(), b"two".to_vec(), false),
+            app::FileOutcome::Exists(path.clone(), b"two".to_vec())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        save_file(path.clone(), b"two".to_vec(), true);
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

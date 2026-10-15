@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
-    AccessToken, Address, Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags,
-    FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder,
+    AccessToken, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body, BodyKind,
+    Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
+    Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor,
+    RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -48,12 +49,35 @@ pub struct GraphMailStore<A> {
     roles: Mutex<Option<Arc<Roles>>>,
     /// The hidden root folder's ID, once looked up on its own.
     root: Mutex<Option<Option<FolderId>>>,
-    /// Reply and forward drafts kept on the server after a send or update
+    /// Server drafts kept after a send or update
     /// whose outcome is unknown, by what they answer and the composed
     /// message they hold ([`Draft::attempt`]): sending or postponing that
     /// message again updates the draft rather than making another.
-    kept: Mutex<HashMap<(DraftOrigin, u64), MessageId>>,
+    kept: Mutex<HashMap<(Option<DraftOrigin>, u64), Kept>>,
 }
+
+/// A server draft kept after an attempt whose outcome is unknown.
+#[derive(Clone, Debug)]
+struct Kept {
+    id: MessageId,
+    /// The attachments the draft had before mett attached any (what a
+    /// forward carries along), once known: the others come off before
+    /// attaching again, even those whose upload's answer was lost.
+    base: Option<Vec<String>>,
+}
+
+/// A new message whose request (with its attachments in base64) comes to
+/// at most this size is sent or saved in one; Graph takes requests of up
+/// to 4 MB, and this leaves room for the rest of the request.
+const INLINE_REQUEST: usize = 3_500_000;
+
+/// Attachments up to this size are added in one request; larger ones go up
+/// in pieces through an upload session, as Graph requires.
+const SMALL_ATTACHMENT: usize = 3_000_000;
+
+/// The size of each piece of an upload: a multiple of 320 KiB, as Graph
+/// requires.
+const UPLOAD_CHUNK: usize = 10 * 320 * 1024;
 
 /// Which folders play special roles. Folder IDs don't change, so this is
 /// looked up once.
@@ -605,20 +629,69 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
-        match &draft.origin {
-            // A plain draft is created with its content in one request.
-            None => {
-                let url = self.url(&["me", "messages"]);
-                let created: IdOnly = self
-                    .json(
-                        self.request(Method::POST, url).json(&message_json(draft)),
-                        About::MAILBOX,
-                    )
-                    .await?;
-                Ok(MessageId::new(created.id))
-            }
-            Some(origin) => self.answer(origin, draft).await,
+        if needs_server_draft(draft) || self.has_kept(draft) {
+            return self.server_draft(draft).await;
         }
+        // A plain draft is created with its content in one request.
+        let url = self.url(&["me", "messages"]);
+        let created: IdOnly = self
+            .json(
+                self.request(Method::POST, url)
+                    .json(&message_json(draft, true)),
+                About::MAILBOX,
+            )
+            .await?;
+        Ok(MessageId::new(created.id))
+    }
+
+    async fn list_attachments(&self, message: &MessageId) -> Result<Vec<Attachment>> {
+        let mut url = self.url(&["me", "messages", message.as_str(), "attachments"]);
+        url.query_pairs_mut()
+            .append_pair("$select", "id,name,contentType,size,isInline")
+            // What an attached item is (a message, an event, a contact),
+            // when Graph gives no content type for it.
+            .append_pair("$expand", "microsoft.graph.itemAttachment/item($select=id)");
+        let mut attachments = Vec::new();
+        loop {
+            let page: Collection<GraphAttachment> = self
+                .json(
+                    self.request(Method::GET, url),
+                    About::message(message.as_str()),
+                )
+                .await?;
+            attachments.extend(page.value.into_iter().map(GraphAttachment::into_attachment));
+            match page.next_link {
+                Some(next) => url = self.next_page_url(&next)?,
+                None => return Ok(attachments),
+            }
+        }
+    }
+
+    async fn fetch_attachment(
+        &self,
+        message: &MessageId,
+        attachment: &AttachmentId,
+    ) -> Result<Vec<u8>> {
+        // A file's bytes, or an attached message as MIME.
+        let url = self.url(&[
+            "me",
+            "messages",
+            message.as_str(),
+            "attachments",
+            attachment.as_str(),
+            "$value",
+        ]);
+        let response = self
+            .send(
+                self.request(Method::GET, url),
+                About::message(message.as_str()),
+            )
+            .await?;
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| Error::Network(e.to_string()))
     }
 }
 
@@ -688,23 +761,30 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         self.discard_kept_draft(draft).await
     }
 
+    fn keeps_draft(&self, draft: &Draft) -> bool {
+        self.has_kept(draft)
+    }
+
     async fn send(&self, draft: &Draft) -> Result<()> {
-        let Some(origin) = &draft.origin else {
+        // A server draft kept from an earlier attempt is sent, not left
+        // behind.
+        if !needs_server_draft(draft) && !self.has_kept(draft) {
             let url = self.url(&["me", "sendMail"]);
             let body = json!({
-                "message": message_json(draft),
+                "message": message_json(draft, true),
                 "saveToSentItems": draft.save_copy,
             });
             return self
                 .hand_over(self.request(Method::POST, url).json(&body), About::MAILBOX)
                 .await;
-        };
-        // Replies and forwards go through a server draft, so that Graph
-        // threads them under the original and keeps a forwarded message's
-        // attachments. Sending a draft always keeps a copy in Sent Items.
+        }
+        // Replies, forwards and messages with large attachments go through
+        // a server draft, so that Graph threads them under the original,
+        // keeps a forwarded message's attachments, and takes large files in
+        // pieces. Sending a draft always keeps a copy in Sent Items.
         // Failing before the send request leaves nothing sent, whatever
         // became of the draft.
-        let id = self.answer(origin, draft).await.map_err(unsent)?;
+        let (id, base) = self.server_draft_kept(draft).await.map_err(unsent)?;
         let url = self.url(&["me", "messages", id.as_str(), "send"]);
         let sent = self
             .hand_over(self.request(Method::POST, url), About::message(id.as_str()))
@@ -714,7 +794,7 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
             // gone out anyway. Keep the draft, so nothing is lost if it
             // didn't, and say so; sending again reuses it.
             Err(Error::Network(e)) => {
-                self.keep(origin, draft, id);
+                self.keep(draft, id, base);
                 return Err(Error::Network(format!(
                     "{e}; if it wasn't sent, it is in Drafts"
                 )));
@@ -723,7 +803,7 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
             // deleted either is kept, for the next attempt.
             Err(_) => {
                 if !self.discard(&id).await {
-                    self.keep(origin, draft, id);
+                    self.keep(draft, id, base);
                 }
             }
             Ok(_) => {}
@@ -733,63 +813,235 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
 }
 
 impl<A: Authenticator> GraphMailStore<A> {
-    /// Creates a server draft that replies to or forwards the original, with
-    /// `draft`'s content, and returns its ID.
-    async fn answer(&self, origin: &DraftOrigin, draft: &Draft) -> Result<MessageId> {
-        let (original, action) = match origin {
-            DraftOrigin::Reply(id) => (id, "createReply"),
-            DraftOrigin::Forward(id) => (id, "createForward"),
-        };
-        // A draft kept after an earlier attempt gets the new content; if it
-        // is gone (it was sent after all, or deleted), a new one is made.
-        let key = (origin.clone(), draft.attempt);
+    /// Creates a server draft with `draft`'s content and attachments, which
+    /// replies to or forwards the original if it does, and returns its ID.
+    async fn server_draft(&self, draft: &Draft) -> Result<MessageId> {
+        self.server_draft_kept(draft).await.map(|(id, _)| id)
+    }
+
+    /// [`Self::server_draft`], with what to keep of it should sending it
+    /// fail.
+    async fn server_draft_kept(&self, draft: &Draft) -> Result<(MessageId, Option<Vec<String>>)> {
+        // A draft kept after an earlier attempt gets the new content (and
+        // its attachments again); if it is gone (it was sent after all, or
+        // deleted), a new one is made.
+        let key = (draft.origin.clone(), draft.attempt);
         let kept = self.kept.lock().expect("lock").remove(&key);
-        if let Some(id) = kept {
+        if let Some(Kept { id, base }) = kept {
             match self.update_draft(&id, draft).await {
-                Ok(()) => return Ok(id),
+                Ok(()) => return self.attach_all(draft, id, base, false).await,
                 Err(Error::NotFound { .. }) => {}
                 Err(e) => {
-                    self.keep(origin, draft, id);
+                    self.keep(draft, id, base);
                     return Err(e);
                 }
             }
         }
-        let url = self.url(&["me", "messages", original.as_str(), action]);
         // A lost response may still have made a draft, which mett can't
         // tell apart from others: say so. Failing before the request is
         // made leaves nothing.
-        let created: IdOnly = self
-            .json_with(
-                self.request(Method::POST, url),
-                About::message(original.as_str()),
-                unsent,
-            )
-            .await
-            .map_err(|e| match e {
-                Error::Network(e) => {
-                    Error::Network(format!("{e}; a draft of it may be left in Drafts"))
-                }
-                e => e,
-            })?;
+        let (request, about) = match &draft.origin {
+            Some(origin) => {
+                let (original, action) = match origin {
+                    DraftOrigin::Reply(id) => (id, "createReply"),
+                    DraftOrigin::Forward(id) => (id, "createForward"),
+                };
+                let url = self.url(&["me", "messages", original.as_str(), action]);
+                (
+                    self.request(Method::POST, url),
+                    About::message(original.as_str()),
+                )
+            }
+            None => {
+                let url = self.url(&["me", "messages"]);
+                (
+                    self.request(Method::POST, url)
+                        .json(&message_json(draft, false)),
+                    About::MAILBOX,
+                )
+            }
+        };
+        let created: IdOnly =
+            self.json_with(request, about, unsent)
+                .await
+                .map_err(|e| match e {
+                    Error::Network(e) => {
+                        Error::Network(format!("{e}; a draft of it may be left in Drafts"))
+                    }
+                    e => e,
+                })?;
         let id = MessageId::new(created.id);
         // Replace what Graph filled in (recipients, a quoted HTML body) with
         // what the user wrote.
-        match self.update_draft(&id, draft).await {
-            Ok(()) => Ok(id),
-            // The update may have been made: keep the draft, for the next
+        let updated = match draft.origin {
+            Some(_) => self.update_draft(&id, draft).await,
+            None => Ok(()),
+        };
+        match updated {
+            Ok(()) => self.attach_all(draft, id, None, true).await,
+            Err(e) => Err(self.give_up(draft, id, None, e).await),
+        }
+    }
+
+    /// Gives the server draft `id` `draft`'s attachments: what it has
+    /// beyond `base` (an earlier attempt's) comes off, then `draft`'s go
+    /// on. Without `base`, mett has attached nothing to it yet, and what it
+    /// has now is its base (a `fresh` new message has none).
+    async fn attach_all(
+        &self,
+        draft: &Draft,
+        id: MessageId,
+        base: Option<Vec<String>>,
+        fresh: bool,
+    ) -> Result<(MessageId, Option<Vec<String>>)> {
+        // Nothing of mett's there, and nothing to put on: done. (What an
+        // earlier attempt attached comes off even if nothing is to go on
+        // now.)
+        if base.is_none() && draft.attachments.is_empty() {
+            return Ok((id, base));
+        }
+        let present = match &base {
+            None if fresh && draft.origin.is_none() => Vec::new(),
+            _ => match self.list_attachments(&id).await {
+                Ok(present) => present,
+                Err(e) => return Err(self.give_up(draft, id, base, e).await),
+            },
+        };
+        let base = base.unwrap_or_else(|| present.iter().map(|a| a.id.to_string()).collect());
+        for attachment in present.iter().filter(|a| !base.contains(&a.id.to_string())) {
+            if let Err(e) = self.remove_attachment(&id, attachment.id.as_str()).await {
+                return Err(self.give_up(draft, id, Some(base), e).await);
+            }
+        }
+        for file in &draft.attachments {
+            if let Err(e) = self.attach(&id, file).await {
+                return Err(self.give_up(draft, id, Some(base), e).await);
+            }
+        }
+        Ok((id, Some(base)))
+    }
+
+    /// Gives up on the server draft `id` after `e`: kept for the next
+    /// attempt if `e` leaves its state unknown (or it can't be deleted),
+    /// deleted otherwise.
+    async fn give_up(
+        &self,
+        draft: &Draft,
+        id: MessageId,
+        base: Option<Vec<String>>,
+        e: Error,
+    ) -> Error {
+        match e {
+            // The change may have been made: keep the draft, for the next
             // attempt to update.
-            Err(e @ Error::Network(_)) => {
-                self.keep(origin, draft, id);
-                Err(e)
-            }
-            Err(e) => {
-                // One that can't be deleted (access was denied, say) is kept
-                // for the next attempt, rather than left behind.
+            Error::Network(_) => self.keep(draft, id, base),
+            // One that can't be deleted (access was denied, say) is kept
+            // for the next attempt, rather than left behind.
+            _ => {
                 if !self.discard(&id).await {
-                    self.keep(origin, draft, id);
+                    self.keep(draft, id, base);
                 }
-                Err(e)
             }
+        }
+        e
+    }
+
+    /// Attaches `file` to the server draft `message`.
+    async fn attach(&self, message: &MessageId, file: &OutgoingAttachment) -> Result<()> {
+        use base64::Engine;
+
+        if file.data.len() < SMALL_ATTACHMENT {
+            let url = self.url(&["me", "messages", message.as_str(), "attachments"]);
+            let body = json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": file.name,
+                "contentType": file.content_type,
+                "contentBytes": base64::engine::general_purpose::STANDARD.encode(&file.data),
+            });
+            return self
+                .send(
+                    self.request(Method::POST, url).json(&body),
+                    About::message(message.as_str()),
+                )
+                .await
+                .map(drop);
+        }
+        let url = self.url(&[
+            "me",
+            "messages",
+            message.as_str(),
+            "attachments",
+            "createUploadSession",
+        ]);
+        let body = json!({
+            "AttachmentItem": {
+                "attachmentType": "file",
+                "name": file.name,
+                "size": file.data.len(),
+                "contentType": file.content_type,
+            }
+        });
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Session {
+            upload_url: String,
+        }
+        let session: Session = self
+            .json(
+                self.request(Method::POST, url).json(&body),
+                About::message(message.as_str()),
+            )
+            .await?;
+        // The upload URL carries its own authorisation: the access token
+        // never goes there.
+        let upload = Url::parse(&session.upload_url)
+            .map_err(|e| Error::Backend(format!("bad upload URL from Graph: {e}")))?;
+        // HTTPS, unless it is the configured endpoint's own (a local proxy).
+        if upload.scheme() != "https" && upload.origin() != self.base.origin() {
+            return Err(Error::Backend(
+                "Graph offered an upload URL without HTTPS".into(),
+            ));
+        }
+        let total = file.data.len();
+        for (i, chunk) in file.data.chunks(UPLOAD_CHUNK).enumerate() {
+            let start = i * UPLOAD_CHUNK;
+            let end = start + chunk.len() - 1;
+            let response = self
+                .http
+                .put(upload.clone())
+                .timeout(REQUEST_TIMEOUT)
+                .header("Content-Range", format!("bytes {start}-{end}/{total}"))
+                // Graph requires it of every piece.
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", chunk.len())
+                .body(chunk.to_vec())
+                .send()
+                .await
+                .map_err(|e| Error::Network(e.to_string()))?;
+            Self::checked(response, About::message(message.as_str())).await?;
+        }
+        Ok(())
+    }
+
+    /// Takes an attachment off a server draft. One already gone is as good
+    /// as taken off.
+    async fn remove_attachment(&self, message: &MessageId, attachment: &str) -> Result<()> {
+        let url = self.url(&[
+            "me",
+            "messages",
+            message.as_str(),
+            "attachments",
+            attachment,
+        ]);
+        match self
+            .send(
+                self.request(Method::DELETE, url),
+                About::message(message.as_str()),
+            )
+            .await
+        {
+            Ok(_) | Err(Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -797,7 +1049,8 @@ impl<A: Authenticator> GraphMailStore<A> {
     async fn update_draft(&self, id: &MessageId, draft: &Draft) -> Result<()> {
         let url = self.url(&["me", "messages", id.as_str()]);
         self.send(
-            self.request(Method::PATCH, url).json(&message_json(draft)),
+            self.request(Method::PATCH, url)
+                .json(&message_json(draft, false)),
             About::message(id.as_str()),
         )
         .await
@@ -807,27 +1060,32 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// Deletes the server draft kept for `draft`, if any. It is kept still
     /// if that fails.
     async fn discard_kept_draft(&self, draft: &Draft) -> Result<()> {
-        let Some(origin) = &draft.origin else {
-            return Ok(());
-        };
-        let key = (origin.clone(), draft.attempt);
-        let Some(id) = self.kept.lock().expect("lock").remove(&key) else {
+        let key = (draft.origin.clone(), draft.attempt);
+        let Some(Kept { id, base }) = self.kept.lock().expect("lock").remove(&key) else {
             return Ok(());
         };
         let deleted = self.delete_draft(&id).await;
         if deleted.is_err() {
-            self.keep(origin, draft, id);
+            self.keep(draft, id, base);
         }
         deleted
     }
 
-    /// Remembers a server draft kept after an attempt whose outcome is
-    /// unknown.
-    fn keep(&self, origin: &DraftOrigin, draft: &Draft, id: MessageId) {
+    /// Whether a server draft is kept for `draft`.
+    fn has_kept(&self, draft: &Draft) -> bool {
         self.kept
             .lock()
             .expect("lock")
-            .insert((origin.clone(), draft.attempt), id);
+            .contains_key(&(draft.origin.clone(), draft.attempt))
+    }
+
+    /// Remembers a server draft kept after an attempt whose outcome is
+    /// unknown, with the attachments it added.
+    fn keep(&self, draft: &Draft, id: MessageId, base: Option<Vec<String>>) {
+        self.kept
+            .lock()
+            .expect("lock")
+            .insert((draft.origin.clone(), draft.attempt), Kept { id, base });
     }
 
     /// Deletes a server draft that could not be completed, so it doesn't
@@ -863,7 +1121,39 @@ fn unsent(e: Error) -> Error {
 }
 
 /// A Graph `message` resource with `draft`'s content.
-fn message_json(draft: &Draft) -> serde_json::Value {
+/// Whether `draft` goes through a server draft: it answers a message, or
+/// its attachments are too large to go with it in one request. Such a
+/// message, once sent, is always kept in Sent Items, and a failed attempt
+/// may leave its draft behind.
+pub fn needs_server_draft(draft: &Draft) -> bool {
+    if draft.origin.is_some() {
+        return true;
+    }
+    if draft.attachments.is_empty() {
+        return false;
+    }
+    // Base64 takes 4 bytes for every 3: too large already, without
+    // encoding it all to find out.
+    let encoded: usize = draft
+        .attachments
+        .iter()
+        .map(|a| a.data.len().div_ceil(3) * 4)
+        .sum();
+    if encoded + draft.body.len() > INLINE_REQUEST {
+        return true;
+    }
+    // Otherwise, the request as sent: escaping may make the text much
+    // larger.
+    let request = json!({
+        "message": message_json(draft, true),
+        "saveToSentItems": draft.save_copy,
+    });
+    serde_json::to_vec(&request).map_or(true, |bytes| bytes.len() > INLINE_REQUEST)
+}
+
+/// A Graph `message` resource with `draft`'s content, and its attachments
+/// if `attachments`.
+fn message_json(draft: &Draft, attachments: bool) -> serde_json::Value {
     let recipients = |list: &[Address]| -> Vec<serde_json::Value> {
         list.iter()
             .map(|a| {
@@ -884,6 +1174,22 @@ fn message_json(draft: &Draft) -> serde_json::Value {
     });
     if let Some(from) = &draft.from {
         message["from"] = recipients(std::slice::from_ref(from)).remove(0);
+    }
+    if attachments && !draft.attachments.is_empty() {
+        use base64::Engine;
+
+        message["attachments"] = draft
+            .attachments
+            .iter()
+            .map(|file| {
+                json!({
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": file.name,
+                    "contentType": file.content_type,
+                    "contentBytes": base64::engine::general_purpose::STANDARD.encode(&file.data),
+                })
+            })
+            .collect();
     }
     message
 }
@@ -1014,6 +1320,59 @@ struct Me {
 #[derive(Deserialize)]
 struct IdOnly {
     id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphAttachment {
+    #[serde(rename = "@odata.type")]
+    odata_type: Option<String>,
+    id: String,
+    name: Option<String>,
+    content_type: Option<String>,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    is_inline: bool,
+    /// The attached item, of an item attachment.
+    item: Option<AttachedItem>,
+}
+
+#[derive(Deserialize)]
+struct AttachedItem {
+    #[serde(rename = "@odata.type")]
+    odata_type: Option<String>,
+}
+
+impl GraphAttachment {
+    fn into_attachment(self) -> Attachment {
+        let kind = match self.odata_type.as_deref() {
+            Some("#microsoft.graph.itemAttachment") => AttachmentKind::Item,
+            Some("#microsoft.graph.referenceAttachment") => AttachmentKind::Link,
+            _ => AttachmentKind::File,
+        };
+        Attachment {
+            id: AttachmentId::new(self.id),
+            name: self.name.unwrap_or_default(),
+            // An item comes as MIME (a message), iCalendar (an event) or a
+            // vCard (a contact).
+            content_type: self.content_type.unwrap_or_else(|| {
+                let item = self.item.and_then(|i| i.odata_type);
+                match (kind, item.as_deref()) {
+                    (AttachmentKind::Item, Some("#microsoft.graph.event")) => "text/calendar",
+                    (AttachmentKind::Item, Some("#microsoft.graph.contact")) => "text/vcard",
+                    (AttachmentKind::Item, Some("#microsoft.graph.message") | None) => {
+                        "message/rfc822"
+                    }
+                    _ => "application/octet-stream",
+                }
+                .into()
+            }),
+            size: self.size,
+            inline: self.is_inline,
+            kind,
+        }
+    }
 }
 
 #[derive(Deserialize)]
