@@ -215,6 +215,16 @@ fn hostname() -> String {
             .iter()
             .find_map(|file| std::fs::read_to_string(file).ok())
             .or_else(|| std::env::var("HOSTNAME").ok())
+            .or_else(|| std::env::var("COMPUTERNAME").ok())
+            // Elsewhere (macOS, the BSDs), the system says.
+            .or_else(|| {
+                std::process::Command::new("hostname")
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            })
             .unwrap_or_default();
         let name = name.trim();
         name.split('.').next().unwrap_or(name).to_owned()
