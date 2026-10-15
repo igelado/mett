@@ -3,9 +3,9 @@
 //! compose flow is tested without an editor or a mailbox.
 
 use chrono::Local;
-use mett_core::{Address, Message};
+use mett_core::{AccountId, Address, Message};
 
-use crate::config::Quad;
+use crate::config::{Config, Quad};
 use crate::text;
 
 /// The settings that shape new messages, from the configuration.
@@ -74,6 +74,60 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// How to write messages, from the configuration. `account` is the
+    /// signed-in user, whose address counts as the user's own.
+    pub fn from_config(config: &Config, account: &AccountId) -> Result<Self, String> {
+        let from = match config.string("from") {
+            "" => None,
+            from => {
+                let mut address = Address::parse(from).map_err(|e| format!("from: {e}"))?;
+                let realname = config.string("realname");
+                if address.name.is_none() && !realname.is_empty() {
+                    address.name = Some(realname.to_owned());
+                }
+                Some(address)
+            }
+        };
+        let mut me = vec![account.as_str().to_lowercase()];
+        me.extend(from.iter().map(|a| a.email.to_lowercase()));
+        // Without `use_from`, the address still counts as the user's own, but
+        // messages carry no explicit sender: Graph uses the signed-in user.
+        let from = from.filter(|_| config.flag("use_from"));
+        let signature = match config.string("signature") {
+            "" => None,
+            path if path.ends_with('|') => {
+                return Err(format!(
+                    "signature: commands ({path}) are not supported yet; use a file"
+                ));
+            }
+            path => match std::fs::read_to_string(path) {
+                Ok(text) => Some(text),
+                // mutt's default, ~/.signature, often doesn't exist.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("signature: cannot read {path}: {e}")),
+            },
+        };
+        Ok(Settings {
+            from,
+            me,
+            signature,
+            sig_dashes: config.flag("sig_dashes"),
+            attribution: config.string("attribution").to_owned(),
+            indent_string: config.string("indent_string").to_owned(),
+            forward_format: config.string("forward_format").to_owned(),
+            include: config.quad("include"),
+            reply_to: config.quad("reply_to"),
+            postpone: config.quad("postpone"),
+            abort_unmodified: config.quad("abort_unmodified"),
+            abort_nosubject: config.quad("abort_nosubject"),
+            copy: config.quad("copy"),
+            askcc: config.flag("askcc"),
+            askbcc: config.flag("askbcc"),
+            fast_reply: config.flag("fast_reply"),
+            metoo: config.flag("metoo"),
+        })
+    }
+
     fn is_me(&self, address: &Address) -> bool {
         let email = address.email.to_lowercase();
         self.me.contains(&email)
@@ -285,6 +339,41 @@ mod tests {
             me: vec!["me@contoso.com".into()],
             ..Settings::default()
         }
+    }
+
+    fn config(source: &str) -> Config {
+        let mut config = Config::new(Some("/nonexistent-home".into()));
+        config.load_str(source, std::path::Path::new("mettrc"));
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        config
+    }
+
+    #[test]
+    fn reads_the_settings_from_the_configuration() {
+        let account = AccountId::new("Me@Contoso.com");
+        let settings = Settings::from_config(
+            &config("set from=other@x.org realname='Me Myself' include=no askcc\n"),
+            &account,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.from,
+            Some(Address::new("other@x.org").with_name("Me Myself"))
+        );
+        assert_eq!(settings.me, ["me@contoso.com", "other@x.org"]);
+        assert_eq!(settings.signature, None, "~/.signature doesn't exist");
+        assert_eq!(settings.include, Quad::No);
+        assert!(settings.askcc);
+        assert_eq!(settings.attribution, "On %d, %n wrote:");
+
+        // Without use_from, messages have no explicit sender.
+        let settings =
+            Settings::from_config(&config("set from=other@x.org nouse_from\n"), &account).unwrap();
+        assert_eq!(settings.from, None);
+        assert!(settings.me.contains(&"other@x.org".to_owned()));
+
+        assert!(Settings::from_config(&config("set from=nobody\n"), &account).is_err());
+        assert!(Settings::from_config(&config("set signature='sig.sh|'\n"), &account).is_err());
     }
 
     #[test]

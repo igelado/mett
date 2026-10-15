@@ -69,6 +69,9 @@ impl Address {
                 let name = entry[..open].trim();
                 let name = match name.strip_prefix('"') {
                     Some(quoted) => unquote(quoted.strip_suffix('"').ok_or_else(bad)?),
+                    // An unquoted name can't hold brackets: `A <a@x, B <b@y>`
+                    // is a mistake, not B alone.
+                    None if name.contains(['<', '>']) => return Err(bad()),
                     None => name.to_owned(),
                 };
                 (Some(name).filter(|n| !n.is_empty()), email.trim())
@@ -269,6 +272,8 @@ mod tests {
             "\"Bob <b@x>",
             "@x",
             "a@",
+            "Alice <a@x.org, Bob <b@y.org>",
+            "Bob <b@y.org>>",
         ] {
             assert!(Address::parse(bad).is_err(), "{bad}");
         }

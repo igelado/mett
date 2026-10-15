@@ -117,7 +117,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let compose = match compose_settings(&config, &spoolfile.account) {
+        let compose = match compose::Settings::from_config(&config, &spoolfile.account) {
             Ok(compose) => compose,
             Err(e) => {
                 eprintln!("mett: {e}");
@@ -548,59 +548,4 @@ impl Input {
         terminal.clear()?;
         Ok(result)
     }
-}
-
-/// How to write messages, from the configuration. `account` is the
-/// signed-in user, whose address counts as the user's own.
-fn compose_settings(
-    config: &config::Config,
-    account: &mett_core::AccountId,
-) -> Result<compose::Settings, String> {
-    use mett_core::Address;
-    let from = match config.string("from") {
-        "" => None,
-        from => {
-            let mut address = Address::parse(from).map_err(|e| format!("from: {e}"))?;
-            let realname = config.string("realname");
-            if address.name.is_none() && !realname.is_empty() {
-                address.name = Some(realname.to_owned());
-            }
-            Some(address)
-        }
-    };
-    let mut me = vec![account.as_str().to_lowercase()];
-    me.extend(from.iter().map(|a| a.email.to_lowercase()));
-    let signature = match config.string("signature") {
-        "" => None,
-        path if path.ends_with('|') => {
-            return Err(format!(
-                "signature: commands ({path}) are not supported yet; use a file"
-            ));
-        }
-        path => match std::fs::read_to_string(path) {
-            Ok(text) => Some(text),
-            // mutt's default, ~/.signature, often doesn't exist.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("signature: cannot read {path}: {e}")),
-        },
-    };
-    Ok(compose::Settings {
-        from,
-        me,
-        signature,
-        sig_dashes: config.flag("sig_dashes"),
-        attribution: config.string("attribution").to_owned(),
-        indent_string: config.string("indent_string").to_owned(),
-        forward_format: config.string("forward_format").to_owned(),
-        include: config.quad("include"),
-        reply_to: config.quad("reply_to"),
-        postpone: config.quad("postpone"),
-        abort_unmodified: config.quad("abort_unmodified"),
-        abort_nosubject: config.quad("abort_nosubject"),
-        copy: config.quad("copy"),
-        askcc: config.flag("askcc"),
-        askbcc: config.flag("askbcc"),
-        fast_reply: config.flag("fast_reply"),
-        metoo: config.flag("metoo"),
-    })
 }

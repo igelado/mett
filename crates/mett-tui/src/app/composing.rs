@@ -118,6 +118,9 @@ impl App {
     /// whole selected message, which is fetched first unless the pager
     /// already shows it.
     pub(super) fn start_compose(&mut self, kind: Kind) -> Vec<Effect> {
+        // A message still being fetched for an earlier reply mustn't take
+        // over this one when it arrives.
+        self.compose_fetch = None;
         if kind == Kind::New {
             return self.begin(kind, None);
         }
@@ -810,6 +813,19 @@ mod tests {
         // fast_reply: straight to the editor, without quoting.
         assert_eq!(effects, [Effect::Edit("\n-- \nMe\n".into())]);
         assert_eq!(app.screen(), &Screen::Index, "the pager isn't opened");
+    }
+
+    #[test]
+    fn a_late_fetch_does_not_replace_a_newer_message() {
+        let mut app = app(settings());
+        let (fetch, _) = request(&act(&mut app, Action::Reply));
+        act(&mut app, Action::Mail);
+        let effects = app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(original())),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(prompt(&app), "To: ");
     }
 
     #[test]
