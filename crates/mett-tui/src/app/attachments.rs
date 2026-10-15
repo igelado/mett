@@ -417,6 +417,10 @@ impl App {
             Action::LastEntry => view.scroll = last,
             Action::NextPage => view.scroll = (view.scroll + page).min(last),
             Action::PreviousPage => view.scroll = view.scroll.saturating_sub(page),
+            // The pager's keys for it do something here too: say so.
+            Action::Search | Action::SearchNext => {
+                self.fail("Searching an attachment isn't supported yet; save it to search it.");
+            }
             _ => {}
         }
         Vec::new()
@@ -592,7 +596,8 @@ fn media_type(content_type: &str) -> String {
 fn file_name(attachment: &Attachment) -> String {
     let name = attachment
         .name
-        .rsplit(['/', '\\'])
+        // Nor a drive (`C:report.pdf`), on Windows.
+        .rsplit(['/', '\\', ':'])
         .next()
         .unwrap_or_default()
         .trim();
@@ -795,6 +800,10 @@ mod tests {
         assert_eq!(scroll(&app), 7);
         act(&mut app, Action::FirstEntry);
         assert_eq!(scroll(&app), 0);
+        // Search isn't silently ignored.
+        act(&mut app, Action::Search);
+        assert!(app.status.contains("isn't supported"), "{}", app.status);
+        assert!(app.input.is_none());
     }
 
     #[test]
@@ -805,6 +814,16 @@ mod tests {
         assert_eq!(item("Budget v1.2", "message/rfc822"), "Budget v1.2.eml");
         assert_eq!(item("Lunch.ICS", "text/calendar"), "Lunch.ICS");
         assert_eq!(item("", "text/vcard"), "item.vcf");
+        let file = |name: &str| {
+            file_name(&attachment(
+                "f",
+                name,
+                "application/pdf",
+                AttachmentKind::File,
+            ))
+        };
+        assert_eq!(file("C:report.pdf"), "report.pdf");
+        assert_eq!(file("../a\\b/c.pdf"), "c.pdf");
         assert_eq!(item("Lunch", "Text/Calendar; charset=utf-8"), "Lunch.ics");
     }
 
