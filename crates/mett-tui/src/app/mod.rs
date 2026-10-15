@@ -1958,6 +1958,20 @@ impl App {
         vec![list]
     }
 
+    /// Whether the folder lists drafts: the Drafts folder, or one with a
+    /// draft listed so far.
+    fn drafts_about(&self) -> bool {
+        self.folder
+            .as_ref()
+            .is_some_and(|f| f.well_known == Some(mett_core::WellKnownFolder::Drafts))
+            || self
+                .messages
+                .iter()
+                .chain(&self.hidden)
+                .chain(&self.folded)
+                .any(|m| m.draft)
+    }
+
     /// The date of the oldest message listed so far.
     fn oldest_listed(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.messages
@@ -2025,9 +2039,12 @@ impl App {
                 // date), and none of the way there is as old as the oldest
                 // listed: later pages bring older mail, and mail from the
                 // same time may go anywhere among it (by `sort_aux`).
+                // Drafts come in a group of their own, by another date:
+                // with any about, nothing is.
                 let settled = |from: usize, entry: usize| {
                     !loading
                         || self.ordering.sort.method == crate::sort::Method::Date
+                            && !self.drafts_about()
                             && self.oldest_listed().is_some_and(|oldest| {
                                 self.messages[from..=entry]
                                     .iter()

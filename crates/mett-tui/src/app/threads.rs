@@ -617,6 +617,60 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_move_waits_among_drafts() {
+        let settings = Settings {
+            ordering: Ordering {
+                sort: Sort::parse("reverse-date", true).unwrap(),
+                ..Ordering::default()
+            },
+            ..Settings::default()
+        };
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let (mut app, effects) = App::open(80, 24, inbox, settings);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let at = |id: &str, minutes: i64, draft: bool| {
+            let mut m = mock::message(
+                id,
+                "in",
+                id,
+                DateTime::UNIX_EPOCH + TimeDelta::minutes(minutes),
+            )
+            .summary;
+            m.draft = draft;
+            m
+        };
+        let listed = |app: &mut App, id, messages, more: bool| {
+            let effects = app.update(Msg::Response(Response {
+                id,
+                event: Event::MessagesListed(Ok(MessagePage {
+                    messages,
+                    next: more.then(|| mett_core::PageCursor::new("in next")),
+                })),
+            }));
+            match effects.first() {
+                Some(Effect::Request(next, _)) => Some(*next),
+                _ => None,
+            }
+        };
+        // Drafts first, then the rest, each by its own date.
+        let next = listed(&mut app, list, vec![at("d9", 9, true)], true).unwrap();
+        act(&mut app, Action::NextEntry);
+        let next = listed(&mut app, next, vec![at("d2", 2, true)], true).unwrap();
+        assert_eq!(app.messages[app.selected].id.as_str(), "d9");
+        listed(&mut app, next, vec![at("s5", 5, false)], false);
+        assert_eq!(app.messages[app.selected].id.as_str(), "s5");
+    }
+
+    #[test]
     fn a_collapsed_thread_tells_of_its_unread_mail() {
         let mut app = app();
         for m in &mut app.messages {
