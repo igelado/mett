@@ -470,6 +470,27 @@ mod tests {
     }
 
     #[test]
+    fn a_search_looks_under_the_selected_collapsed_thread_first() {
+        let mut app = app();
+        let a1 = app
+            .messages
+            .iter_mut()
+            .find(|m| m.id.as_str() == "a1")
+            .unwrap();
+        a1.subject = "Re: a, found".into();
+        let b1 = app
+            .messages
+            .iter_mut()
+            .find(|m| m.id.as_str() == "b1")
+            .unwrap();
+        b1.subject = "Re: b, found".into();
+        act(&mut app, Action::CollapseAll);
+        app.selected = 0;
+        app.new_search("~s found");
+        assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+    }
+
+    #[test]
     fn a_limit_works_on_collapsed_threads() {
         let mut app = app();
         act(&mut app, Action::CollapseAll);

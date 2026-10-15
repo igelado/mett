@@ -163,6 +163,16 @@ impl App {
                 return Vec::new();
             }
         };
+        // Replies folded under the selected (collapsed) thread come before
+        // the next row.
+        if !self.search_from_top
+            && self.selected < self.messages.len()
+            && let Some(id) = self.folded_match(&pattern, self.selected)
+        {
+            self.status.clear();
+            self.uncollapse_to(&id);
+            return Vec::new();
+        }
         let count = self.messages.len();
         let matches = |i: &usize| self.search_match(&pattern, *i).is_some();
         // From the next message on, then (once the whole folder is listed:
