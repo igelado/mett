@@ -155,6 +155,19 @@ pub struct Compose {
 }
 
 impl Compose {
+    /// The compose menu for `draft`, which carries a forwarded message's
+    /// attachments if `forwarded_attachments`.
+    pub fn new(draft: Draft, forwarded_attachments: bool) -> Self {
+        Self {
+            draft,
+            delivery: None,
+            unauthorized: None,
+            forwarded_attachments,
+            left_draft: false,
+            selected: 0,
+        }
+    }
+
     /// How many parts the message has.
     pub fn parts(&self) -> usize {
         1 + usize::from(self.forwarded_attachments) + self.draft.attachments.len()
@@ -616,13 +629,14 @@ impl App {
     }
 
     /// Sends the compose menu's message, asking first whether to keep a
-    /// copy (`copy`). Graph always keeps a copy of replies and forwards, so
-    /// `copy` only applies to new mail.
+    /// copy (`copy`). Graph always keeps a copy of what it sends through a
+    /// server draft (replies, forwards, messages with large attachments),
+    /// so `copy` only applies to other mail.
     fn send_or_ask_copy(&mut self) -> Vec<Effect> {
         let Some(Screen::Compose(compose)) = self.screens.last() else {
             return Vec::new();
         };
-        if compose.draft.origin.is_some() {
+        if mett_msgraph::needs_server_draft(&compose.draft) {
             return self.answer(Question::Copy, true);
         }
         let prompt = "Save a copy of this message?".to_owned();
@@ -699,14 +713,10 @@ impl App {
                     .original
                     .as_ref()
                     .is_some_and(|m| m.summary.has_attachments);
-            self.screens.push(Screen::Compose(Compose {
-                draft: composing.draft,
-                delivery: None,
-                unauthorized: None,
+            self.screens.push(Screen::Compose(Compose::new(
+                composing.draft,
                 forwarded_attachments,
-                left_draft: false,
-                selected: 0,
-            }));
+            )));
         }
         Vec::new()
     }
@@ -851,8 +861,9 @@ impl App {
                 if matches!(e, mett_core::Error::Auth(_)) {
                     compose.unauthorized = delivery;
                 }
-                // Replies and forwards go through a server draft.
-                compose.left_draft |= compose.draft.origin.is_some();
+                // Replies, forwards and messages with large attachments go
+                // through a server draft.
+                compose.left_draft |= mett_msgraph::needs_server_draft(&compose.draft);
                 // A lost response doesn't mean nothing happened.
                 let failure = match (delivery, &e) {
                     (Some(Delivery::Send), mett_core::Error::Network(_)) if saved_copy => format!(

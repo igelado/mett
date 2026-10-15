@@ -1653,3 +1653,105 @@ async fn uploads_large_attachments_without_the_token() {
     draft.attachments.push(attached("big.bin", 4_000_000));
     store(&server).send(&draft).await.unwrap();
 }
+
+#[tokio::test]
+async fn follows_every_page_of_attachments() {
+    let server = MockServer::start().await;
+    let next = format!(
+        "{}/v1.0/me/messages/m1/attachments?$skiptoken=2",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments"))
+        .and(query_param("$skiptoken", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a2", "name": "two", "size": 1 }],
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/m1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a1", "name": "one", "size": 1 }],
+            "@odata.nextLink": next,
+        })))
+        .mount(&server)
+        .await;
+    let names: Vec<String> = store(&server)
+        .list_attachments(&MessageId::new("m1"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
+    assert_eq!(names, ["one", "two"]);
+}
+
+#[tokio::test]
+async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createForward"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    // The forward carries the original's attachment along.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "carried", "name": "original.pdf", "size": 1 }],
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // The first upload's answer is lost: it was attached as "lost".
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let mut forward = draft(Some(DraftOrigin::Forward(MessageId::new("orig"))));
+    forward.attachments.push(attached("a.bin", 3));
+    let store = store(&server);
+    assert!(matches!(store.send(&forward).await, Err(Error::NotSent(_))));
+
+    // The retry finds it there, takes it off, and attaches the file again,
+    // leaving the forwarded one.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "carried", "name": "original.pdf", "size": 1 },
+                { "id": "lost", "name": "a.bin", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/lost"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "again" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store.send(&forward).await.unwrap();
+}

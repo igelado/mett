@@ -305,7 +305,11 @@ fn render_compose(compose: &Compose, colors: &Colors, frame: &mut Frame, area: R
         ));
     }
     let count = parts.len();
-    for (i, part) in parts.into_iter().enumerate() {
+    // A page of parts at a time, with the selected one, when they don't
+    // all fit under the headers.
+    let room = usize::from(area.height).saturating_sub(lines.len()).max(1);
+    let first = compose.selected / room * room;
+    for (i, part) in parts.into_iter().enumerate().skip(first).take(room) {
         let line = Line::raw(truncate(&part, width));
         lines.push(if i == compose.selected {
             line.style(colors.indicator)
@@ -971,6 +975,24 @@ mod tests {
         assert_eq!(buffer[(3, cafe)].symbol(), "e\u{301}");
         assert_eq!(buffer[(3, cafe)].fg, Color::Red);
         assert_eq!(buffer[(4, cafe)].symbol(), " ");
+    }
+
+    #[test]
+    fn the_compose_menu_keeps_the_selected_part_in_view() {
+        let mut app = app(1);
+        let mut draft = mett_core::Draft::default();
+        for i in 0..6 {
+            draft.attachments.push(mett_core::OutgoingAttachment {
+                name: format!("file{i}.txt"),
+                content_type: "text/plain".into(),
+                data: Vec::new(),
+            });
+        }
+        let mut compose = crate::app::Compose::new(draft, false);
+        compose.selected = 6;
+        app.screens.push(Screen::Compose(compose));
+        let lines = sized_screen(&app, WIDTH, 12);
+        assert!(lines.iter().any(|l| l.contains("file5.txt")), "{lines:#?}");
     }
 
     #[test]

@@ -92,29 +92,39 @@ impl App {
         id: RequestId,
         result: mett_core::Result<Vec<Attachment>>,
     ) -> Vec<Effect> {
-        let Some(Screen::Attachments(menu)) = self.screens.last_mut() else {
+        // The menu may be under another screen (help) by now.
+        let Some(position) = self
+            .screens
+            .iter()
+            .rposition(|s| matches!(s, Screen::Attachments(m) if m.listing == Some(id)))
+        else {
             return Vec::new();
         };
-        if menu.listing != Some(id) {
-            return Vec::new();
-        }
+        let Screen::Attachments(menu) = &mut self.screens[position] else {
+            unreachable!("found above");
+        };
         menu.listing = None;
         match result {
-            Ok(entries) => {
-                // As mutt shows them: the message's own parts first are
-                // its body, which the pager shows; here, its files.
-                menu.entries = entries;
-                if menu.entries.is_empty() {
-                    self.screens.pop();
-                    self.fail("This message has no attachments.");
-                }
+            Ok(entries) if entries.is_empty() => {
+                self.screens.remove(position);
+                self.fail("This message has no attachments.");
             }
+            Ok(entries) => menu.entries = entries,
             Err(e) => {
-                self.screens.pop();
+                self.screens.remove(position);
                 self.report(e);
             }
         }
         Vec::new()
+    }
+
+    /// The request listing the attachment menu's attachments, while it
+    /// is pending.
+    pub(super) fn attachments_request(&self) -> Option<RequestId> {
+        self.screens.iter().find_map(|s| match s {
+            Screen::Attachments(menu) => menu.listing,
+            _ => None,
+        })
     }
 
     /// The selected attachment of the attachment menu.
@@ -614,6 +624,34 @@ mod tests {
     }
 
     #[test]
+    fn attachments_listed_under_the_help_screen_still_show() {
+        let mut app = app();
+        let (id, _) = sent(&act(&mut app, Action::ViewAttachments));
+        // Keys wait for the listing.
+        assert!(app.waiting());
+        app.screens.push(Screen::Help(crate::app::Help {
+            menu: crate::keymap::Menu::Attach,
+            scroll: 0,
+        }));
+        respond(
+            &mut app,
+            id,
+            Event::AttachmentsListed(Ok(vec![attachment(
+                "a0",
+                "notes.txt",
+                "text/plain",
+                AttachmentKind::File,
+            )])),
+        );
+        assert!(!app.waiting());
+        app.screens.pop();
+        let Screen::Attachments(menu) = app.screen() else {
+            panic!("expected the menu");
+        };
+        assert_eq!(menu.entries.len(), 1);
+    }
+
+    #[test]
     fn a_message_without_attachments_says_so() {
         let mut app = app();
         let (id, _) = sent(&act(&mut app, Action::ViewAttachments));
@@ -625,14 +663,10 @@ mod tests {
     #[test]
     fn attaches_and_detaches_files_in_the_compose_menu() {
         let mut app = app();
-        app.screens.push(Screen::Compose(super::super::Compose {
-            draft: mett_core::Draft::default(),
-            delivery: None,
-            unauthorized: None,
-            forwarded_attachments: false,
-            left_draft: false,
-            selected: 0,
-        }));
+        app.screens.push(Screen::Compose(super::super::Compose::new(
+            mett_core::Draft::default(),
+            false,
+        )));
         act(&mut app, Action::AttachFile);
         app.input = None;
         let effects = app.answer_attach_file("~/report.pdf".into());

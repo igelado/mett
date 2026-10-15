@@ -213,6 +213,9 @@ impl App {
             || self.listing.is_some()
             || loading_pager
             || self.browser_request().is_some()
+            // Attachments being listed, or one fetched to show or save.
+            || self.attachments_request().is_some()
+            || self.fetching.is_some()
             || self.delivering()
             // A move or purge decides what the next keys act on (and the
             // mailbox refuses to touch a message on its way).

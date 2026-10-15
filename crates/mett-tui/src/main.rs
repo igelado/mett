@@ -726,15 +726,27 @@ fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::F
 /// user, and opens it with the program the system has for it.
 fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
     static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("mett-{}-{n}", std::process::id()));
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(&dir)?;
+    // A name no earlier run left behind: the process, the time, and a
+    // count, tried again if taken all the same.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = loop {
+        let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mett-{}-{started}-{n}", std::process::id()));
+        match builder.create(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => continue,
+            Err(e) => return Err(e),
+        }
+    };
     let path = dir.join(name);
     std::fs::write(&path, data)?;
     open::that_detached(&path)
