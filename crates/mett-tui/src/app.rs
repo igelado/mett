@@ -309,8 +309,11 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Effect> {
-        // Any new action replaces a pending move.
-        self.pending = None;
+        // Any new action in a menu replaces a pending move; the sign-in
+        // window's keys don't move anywhere, so leave it.
+        if self.menu() != Menu::SignIn {
+            self.pending = None;
+        }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
@@ -375,7 +378,12 @@ impl App {
         };
         let failed = window.failure.is_some();
         match action {
-            Action::Exit if failed => self.sign_in = None,
+            Action::Exit if failed => {
+                self.sign_in = None;
+                // The user gave up: don't let a retry that was waiting
+                // start another sign-in.
+                self.retry_after.clear();
+            }
             Action::Exit => {
                 self.sign_in = None;
                 self.sign_in_cancelled = true;
@@ -1669,5 +1677,27 @@ mod tests {
             ),
             "{effects:?}"
         );
+    }
+
+    #[test]
+    fn the_sign_in_window_keeps_a_pending_move() {
+        let (mut app, second) = loading_more(1);
+        act(&mut app, Action::NextEntry);
+        app.update(Msg::SignIn(browser_prompt()));
+        act(&mut app, Action::OpenBrowser);
+        app.update(Msg::SignIn(finished(Ok(()))));
+        let mut more = summaries(2);
+        more.remove(0);
+        deliver_last_page(&mut app, second, more);
+        assert_eq!(app.selected, 1, "moved on once the page arrived");
+    }
+
+    #[test]
+    fn closing_a_failed_sign_in_drops_waiting_retries() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        app.retry_after.insert(RequestId(1));
+        act(&mut app, Action::Exit);
+        assert!(app.retry_after.is_empty());
     }
 }
