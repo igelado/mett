@@ -536,8 +536,14 @@ pub struct App {
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
-    /// The request reading the mailboxes' counts.
-    checking: Option<RequestId>,
+    /// The request reading the mailboxes' counts, and the retries before
+    /// it was made.
+    checking: Option<(RequestId, u64)>,
+    /// How many times the user retried after a failed sign-in: background
+    /// checks made before the last retry don't hold off checking.
+    poll_epoch: u64,
+    /// When the folder was last listed from the start.
+    listed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl App {
@@ -643,6 +649,8 @@ impl App {
             poll_timer: 0,
             known_before_refresh: None,
             checking: None,
+            poll_epoch: 0,
+            listed_at: None,
         };
         let effects = app.open_folder();
         (app, effects)
@@ -985,6 +993,7 @@ impl App {
     fn retry(&mut self) -> Vec<Effect> {
         // Signed in again: checking for new mail can go on.
         self.poll_paused = false;
+        self.poll_epoch += 1;
         if self.quit {
             let mut effects = self.retry_saves();
             effects.extend(self.retry_discards());
