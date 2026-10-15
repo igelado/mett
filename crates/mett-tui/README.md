@@ -51,7 +51,8 @@ set spoolfile = =@inbox
 set msgraph_client_id = <your app's client ID>
 ```
 
-So far `set`, `unset`, `toggle`, `reset` and `source` are supported, with
+So far `set`, `unset`, `toggle`, `reset`, `source` and `alternates` (the
+user's other addresses, for replies) are supported, with
 mutt's quoting, `$` expansion, backticks and `my_` variables. Other mutt
 commands and unknown variables are ignored with a warning, so a mettrc can
 `source` an existing muttrc.

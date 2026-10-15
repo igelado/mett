@@ -16,6 +16,10 @@ pub struct Settings {
     /// The user's own addresses, in lower case, left out of group replies
     /// (unless `metoo`).
     pub me: Vec<String>,
+    /// mutt's `alternates`: regular expressions for the user's other
+    /// addresses, such as a mail address that differs from the account's
+    /// name. They match ignoring case.
+    pub alternates: Vec<String>,
     /// The signature's text, if there is one.
     pub signature: Option<String>,
     /// `sig_dashes`: put `-- ` before the signature.
@@ -54,6 +58,7 @@ impl Default for Settings {
         Self {
             from: None,
             me: Vec::new(),
+            alternates: Vec::new(),
             signature: None,
             sig_dashes: true,
             attribution: "On %d, %n wrote:".into(),
@@ -113,6 +118,7 @@ impl Settings {
         Ok(Settings {
             from,
             me,
+            alternates: config.alternates().to_vec(),
             signature,
             sig_dashes: config.flag("sig_dashes"),
             attribution: config.string("attribution").to_owned(),
@@ -134,6 +140,12 @@ impl Settings {
     fn is_me(&self, address: &Address) -> bool {
         let email = address.email.to_lowercase();
         self.me.contains(&email)
+            || self.alternates.iter().any(|alternate| {
+                regex::RegexBuilder::new(alternate)
+                    .case_insensitive(true)
+                    .build()
+                    .is_ok_and(|regex| regex.is_match(&address.email))
+            })
     }
 }
 
@@ -389,8 +401,12 @@ mod tests {
         assert_eq!(settings.from, None);
         assert!(settings.me.contains(&"other@x.org".to_owned()));
 
-        let settings =
-            Settings::from_config(&config("set realname='Me Myself'\n"), &account).unwrap();
+        let settings = Settings::from_config(
+            &config("set realname='Me Myself'\nalternates '^me@x\\.org$' other\n"),
+            &account,
+        )
+        .unwrap();
+        assert_eq!(settings.alternates, ["^me@x\\.org$", "other"]);
         assert_eq!(
             settings.from,
             Some(Address::new("Me@Contoso.com").with_name("Me Myself"))
@@ -482,6 +498,18 @@ mod tests {
         };
         let (_, cc) = reply_recipients(&message(), true, true, &metoo);
         assert_eq!(cc[0].email, "me@contoso.com");
+    }
+
+    #[test]
+    fn alternates_count_as_me() {
+        let settings = Settings {
+            alternates: vec!["^isaac\\..*@contoso\\.com$".into()],
+            ..settings()
+        };
+        let mut message = message();
+        message.summary.from = Some(Address::new("Isaac.Gelado@contoso.com"));
+        let (to, _) = reply_recipients(&message, true, false, &settings);
+        assert!(to.iter().all(|a| a.email != "Isaac.Gelado@contoso.com"));
     }
 
     #[test]

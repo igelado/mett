@@ -639,14 +639,16 @@ impl App {
                 if matches!(e, mett_core::Error::Auth(_)) {
                     compose.unauthorized = delivery;
                 }
-                // A lost response doesn't mean the message wasn't sent.
-                if delivery == Some(Delivery::Send) && matches!(e, mett_core::Error::Network(_)) {
-                    self.status = format!(
+                // A lost response doesn't mean nothing happened.
+                self.status = match (delivery, &e) {
+                    (Some(Delivery::Send), mett_core::Error::Network(_)) => format!(
                         "The message may have been sent ({e}). Check Sent Items before sending it again."
-                    );
-                } else {
-                    self.report(e);
-                }
+                    ),
+                    (Some(Delivery::Postpone), mett_core::Error::Network(_)) => format!(
+                        "The message may have been saved ({e}). Check Drafts before postponing it again."
+                    ),
+                    _ => e.to_string(),
+                };
             }
         }
         Vec::new()
@@ -1238,5 +1240,24 @@ mod tests {
             })
             .collect();
         assert_eq!(requests, ["send", "flags"]);
+    }
+
+    #[test]
+    fn a_lost_postpone_response_may_have_saved_the_draft() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::PostponeMessage));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::DraftSaved(Err(Error::Network("timed out".into()))),
+        }));
+        assert!(
+            app.status.starts_with("The message may have been saved"),
+            "{}",
+            app.status
+        );
     }
 }

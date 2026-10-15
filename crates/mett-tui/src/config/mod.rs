@@ -28,7 +28,6 @@ const MAX_SOURCE_DEPTH: usize = 16;
 const NOT_YET_SUPPORTED: &[&str] = &[
     "account-hook",
     "alias",
-    "alternates",
     "alternative_order",
     "append-hook",
     "attachments",
@@ -73,7 +72,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "subjectrx",
     "subscribe",
     "unalias",
-    "unalternates",
     "unalternative_order",
     "unattachments",
     "unauto_view",
@@ -102,6 +100,8 @@ pub struct Config {
     /// Problems that stop the configuration from being used, as
     /// `file:line: message`.
     pub errors: Vec<String>,
+    /// `alternates`: regular expressions for the user's other addresses.
+    alternates: Vec<String>,
     /// Things that were ignored, such as unsupported mutt commands.
     pub warnings: Vec<String>,
     /// Warnings from the command being run, waiting for its location.
@@ -126,6 +126,7 @@ impl Config {
             values: HashMap::new(),
             user: HashMap::new(),
             errors: Vec::new(),
+            alternates: Vec::new(),
             warnings: Vec::new(),
             pending: Vec::new(),
             warned: Default::default(),
@@ -161,6 +162,11 @@ impl Config {
             Some(Value::Quad(q)) => *q,
             _ => Quad::No,
         }
+    }
+
+    /// The user's other addresses, as regular expressions (`alternates`).
+    pub fn alternates(&self) -> &[String] {
+        &self.alternates
     }
 
     /// Reads and runs the mettrc at `path`.
@@ -252,6 +258,23 @@ impl Config {
                 "unset" => self.each(args, |c, name| c.unset(name)),
                 "toggle" => self.each(args, |c, name| c.toggle(name)),
                 "reset" => self.each(args, |c, name| c.reset_named(name)),
+                "alternates" => self.each(args, |c, regex| {
+                    regex::Regex::new(regex).map_err(|e| {
+                        format!("alternates: bad regular expression {regex:?}: {e}")
+                    })?;
+                    if !c.alternates.iter().any(|a| a == regex) {
+                        c.alternates.push(regex.to_owned());
+                    }
+                    Ok(())
+                }),
+                "unalternates" => self.each(args, |c, regex| {
+                    if regex == "*" {
+                        c.alternates.clear();
+                    } else {
+                        c.alternates.retain(|a| a != regex);
+                    }
+                    Ok(())
+                }),
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
                         let path = self.resolve_source(&path, origin.file);
