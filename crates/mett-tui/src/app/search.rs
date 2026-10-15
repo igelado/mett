@@ -1,9 +1,10 @@
 //! Searching (`/`, `n`) and limiting (`l`) the index with mutt's patterns,
 //! and searching the text in the pager.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
-use mett_core::MessageSummary;
+use mett_core::{MessageId, MessageSummary};
 
 use super::composing::{Input, Question};
 use super::{App, Effect, Screen};
@@ -136,7 +137,7 @@ impl App {
 
     /// Starts looking for `text`, from the first message if the index is
     /// empty (it may be loading).
-    fn new_search(&mut self, text: &str) -> Vec<Effect> {
+    pub(super) fn new_search(&mut self, text: &str) -> Vec<Effect> {
         self.search_from_top = self.messages.is_empty();
         self.search(text)
     }
@@ -163,14 +164,19 @@ impl App {
                 return Vec::new();
             }
         };
+        // Replies folded under the selected (collapsed) thread come before
+        // the next row.
+        let folded = self.folded_matches(&pattern);
+        if !self.search_from_top
+            && let Some(entry) = self.messages.get(self.selected)
+            && let Some(id) = folded.get(&entry.id).cloned()
+        {
+            self.status.clear();
+            self.uncollapse_to(&id);
+            return Vec::new();
+        }
         let count = self.messages.len();
-        let matches = |i: &usize| {
-            let summary = &self.messages[*i];
-            pattern.matches(&Candidate {
-                summary,
-                deleted: self.deleted.contains(&summary.id),
-            })
-        };
+        let matches = |i: &usize| self.search_match(&pattern, &folded, *i).is_some();
         // From the next message on, then (once the whole folder is listed:
         // the next match may be on a page still to come) wrapping around
         // to the top.
@@ -197,7 +203,15 @@ impl App {
                 } else {
                     String::new()
                 };
+                let id = self
+                    .search_match(&pattern, &folded, i)
+                    .expect("found above");
                 self.selected = i;
+                // A collapsed thread with matches folded into it opens, so
+                // that `n` goes on to them.
+                if folded.contains_key(&self.messages[i].id) {
+                    self.uncollapse_to(&id);
+                }
             }
             // More of the folder is on its way: look again when it comes.
             None if more => {
@@ -298,10 +312,53 @@ impl App {
         }
     }
 
+    /// What matches `pattern` at entry `i` of the index: the message, or
+    /// one folded under it into its collapsed thread.
+    fn search_match(
+        &self,
+        pattern: &Pattern,
+        folded: &HashMap<MessageId, MessageId>,
+        i: usize,
+    ) -> Option<MessageId> {
+        let matches = |summary: &MessageSummary| {
+            pattern.matches(&Candidate {
+                summary,
+                deleted: self.deleted.contains(&summary.id),
+            })
+        };
+        let entry = &self.messages[i];
+        if matches(entry) {
+            return Some(entry.id.clone());
+        }
+        folded.get(&entry.id).cloned()
+    }
+
+    /// For each collapsed thread, the first message folded into it that
+    /// matches `pattern`, by the thread's first message: all found in one
+    /// pass.
+    fn folded_matches(&self, pattern: &Pattern) -> HashMap<MessageId, MessageId> {
+        let mut found = HashMap::new();
+        for message in &self.folded {
+            let Some(thread) = self.thread_of(&message.id) else {
+                continue;
+            };
+            if found.contains_key(&thread.root) {
+                continue;
+            }
+            if pattern.matches(&Candidate {
+                summary: message,
+                deleted: self.deleted.contains(&message.id),
+            }) {
+                found.insert(thread.root.clone(), message.id.clone());
+            }
+        }
+        found
+    }
+
     /// Limits the index to the messages matching `text`, or shows them all
     /// again for an empty pattern, `all` or `~A`. A bad pattern changes
     /// nothing.
-    fn set_limit(&mut self, text: &str) {
+    pub(super) fn set_limit(&mut self, text: &str) {
         let text = text.trim();
         let pattern = if text.is_empty() || text == "all" || text == "~A" {
             None
@@ -319,6 +376,7 @@ impl App {
         // mail that arrived since in its place).
         let mut all = std::mem::take(&mut self.messages);
         all.append(&mut self.hidden);
+        all.append(&mut self.folded);
         all.sort_by_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
         self.messages = all;
         self.limit = None;
@@ -334,6 +392,7 @@ impl App {
                 self.status = NO_MATCHES.into();
             }
         }
+        self.arrange();
         self.limit_index_to(selected.as_ref());
     }
 
@@ -359,33 +418,40 @@ impl App {
         self.limit = Some(limit);
     }
 
-    /// Selects the message `id` if it is shown, or the first one.
+    /// Selects the message `id` if it is shown (or the collapsed thread
+    /// it is in), or the first one.
     fn limit_index_to(&mut self, id: Option<&mett_core::MessageId>) {
+        let shown = |id: &mett_core::MessageId| self.messages.iter().position(|m| &m.id == id);
         self.selected = id
-            .and_then(|id| self.messages.iter().position(|m| &m.id == id))
+            .and_then(|id| shown(id).or_else(|| self.thread_of(id).and_then(|t| shown(&t.root))))
             .unwrap_or(0);
     }
 
     /// Adds newly listed messages to the index, or aside if the index is
     /// limited and they don't match.
-    pub(super) fn add_listed(&mut self, messages: Vec<MessageSummary>) {
+    pub(super) fn add_listed(&mut self, messages: Vec<MessageSummary>, last: bool) {
         for message in &messages {
             let next = self.positions.len();
             self.positions.entry(message.id.clone()).or_insert(next);
         }
-        if self.limit.is_none() {
-            self.messages.extend(messages);
-            return;
-        }
+        // The first page starts at the top, wherever its first message
+        // goes.
+        let first = self.messages.is_empty() && self.hidden.is_empty() && self.folded.is_empty();
+        let limited = self.limit.is_some();
+        let mut shown = Vec::with_capacity(messages.len());
         for message in messages {
             if self.limit_shows(&message) {
-                self.messages.push(message);
+                shown.push(message);
             } else {
                 self.hidden.push(message);
             }
         }
+        self.arrange_listed(shown, last);
+        if first {
+            self.selected = 0;
+        }
         // A later page had matches after all.
-        if !self.messages.is_empty() && self.status == NO_MATCHES {
+        if limited && !self.messages.is_empty() && self.status == NO_MATCHES {
             self.status.clear();
         }
     }
@@ -406,7 +472,7 @@ impl App {
 
     /// The number of messages in the folder, shown or not.
     pub fn total_messages(&self) -> usize {
-        self.messages.len() + self.hidden.len()
+        self.messages.len() + self.hidden.len() + self.folded.len()
     }
 }
 

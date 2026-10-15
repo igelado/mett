@@ -71,6 +71,14 @@ commands and unknown variables are ignored with a warning, so a mettrc can
 
 ### Display
 
+The index is ordered by `sort` (mett's default is `reverse-date`, newest
+first, where mutt's is `date`), with `sort_aux` breaking ties: `date`
+(also `date-sent`), `date-received` (when it reached the mailbox), `from`, `subject`, `to`,
+`unsorted` (as listed) or, for `sort`, `threads`, each with `reverse-`;
+with threads, `sort_aux` orders each thread's messages, and with `last-`,
+orders the threads by their latest message. Threads are drawn with line
+characters, or with `ascii_chars`, with `|`, `` ` ``, `-` and `>`.
+
 `index_format`, `pager_format` and `status_format` take mutt's format
 strings: `%-15.15L` widths, `%?X?then&else?` conditionals, `%>X`, `%*X` and
 `%|X` fills, and dates as `%{fmt}`, `%[fmt]` or `%(fmt)` (all in local
@@ -78,8 +86,8 @@ time; `date_format` is used by `%d` and `%D`). The expandos mett knows:
 
 | Format | Expandos |
 |--------|----------|
-| `index_format`, `pager_format` | `%a` sender's address, `%C` number, `%d`/`%D` date, `%F`/`%L` sender (or `To` recipient, for the user's own mail), `%f` sender with address, `%m` messages in the folder, `%n` sender's name, `%s` subject, `%S` status (`D`, `!`, `N`), `%t` first recipient, `%u` sender's user name, `%v` sender's first name, `%X` attachments (1 or 0), `%Z` flags (`D`/`N`, `!`, `+` for attachments); in `pager_format`, `%P` how far down. |
-| `status_format` | `%b` mailboxes with new mail, `%d` marked for deletion, `%F` flagged, `%f` folder, `%h` host name, `%M` shown by the limit, `%m` messages, `%n`/`%u` unread, `%P` how far down, `%r` `*` with changes waiting (`-` otherwise), `%V` the limit, `%v` mett's version, and mett's `%I`, set when part of the folder couldn't be listed. |
+| `index_format`, `pager_format` | `%M` messages folded into a collapsed thread, `%a` sender's address, `%C` number, `%d`/`%D` date, `%F`/`%L` sender (or `To` recipient, for the user's own mail), `%f` sender with address, `%m` messages in the folder, `%n` sender's name, `%s` subject (after the thread's lines, and left out when it is its parent's), `%S` status (`D`, `!`, `N`), `%t` first recipient, `%u` sender's user name, `%v` sender's first name, `%X` attachments (1 or 0), `%Z` flags (`D`/`N`, `!`, `+` for attachments); in `pager_format`, `%P` how far down. |
+| `status_format` | `%b` mailboxes with new mail, `%d` marked for deletion, `%F` flagged, `%f` folder, `%h` host name, `%M` shown by the limit, `%m` messages, `%n`/`%u` unread, `%P` how far down, `%r` `*` with changes waiting (`-` otherwise), `%s`/`%S` `sort` and `sort_aux`, `%V` the limit, `%v` mett's version, and mett's `%I`, set when part of the folder couldn't be listed. |
 
 Expandos mett can't fill yet (such as sizes and line counts) are empty, so
 `%?l?...?` conditionals take their `else` part.
@@ -167,10 +175,10 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 
 | Menu | Keys |
 |------|------|
-| Index | `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
+| Index | `Esc v`/`Esc V`: collapse or open the thread, or all of them (with `sort=threads`). `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
 | Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size` and `msgraph_sync_interval` take effect when mett starts again). |
-| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
+| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
 | Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. `Tab`: switch between the `mailboxes` (listed first, if there are any) and every folder. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
 | Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. |
 | Questions | Type the answer and press `Enter`; `Esc` or `^G` gives up. The usual line-editing keys work (`^A`, `^E`, `^U`, `^K`, `^W`, arrows). Yes/no questions take `y`, `n`, or `Enter` for the suggested answer. |
@@ -191,6 +199,10 @@ Check that:
   `Mail sent.`. `r` on a message asks whether to include it, and quotes it
   in the editor. Leaving the editor without changes aborts the message, as
   in mutt.
+- `:set sort=threads` groups the replies under the messages they answer,
+  `Esc v` folds a thread into its first message and `^N` moves to the next
+  thread; `:set sort=reverse-threads sort_aux=last-date` puts the thread
+  with the latest message first.
 - The pager's status bar shows `(all)`, a percentage, or `(end)` as you
   scroll.
 - Resizing the terminal keeps the layout intact.

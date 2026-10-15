@@ -12,7 +12,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags,
     FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, WellKnownFolder,
+    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -26,7 +26,7 @@ use crate::settings::{AuthSettings, Cloud};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The message fields the index needs.
-const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments,lastModifiedDateTime";
+const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments,lastModifiedDateTime,receivedDateTime,conversationId,conversationIndex";
 
 /// A [`MailStore`] backed by Microsoft Graph.
 ///
@@ -1087,6 +1087,7 @@ struct GraphMessage {
     is_draft: bool,
     created_date_time: Option<String>,
     last_modified_date_time: Option<String>,
+    received_date_time: Option<String>,
     #[serde(default)]
     is_read: bool,
     flag: Option<FollowupFlag>,
@@ -1094,6 +1095,10 @@ struct GraphMessage {
     has_attachments: bool,
     internet_message_id: Option<String>,
     body: Option<ItemBody>,
+    conversation_id: Option<String>,
+    /// Base64: a 22-byte header, then 5 bytes for each reply down the
+    /// conversation.
+    conversation_index: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1197,11 +1202,24 @@ impl GraphMessage {
             // Without a sent date, it is listed with the drafts, whatever
             // Graph calls it.
             draft: unsent,
+            delivered: self
+                .received_date_time
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&Utc)),
             modified: self
                 .last_modified_date_time
                 .as_deref()
                 .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
                 .map(|t| t.with_timezone(&Utc)),
+            thread: self.conversation_id.map(|conversation| ThreadPosition {
+                conversation,
+                path: self
+                    .conversation_index
+                    .as_deref()
+                    .map(thread_path)
+                    .unwrap_or_default(),
+            }),
         };
         let rest = Rest {
             cc: self.cc_recipients,
@@ -1212,6 +1230,25 @@ impl GraphMessage {
         };
         Ok((summary, rest))
     }
+}
+
+/// A message's path in its conversation, from Outlook's conversation
+/// index: the 22-byte header (the conversation's first message), then a
+/// 5-byte block for each reply. An index that doesn't decode, or doesn't
+/// have that shape, gives none.
+fn thread_path(index: &str) -> Vec<Vec<u8>> {
+    use base64::Engine;
+
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(index) else {
+        return Vec::new();
+    };
+    if bytes.len() < 22 || (bytes.len() - 22) % 5 != 0 {
+        return Vec::new();
+    }
+    let (header, replies) = bytes.split_at(22);
+    std::iter::once(header.to_vec())
+        .chain(replies.chunks(5).map(<[u8]>::to_vec))
+        .collect()
 }
 
 /// The parts of a [`GraphMessage`] that only a full [`Message`] needs.

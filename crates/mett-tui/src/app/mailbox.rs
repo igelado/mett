@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use mett_core::{Error, FlagsUpdate, Folder, FolderId, MessageId, Page};
 
 use super::composing::{Input, Question};
-use super::{App, Effect, Screen, effect_id};
+use super::{App, Effect, Screen, Target, effect_id};
 use crate::action::Action;
 use crate::config::Quad;
 use crate::config::mailbox::{FolderPath, MailboxError, configured_path};
@@ -686,6 +686,11 @@ impl App {
         self.folder = None;
         self.messages.clear();
         self.hidden.clear();
+        self.folded.clear();
+        self.threads.clear();
+        self.threaded_count = 0;
+        self.collapsed.clear();
+        self.collapse_all = false;
         self.positions.clear();
         self.limit = None;
         self.limited.clear();
@@ -970,6 +975,7 @@ impl App {
             .messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .map(|m| &m.id)
             .collect();
         self.deleted.retain(|id| listed.contains(id));
@@ -992,8 +998,44 @@ impl App {
             .iter()
             .filter(|m| gone.contains(&m.id))
             .count();
+        // A pending move from a message that goes counts from the message
+        // before it (or the top), not from the end it can no longer find.
+        if let Some(Target::After(anchor, steps)) = &self.pending
+            && gone.contains(anchor)
+        {
+            let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+            let at = shown(anchor).or_else(|| self.thread_of(anchor).and_then(|t| shown(&t.root)));
+            if let Some(at) = at {
+                let steps = *steps;
+                self.pending = Some(
+                    match self.messages[..=at]
+                        .iter()
+                        .rev()
+                        .find(|m| !gone.contains(&m.id))
+                    {
+                        Some(kept) => Target::After(kept.id.clone(), steps),
+                        None => Target::Entry(steps - 1),
+                    },
+                );
+            }
+        }
+        // A selected collapsed thread whose first message goes stays
+        // selected, by what is left of it.
+        let left_of_thread = selected
+            .as_ref()
+            .filter(|id| gone.contains(*id))
+            .and_then(|id| {
+                self.folded
+                    .iter()
+                    .find(|m| {
+                        !gone.contains(&m.id)
+                            && self.thread_of(&m.id).is_some_and(|t| &t.root == id)
+                    })
+                    .map(|m| m.id.clone())
+            });
         self.messages.retain(|m| !gone.contains(&m.id));
         self.hidden.retain(|m| !gone.contains(&m.id));
+        self.folded.retain(|m| !gone.contains(&m.id));
         for id in gone {
             self.deleted.remove(id);
         }
@@ -1003,6 +1045,14 @@ impl App {
             _ => self.selected.saturating_sub(before),
         }
         .min(self.messages.len().saturating_sub(1));
+        // Their threads change.
+        self.arrange();
+        if let Some(member) = left_of_thread {
+            let root = self.thread_of(&member).map_or(member, |t| t.root.clone());
+            if let Some(at) = self.messages.iter().position(|m| m.id == root) {
+                self.selected = at;
+            }
+        }
     }
 
     /// Opens the folder browser.

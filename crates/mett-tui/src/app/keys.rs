@@ -2,7 +2,7 @@
 //! macro's keys played one by one), the help screen, and mettrc commands
 //! typed at the `:` prompt.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::composing::{Input, Question};
 use super::{App, Effect, Msg, Screen, Settings};
@@ -37,6 +37,9 @@ pub struct Reconfigured {
     pub pushed: Vec<String>,
 }
 
+/// How soon after Escape a key is Meta and that key.
+const ESCAPE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl App {
     /// Handles a key press: as typed, while a question is asked; otherwise
     /// through the key bindings of the current menu.
@@ -44,6 +47,8 @@ impl App {
         // Ctrl-J is a newline: it does what Enter does, unless bound.
         let ctrl_j = Key::from(event) == Key::ctrl('j');
         if self.input.is_some() && self.sign_in.is_none() {
+            // A question took over: an Escape before it is forgotten.
+            self.escape = None;
             let event = if ctrl_j {
                 KeyEvent::from(KeyCode::Enter)
             } else {
@@ -51,8 +56,28 @@ impl App {
             };
             return self.on_key(event);
         }
-        let key = Key::from(event);
+        let mut key = Key::from(event);
         let menu = self.menu();
+        // Escape where it is bound to nothing starts Meta and the next key,
+        // for terminals that send them apart.
+        if key == Key::new(KeyCode::Esc) && self.keymap.lookup(menu, key).is_none() {
+            self.escape = Some((menu, std::time::Instant::now()));
+            return Vec::new();
+        }
+        // Only in the menu it was typed in: another may have taken over
+        // since (the sign-in window, say).
+        // A key long after it is a key of its own, as with curses'
+        // ESCDELAY.
+        if self
+            .escape
+            .take()
+            .is_some_and(|(at, when)| at == menu && when.elapsed() < ESCAPE_DELAY)
+            && let KeyCode::Char(c) = event.code
+            // A key with Control (or Alt) of its own stays as it is.
+            && event.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        {
+            key = Key::alt(c);
+        }
         let binding = self.keymap.lookup(menu, key).or_else(|| {
             ctrl_j
                 .then(|| self.keymap.lookup(menu, Key::new(KeyCode::Enter)))
@@ -700,7 +725,6 @@ mod tests {
 
     #[test]
     fn back_tab_bindings_match_shift_tab() {
-        use ratatui::crossterm::event::KeyModifiers;
         let event = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
         assert_eq!(
             Key::from(event),

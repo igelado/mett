@@ -238,7 +238,7 @@ account's Drafts folder.
 | `~y EXPR`, `<edit-label>`, `%y` | Categories. A message matches if any of its categories matches. `<edit-label>` edits the category list, separated by commas. |
 | `=b`, `=B`, `=h` patterns | Translated to Graph `$search` where possible. Anything else is evaluated locally on cached messages. |
 | `my_hdr Importance: high` | Sets the Graph `importance` property. |
-| Threads (`sort=threads`) | Built from `References`/`In-Reply-To` as in mutt, with Graph's `conversationId` used when those headers are missing. |
+| Threads (`sort=threads`) | Built from Graph's `conversationId` (which messages are one thread) and `conversationIndex` (which message each answers), rather than `References`/`In-Reply-To`, which Graph lists only message by message. A message whose parent isn't in the folder hangs from its thread's first message. |
 | `header_cache`, `message_cachedir` | Location of the local cache. |
 | `trash` | Deleting a message moves it to `trash`. With `trash` unset, mett deletes permanently, after the usual confirmation. |
 

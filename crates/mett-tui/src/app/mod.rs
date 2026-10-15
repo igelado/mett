@@ -10,6 +10,7 @@ mod keys;
 mod mailbox;
 mod newmail;
 mod search;
+mod threads;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -24,6 +25,7 @@ pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
 pub use self::newmail::MailboxEntry;
 pub use self::search::{Limit, highlighted};
+pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
 use crate::compose::Kind;
 use crate::config::Quad;
@@ -37,12 +39,19 @@ use crate::worker::{Event, Request, RequestId, Response};
 pub const PAGE_SIZE: u32 = 100;
 
 /// Where a pending move goes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Target {
     /// The entry at this position.
     Entry(usize),
+    /// The entry this many after a message: the index's order may change
+    /// as pages come (with `sort`), and the message stays where it goes.
+    After(MessageId, usize),
     /// The last message of the folder.
     Last,
+    /// The next thread after the selected message.
+    NextThread,
+    /// The thread before the selected message's.
+    PreviousThread,
 }
 
 /// Rows used by the help line, the status bar and the message line.
@@ -72,6 +81,8 @@ pub struct Settings {
     pub mailboxes: Vec<MailboxEntry>,
     /// How the screen is drawn.
     pub display: crate::expando::Display,
+    /// How the index is ordered.
+    pub ordering: Ordering,
     /// How often to check for new mail (`msgraph_sync_interval`), or
     /// `None` not to.
     pub sync_interval: Option<std::time::Duration>,
@@ -102,6 +113,7 @@ impl Default for Settings {
             shortcuts: Shortcuts::default(),
             mailboxes: Vec::new(),
             display: crate::expando::Display::default(),
+            ordering: Ordering::default(),
             sync_interval: None,
         }
     }
@@ -372,6 +384,10 @@ pub struct App {
     redraw: bool,
     /// Keys to play once the folder is listed.
     after_load: Vec<Stroke>,
+    /// Escape was typed where it does nothing by itself, in this menu, and
+    /// when: with the next key there, soon after, it is Meta and that key
+    /// (`Esc v`), as in mutt.
+    escape: Option<(Menu, std::time::Instant)>,
     /// The user cancelled the sign-in in progress: the outcome it still
     /// reports isn't shown.
     cancelled: bool,
@@ -418,6 +434,20 @@ pub struct App {
     pub limit: Option<Limit>,
     /// The messages that the limit hides, newest first.
     hidden: Vec<MessageSummary>,
+    /// The messages folded into collapsed threads.
+    folded: Vec<MessageSummary>,
+    /// How the index is ordered.
+    pub ordering: Ordering,
+    /// Where each message is in its thread, when the index shows threads.
+    threads: HashMap<MessageId, Threaded>,
+    /// How many messages the threads were last built from: while a large
+    /// folder is listed, they are built again only as it doubles.
+    threaded_count: usize,
+    /// The threads (by key) collapsed, or with `collapse_all`, opened:
+    /// those that differ from the rest.
+    collapsed: HashSet<String>,
+    /// `Esc V` collapsed every thread, including those listed since.
+    collapse_all: bool,
     /// Whether the limit showed each message it was applied to, kept
     /// across listings so that they show the same messages.
     limited: HashMap<MessageId, bool>,
@@ -599,6 +629,7 @@ impl App {
             played: 0,
             redraw: false,
             after_load: Vec::new(),
+            escape: None,
             cancelled: false,
             dismissed: false,
             input: None,
@@ -616,6 +647,12 @@ impl App {
             left_drafts: Vec::new(),
             limit: None,
             hidden: Vec::new(),
+            folded: Vec::new(),
+            ordering: settings.ordering,
+            threads: HashMap::new(),
+            threaded_count: 0,
+            collapsed: HashSet::new(),
+            collapse_all: false,
             limited: HashMap::new(),
             positions: HashMap::new(),
             last_search: None,
@@ -794,6 +831,8 @@ impl App {
                     | Action::LastEntry
                     | Action::NextPage
                     | Action::PreviousPage
+                    | Action::NextThread
+                    | Action::PreviousThread
                     // Opening a message chooses it too.
                     | Action::DisplayMessage
             );
@@ -1101,6 +1140,9 @@ impl App {
         if let Some(effects) = self.on_mailbox_action(action) {
             return effects;
         }
+        if let Some(effects) = self.on_thread_action(action) {
+            return effects;
+        }
         if let Some(effects) = self.on_search_action(action) {
             return effects;
         }
@@ -1123,10 +1165,17 @@ impl App {
                 }
             }
             Action::NextPage => {
+                // A page on from where it started: pages to come may put
+                // messages before the last one listed.
+                let start = self.messages.get(self.selected).map(|m| m.id.clone());
                 let target = self.selected + page;
                 self.selected = target.min(last);
                 if target > last && self.more_to_list() {
-                    return self.wait_for(Target::Entry(target));
+                    let target = match start {
+                        Some(start) => Target::After(start, page),
+                        None => Target::Entry(target),
+                    };
+                    return self.wait_for(target);
                 }
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
@@ -1150,6 +1199,9 @@ impl App {
 
     fn on_pager_action(&mut self, action: Action) -> Vec<Effect> {
         if let Some(effects) = self.on_mailbox_action(action) {
+            return effects;
+        }
+        if let Some(effects) = self.on_thread_action(action) {
             return effects;
         }
         if let Some(effects) = self.on_search_action(action) {
@@ -1302,7 +1354,7 @@ impl App {
                     let mut messages = page.messages;
                     messages.retain(|m| !self.removed_while_listing.contains(&m.id));
                     self.overlay_wanted_flags(&mut messages);
-                    self.add_listed(messages);
+                    self.add_listed(messages, page.next.is_none());
                     self.see_index();
                     self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
@@ -1334,6 +1386,8 @@ impl App {
                     self.listing = None;
                     self.known_before_refresh = None;
                     self.unlisted = self.listing_page.take();
+                    // What was listed is threaded, while the rest waits.
+                    self.thread_listed();
                     // Pages asked for again come after the saves.
                     self.saved_flags.clear();
                     self.removed_while_listing.clear();
@@ -1778,6 +1832,7 @@ impl App {
         self.messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .find(|s| &s.id == id)
     }
 
@@ -1786,12 +1841,13 @@ impl App {
         self.messages
             .iter_mut()
             .chain(&mut self.hidden)
+            .chain(&mut self.folded)
             .find(|s| &s.id == id)
     }
 
     /// Every message of the folder listed so far, shown or not.
     pub fn folder_messages(&self) -> impl Iterator<Item = &MessageSummary> {
-        self.messages.iter().chain(&self.hidden)
+        self.messages.iter().chain(&self.hidden).chain(&self.folded)
     }
 
     /// Whether part of the folder could not be listed. The index then
@@ -1823,6 +1879,7 @@ impl App {
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
         self.display = settings.display;
+        self.apply_ordering(settings.ordering);
         self.apply_mailboxes(settings.mailboxes, settings.sync_interval);
     }
 
@@ -1833,7 +1890,11 @@ impl App {
         // As in mutt, the limit's choice of messages stays: only new ones
         // are matched against it.
         if self.limit.is_some() {
-            let shown = self.messages.iter().map(|m| (m.id.clone(), true));
+            let shown = self
+                .messages
+                .iter()
+                .chain(&self.folded)
+                .map(|m| (m.id.clone(), true));
             let hidden = self.hidden.iter().map(|m| (m.id.clone(), false));
             self.limited.extend(shown.chain(hidden));
         }
@@ -1841,6 +1902,9 @@ impl App {
         self.saved_flags.clear();
         self.removed_while_listing.clear();
         self.hidden.clear();
+        self.folded.clear();
+        self.threads.clear();
+        self.threaded_count = 0;
         self.positions.clear();
         self.selected = 0;
         self.pending = None;
@@ -1870,7 +1934,10 @@ impl App {
         let Some((id, at)) = &self.reselect else {
             return;
         };
-        if let Some(found) = self.messages.iter().position(|m| &m.id == id) {
+        // Shown, or folded into a collapsed thread that is.
+        let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+        let found = shown(id).or_else(|| self.thread_of(id).and_then(|t| shown(&t.root)));
+        if let Some(found) = found {
             self.selected = found;
         } else if done {
             self.selected = (*at).min(self.messages.len().saturating_sub(1));
@@ -1905,10 +1972,9 @@ impl App {
     /// The entry after the selected one, or the first if the index shows
     /// none yet (a limit may hide all the messages loaded so far).
     fn next_entry(&self) -> Target {
-        if self.messages.is_empty() {
-            Target::Entry(0)
-        } else {
-            Target::Entry(self.selected + 1)
+        match self.messages.get(self.selected) {
+            Some(message) => Target::After(message.id.clone(), 1),
+            None => Target::Entry(0),
         }
     }
 
@@ -1925,12 +1991,59 @@ impl App {
     /// message once the folder is fully loaded; the last-message target
     /// follows the end of the index until loading finishes.
     fn apply_pending(&mut self) -> Vec<Effect> {
-        let Some(target) = self.pending else {
+        let Some(target) = self.pending.clone() else {
             return Vec::new();
         };
-        let last = self.messages.len().saturating_sub(1);
         let loading = self.listing.is_some();
+        // The next thread needs the threads of what was listed, once it
+        // all is (threading at every page would be slow).
+        if matches!(target, Target::NextThread | Target::PreviousThread) {
+            if loading {
+                return Vec::new();
+            }
+            self.thread_listed();
+        }
+        let last = self.messages.len().saturating_sub(1);
         let selected = match target {
+            // A later page may bring a thread that goes in between.
+            Target::NextThread | Target::PreviousThread if loading => return Vec::new(),
+            Target::PreviousThread => match self.previous_thread_root() {
+                Some(previous) => previous,
+                None => {
+                    self.pending = None;
+                    self.fail("You are on the first thread.");
+                    return Vec::new();
+                }
+            },
+            Target::NextThread => match self.next_thread_root() {
+                Some(next) => next,
+                None => {
+                    self.pending = None;
+                    self.fail("You are on the last thread.");
+                    return Vec::new();
+                }
+            },
+            Target::After(message, steps) => {
+                // Folded into a collapsed thread since: from the thread.
+                let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+                let from = shown(&message)
+                    .or_else(|| self.thread_of(&message).and_then(|t| shown(&t.root)));
+                // While the folder loads, a later page may put a message
+                // in between (mail from the same time, a draft by its own
+                // date, a reply's start): wait for all of it, as mutt
+                // reads every message before showing any.
+                // (Unsorted, later pages only come after; reversed, before.)
+                let in_page_order = self.ordering.sort.method == crate::sort::Method::Unsorted
+                    && !self.ordering.sort.reverse;
+                if loading && !in_page_order {
+                    return Vec::new();
+                }
+                match from.map(|from| from + steps) {
+                    Some(entry) if entry < self.messages.len() => entry,
+                    _ if loading => return Vec::new(),
+                    _ => last,
+                }
+            }
             // Loaded (the index may still be empty, with a limit hiding
             // all the messages loaded so far).
             Target::Entry(entry) if entry < self.messages.len() => entry,
@@ -2082,10 +2195,11 @@ mod tests {
 
     use super::*;
 
+    /// `n` messages, newest first, as Graph lists them.
     fn summaries(n: usize) -> Vec<MessageSummary> {
         (0..n)
             .map(|i| {
-                let received = DateTime::UNIX_EPOCH + TimeDelta::minutes(i as i64);
+                let received = DateTime::UNIX_EPOCH + TimeDelta::minutes((n - i) as i64);
                 mock::message(&format!("m{i}"), "in", &format!("subject {i}"), received).summary
             })
             .collect()

@@ -95,6 +95,15 @@ impl Key {
         }
     }
 
+    /// Escape and a character, as mutt writes Meta (`\\ev`): terminals send
+    /// Alt-v as Escape then `v`.
+    pub const fn alt(c: char) -> Self {
+        Self {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::ALT,
+        }
+    }
+
     /// The key press this key stands for, to replay it.
     pub fn event(self) -> KeyEvent {
         KeyEvent::new(self.code, self.modifiers)
@@ -116,7 +125,14 @@ impl Key {
                         Some(x) => control(x),
                         None => return Err(format!("{text}: \\C needs a key")),
                     },
-                    Some('e' | 'E') => Key::new(KeyCode::Esc),
+                    // Escape then a character is Meta-character.
+                    Some('e' | 'E') => match chars.peek() {
+                        Some(&c) if is_meta_char(c) => {
+                            chars.next();
+                            Key::alt(c)
+                        }
+                        _ => Key::new(KeyCode::Esc),
+                    },
                     Some('t') => Key::new(KeyCode::Tab),
                     Some('n') => Key::ctrl('j'),
                     Some('r') => Key::new(KeyCode::Enter),
@@ -141,7 +157,13 @@ impl Key {
                 }
                 // What the mettrc lexer made of `\e`, `\t`, `\Cx` and
                 // friends.
-                '\u{1b}' => Key::new(KeyCode::Esc),
+                '\u{1b}' => match chars.peek() {
+                    Some(&c) if is_meta_char(c) => {
+                        chars.next();
+                        Key::alt(c)
+                    }
+                    _ => Key::new(KeyCode::Esc),
+                },
                 '\t' => Key::new(KeyCode::Tab),
                 '\n' => Key::ctrl('j'),
                 '\r' => Key::new(KeyCode::Enter),
@@ -160,6 +182,12 @@ impl Key {
 
 /// Control-`x`, as the terminal reports it: `^M` is Enter, `^I`
 /// is Tab, `^[` is Esc and `^?` is Backspace.
+/// Whether Escape followed by `c` stands for Meta-`c`: a printable
+/// character, not the start of other notation.
+fn is_meta_char(c: char) -> bool {
+    c.is_ascii_graphic() && !matches!(c, '\\' | '<' | '^')
+}
+
 fn control(x: char) -> Key {
     match x.to_ascii_lowercase() {
         'm' => Key::new(KeyCode::Enter),
@@ -228,7 +256,7 @@ impl fmt::Display for Key {
             f.write_str("^")?;
         }
         if self.modifiers.contains(KeyModifiers::ALT) {
-            f.write_str("M-")?;
+            f.write_str("Esc ")?;
         }
         match self.code {
             // Written as typed in a mettrc, not as crossterm reports them.
@@ -310,6 +338,8 @@ impl Keymap {
             (Key::char('y'), BrowseMailboxes),
             (Key::char('/'), Search),
             (Key::char('n'), SearchNext),
+            (Key::ctrl('n'), NextThread),
+            (Key::ctrl('p'), PreviousThread),
         ];
 
         // mutt's generic menu: keys that work in every menu but the pager,
@@ -342,6 +372,8 @@ impl Keymap {
             (Key::char('g'), GroupReply),
             (Key::char('f'), Forward),
             (Key::char('l'), Limit),
+            (Key::alt('v'), CollapseThread),
+            (Key::alt('V'), CollapseAll),
         ];
         for (key, action) in index.iter().chain(mailbox) {
             keymap.bind_action(Menu::Index, *key, *action);
@@ -650,6 +682,16 @@ mod tests {
             keys("ab"),
             [Stroke::Key(Key::char('a')), Stroke::Key(Key::char('b'))]
         );
+        // Escape then a character is Meta.
+        assert_eq!(
+            keys("\\ev\u{1b}V\\e"),
+            [
+                Stroke::Key(Key::alt('v')),
+                Stroke::Key(Key::alt('V')),
+                Stroke::Key(Key::new(KeyCode::Esc)),
+            ]
+        );
+        assert_eq!(Key::alt('v').to_string(), "Esc v");
         assert_eq!(keys("\\Cx"), [Stroke::Key(Key::ctrl('x'))]);
         assert_eq!(keys("^L"), [Stroke::Key(Key::ctrl('l'))]);
         // Control characters as the lexer leaves `\\C_` and `\\C?`.

@@ -222,6 +222,56 @@ async fn finds_when_unread_mail_last_changed() {
 }
 
 #[tokio::test]
+async fn reads_where_messages_are_in_their_conversations() {
+    use base64::Engine;
+
+    let server = MockServer::start().await;
+    let header = [7u8; 22];
+    let reply: Vec<u8> = header.iter().copied().chain([1, 2, 3, 4, 5]).collect();
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mut first = message("first", "2024-05-01T10:00:00Z");
+    first["conversationId"] = json!("conv");
+    first["conversationIndex"] = json!(encode(&header));
+    let mut second = message("second", "2024-05-01T11:00:00Z");
+    second["conversationId"] = json!("conv");
+    second["conversationIndex"] = json!(encode(&reply));
+    let mut odd = message("odd", "2024-05-01T12:00:00Z");
+    odd["conversationId"] = json!("other");
+    odd["conversationIndex"] = json!(encode(&[1, 2, 3]));
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [second, first, odd, message("lone", "2024-05-01T09:00:00Z")],
+        })))
+        .mount(&server)
+        .await;
+    let page = store(&server)
+        .list_messages(&FolderId::new("inbox-id"), Page::first(10))
+        .await
+        .unwrap();
+    let threads: Vec<_> = page
+        .messages
+        .iter()
+        .map(|m| {
+            m.thread
+                .as_ref()
+                .map(|t| (t.conversation.as_str(), t.path.len()))
+        })
+        .collect();
+    assert_eq!(
+        threads,
+        [
+            Some(("conv", 2)),
+            Some(("conv", 1)),
+            Some(("other", 0)),
+            None
+        ]
+    );
+    let second = page.messages[0].thread.as_ref().unwrap();
+    assert_eq!(second.path[1], [1, 2, 3, 4, 5]);
+}
+
+#[tokio::test]
 async fn does_not_cache_roles_after_a_failed_lookup() {
     let server = MockServer::start().await;
     mount_roles_with(&server, 503).await;

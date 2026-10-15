@@ -198,9 +198,26 @@ pub struct MessageSummary {
     /// Whether it has no sent date, as an unsent draft: it is dated when
     /// it was created, and comes apart from the rest when listed by date.
     pub draft: bool,
+    /// When it reached the mailbox, if the backend says (`received` is
+    /// when it was sent).
+    pub delivered: Option<DateTime<Utc>>,
     /// When it last changed (arrived, was moved, read, flagged), if the
     /// backend says.
     pub modified: Option<DateTime<Utc>>,
+    /// Where it is in its conversation, for threading, if the backend
+    /// knows.
+    pub thread: Option<ThreadPosition>,
+}
+
+/// Where a message is in its conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadPosition {
+    /// The conversation it belongs to.
+    pub conversation: String,
+    /// Its path in the conversation's tree, from the start of the
+    /// conversation: a message's parent is the message whose path is this
+    /// one without its last step. Empty if only the conversation is known.
+    pub path: Vec<Vec<u8>>,
 }
 
 /// The format of a message body.

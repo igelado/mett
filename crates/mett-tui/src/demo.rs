@@ -62,11 +62,31 @@ pub fn mailbox() -> MemoryStore {
             Some(WellKnownFolder::SentItems),
         ));
 
-    for i in 0..40 {
+    const COUNT: usize = 40;
+    for i in 0..COUNT {
         let (name, email) = PEOPLE[i % PEOPLE.len()];
-        let subject = SUBJECTS[i % SUBJECTS.len()];
+        // Messages with the same subject are a conversation: the oldest
+        // starts it, and the others answer it.
+        let topic = i % SUBJECTS.len();
+        let oldest = (COUNT - 1 - topic) / SUBJECTS.len() * SUBJECTS.len() + topic;
+        // (The welcome message stands alone.)
+        let reply = i != oldest && i != 0;
+        let subject = if reply && !SUBJECTS[topic].starts_with("Re:") {
+            format!("Re: {}", SUBJECTS[topic])
+        } else {
+            SUBJECTS[topic].to_owned()
+        };
         let received = now - TimeDelta::hours(7 * i as i64);
-        let mut message = mock::message(&format!("demo-{i}"), "inbox", subject, received);
+        let mut message = mock::message(&format!("demo-{i}"), "inbox", &subject, received);
+        let start = vec![u8::try_from(topic).unwrap_or(u8::MAX)];
+        message.summary.thread = (i != 0).then(|| mett_core::ThreadPosition {
+            conversation: SUBJECTS[topic].to_owned(),
+            path: if reply {
+                vec![start, vec![u8::try_from(i).unwrap_or(u8::MAX)]]
+            } else {
+                vec![start]
+            },
+        });
         message.summary.from = Some(Address::new(email).with_name(name));
         message.summary.to = vec![Address::new(YOU).with_name("You")];
         message.summary.flags.read = i > 3;
