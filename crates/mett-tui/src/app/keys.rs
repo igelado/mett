@@ -75,10 +75,11 @@ impl App {
                 Vec::new()
             }
             None => {
-                self.status = match self.keymap.key_for(self.menu(), Action::Help) {
+                let unbound = match self.keymap.key_for(self.menu(), Action::Help) {
                     Some(help) => format!("Key is not bound.  Press '{help}' for help."),
                     None => "Key is not bound.".into(),
                 };
+                self.fail(unbound);
                 Vec::new()
             }
         }
@@ -339,7 +340,11 @@ impl App {
             .collect();
         push_problems.reverse();
         problems.extend(push_problems);
-        self.status = problems.join("; ");
+        if problems.is_empty() {
+            self.status.clear();
+        } else {
+            self.fail(problems.join("; "));
+        }
         // Checking for new mail may have been turned on.
         self.arm_poll()
     }

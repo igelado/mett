@@ -638,7 +638,7 @@ impl App {
                 // The message being set up is lost without its text; one
                 // in the compose menu keeps the text it had.
                 self.composing = None;
-                self.status = e;
+                self.fail(e);
                 return Vec::new();
             }
         };

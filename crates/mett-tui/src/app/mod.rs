@@ -220,6 +220,10 @@ pub struct Pager {
     pub highlight: Option<(usize, std::ops::Range<usize>)>,
     /// A search made before the message arrived, to run when it does.
     pub pending_search: Option<String>,
+    /// The first line of the body, after the headers and the blank line.
+    pub body_start: usize,
+    /// The line the signature starts at (`-- `), if there is one.
+    pub signature: Option<usize>,
 }
 
 impl Pager {
@@ -1105,9 +1109,9 @@ impl App {
             Action::NextEntry if self.more_to_list() => {
                 return self.wait_for(self.next_entry());
             }
-            Action::NextEntry => self.status = "You are on the last message.".into(),
+            Action::NextEntry => self.fail("You are on the last message."),
             Action::PreviousEntry if self.selected > 0 => self.selected -= 1,
-            Action::PreviousEntry => self.status = "You are on the first message.".into(),
+            Action::PreviousEntry => self.fail("You are on the first message."),
             Action::FirstEntry => self.selected = 0,
             Action::LastEntry => {
                 self.selected = last;
@@ -1160,10 +1164,10 @@ impl App {
                 if self.more_to_list() {
                     return self.wait_for(self.next_entry());
                 }
-                self.status = "You are on the last message.".into();
+                self.fail("You are on the last message.");
             }
             Action::PreviousEntry if self.selected == 0 => {
-                self.status = "You are on the first message.".into();
+                self.fail("You are on the first message.");
             }
             Action::NextEntry | Action::PreviousEntry => {
                 if action == Action::NextEntry {
@@ -1240,6 +1244,8 @@ impl App {
             search_match: None,
             highlight: None,
             pending_search: None,
+            body_start: 0,
+            signature: None,
         }));
         vec![fetch]
     }
@@ -1430,7 +1436,7 @@ impl App {
                     // Retry deletes it once signed in.
                     let retry = draft.filter(|_| matches!(e, Error::Auth(_)));
                     self.left_drafts.push((left.clone(), retry));
-                    self.status = left;
+                    self.fail(left);
                 }
             }
             Event::FlagsUpdated(result) => {
@@ -1493,6 +1499,15 @@ impl App {
             unreachable!("found above");
         };
         pager.lines = text::pager_lines(&message);
+        pager.body_start = pager
+            .lines
+            .iter()
+            .position(String::is_empty)
+            .map_or(pager.lines.len(), |blank| blank + 1);
+        pager.signature = pager.lines[pager.body_start..]
+            .iter()
+            .position(|line| line == "-- ")
+            .map(|at| pager.body_start + at);
         pager.rows_width = None;
         pager.layout(self.width);
         let message_id = message.summary.id.clone();

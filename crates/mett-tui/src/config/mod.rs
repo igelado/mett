@@ -418,6 +418,7 @@ impl Config {
                     words.and_then(|words| match name.as_str() {
                         "color" => self.colors.color(&words),
                         "mono" => self.colors.mono(&words),
+                        "unmono" => self.colors.unmono(&words),
                         _ => self.colors.uncolor(&words),
                     })
                 }

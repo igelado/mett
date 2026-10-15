@@ -478,17 +478,9 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     // The app keeps the message wrapped to the terminal width; wrap here
     // only if the drawing area differs, so no text is clipped.
     let width = usize::from(area.width);
-    let rows: Vec<(usize, Range<usize>)> = if pager.rows_width == Some(width) {
-        let mut rows = Vec::with_capacity(pager.rows.len());
-        for (line, first) in pager.line_rows.iter().enumerate() {
-            let end = pager
-                .line_rows
-                .get(line + 1)
-                .copied()
-                .unwrap_or(pager.rows.len());
-            rows.extend((*first..end).map(|row| (line, pager.row_ranges[row].clone())));
-        }
-        rows
+    let cached = pager.rows_width == Some(width);
+    let rewrapped: Vec<(usize, Range<usize>)> = if cached {
+        Vec::new()
     } else {
         pager
             .lines
@@ -501,25 +493,39 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
             })
             .collect()
     };
+    let total = if cached {
+        pager.rows.len()
+    } else {
+        rewrapped.len()
+    };
     let height = usize::from(area.height);
-    let last_top = rows.len().saturating_sub(height);
+    let last_top = total.saturating_sub(height);
     let top = pager.scroll.min(last_top);
+    let end = (top + height).min(total);
+    // Only the rows on screen are looked at: each is part of a line.
+    let rows: Vec<(usize, (usize, Range<usize>))> = (top..end)
+        .map(|row| {
+            let part = if cached {
+                let line = pager.line_rows.partition_point(|&first| first <= row) - 1;
+                (line, pager.row_ranges[row].clone())
+            } else {
+                rewrapped[row].clone()
+            };
+            (row, part)
+        })
+        .collect();
     // The last search's match, where the rows are the app's.
-    let found = if pager.rows_width == Some(width) {
+    let found = if cached {
         highlighted(pager)
     } else {
         Vec::new()
     };
     let colors = &app.display.colors;
-    let styles = line_styles(&pager.lines, &app.display);
     let visible: Vec<Line> = rows
         .iter()
-        .enumerate()
-        .skip(top)
-        .take(height)
         .map(|(row, (line, range))| {
             let text = &pager.lines[*line];
-            let (style, body) = styles[*line];
+            let (style, body) = line_style(pager, *line, &app.display);
             // Byte by byte, what colors each part of the row.
             let mut marks: Vec<Option<Style>> = vec![None; range.len()];
             let mut mark = |start: usize, end: usize, style: Style| {
@@ -539,7 +545,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
                     }
                 }
             }
-            for (_, found) in found.iter().filter(|(r, _)| *r == row) {
+            for (_, found) in found.iter().filter(|(r, _)| r == row) {
                 mark(
                     range.start + found.start,
                     range.start + found.end,
@@ -564,7 +570,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         .collect();
     frame.render_widget(Paragraph::new(visible), area);
 
-    let position = expando::position(top, height, rows.len());
+    let position = expando::position(top, height, total);
     // The message as the index currently shows it, as in mutt's `%Z`: its
     // flags may have changed since it was fetched.
     let index = app.messages.iter().position(|m| m.id == pager.id);
@@ -581,47 +587,34 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     format::expand(&app.display.pager_format, &entry, width)
 }
 
-/// How each line of a message in the pager is drawn, and whether it is in
+/// How a line of the message in the pager is drawn, and whether it is in
 /// the body (which `color body` colors): headers with `color header` or
 /// `hdrdefault`, quoted text by its depth, and the signature.
-fn line_styles(lines: &[String], display: &Display) -> Vec<(Style, bool)> {
+fn line_style(pager: &Pager, line: usize, display: &Display) -> (Style, bool) {
     let colors = &display.colors;
-    let headers = lines
-        .iter()
-        .position(String::is_empty)
-        .unwrap_or(lines.len());
-    let mut signature = false;
-    lines
-        .iter()
-        .enumerate()
-        .map(|(i, line)| {
-            if i < headers {
-                return (colors.header_style(line), false);
-            }
-            if line == "-- " {
-                signature = true;
-            }
-            if signature {
-                return (colors.normal.patch(colors.signature), true);
-            }
-            let depth = display
-                .quote
-                .find(line)
-                .filter(|found| found.start() == 0)
-                .map_or(0, |found| {
-                    found
-                        .as_str()
-                        .chars()
-                        .filter(|c| !c.is_whitespace())
-                        .count()
-                });
-            if depth > 0 {
-                (colors.quoted_style(depth), true)
-            } else {
-                (colors.normal, true)
-            }
-        })
-        .collect()
+    let text = &pager.lines[line];
+    if line < pager.body_start {
+        return (colors.header_style(text), false);
+    }
+    if pager.signature.is_some_and(|start| line >= start) {
+        return (colors.normal.patch(colors.signature), true);
+    }
+    let depth = display
+        .quote
+        .find(text)
+        .filter(|found| found.start() == 0)
+        .map_or(0, |found| {
+            found
+                .as_str()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .count()
+        });
+    if depth > 0 {
+        (colors.quoted_style(depth), true)
+    } else {
+        (colors.normal, true)
+    }
 }
 
 #[cfg(test)]
@@ -762,8 +755,11 @@ mod tests {
         assert_eq!(buffer[(0, 0)].bg, Color::Blue, "the help line too");
         // Errors in their own color.
         colored(&mut app, &["color error brightred default"]);
-        app.update(Msg::Action(Action::PreviousEntry));
+        app.status = "Mail sent.".into();
         assert_eq!(styles(&app)[(0, 7)].fg, Color::Reset, "not an error");
+        // As in mutt, this is an error.
+        app.update(Msg::Action(Action::PreviousEntry));
+        assert_eq!(styles(&app)[(0, 7)].fg, Color::LightRed);
         let effects = app.update(Msg::Action(Action::DisplayMessage));
         let Effect::Request(fetch, _) = effects[0].clone() else {
             panic!("expected a request, got {effects:?}");

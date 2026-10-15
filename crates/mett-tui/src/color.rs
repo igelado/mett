@@ -255,9 +255,9 @@ impl Colors {
     }
 
     /// `mono OBJECT ATTRIBUTE [EXPRESSION]`: like `color`, for terminals
-    /// without colors. mett has colors, so the attribute is added to the
-    /// object's colors.
-    pub fn mono(&mut self, args: &[String]) -> Result<(), String> {
+    /// without colors. As in mutt on a terminal with colors, it is checked
+    /// but changes nothing.
+    pub fn mono(&self, args: &[String]) -> Result<(), String> {
         let [object, attr, rest @ ..] = args else {
             return Err("mono: expected an object and an attribute".into());
         };
@@ -265,12 +265,19 @@ impl Colors {
         if attribute(attr).is_none() {
             return Err(format!("mono: {attr}: no such attribute"));
         }
-        let style = with_attribute(Style::new(), attr);
         match (rest, object.matches()) {
-            ([], false) => self.set(object, style, None),
-            ([expression], true) => self.set(object, style, Some(expression)),
+            ([], false) => Ok(()),
+            ([expression], true) => Self::default().set(object, Style::new(), Some(expression)),
             _ => Err("mono: expected an object, an attribute and maybe an expression".into()),
         }
+    }
+
+    /// `unmono OBJECT [* | EXPRESSION ...]`: undoes `mono`, which changes
+    /// nothing; checked all the same.
+    pub fn unmono(&self, args: &[String]) -> Result<(), String> {
+        Self::default()
+            .uncolor(args)
+            .map_err(|e| e.replacen("uncolor", "unmono", 1))
     }
 
     fn set(
@@ -470,8 +477,14 @@ mod tests {
             .unwrap();
         assert_eq!(colors.header_style("Subject: hi").fg, Some(Color::Yellow));
         assert_eq!(colors.header_style("From: a").fg, None);
+        // `mono` is for terminals without colors.
         colors.mono(&words("body underline http://\\S+")).unwrap();
-        assert_eq!(colors.body.len(), 1);
+        colors.mono(&words("indicator underline")).unwrap();
+        assert!(colors.body.is_empty());
+        assert!(!colors.indicator.add_modifier.contains(Modifier::UNDERLINED));
+        colors.unmono(&words("indicator")).unwrap();
+        assert!(colors.unmono(&words("index")).is_err());
+        assert!(colors.mono(&words("body underline (")).is_err());
     }
 
     #[test]

@@ -111,7 +111,8 @@ fn expand_chars(chars: &[char], values: &dyn Expandos, width: usize) -> String {
 }
 
 /// A conditional's parts, starting after `%?`: its expando, the `then`
-/// and `else` parts, and where the format goes on.
+/// and `else` parts, and where the format goes on. The parts may hold
+/// expandos, and conditionals of their own.
 fn conditional(chars: &[char], start: usize) -> Option<(char, &[char], &[char], usize)> {
     let code = *chars.get(start)?;
     if chars.get(start + 1) != Some(&'?') {
@@ -122,8 +123,11 @@ fn conditional(chars: &[char], start: usize) -> Option<(char, &[char], &[char], 
     let mut else_start = None;
     while i < chars.len() {
         match chars[i] {
-            // An expando's `%`, `%?` or `%&` doesn't end a part.
-            '%' => i += 1,
+            // An expando's `?` or `&` doesn't end a part.
+            '%' => {
+                i = skip_expando(chars, i + 1);
+                continue;
+            }
             '&' if else_start.is_none() => else_start = Some(i),
             '?' => {
                 let (then, otherwise) = match else_start {
@@ -137,6 +141,32 @@ fn conditional(chars: &[char], start: usize) -> Option<(char, &[char], &[char], 
         i += 1;
     }
     None
+}
+
+/// Where the format goes on after the expando starting at `start` (just
+/// after its `%`): a whole conditional, a fill, or an expando with its
+/// spec and date format.
+fn skip_expando(chars: &[char], start: usize) -> usize {
+    match chars.get(start) {
+        None => start,
+        Some('%') => start + 1,
+        Some('?') => conditional(chars, start + 1).map_or(start + 1, |(.., next)| next),
+        Some('>' | '*' | '|') => (start + 2).min(chars.len()),
+        Some(_) => {
+            let (_, code) = spec(chars, start);
+            let close = match chars.get(code) {
+                Some('{') => '}',
+                Some('[') => ']',
+                Some('(') => ')',
+                Some(_) => return code + 1,
+                None => return code,
+            };
+            chars[code..]
+                .iter()
+                .position(|&c| c == close)
+                .map_or(chars.len(), |n| code + n + 1)
+        }
+    }
 }
 
 /// Whether a conditional's expando counts as true: not empty, and not
@@ -279,6 +309,9 @@ mod tests {
         assert_eq!(x("%?C?(%C)&none?"), "(7)");
         assert_eq!(x("%?z?(%z)&none?"), "none");
         assert_eq!(x("a%?q? q?b"), "ab");
+        // Conditionals inside conditionals, and expandos with `?` or `&`.
+        assert_eq!(x("%?C?<%?z?z&no z?>&none?."), "<no z>.");
+        assert_eq!(x("%?C?%{a?b&c}&none?"), "date(a?b&c)");
         // Not a conditional: taken as written.
         assert_eq!(x("%?"), "%?");
     }

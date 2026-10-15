@@ -341,7 +341,7 @@ impl App {
         let path = match browsed.map_or_else(|| self.mailbox_path(&text), Ok) {
             Ok(path) => path,
             Err(e) => {
-                self.status = e.to_string();
+                self.fail(e.to_string());
                 return Vec::new();
             }
         };
@@ -939,7 +939,10 @@ impl App {
             if transfer == Transfer::Purge && failed > unauthorized_count {
                 self.then = None;
             }
-            self.status = format!("{failed} of {} failed: {e}", messages(total, "message"));
+            self.fail(format!(
+                "{failed} of {} failed: {e}",
+                messages(total, "message")
+            ));
             return Vec::new();
         }
         self.status = match transfer {
