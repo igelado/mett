@@ -190,9 +190,11 @@ impl App {
     }
 
     fn begin(&mut self, kind: Kind, original: Option<Message>) -> Vec<Effect> {
+        self.last_draft += 1;
         let settings = &self.settings;
         let mut draft = Draft {
             from: settings.from.clone(),
+            attempt: self.last_draft,
             ..Draft::default()
         };
         let mut steps = VecDeque::new();
@@ -693,6 +695,10 @@ impl App {
                         "The message may have been sent ({e}), without a copy in Sent Items. \
                          Check with its recipients before sending it again."
                     ),
+                    // It failed before being handed over.
+                    (Some(Delivery::Send), mett_core::Error::NotSent(why)) => {
+                        format!("The message wasn't sent: {why}.")
+                    }
                     (Some(Delivery::Postpone), mett_core::Error::Network(_)) => format!(
                         "The message may have been saved ({e}). Check Drafts before postponing it again."
                     ),
@@ -1261,6 +1267,54 @@ mod tests {
             "{}",
             app.status
         );
+    }
+
+    #[test]
+    fn a_message_that_failed_before_sending_was_not_sent() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::NotSent("network error: timed out".into()))),
+        }));
+        assert_eq!(
+            app.status,
+            "The message wasn't sent: network error: timed out."
+        );
+    }
+
+    #[test]
+    fn each_composed_message_is_its_own_attempt() {
+        let mut app = app(settings());
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            act(&mut app, Action::Mail);
+            answer(&mut app, "bob@x.org");
+            answer(&mut app, "Hi");
+            app.update(Msg::Edited(Ok("text".into())));
+            let (id, Request::Send(sent)) = request(&act(&mut app, Action::SendMessage)) else {
+                panic!("expected Send");
+            };
+            app.update(Msg::Response(Response {
+                id,
+                event: Event::Sent(Err(Error::Network("timed out".into()))),
+            }));
+            // Sending the same message again is the same attempt.
+            let (id, Request::Send(again)) = request(&act(&mut app, Action::SendMessage)) else {
+                panic!("expected Send");
+            };
+            assert_eq!(again.attempt, sent.attempt);
+            app.update(Msg::Response(Response {
+                id,
+                event: Event::Sent(Ok(())),
+            }));
+            attempts.push(sent.attempt);
+        }
+        assert_ne!(attempts[0], attempts[1]);
     }
 
     #[test]

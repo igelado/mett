@@ -109,6 +109,9 @@ pub struct Config {
     /// Ignored commands and variables already warned about: each is
     /// reported once, where it first appears.
     warned: std::collections::HashSet<String>,
+    /// Variables given a value by `set`, `unset` or `toggle`, as opposed
+    /// to their defaults.
+    assigned: std::collections::HashSet<&'static str>,
     home: Option<String>,
 }
 
@@ -130,6 +133,7 @@ impl Config {
             warnings: Vec::new(),
             pending: Vec::new(),
             warned: Default::default(),
+            assigned: Default::default(),
             home,
         };
         for var in VARS {
@@ -143,14 +147,10 @@ impl Config {
         self.values.get(name)
     }
 
-    /// Whether a known variable has its default value.
-    pub fn is_default(&self, name: &str) -> bool {
-        vars::find(name).is_some_and(|var| {
-            vars::parse(var, var.default, self.home.as_deref())
-                .ok()
-                .as_ref()
-                == self.get(name)
-        })
+    /// Whether a known variable was given a value by the configuration,
+    /// rather than left at (or reset to) its default.
+    pub fn was_set(&self, name: &str) -> bool {
+        self.assigned.contains(name)
     }
 
     /// The value of a known string or path variable, or `""`.
@@ -410,10 +410,12 @@ impl Config {
             match vars::find(arg) {
                 Some(var) if var.kind == Kind::Bool => {
                     self.values.insert(var.name, Value::Bool(true));
+                    self.assigned.insert(var.name);
                     Ok(())
                 }
                 Some(var) if var.kind == Kind::Quad => {
                     self.values.insert(var.name, Value::Quad(Quad::Yes));
+                    self.assigned.insert(var.name);
                     Ok(())
                 }
                 Some(var) => Err(format!("{}: needs a value", var.name)),
@@ -436,6 +438,7 @@ impl Config {
         let value = self.expand(value)?;
         let value = vars::parse(var, &value, self.home.as_deref())?;
         self.values.insert(var.name, value);
+        self.assigned.insert(var.name);
         Ok(())
     }
 
@@ -454,6 +457,7 @@ impl Config {
             Kind::String | Kind::Path => Value::Str(String::new()),
         };
         self.values.insert(var.name, value);
+        self.assigned.insert(var.name);
         Ok(())
     }
 
@@ -462,11 +466,13 @@ impl Config {
             Some(var) if var.kind == Kind::Bool => {
                 let current = self.values.get(var.name) == Some(&Value::Bool(true));
                 self.values.insert(var.name, Value::Bool(!current));
+                self.assigned.insert(var.name);
                 Ok(())
             }
             Some(var) if var.kind == Kind::Quad => {
                 let current = self.quad(var.name);
                 self.values.insert(var.name, Value::Quad(current.toggled()));
+                self.assigned.insert(var.name);
                 Ok(())
             }
             Some(var) => Err(format!(
@@ -502,6 +508,7 @@ impl Config {
         let value =
             vars::parse(var, var.default, self.home.as_deref()).expect("defaults are valid");
         self.values.insert(var.name, value);
+        self.assigned.remove(var.name);
     }
 
     /// Unknown variables are reported, but don't stop the configuration

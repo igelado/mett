@@ -84,6 +84,8 @@ pub enum Msg {
 }
 
 /// A side effect for the main loop to carry out.
+// Effects are handed over as soon as they are made.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Send `Request` to the worker.
@@ -308,6 +310,8 @@ pub struct App {
     /// back yet; what failed among them is retried once they all have.
     retry_after: HashSet<RequestId>,
     next_request: u64,
+    /// The last [`mett_core::Draft::attempt`] given to a composed message.
+    last_draft: u64,
     /// How many messages to request per page.
     page_size: u32,
 }
@@ -358,6 +362,7 @@ impl App {
             unfetched: None,
             retry_after: HashSet::new(),
             next_request: 0,
+            last_draft: 0,
             page_size: settings.page_size,
         };
         let effects = app.open_folder();

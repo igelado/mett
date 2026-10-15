@@ -49,9 +49,10 @@ pub struct GraphMailStore<A> {
     /// The hidden root folder's ID, once looked up on its own.
     root: Mutex<Option<Option<FolderId>>>,
     /// Reply and forward drafts kept on the server after a send or update
-    /// whose outcome is unknown, by what they answer: sending or
-    /// postponing again updates the draft rather than making another.
-    kept: Mutex<HashMap<DraftOrigin, MessageId>>,
+    /// whose outcome is unknown, by what they answer and the composed
+    /// message they hold ([`Draft::attempt`]): sending or postponing that
+    /// message again updates the draft rather than making another.
+    kept: Mutex<HashMap<(DraftOrigin, u64), MessageId>>,
 }
 
 /// Which folders play special roles. Folder IDs don't change, so this is
@@ -525,7 +526,12 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         // Replies and forwards go through a server draft, so that Graph
         // threads them under the original and keeps a forwarded message's
         // attachments. Sending a draft always keeps a copy in Sent Items.
-        let id = self.answer(origin, draft).await?;
+        // Failing before the send request leaves nothing sent, whatever
+        // became of the draft.
+        let id = self.answer(origin, draft).await.map_err(|e| match e {
+            Error::Network(e) => Error::NotSent(format!("network error: {e}")),
+            e => e,
+        })?;
         let url = self.url(&["me", "messages", id.as_str(), "send"]);
         let sent = self
             .send(self.request(Method::POST, url), About::message(id.as_str()))
@@ -535,7 +541,7 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
             // gone out anyway. Keep the draft, so nothing is lost if it
             // didn't, and say so; sending again reuses it.
             Err(Error::Network(e)) => {
-                self.keep(origin, id);
+                self.keep(origin, draft, id);
                 return Err(Error::Network(format!(
                     "{e}; if it wasn't sent, it is in Drafts"
                 )));
@@ -558,13 +564,14 @@ impl<A: Authenticator> GraphMailStore<A> {
         };
         // A draft kept after an earlier attempt gets the new content; if it
         // is gone (it was sent after all, or deleted), a new one is made.
-        let kept = self.kept.lock().expect("lock").remove(origin);
+        let key = (origin.clone(), draft.attempt);
+        let kept = self.kept.lock().expect("lock").remove(&key);
         if let Some(id) = kept {
             match self.update_draft(&id, draft).await {
                 Ok(()) => return Ok(id),
                 Err(Error::NotFound { .. }) => {}
                 Err(e) => {
-                    self.keep(origin, id);
+                    self.keep(origin, draft, id);
                     return Err(e);
                 }
             }
@@ -584,7 +591,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             // The update may have been made: keep the draft, for the next
             // attempt to update.
             Err(e @ Error::Network(_)) => {
-                self.keep(origin, id);
+                self.keep(origin, draft, id);
                 Err(e)
             }
             Err(e) => {
@@ -607,8 +614,11 @@ impl<A: Authenticator> GraphMailStore<A> {
 
     /// Remembers a server draft kept after an attempt whose outcome is
     /// unknown.
-    fn keep(&self, origin: &DraftOrigin, id: MessageId) {
-        self.kept.lock().expect("lock").insert(origin.clone(), id);
+    fn keep(&self, origin: &DraftOrigin, draft: &Draft, id: MessageId) {
+        self.kept
+            .lock()
+            .expect("lock")
+            .insert((origin.clone(), draft.attempt), id);
     }
 
     /// Deletes a server draft that could not be completed, so it doesn't

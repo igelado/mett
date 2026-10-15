@@ -85,7 +85,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `realname` | string | Display name for outgoing mail. |
 | | `use_from` | boolean | Generate the `From:` header. |
 | | `hostname` | string | Fully qualified host name, used for Message-IDs. |
-| | `signature` | path | Signature file. Only the default, `~/.signature`, may be missing; a missing file that was set is an error. |
+| | `signature` | path | Signature file. Left unset, the default `~/.signature` may be missing; a file set in the mettrc (even that one) must exist. |
 | Mailboxes | `folder` | path | Base of the mailbox tree, often an `imaps://` URL. Default `~/Mail`. |
 | | `spoolfile` | path | Incoming mailbox, opened at startup. |
 | | `record` | path | Where copies of sent mail are saved. |

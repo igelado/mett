@@ -33,6 +33,11 @@ pub struct Draft {
     pub origin: Option<DraftOrigin>,
     /// Whether to keep a copy in the sent-items folder (mutt's `copy`).
     pub save_copy: bool,
+    /// Tells this message apart from others answering the same message:
+    /// the same for every attempt to send or postpone one composed
+    /// message, different for each message composed. A backend can then
+    /// reuse what an earlier attempt left behind.
+    pub attempt: u64,
 }
 
 impl Draft {

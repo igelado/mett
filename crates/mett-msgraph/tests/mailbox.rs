@@ -1101,3 +1101,74 @@ async fn a_kept_draft_that_is_gone_is_made_again() {
         MessageId::new("d2")
     );
 }
+
+#[tokio::test]
+async fn a_failure_before_sending_is_not_sent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store(&server).send(&reply).await.unwrap_err();
+    assert!(matches!(err, Error::NotSent(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn another_reply_to_the_same_message_gets_its_own_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d2" })))
+        .mount(&server)
+        .await;
+    for id in ["d1", "d2"] {
+        Mock::given(method("PATCH"))
+            .and(path(format!("/v1.0/me/messages/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": id })))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let first = Draft {
+        attempt: 1,
+        ..draft(Some(DraftOrigin::Reply(MessageId::new("orig"))))
+    };
+    store.send(&first).await.unwrap_err();
+    let second = Draft {
+        attempt: 2,
+        ..first.clone()
+    };
+    assert_eq!(
+        store.save_draft(&second).await.unwrap(),
+        MessageId::new("d2")
+    );
+    // The first is still kept for its own message.
+    assert_eq!(
+        store.save_draft(&first).await.unwrap(),
+        MessageId::new("d1")
+    );
+}

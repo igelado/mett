@@ -113,8 +113,7 @@ impl Settings {
                 // mutt's default, ~/.signature, often doesn't exist; a
                 // signature the user set should.
                 Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        && config.is_default("signature") =>
+                    if e.kind() == std::io::ErrorKind::NotFound && !config.was_set("signature") =>
                 {
                     None
                 }
@@ -441,6 +440,14 @@ mod tests {
         );
         let missing = Settings::from_config(&config("set signature=/nonexistent/sig\n"), &account);
         assert!(missing.unwrap_err().contains("/nonexistent/sig"));
+        // Even if it is the default's own path.
+        let missing = Settings::from_config(&config("set signature=~/.signature\n"), &account);
+        assert!(missing.unwrap_err().contains(".signature"));
+        let reset = Settings::from_config(
+            &config("set signature=/nonexistent/sig\nreset signature\n"),
+            &account,
+        );
+        assert_eq!(reset.unwrap().signature, None);
     }
 
     #[test]
