@@ -86,6 +86,8 @@ actions! {
     PreviousThread => "previous-thread", "Move to the previous thread";
     CollapseThread => "collapse-thread", "Collapse or uncollapse the current thread";
     CollapseAll => "collapse-all", "Collapse or uncollapse every thread";
+    Query => "query", "Find addresses with query_command or the directory";
+    CreateAlias => "create-alias", "Save the sender as an alias";
     ViewAttachments => "view-attachments", "Show the message's attachments";
     ViewAttach => "view-attach", "View the attachment";
     SaveEntry => "save-entry", "Save the attachment to a file";

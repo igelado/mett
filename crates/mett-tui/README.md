@@ -108,6 +108,19 @@ or `NO_COLOR` set). Objects and patterns mett doesn't do yet (such as
 `color compose ...` or `color index ... ~T`) are ignored with a warning.
 `tree`, `tilde` and `markers` are accepted but not drawn yet.
 
+### Aliases and queries
+
+`alias KEY ADDRESS[, ADDRESS ...]` names a list of addresses (which may hold
+other aliases), and `unalias KEY` (or `*`) forgets it. In the `To:`, `Cc:`
+and `Bcc:` questions, aliases are replaced by their addresses, `Tab`
+completes the alias being typed (listing them when several match), and
+`^T` looks up what has been typed. `Q` asks what to look up, and `a` saves
+the sender of the selected message as an alias, appended to `alias_file`
+(the user's mettrc, by default, or `~/.config/mett/mettrc` without one). Lookups run `query_command`, as in mutt (`%s`
+is the text, and the output is mutt's: a line of text, then one
+`address<TAB>name` per line); without one, the Office365 account's people
+and directory are searched (`msgraph_query_directory`).
+
 `mett -D` prints every setting after reading the configuration, which is a
 quick way to check it:
 
@@ -183,12 +196,13 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 |------|------|
 | Index | `Esc v`/`Esc V`: collapse or open the thread, or all of them (with `sort=threads`). `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
-| Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size` and `msgraph_sync_interval` take effect when mett starts again). |
-| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `v`: the message's attachments. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
+| Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size`, `msgraph_sync_interval` and `msgraph_query_directory` take effect when mett starts again). |
+| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `v`: the message's attachments. `Q`: look up addresses, to write to one. `a`: save the sender as an alias. `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
 | Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. `Tab`: switch between the `mailboxes` (listed first, if there are any) and every folder. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
 | Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. `a`: attach a file. `D`: take the selected file off. `j`/`k`: select a part. |
+| Query | `Enter`/`Space`/`m`: choose the address (after `Q`, write to it). `j`/`k`, `z`/`Z`, `=`/`*`: move. `q`: back. |
 | Attachments | `Enter`/`m`: view (text in mett; other files open in the program your system has for them, from a private copy that a later run of mett removes after a day). `s`: save to a file (asks before replacing one). `j`/`k`, `z`/`Z`: move. `q`: back. While a file is read (to attach) or saved, keys wait for it; `^G` gives up waiting. |
-| Questions | Type the answer and press `Enter`; `Esc` or `^G` gives up. The usual line-editing keys work (`^A`, `^E`, `^U`, `^K`, `^W`, arrows). Yes/no questions take `y`, `n`, or `Enter` for the suggested answer. |
+| Questions | Type the answer and press `Enter`; `Esc` or `^G` gives up. The usual line-editing keys work (`^A`, `^E`, `^U`, `^K`, `^W`, arrows). Yes/no questions take `y`, `n`, or `Enter` for the suggested answer. In `To:`, `Cc:` and `Bcc:`, `Tab` completes an alias and `^T` looks up the addresses. |
 | Sign-in window | `o`: open the sign-in page in a browser. `c`: copy the link (or the device code) to the clipboard, in terminals that support OSC 52 (in tmux, `set -g set-clipboard on`). `q`/`Esc`: cancel, or close after a failure. `Enter`: try again after a failure. `j`/`k` or arrows: scroll, when the terminal is too small to show it all. |
 
 Check that:
@@ -213,6 +227,8 @@ Check that:
 - `v` on a message with attachments (`+`) lists them; `Enter` on
   `notes.txt` shows it, and `s` saves it. In the compose menu, `a` attaches
   a file and `D` takes it off again.
+- `a` on a message saves its sender as an alias, which `m` then completes
+  with `Tab` in `To:`; `^T` there (or `Q`) finds people in the directory.
 - The pager's status bar shows `(all)`, a percentage, or `(end)` as you
   scroll.
 - Resizing the terminal keeps the layout intact.

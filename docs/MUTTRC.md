@@ -122,6 +122,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |
 | | `mailcap_path` | string | mailcap files used to view MIME parts. |
 | | `query_command` | path | External address-book query. |
+| | `alias_file` | path | Where aliases created with `a` (`<create-alias>`) are saved. Defaults to the user's own mettrc (`~/.config/mett/mettrc` for a user who has none yet). |
 
 ## 4. Commands
 

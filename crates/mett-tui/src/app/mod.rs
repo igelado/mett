@@ -10,6 +10,7 @@ mod composing;
 mod keys;
 mod mailbox;
 mod newmail;
+mod query;
 mod search;
 mod threads;
 
@@ -26,6 +27,7 @@ pub use self::keys::{Help, Reconfigured};
 pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
 pub use self::newmail::MailboxEntry;
+pub use self::query::{QueryMenu, QuerySettings};
 pub use self::search::{Limit, highlighted};
 pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
@@ -90,6 +92,12 @@ pub struct Settings {
     pub sync_interval: Option<std::time::Duration>,
     /// The home directory, for `~` in file names.
     pub home: Option<String>,
+    /// `alias`.
+    pub aliases: Vec<crate::alias::Alias>,
+    /// `alias_file`: where `a` saves aliases.
+    pub alias_file: Option<std::path::PathBuf>,
+    /// How to find addresses.
+    pub query: QuerySettings,
 }
 
 /// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
@@ -120,6 +128,9 @@ impl Default for Settings {
             ordering: Ordering::default(),
             sync_interval: None,
             home: None,
+            aliases: Vec::new(),
+            alias_file: None,
+            query: QuerySettings::default(),
         }
     }
 }
@@ -148,6 +159,8 @@ pub enum Msg {
     FileRead(FileOp, std::path::PathBuf, Result<Vec<u8>, String>),
     /// Something done apart from the app failed (opening a file, say).
     Failed(String),
+    /// Text was added to a file, or not.
+    Appended(Result<std::path::PathBuf, String>),
     /// A timer the app set went off.
     Timer(Timer),
     /// The terminal was resized.
@@ -193,6 +206,13 @@ pub enum Effect {
     },
     /// Read a file, then send back [`Msg::FileRead`].
     ReadFile(FileOp, std::path::PathBuf),
+    /// Add text to the end of a file, then send back [`Msg::Appended`].
+    AppendFile {
+        /// The file.
+        path: std::path::PathBuf,
+        /// The text.
+        text: String,
+    },
     /// Edit the text in the user's editor, then send back
     /// [`Msg::Edited`].
     Edit(String),
@@ -232,6 +252,8 @@ pub enum Screen {
     Attachments(AttachMenu),
     /// Text on its own, such as a text attachment.
     Text(TextView),
+    /// Addresses to choose from: aliases, or a query's results.
+    Query(QueryMenu),
 }
 
 /// Pager state.
@@ -404,6 +426,9 @@ pub struct App {
     /// The last error reported on the message line, so that the view can
     /// tell it from other messages.
     pub error: Option<String>,
+    /// Why a question was asked again (a lookup found nothing, say):
+    /// shown in its place until the next key.
+    pub input_note: Option<String>,
     /// `alternates`, compiled: the index asks for every row.
     alternates: Vec<regex::Regex>,
     /// Keys and functions a macro or `push` queued, played before new
@@ -612,6 +637,18 @@ pub struct App {
     unsaved: Option<(std::path::PathBuf, Vec<u8>)>,
     /// See [`Settings::home`].
     home: Option<String>,
+    /// See [`Settings::aliases`].
+    aliases: Vec<crate::alias::Alias>,
+    /// See [`Settings::alias_file`].
+    alias_file: Option<std::path::PathBuf>,
+    /// See [`Settings::query`].
+    query: QuerySettings,
+    /// The address of an alias being made, until its name is given.
+    new_alias: Option<String>,
+    /// The name of an alias being made, until its address is given.
+    alias_key: Option<String>,
+    /// What to say once the `:` commands on their way are done.
+    after_configured: Option<String>,
     /// See [`Settings::mailboxes`].
     mailboxes: Vec<MailboxEntry>,
     /// What is known of each mailbox's new mail.
@@ -673,6 +710,7 @@ impl App {
             keymap: Keymap::mutt_defaults(),
             display: settings.display,
             error: None,
+            input_note: None,
             alternates: compile_alternates(&settings.compose.alternates),
             strokes: VecDeque::new(),
             sign_in_strokes: VecDeque::new(),
@@ -754,6 +792,12 @@ impl App {
             last_file_op: 0,
             unsaved: None,
             home: settings.home,
+            aliases: settings.aliases,
+            alias_file: settings.alias_file,
+            query: settings.query,
+            new_alias: None,
+            alias_key: None,
+            after_configured: None,
             mailboxes: settings.mailboxes,
             mailbox_state: HashMap::new(),
             sync_interval: settings.sync_interval,
@@ -793,6 +837,7 @@ impl App {
             Screen::Browser(_) => Menu::Browser,
             Screen::Help(_) => Menu::Help,
             Screen::Attachments(_) => Menu::Attach,
+            Screen::Query(_) => Menu::Query,
             // Read like a message.
             Screen::Text(_) => Menu::Pager,
         }
@@ -841,6 +886,7 @@ impl App {
                 self.fail(why);
                 Vec::new()
             }
+            Msg::Appended(result) => self.on_appended(result),
             Msg::Timer(Timer::RelistSentItems) => {
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
                 if open == Some(mett_core::WellKnownFolder::SentItems) {
@@ -917,6 +963,12 @@ impl App {
         match action {
             // Help and commands work in every menu but the sign-in window.
             Action::Help if menu != Menu::SignIn => return self.open_help(),
+            // A lookup's answer may bring back the question it came from,
+            // over the command.
+            Action::EnterCommand if matches!(self.screens.last(), Some(Screen::Query(q)) if q.request.is_some()) =>
+            {
+                self.fail("Looking up addresses; wait a moment.");
+            }
             Action::EnterCommand if menu != Menu::SignIn => return self.ask_command(),
             _ => {}
         }
@@ -925,6 +977,7 @@ impl App {
             Menu::Pager if matches!(self.screen(), Screen::Text(_)) => self.on_text_action(action),
             Menu::Pager => self.on_pager_action(action),
             Menu::Attach => self.on_attach_action(action),
+            Menu::Query => self.on_query_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
             Menu::Compose => self.on_compose_action(action),
             Menu::Browser => self.on_browser_action(action),
@@ -1264,6 +1317,8 @@ impl App {
             Action::GroupReply => return self.start_compose(Kind::GroupReply),
             Action::Forward => return self.start_compose(Kind::Forward),
             Action::ViewAttachments => return self.view_attachments(),
+            Action::Query => self.ask_query(),
+            Action::CreateAlias => return self.create_alias(),
             _ => {}
         }
         Vec::new()
@@ -1314,6 +1369,8 @@ impl App {
             Action::GroupReply => return self.start_compose(Kind::GroupReply),
             Action::Forward => return self.start_compose(Kind::Forward),
             Action::ViewAttachments => return self.view_attachments(),
+            Action::Query => self.ask_query(),
+            Action::CreateAlias => return self.create_alias(),
             _ => {}
         }
         Vec::new()
@@ -1497,6 +1554,7 @@ impl App {
             Event::FoldersListed(result) => return self.on_folders_listed(id, result),
             Event::AttachmentsListed(result) => return self.on_attachments_listed(id, result),
             Event::AttachmentFetched(result) => return self.on_attachment_fetched(id, result),
+            Event::Queried(result) => return self.on_queried(id, result),
             Event::MailboxesChecked(checked) => return self.on_mailboxes_checked(id, checked),
             Event::StillThere(result) => return self.on_still_there(id, result),
             Event::Transferred(result) => {
@@ -1954,6 +2012,9 @@ impl App {
     pub(super) fn apply_settings(&mut self, settings: Settings) {
         self.page_size = settings.page_size;
         self.home = settings.home;
+        self.aliases = settings.aliases;
+        self.alias_file = settings.alias_file;
+        self.query = settings.query;
         self.alternates = compile_alternates(&settings.compose.alternates);
         self.settings = settings.compose;
         // The configuration doesn't know what the mailbox told.
@@ -2154,7 +2215,8 @@ impl App {
             | Screen::Browser(_)
             | Screen::Help(_)
             | Screen::Attachments(_)
-            | Screen::Text(_) => Vec::new(),
+            | Screen::Text(_)
+            | Screen::Query(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()
@@ -2223,6 +2285,12 @@ impl App {
     pub(super) fn fail(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.error = Some(self.status.clone());
+    }
+
+    /// [`Self::fail`], shown over the question being asked too.
+    pub(super) fn fail_at_question(&mut self, text: impl Into<String>) {
+        self.fail(text);
+        self.input_note = Some(self.status.clone());
     }
 
     /// Whether the user sent mail from `address`.

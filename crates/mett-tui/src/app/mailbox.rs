@@ -112,7 +112,7 @@ impl App {
     /// The message mailbox actions act on: the one the pager shows, or the
     /// one selected in the index. (A background listing may move the
     /// index's selection while the pager is open.)
-    fn acted_on(&self) -> Option<MessageId> {
+    pub(super) fn acted_on(&self) -> Option<MessageId> {
         match self.screens.last() {
             Some(Screen::Pager(pager)) => Some(pager.id.clone()),
             _ => self.selected_id(),

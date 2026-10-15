@@ -25,6 +25,10 @@ pub enum Part {
 pub struct Word {
     /// The parts, in order.
     pub parts: Vec<Part>,
+    /// The parts with the quotes as written (in double quotes, whichever
+    /// were used), as mutt keeps them for an address list (`alias`):
+    /// `"Doe, Jane"<jane@x.org>` is one address, not two.
+    pub kept: Vec<Part>,
 }
 
 /// A command: its words and where it starts.
@@ -60,26 +64,89 @@ pub trait Expander {
     fn command(&self, command: &str) -> Result<String, String>;
 }
 
+/// Adds `s` to the literal text at the end of `parts`.
+fn push_literal(parts: &mut Vec<Part>, s: &str) {
+    match parts.last_mut() {
+        Some(Part::Literal(text)) => text.push_str(s),
+        _ => parts.push(Part::Literal(s.to_owned())),
+    }
+}
+
 impl Word {
     fn push_char(&mut self, c: char) {
-        match self.parts.last_mut() {
-            Some(Part::Literal(text)) => text.push(c),
-            _ => self.parts.push(Part::Literal(c.to_string())),
-        }
+        self.push_str(c.encode_utf8(&mut [0; 4]));
     }
 
     fn push_str(&mut self, s: &str) {
-        match self.parts.last_mut() {
-            Some(Part::Literal(text)) => text.push_str(s),
-            _ => self.parts.push(Part::Literal(s.to_owned())),
+        push_literal(&mut self.parts, s);
+        push_literal(&mut self.kept, s);
+    }
+
+    /// A variable or a command.
+    fn push_part(&mut self, part: Part) {
+        self.kept.push(part.clone());
+        self.parts.push(part);
+    }
+
+    /// Starts or ends a quoted string.
+    fn push_quote(&mut self) {
+        push_literal(&mut self.kept, "\"");
+    }
+
+    /// A character inside quotes: kept with a backslash if it would end
+    /// them.
+    fn push_quoted_char(&mut self, c: char) {
+        push_literal(&mut self.parts, c.encode_utf8(&mut [0; 4]));
+        if matches!(c, '"' | '\\') {
+            push_literal(&mut self.kept, "\\");
         }
+        push_literal(&mut self.kept, c.encode_utf8(&mut [0; 4]));
     }
 
     /// The word's value: variables are replaced and backtick commands run
     /// (without their trailing newline).
     pub fn expand(&self, expander: &dyn Expander) -> Result<String, String> {
+        expand_parts(&self.parts, expander)
+    }
+
+    /// [`Self::expand`] with the quotes as written (see [`Self::kept`]).
+    /// What a variable or command gives inside quotes is escaped, so that
+    /// it stays inside them.
+    pub fn expand_kept(&self, expander: &dyn Expander) -> Result<String, String> {
         let mut out = String::new();
-        for part in &self.parts {
+        let mut quoted = false;
+        for part in &self.kept {
+            let value = match part {
+                Part::Literal(text) => {
+                    let mut escaped = false;
+                    for c in text.chars() {
+                        match c {
+                            _ if escaped => escaped = false,
+                            '\\' => escaped = true,
+                            '"' => quoted = !quoted,
+                            _ => {}
+                        }
+                    }
+                    out.push_str(text);
+                    continue;
+                }
+                part => expand_parts(std::slice::from_ref(part), expander)?,
+            };
+            if quoted {
+                out.push_str(&value.replace('\\', "\\\\").replace('"', "\\\""));
+            } else {
+                out.push_str(&value);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// `parts`, with variables replaced and backtick commands run.
+fn expand_parts(parts: &[Part], expander: &dyn Expander) -> Result<String, String> {
+    {
+        let mut out = String::new();
+        for part in parts {
             match part {
                 Part::Literal(text) => out.push_str(text),
                 Part::Variable(name) => {
@@ -95,7 +162,9 @@ impl Word {
         }
         Ok(out)
     }
+}
 
+impl Word {
     /// The word's text if it has no variables or commands.
     pub fn literal(&self) -> Option<String> {
         let mut out = String::new();
@@ -266,10 +335,12 @@ impl<'a> Lexer<'a> {
                     // A quoted string starts its own part, so that even `''`
                     // after `=` counts as an (empty) value.
                     word.parts.push(Part::Literal(String::new()));
+                    word.push_quote();
                     loop {
                         match self.chars.peek() {
                             Some('\'') => {
                                 self.bump();
+                                word.push_quote();
                                 break;
                             }
                             // As in mutt, a quote ends at the end of its line.
@@ -278,7 +349,7 @@ impl<'a> Lexer<'a> {
                             }
                             Some(_) => {
                                 let c = self.bump().expect("peeked");
-                                word.push_char(c);
+                                word.push_quoted_char(c);
                             }
                         }
                     }
@@ -286,12 +357,13 @@ impl<'a> Lexer<'a> {
                 '"' => {
                     self.bump();
                     word.parts.push(Part::Literal(String::new()));
+                    word.push_quote();
                     self.read_double_quoted(&mut word)?;
                 }
                 '`' => {
                     self.bump();
                     let command = self.read_backtick()?;
-                    word.parts.push(Part::Command(command));
+                    word.push_part(Part::Command(command));
                 }
                 '$' => {
                     self.bump();
@@ -317,21 +389,24 @@ impl<'a> Lexer<'a> {
                 return Err(self.error("unterminated double quote"));
             }
             match self.bump() {
-                Some('"') => return Ok(()),
+                Some('"') => {
+                    word.push_quote();
+                    return Ok(());
+                }
                 Some('\\') => match self.bump() {
                     Some('\n') => {}
                     Some(c) => {
                         let c = self.escaped(c)?;
-                        word.push_char(c);
+                        word.push_quoted_char(c);
                     }
                     None => return Err(self.error("unterminated double quote")),
                 },
                 Some('`') => {
                     let command = self.read_backtick()?;
-                    word.parts.push(Part::Command(command));
+                    word.push_part(Part::Command(command));
                 }
                 Some('$') => self.read_variable(word)?,
-                Some(c) => word.push_char(c),
+                Some(c) => word.push_quoted_char(c),
                 None => return Err(self.error("unterminated double quote")),
             }
         }
@@ -394,7 +469,7 @@ impl<'a> Lexer<'a> {
         if name.is_empty() {
             word.push_str(if braced { "${" } else { "$" });
         } else {
-            word.parts.push(Part::Variable(name));
+            word.push_part(Part::Variable(name));
         }
         Ok(())
     }

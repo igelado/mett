@@ -17,8 +17,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
 use crate::app::{
-    App, AttachMenu, Browser, Compose, Help, Input, Pager, Row, Screen, SignIn, TextView,
-    highlighted,
+    App, AttachMenu, Browser, Compose, Help, Input, Pager, QueryMenu, Row, Screen, SignIn,
+    TextView, highlighted,
 };
 use crate::color::Colors;
 use crate::expando::{self, Display, Entry, Status};
@@ -90,6 +90,16 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
         ],
     ),
     (
+        Menu::Query,
+        &[
+            (Action::Exit, "Exit"),
+            (Action::DisplayMessage, "Select"),
+            (Action::Mail, "Mail"),
+            (Action::NextEntry, "Next"),
+            (Action::PreviousEntry, "Prev"),
+        ],
+    ),
+    (
         Menu::SignIn,
         &[
             (Action::Exit, "Close"),
@@ -142,9 +152,13 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         Screen::Help(help) => render_help(app, help, frame, body),
         Screen::Attachments(menu) => render_attachments(menu, colors, frame, body),
         Screen::Text(view) => render_text(view, frame, body),
+        Screen::Query(menu) => render_query(menu, colors, frame, body),
     };
     frame.render_widget(Paragraph::new(status_line).style(colors.status), status);
     match &app.input {
+        Some(_) if let Some(note) = &app.input_note => {
+            frame.render_widget(Paragraph::new(note.as_str()).style(colors.error), message);
+        }
         Some(input) => render_input(input, colors.prompt, frame, message),
         None => {
             let style = if app.error.as_deref() == Some(app.status.as_str()) {
@@ -376,6 +390,34 @@ fn render_attachments(menu: &AttachMenu, colors: &Colors, frame: &mut Frame, are
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
     format!("---mett: Attachments [{}]---", menu.entries.len())
+}
+
+/// Draws a list of addresses to choose from and returns its status line.
+fn render_query(menu: &QueryMenu, colors: &Colors, frame: &mut Frame, area: Rect) -> String {
+    if menu.entries.is_empty() {
+        frame.render_widget(Paragraph::new("Searching..."), area);
+        return format!("---mett: {}---", menu.title);
+    }
+    let height = usize::from(area.height).max(1);
+    let first = menu.selected / height * height;
+    let width = usize::from(area.width);
+    let lines: Vec<Line> = menu
+        .entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, entry)| {
+            let line = Line::raw(truncate(&format!("{:>4} {}", i + 1, entry.label), width));
+            if i == menu.selected {
+                line.style(colors.indicator)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    format!("---mett: {} [{}]---", menu.title, menu.entries.len())
 }
 
 /// Draws text on its own screen and returns its status line.

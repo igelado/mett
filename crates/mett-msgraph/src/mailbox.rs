@@ -400,6 +400,96 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .collect())
     }
 
+    async fn search_people(&self, text: &str) -> Result<Vec<Address>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Person {
+            display_name: Option<String>,
+            #[serde(default)]
+            scored_email_addresses: Vec<Scored>,
+        }
+        #[derive(Deserialize)]
+        struct Scored {
+            address: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct User {
+            display_name: Option<String>,
+            mail: Option<String>,
+        }
+        // Graph's `$search` takes the text in double quotes.
+        let quoted = format!("\"{}\"", text.replace(['"', '\\'], " "));
+        let mut found: Vec<Address> = Vec::new();
+        let mut add = |name: Option<String>, email: Option<String>| {
+            let Some(email) = email.filter(|e| e.contains('@')) else {
+                return;
+            };
+            if found.iter().any(|f| f.email.eq_ignore_ascii_case(&email)) {
+                return;
+            }
+            let address = Address::new(email);
+            found.push(match name.filter(|n| !n.is_empty()) {
+                Some(name) => address.with_name(name),
+                None => address,
+            });
+        };
+        // The people the user works with (People.Read).
+        let mut url = self.url(&["me", "people"]);
+        url.query_pairs_mut()
+            .append_pair("$search", &quoted)
+            .append_pair("$top", "20")
+            .append_pair("$select", "displayName,scoredEmailAddresses");
+        // Either search may be refused (the app may not have its
+        // permission): the other's results are what there is.
+        let refused = |e: &Error| matches!(e, Error::Auth(_));
+        let people = self
+            .json::<Collection<Person>>(self.request(Method::GET, url), About::MAILBOX)
+            .await;
+        let people_refused = match people {
+            Ok(people) => {
+                for person in people.value {
+                    let email = person
+                        .scored_email_addresses
+                        .into_iter()
+                        .find_map(|s| s.address);
+                    add(person.display_name, email);
+                }
+                None
+            }
+            Err(e) if refused(&e) => Some(e),
+            Err(e) => return Err(e),
+        };
+        // The whole directory (User.ReadBasic.All).
+        let mut url = self.url(&["users"]);
+        let term = text.replace(['"', '\\'], " ");
+        url.query_pairs_mut()
+            .append_pair(
+                "$search",
+                &format!("\"displayName:{term}\" OR \"mail:{term}\""),
+            )
+            .append_pair("$top", "20")
+            .append_pair("$select", "displayName,mail");
+        let request = self
+            .request(Method::GET, url)
+            .header("ConsistencyLevel", "eventual");
+        match self.json::<Collection<User>>(request, About::MAILBOX).await {
+            Ok(users) => {
+                for user in users.value {
+                    add(user.display_name, user.mail);
+                }
+            }
+            // Both refused: say why.
+            Err(e) if refused(&e) => {
+                if let Some(e) = people_refused {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(found)
+    }
+
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let roles = self.roles().await?;
         let top = |mut url: Url| {

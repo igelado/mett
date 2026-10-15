@@ -46,6 +46,7 @@ impl App {
     pub(super) fn on_key_press(&mut self, event: KeyEvent) -> Vec<Effect> {
         // Ctrl-J is a newline: it does what Enter does, unless bound.
         let ctrl_j = Key::from(event) == Key::ctrl('j');
+        self.input_note = None;
         // Keys wait for a file being read or saved; `^G` gives up on it.
         if let Some((_, path)) = &self.file_wait
             && self.sign_in.is_none()
@@ -228,6 +229,7 @@ impl App {
             || self.browser_request().is_some()
             // Attachments being listed, or one fetched to show or save.
             || self.attachments_request().is_some()
+            || self.query_request().is_some()
             || self.fetching.is_some()
             // A file being read or saved.
             || self.file_wait.is_some()
@@ -269,6 +271,12 @@ impl App {
         // Opening another folder starts it afresh, without the help.
         if self.switching.is_some() {
             self.fail("Opening folder; wait a moment.");
+            return Vec::new();
+        }
+        // A lookup's answer may take its menu away (and bring back the
+        // question it came from): not from under the help.
+        if matches!(self.screens.last(), Some(Screen::Query(menu)) if menu.request.is_some()) {
+            self.fail("Looking up addresses; wait a moment.");
             return Vec::new();
         }
         let menu = self.menu();
@@ -384,7 +392,7 @@ impl App {
         push_problems.reverse();
         problems.extend(push_problems);
         if problems.is_empty() {
-            self.status.clear();
+            self.status = self.after_configured.take().unwrap_or_default();
         } else {
             self.fail(problems.join("; "));
         }
