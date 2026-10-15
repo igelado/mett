@@ -166,7 +166,9 @@ impl App {
         if self.threaded() {
             self.messages.extend(listed);
             let count = self.messages.len() + self.folded.len();
-            if last || count >= self.threaded_count.saturating_mul(2) {
+            // Collapsed threads fold their replies as they come.
+            let folding = self.collapse_all || !self.collapsed.is_empty();
+            if last || folding || count >= self.threaded_count.saturating_mul(2) {
                 self.arrange();
             }
             return;
@@ -850,6 +852,27 @@ mod tests {
         };
         page(&mut app, more, vec![message("a0", 1, "a", &[0])]);
         assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0"]);
+    }
+
+    #[test]
+    fn replies_listed_later_fold_into_their_collapsed_thread() {
+        let (mut app, next) = paged(vec![
+            message("a2", 4, "a", &[0, 2]),
+            message("a1", 3, "a", &[0, 1]),
+            message("a0", 2, "a", &[0]),
+            message("b0", 1, "b", &[0]),
+        ]);
+        act(&mut app, Action::CollapseAll);
+        // One more message: not enough to thread the index again.
+        let effects = app.update(Msg::Response(Response {
+            id: next,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![message("b1", 0, "b", &[0, 1])],
+                next: Some(mett_core::PageCursor::new("in more")),
+            })),
+        }));
+        assert!(!effects.is_empty());
+        assert!(!app.messages.iter().any(|m| m.id.as_str() == "b1"));
     }
 
     #[test]

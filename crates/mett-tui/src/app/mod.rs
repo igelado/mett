@@ -2028,11 +2028,13 @@ impl App {
                 // in between (mail from the same time, a draft by its own
                 // date, a reply's start): wait for all of it, as mutt
                 // reads every message before showing any.
-                if loading {
+                // (Unsorted, later pages only come after.)
+                if loading && self.ordering.sort.method != crate::sort::Method::Unsorted {
                     return Vec::new();
                 }
                 match from.map(|from| from + steps) {
                     Some(entry) if entry < self.messages.len() => entry,
+                    _ if loading => return Vec::new(),
                     _ => last,
                 }
             }
