@@ -7,13 +7,13 @@ use ratatui::crossterm::event::KeyCode;
 use super::*;
 
 /// The Inbox, as the app opens it by default.
-pub(super) fn inbox() -> FolderPath {
+pub(crate) fn inbox() -> FolderPath {
     FolderPath::WellKnown(WellKnownFolder::Inbox, vec![])
 }
 
 /// An 80-column, `height`-row app with `settings` that has opened the
 /// Inbox; returns the app and the request listing it.
-pub(super) fn opening(settings: Settings, height: u16) -> (App, RequestId) {
+pub(crate) fn opening(settings: Settings, height: u16) -> (App, RequestId) {
     let (mut app, effects) = App::open(80, height, inbox(), settings);
     let open = first_request(&effects);
     let list = folder_opened(&mut app, open, mock::folder("in", "Inbox", None));
@@ -23,7 +23,7 @@ pub(super) fn opening(settings: Settings, height: u16) -> (App, RequestId) {
 /// An app [`opening`] the Inbox that has listed `messages`, with `next`
 /// as the cursor of a page to come; returns the app and that page's
 /// request.
-pub(super) fn opened(
+pub(crate) fn opened(
     settings: Settings,
     height: u16,
     messages: Vec<MessageSummary>,
@@ -42,13 +42,13 @@ pub(super) fn opened(
 
 /// Answers the opening of a folder with `folder`; returns the request
 /// that lists it.
-pub(super) fn folder_opened(app: &mut App, id: RequestId, folder: Folder) -> RequestId {
+pub(crate) fn folder_opened(app: &mut App, id: RequestId, folder: Folder) -> RequestId {
     first_request(&respond(app, id, Event::FolderOpened(Ok(folder))))
 }
 
 /// Answers a listing with `messages`, and `next` as the cursor of a page
 /// to come; returns the effects.
-pub(super) fn listed(
+pub(crate) fn listed(
     app: &mut App,
     id: RequestId,
     messages: Vec<MessageSummary>,
@@ -63,7 +63,7 @@ pub(super) fn listed(
 
 /// Answers a listing with `messages`, and `next` as the cursor of a page
 /// to come; returns that page's request.
-pub(super) fn page(
+pub(crate) fn page(
     app: &mut App,
     id: RequestId,
     messages: Vec<MessageSummary>,
@@ -72,33 +72,33 @@ pub(super) fn page(
     first_request(&listed(app, id, messages, Some(next)))
 }
 
-pub(super) fn respond(app: &mut App, id: RequestId, event: Event) -> Vec<Effect> {
+pub(crate) fn respond(app: &mut App, id: RequestId, event: Event) -> Vec<Effect> {
     app.update(Msg::Response(Response { id, event }))
 }
 
-pub(super) fn act(app: &mut App, action: Action) -> Vec<Effect> {
+pub(crate) fn act(app: &mut App, action: Action) -> Vec<Effect> {
     app.update(Msg::Action(action))
 }
 
-pub(super) fn key(app: &mut App, code: KeyCode) -> Vec<Effect> {
+pub(crate) fn key(app: &mut App, code: KeyCode) -> Vec<Effect> {
     app.update(Msg::Key(KeyEvent::from(code)))
 }
 
 /// Types `text`.
-pub(super) fn typed(app: &mut App, text: &str) {
+pub(crate) fn typed(app: &mut App, text: &str) {
     for c in text.chars() {
         key(app, KeyCode::Char(c));
     }
 }
 
 /// Types `text` and presses Enter.
-pub(super) fn answer(app: &mut App, text: &str) -> Vec<Effect> {
+pub(crate) fn answer(app: &mut App, text: &str) -> Vec<Effect> {
     typed(app, text);
     key(app, KeyCode::Enter)
 }
 
 /// The question on the message line, with what is typed so far.
-pub(super) fn prompt(app: &App) -> String {
+pub(crate) fn prompt(app: &App) -> String {
     match &app.input {
         Some(Input::Line { prompt, editor, .. }) => format!("{prompt}{}", editor.text()),
         Some(Input::YesNo { prompt, .. }) => prompt.clone(),
@@ -107,7 +107,7 @@ pub(super) fn prompt(app: &App) -> String {
 }
 
 /// The request that comes first among `effects`.
-pub(super) fn first_request(effects: &[Effect]) -> RequestId {
+pub(crate) fn first_request(effects: &[Effect]) -> RequestId {
     let Some(Effect::Request(id, _)) = effects.first() else {
         panic!("expected a request, got {effects:?}");
     };
@@ -115,7 +115,7 @@ pub(super) fn first_request(effects: &[Effect]) -> RequestId {
 }
 
 /// The single request among `effects`.
-pub(super) fn sent(effects: &[Effect]) -> (RequestId, Request) {
+pub(crate) fn sent(effects: &[Effect]) -> (RequestId, Request) {
     match effects {
         [Effect::Request(id, request)] => (*id, request.clone()),
         _ => panic!("expected one request, got {effects:?}"),
@@ -123,7 +123,7 @@ pub(super) fn sent(effects: &[Effect]) -> (RequestId, Request) {
 }
 
 /// The requests among `effects`.
-pub(super) fn requests(effects: &[Effect]) -> Vec<(RequestId, Request)> {
+pub(crate) fn requests(effects: &[Effect]) -> Vec<(RequestId, Request)> {
     effects
         .iter()
         .filter_map(|e| match e {
@@ -133,11 +133,11 @@ pub(super) fn requests(effects: &[Effect]) -> Vec<(RequestId, Request)> {
         .collect()
 }
 
-pub(super) fn ids(app: &App) -> Vec<&str> {
+pub(crate) fn ids(app: &App) -> Vec<&str> {
     app.messages.iter().map(|m| m.id.as_str()).collect()
 }
 
-pub(super) fn pager(app: &App) -> &Pager {
+pub(crate) fn pager(app: &App) -> &Pager {
     let Screen::Pager(pager) = app.screen() else {
         panic!("not in the pager");
     };
@@ -145,7 +145,7 @@ pub(super) fn pager(app: &App) -> &Pager {
 }
 
 /// Settings that sort the index by `sort`, given as `sort` is set.
-pub(super) fn sorted(sort: &str) -> Settings {
+pub(crate) fn sorted(sort: &str) -> Settings {
     Settings {
         ordering: Ordering {
             sort: crate::sort::Sort::parse(sort, true).unwrap(),
@@ -156,7 +156,7 @@ pub(super) fn sorted(sort: &str) -> Settings {
 }
 
 /// A `:` command that changed nothing but the settings, to `settings`.
-pub(super) fn configured(settings: Settings) -> Msg {
+pub(crate) fn configured(settings: Settings) -> Msg {
     Msg::Configured(Reconfigured {
         outcome: Ok(Vec::new()),
         settings: Ok(settings),
@@ -166,7 +166,7 @@ pub(super) fn configured(settings: Settings) -> Msg {
 }
 
 /// The end of Alice's sign-in.
-pub(super) fn finished(outcome: Result<(), String>) -> SignInEvent {
+pub(crate) fn finished(outcome: Result<(), String>) -> SignInEvent {
     SignInEvent::Finished {
         account: AccountId::new("alice@contoso.com"),
         outcome,
@@ -174,7 +174,7 @@ pub(super) fn finished(outcome: Result<(), String>) -> SignInEvent {
 }
 
 /// Alice is asked to sign in in her browser.
-pub(super) fn browser_prompt() -> SignInEvent {
+pub(crate) fn browser_prompt() -> SignInEvent {
     SignInEvent::Prompt {
         account: AccountId::new("alice@contoso.com"),
         prompt: SignInPrompt::OpenBrowser {
@@ -184,27 +184,27 @@ pub(super) fn browser_prompt() -> SignInEvent {
 }
 
 /// Alice's sign-in failed as it expired.
-pub(super) fn signed_out(app: &mut App) {
+pub(crate) fn signed_out(app: &mut App) {
     signed_out_as(app, "expired");
 }
 
 /// Alice's sign-in failed with `error`.
-pub(super) fn signed_out_as(app: &mut App, error: &str) {
+pub(crate) fn signed_out_as(app: &mut App, error: &str) {
     app.update(Msg::SignIn(finished(Err(error.into()))));
 }
 
 /// The network is down.
-pub(super) fn offline() -> Error {
+pub(crate) fn offline() -> Error {
     Error::Network("offline".into())
 }
 
 /// The sign-in expired.
-pub(super) fn expired() -> Error {
+pub(crate) fn expired() -> Error {
     Error::Auth("expired".into())
 }
 
 /// The first request among `effects` that `wanted` picks.
-pub(super) fn request_for(
+pub(crate) fn request_for(
     effects: &[Effect],
     wanted: impl Fn(&Request) -> bool,
 ) -> Option<RequestId> {

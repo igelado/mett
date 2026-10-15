@@ -14,7 +14,7 @@ mod query;
 mod recall;
 mod search;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 mod threads;
 
 use std::collections::{HashMap, HashSet, VecDeque};

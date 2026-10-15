@@ -867,16 +867,18 @@ fn line_style(pager: &Pager, line: usize, display: &Display) -> (Style, bool) {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Local, TimeDelta, Utc};
+    use mett_core::WellKnownFolder;
     use mett_core::mock;
-    use mett_core::{MessagePage, WellKnownFolder};
     use mett_msgraph::SignInPrompt;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::KeyCode;
     use unicode_width::UnicodeWidthStr;
 
     use super::*;
-    use crate::app::{Effect, Msg};
-    use crate::worker::{Event, Response};
+    use crate::app::Msg;
+    use crate::app::testing::*;
+    use crate::worker::Event;
 
     const WIDTH: u16 = 60;
     const HEIGHT: u16 = 8;
@@ -896,20 +898,8 @@ mod tests {
 
     fn app(n: i64) -> App {
         let (mut app, effects) = App::new(WIDTH, HEIGHT);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder(
-                "in",
-                "Inbox",
-                Some(WellKnownFolder::Inbox),
-            ))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let inbox = mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
+        let list = folder_opened(&mut app, first_request(&effects), inbox);
         let messages = (0..n)
             .map(|i| {
                 // Newest first, as Graph lists them.
@@ -924,13 +914,7 @@ mod tests {
                 m.summary
             })
             .collect();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         app
     }
 
@@ -938,14 +922,19 @@ mod tests {
         sized_screen(app, WIDTH, HEIGHT)
     }
 
-    fn sized_screen(app: &App, width: u16, height: u16) -> Vec<String> {
+    /// `app` drawn on a `width`×`height` terminal.
+    fn drawn(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
                 render(app, frame);
             })
             .unwrap();
-        let buffer = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    fn sized_screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let buffer = drawn(app, width, height);
         (0..height)
             .map(|y| {
                 let mut line = String::new();
@@ -967,13 +956,23 @@ mod tests {
     }
 
     fn sized_styles(app: &App, height: u16) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(WIDTH, height)).unwrap();
-        terminal
-            .draw(|frame| {
-                render(app, frame);
-            })
-            .unwrap();
-        terminal.backend().buffer().clone()
+        drawn(app, WIDTH, height)
+    }
+
+    /// Alice is asked to sign in with `prompt`.
+    fn sign_in(app: &mut App, prompt: SignInPrompt) {
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt,
+        }));
+    }
+
+    fn code_prompt() -> SignInPrompt {
+        SignInPrompt::EnterCode {
+            verification_uri: "https://microsoft.com/devicelogin".into(),
+            user_code: "ABCD-EFGH".into(),
+            message: String::new(),
+        }
     }
 
     fn colored(app: &mut App, commands: &[&str]) {
@@ -1010,16 +1009,14 @@ mod tests {
         app.status = "Mail sent.".into();
         assert_eq!(styles(&app)[(0, 7)].fg, Color::Reset, "not an error");
         // As in mutt, this is an error.
-        app.update(Msg::Action(Action::PreviousEntry));
+        act(&mut app, Action::PreviousEntry);
         assert_eq!(styles(&app)[(0, 7)].fg, Color::LightRed);
-        let effects = app.update(Msg::Action(Action::DisplayMessage));
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Err(mett_core::Error::Network("down".into()))),
-        }));
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
+        respond(
+            &mut app,
+            fetch,
+            Event::MessageFetched(Err(mett_core::Error::Network("down".into()))),
+        );
         assert_eq!(styles(&app)[(0, 7)].fg, Color::LightRed, "{}", app.status);
     }
 
@@ -1043,17 +1040,11 @@ mod tests {
             width: WIDTH,
             height: 16,
         });
-        let effects = app.update(Msg::Action(Action::DisplayMessage));
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
         let mut message = mock::message("m0", "in", "Hi", received(0));
         message.summary.from = Some(Address::new("alice@contoso.com"));
         message.body.content = "> a\n>> b\nhello world\ncafe\u{301} ok\n-- \nAlice".into();
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         let buffer = sized_styles(&app, 16);
         let lines = sized_screen(&app, WIDTH, 16);
         let row = |text: &str| {
@@ -1131,7 +1122,7 @@ mod tests {
         let mut app = app(12);
         // 5 body rows: entry 7 is on the second page.
         for _ in 0..6 {
-            app.update(Msg::Action(Action::NextEntry));
+            act(&mut app, Action::NextEntry);
         }
         let lines = screen(&app);
         assert!(lines[1].starts_with("   6 "), "{lines:#?}");
@@ -1154,18 +1145,12 @@ mod tests {
     #[test]
     fn draws_the_pager_with_headers_and_body() {
         let mut app = app(1);
-        let effects = app.update(Msg::Action(Action::DisplayMessage));
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
         assert_eq!(screen(&app)[1], "Loading message...");
 
         let mut message = mock::message("m0", "in", "Subject 0", received(0));
         message.summary.from = Some(Address::new("alice@contoso.com").with_name("Alice Example"));
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
         let lines = screen(&app);
         assert_eq!(lines[0], "i:Exit  -:PrevPg  <Space>:NextPg  j:Next  k:Prev");
         let date = received(0).with_timezone(&Local).format("%a, %d %b %Y");
@@ -1180,7 +1165,7 @@ mod tests {
         };
         assert_eq!(lines[6], pager_status("   "));
         // Marked for deletion from the pager (the only message, so it stays).
-        app.update(Msg::Action(Action::DeleteMessage));
+        act(&mut app, Action::DeleteMessage);
         assert_eq!(screen(&app)[6], pager_status("D  "));
     }
 
@@ -1189,14 +1174,7 @@ mod tests {
         use ratatui::style::Color;
         let mut app = app(2);
         colored(&mut app, &["color normal white blue"]);
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            prompt: SignInPrompt::EnterCode {
-                verification_uri: "https://microsoft.com/devicelogin".into(),
-                user_code: "ABCD-EFGH".into(),
-                message: String::new(),
-            },
-        }));
+        sign_in(&mut app, code_prompt());
         let buffer = styles(&app);
         let lines = screen(&app);
         let code = lines.iter().position(|l| l.contains("ABCD-EFGH")).unwrap();
@@ -1206,14 +1184,7 @@ mod tests {
     #[test]
     fn draws_the_sign_in_window_over_the_index() {
         let mut app = app(2);
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            prompt: SignInPrompt::EnterCode {
-                verification_uri: "https://microsoft.com/devicelogin".into(),
-                user_code: "ABCD-EFGH".into(),
-                message: String::new(),
-            },
-        }));
+        sign_in(&mut app, code_prompt());
         let lines = sized_screen(&app, 60, 12);
         assert_eq!(lines[0], "q:Close  o:Browser  c:Copy");
         let window = lines.join("\n");
@@ -1227,10 +1198,7 @@ mod tests {
             "{lines:#?}"
         );
 
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            outcome: Err("denied".into()),
-        }));
+        signed_out_as(&mut app, "denied");
         let lines = sized_screen(&app, 60, 12);
         assert_eq!(lines[0], "q:Close  <Enter>:Retry");
         let window = lines.join("\n");
@@ -1241,16 +1209,16 @@ mod tests {
     fn a_long_sign_in_link_can_be_scrolled_into_view() {
         let mut app = app(1);
         let url = format!("https://login.example/authorize?{}end", "x".repeat(400));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            prompt: SignInPrompt::OpenBrowser {
+        sign_in(
+            &mut app,
+            SignInPrompt::OpenBrowser {
                 url: url.parse().unwrap(),
             },
-        }));
+        );
         let lines = screen(&app);
         assert!(lines[1].contains("j/k to scroll"), "{lines:#?}");
         for _ in 0..20 {
-            app.update(Msg::Action(Action::NextLine));
+            act(&mut app, Action::NextLine);
         }
         let shown = screen(&app).join("\n");
         assert!(shown.contains("end"), "{shown}");
@@ -1261,12 +1229,12 @@ mod tests {
     fn the_sign_in_link_is_handed_over_whole() {
         let mut app = app(1);
         let url = format!("https://login.example/authorize?{}end", "x".repeat(80));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            prompt: SignInPrompt::OpenBrowser {
+        sign_in(
+            &mut app,
+            SignInPrompt::OpenBrowser {
                 url: url.parse().unwrap(),
             },
-        }));
+        );
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, 16)).unwrap();
         let mut overlay = None;
         terminal
@@ -1289,24 +1257,13 @@ mod tests {
     #[test]
     fn draws_prompts_and_the_compose_menu() {
         let mut app = app(1);
-        app.update(Msg::Action(Action::Mail));
-        for c in "bob@x.org".chars() {
-            app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
-                ratatui::crossterm::event::KeyCode::Char(c),
-            )));
-        }
+        act(&mut app, Action::Mail);
+        typed(&mut app, "bob@x.org");
         assert_eq!(screen(&app)[7], "To: bob@x.org");
-        let enter = || {
-            Msg::Key(ratatui::crossterm::event::KeyEvent::from(
-                ratatui::crossterm::event::KeyCode::Enter,
-            ))
-        };
-        app.update(enter());
-        app.update(enter());
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
         assert_eq!(screen(&app)[7], "No subject, abort? ([yes]/no):");
-        app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
-            ratatui::crossterm::event::KeyCode::Char('n'),
-        )));
+        key(&mut app, KeyCode::Char('n'));
         app.update(Msg::Edited(Ok("x".repeat(2048))));
         let lines = sized_screen(&app, WIDTH, 12);
         assert_eq!(
@@ -1335,23 +1292,14 @@ mod tests {
     #[test]
     fn a_forward_shows_the_attachments_it_carries() {
         let mut app = app(1);
-        app.update(Msg::Action(Action::Forward));
-        let effects = app.update(Msg::Action(Action::Forward));
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
+        act(&mut app, Action::Forward);
+        let fetch = first_request(&act(&mut app, Action::Forward));
         let mut message = mock::message("m0", "in", "Subject 0", received(0));
         message.summary.has_attachments = true;
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(message)),
-        }));
-        let key = |code| Msg::Key(ratatui::crossterm::event::KeyEvent::from(code));
-        for c in "bob@x.org".chars() {
-            app.update(key(ratatui::crossterm::event::KeyCode::Char(c)));
-        }
-        app.update(key(ratatui::crossterm::event::KeyCode::Enter));
-        app.update(key(ratatui::crossterm::event::KeyCode::Enter));
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        typed(&mut app, "bob@x.org");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Enter);
         app.update(Msg::Edited(Ok("see below".into())));
         let lines = sized_screen(&app, WIDTH, 13);
         assert_eq!(lines[9], "- A     2 <the forwarded message's attachments>");
@@ -1361,7 +1309,7 @@ mod tests {
     #[test]
     fn marks_deleted_messages_and_lists_folders() {
         let mut app = app(2);
-        app.update(Msg::Action(Action::DeleteMessage));
+        act(&mut app, Action::DeleteMessage);
         let lines = screen(&app);
         assert!(lines[1].starts_with("   1 D   "), "{lines:#?}");
         assert_eq!(
@@ -1369,10 +1317,7 @@ mod tests {
             status_bar("-*-mett: Inbox [Msgs:2 New:2 Del:1 Flag:1]---", "(all)---")
         );
 
-        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let list = first_request(&act(&mut app, Action::BrowseMailboxes));
         assert_eq!(screen(&app)[1], "Listing folders...");
         let mut inbox = mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
         inbox.unread_count = 2;
@@ -1381,10 +1326,11 @@ mod tests {
             parent: Some("in".into()),
             ..mock::folder("p", "Projects", None)
         };
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Ok(vec![inbox, projects])),
-        }));
+        respond(
+            &mut app,
+            list,
+            Event::FoldersListed(Ok(vec![inbox, projects])),
+        );
         let lines = screen(&app);
         assert_eq!(lines[0], "q:Exit  <Enter>:Select  j:Next  k:Prev");
         assert_eq!(lines[1], "   1 N     2/10     Inbox");
@@ -1395,14 +1341,8 @@ mod tests {
     #[test]
     fn an_empty_folder_list_says_so() {
         let mut app = app(1);
-        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Ok(Vec::new())),
-        }));
+        let list = first_request(&act(&mut app, Action::BrowseMailboxes));
+        respond(&mut app, list, Event::FoldersListed(Ok(Vec::new())));
         assert_eq!(screen(&app)[1], "No folders.");
     }
 }
