@@ -812,7 +812,7 @@ impl App {
                 // Replies and forwards go through a server draft.
                 compose.left_draft |= compose.draft.origin.is_some();
                 // A lost response doesn't mean nothing happened.
-                self.status = match (delivery, &e) {
+                let failure = match (delivery, &e) {
                     (Some(Delivery::Send), mett_core::Error::Network(_)) if saved_copy => format!(
                         "The message may have been sent ({e}). Check Sent Items before sending it again."
                     ),
@@ -833,6 +833,7 @@ impl App {
                     ),
                     _ => e.to_string(),
                 };
+                self.fail(failure);
             }
         }
         Vec::new()

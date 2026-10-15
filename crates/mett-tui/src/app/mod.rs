@@ -344,6 +344,9 @@ pub struct App {
     pub sign_in: Option<SignIn>,
     /// The key bindings, which `:bind` and `:macro` change.
     pub keymap: Keymap,
+    /// The last error reported on the message line, so that the view can
+    /// tell it from other messages.
+    pub error: Option<String>,
     /// Keys and functions a macro or `push` queued, played before new
     /// input.
     strokes: VecDeque<Stroke>,
@@ -573,6 +576,7 @@ impl App {
             quit: false,
             sign_in: None,
             keymap: Keymap::mutt_defaults(),
+            error: None,
             strokes: VecDeque::new(),
             sign_in_strokes: VecDeque::new(),
             configuring: 0,
@@ -1973,7 +1977,13 @@ impl App {
             self.status = "Sign-in cancelled.".into();
             return;
         }
-        self.status = error.to_string();
+        self.fail(error.to_string());
+    }
+
+    /// Shows an error on the message line, in the `error` color.
+    pub(super) fn fail(&mut self, text: impl Into<String>) {
+        self.status = text.into();
+        self.error = Some(self.status.clone());
     }
 }
 

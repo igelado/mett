@@ -344,7 +344,7 @@ impl App {
             .is_some_and(|(oldest, listed)| oldest < listed - OVERLAP);
         if (!complete && all_new) || (changed.next.is_some() && !listed_before) {
             if unread {
-                self.status = NEW_MAIL.into();
+                self.announce(NEW_MAIL);
             }
             let effects = self.refresh();
             // New mail may be on pages not seen yet: the listing tells.
@@ -416,7 +416,7 @@ impl App {
         }
         self.see_index();
         if unread {
-            self.status = NEW_MAIL.into();
+            self.announce(NEW_MAIL);
         }
         Vec::new()
     }
@@ -479,7 +479,7 @@ impl App {
             .chain(&self.hidden)
             .any(|m| !m.flags.read && !known.contains(&m.id));
         if arrived {
-            self.status = NEW_MAIL.into();
+            self.announce(NEW_MAIL);
         }
     }
 
@@ -511,6 +511,10 @@ impl App {
                     state.sampled = true;
                     let before: HashSet<MessageId> =
                         state.recent.iter().map(|(id, _)| id.clone()).collect();
+                    // Mail that arrives is newer than what was there: an
+                    // older message that only now makes the sample (one
+                    // above it was read) didn't arrive.
+                    let newest_before = state.recent.iter().map(|(_, at)| *at).max();
                     state.recent = recent;
                     if open {
                         // Not new while open; what was seen is what reaches
@@ -533,7 +537,9 @@ impl App {
                         // the folder was open turns out unseen; not at
                         // first, unless the user had seen the mailbox.
                         let arriving = state.recent.iter().any(|(id, at)| {
-                            !before.contains(id) && seen.as_ref().is_none_or(|s| s.is_new(id, *at))
+                            !before.contains(id)
+                                && newest_before.is_none_or(|newest| *at >= newest)
+                                && seen.as_ref().is_none_or(|s| s.is_new(id, *at))
                         });
                         if state.new && (arriving || !was_new) && (!first || seen.is_some()) {
                             arrived.push(path);
@@ -568,7 +574,7 @@ impl App {
             .map(|m| m.name.as_str())
             .collect();
         if !names.is_empty() {
-            self.status = format!("New mail in {}.", names.join(", "));
+            self.announce(&format!("New mail in {}.", names.join(", ")));
         } else if let Some((path, e)) = failure {
             let name = self
                 .mailboxes
@@ -586,6 +592,14 @@ impl App {
         }
         self.refresh_mailbox_browser();
         Vec::new()
+    }
+
+    /// Says that new mail arrived, unless an error is on the message line:
+    /// that matters more (the mail is still counted as new).
+    fn announce(&mut self, text: &str) {
+        if self.status.is_empty() || self.error.as_deref() != Some(self.status.as_str()) {
+            self.status = text.to_owned();
+        }
     }
 
     /// Whether the mailbox at `path` (found to be `found`, if it was) is
@@ -1794,6 +1808,68 @@ mod tests {
         );
         let recent: Vec<(&str, i64)> = vec![("m2", 30); mett_core::RECENT_UNREAD];
         leave_and_check(&mut app, recent);
+        assert_eq!(app.mailboxes_with_new_mail(), 1);
+    }
+
+    /// Has a check find Work's `recent` unread mail.
+    fn check_work(app: &mut App, check: RequestId, recent: &[(&str, i64)]) {
+        let recent = recent
+            .iter()
+            .map(|(id, m)| {
+                (
+                    MessageId::new(*id),
+                    DateTime::UNIX_EPOCH + TimeDelta::minutes(*m),
+                )
+            })
+            .collect();
+        respond(
+            app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 1, Some(1))),
+                (
+                    work(),
+                    Ok(Checked {
+                        folder: folder("work", "Work", 2),
+                        recent,
+                    }),
+                ),
+            ]),
+        );
+    }
+
+    fn next_check(app: &mut App) -> RequestId {
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        requests(&effects)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn older_mail_coming_into_the_sample_did_not_arrive() {
+        let (mut app, check) = app();
+        check_work(&mut app, check, &[("m10", 10), ("m9", 9)]);
+        app.status.clear();
+        // m10 is read elsewhere: m8, older, now makes the sample.
+        let check = next_check(&mut app);
+        check_work(&mut app, check, &[("m9", 9), ("m8", 8)]);
+        assert!(app.status.is_empty(), "{}", app.status);
+        // m11 arrives.
+        let check = next_check(&mut app);
+        check_work(&mut app, check, &[("m11", 11), ("m9", 9)]);
+        assert_eq!(app.status, "New mail in =Work.");
+    }
+
+    #[test]
+    fn new_mail_leaves_an_error_on_the_message_line() {
+        let (mut app, check) = app();
+        check_work(&mut app, check, &[("m9", 9)]);
+        app.fail("The message may have been sent. Check Sent Items before sending it again.");
+        let check = next_check(&mut app);
+        check_work(&mut app, check, &[("m11", 11), ("m9", 9)]);
+        assert!(app.status.starts_with("The message may"), "{}", app.status);
         assert_eq!(app.mailboxes_with_new_mail(), 1);
     }
 
