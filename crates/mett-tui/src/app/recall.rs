@@ -204,13 +204,11 @@ impl App {
             self.fail("That message is no longer a draft.");
             return Vec::new();
         }
-        // Its attachments are listed, each to keep or take off.
-        if message.summary.has_attachments {
-            let request = self.request(Request::ListAttachments(message.summary.id.clone()));
-            self.recall = Some(Recall::Attachments(effect_id(&request), Box::new(message)));
-            return vec![request];
-        }
-        self.open_recalled(message, Vec::new())
+        // Its attachments are listed, each to keep or take off (even
+        // inline ones only, which Graph doesn't count as attachments).
+        let request = self.request(Request::ListAttachments(message.summary.id.clone()));
+        self.recall = Some(Recall::Attachments(effect_id(&request), Box::new(message)));
+        vec![request]
     }
 
     /// The recalled message's attachments were listed.
@@ -354,6 +352,14 @@ mod tests {
         )
     }
 
+    /// Answers the fetch of the recalled `message`, and the listing of its
+    /// attachments (none).
+    fn opened(app: &mut App, fetch: RequestId, message: Message) {
+        let (list, request) = sent(&respond(app, fetch, Event::MessageFetched(Ok(message))));
+        assert!(matches!(request, Request::ListAttachments(_)));
+        respond(app, list, Event::AttachmentsListed(Ok(Vec::new())));
+    }
+
     fn fetched(id: &str) -> Message {
         let mut message = mock::message(id, "drafts", "Plans", DateTime::UNIX_EPOCH);
         message.summary.from = Some(Address::new("me@work.org"));
@@ -398,7 +404,7 @@ mod tests {
         let effects = recall(&mut app, vec![postponed("d1", "Plans")]);
         let (fetch, request) = sent(&effects);
         assert_eq!(request, Request::FetchMessage(MessageId::new("d1")));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(fetched("d1"))));
+        opened(&mut app, fetch, fetched("d1"));
         let Screen::Compose(compose) = app.screen() else {
             panic!("expected the compose menu, got {:?}", app.screen());
         };
@@ -479,7 +485,7 @@ mod tests {
     fn a_recalled_message_is_postponed_again_as_itself() {
         let mut app = app();
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(fetched("d1"))));
+        opened(&mut app, fetch, fetched("d1"));
         let (_, request) = sent(&app.update(Msg::Action(Action::PostponeMessage)));
         let Request::SaveDraft(draft) = request else {
             panic!("expected a draft saved, got {request:?}");
@@ -595,7 +601,7 @@ mod tests {
         );
         app.update(Msg::Action(Action::DisplayMessage));
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(fetched("d1"))));
+        opened(&mut app, fetch, fetched("d1"));
         let (save, _) = sent(&app.update(Msg::Action(Action::PostponeMessage)));
         let effects = respond(
             &mut app,
@@ -648,7 +654,7 @@ mod tests {
             assert!(matches!(app.screen(), Screen::Pager(_)));
         }
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(fetched("d1"))));
+        opened(&mut app, fetch, fetched("d1"));
         let (send, _) = sent(&app.update(Msg::Action(Action::SendMessage)));
         let effects = respond(&mut app, send, Event::Sent(Ok(()), false));
         assert_eq!(app.screen(), &Screen::Index);

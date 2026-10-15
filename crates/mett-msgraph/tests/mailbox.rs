@@ -2115,6 +2115,9 @@ async fn takes_attachments_off_a_recalled_draft() {
                 { "id": "a3", "name": "c.pdf", "size": 3 },
             ],
         })))
+        // Listed once: what Outlook adds between two listings could be
+        // taken for mett's.
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("DELETE"))

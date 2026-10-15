@@ -965,17 +965,6 @@ impl<A: Authenticator> GraphMailStore<A> {
         let kept = self.kept.lock().expect("lock").remove(&key);
         if let Some(Kept { id, base }) = kept {
             match self.update_draft(&id, draft).await {
-                // A recalled draft's own attachments the user took off since
-                // come off too; any added elsewhere stay.
-                Ok(()) if is_recalled(draft, &id) => {
-                    return match self.recalled_base(draft, &id, base.clone()).await {
-                        Ok(base) => self.attach_all(draft, id, base, false).await,
-                        Err(e) => {
-                            self.keep(draft, id, base);
-                            Err(e)
-                        }
-                    };
-                }
                 Ok(()) => return self.attach_all(draft, id, base, false).await,
                 Err(Error::NotFound { .. }) => {}
                 Err(e) => {
@@ -991,10 +980,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         if let Some(DraftOrigin::Recalled(id)) = &draft.origin {
             return match self.update_draft(id, draft).await {
                 // Those the user took off come off.
-                Ok(()) => {
-                    let base = self.recalled_base(draft, id, None).await?;
-                    self.attach_all(draft, id.clone(), base, false).await
-                }
+                Ok(()) => self.attach_all(draft, id.clone(), None, false).await,
                 Err(Error::NotFound { .. }) => Err(Error::Backend(
                     "the postponed message is no longer in Drafts (it was sent or deleted \
                      elsewhere)"
@@ -1061,10 +1047,22 @@ impl<A: Authenticator> GraphMailStore<A> {
         base: Option<Vec<String>>,
         fresh: bool,
     ) -> Result<(MessageId, Option<Vec<String>>)> {
+        let recalled = is_recalled(draft, &id);
+        let key = (draft.origin.clone(), draft.attempt);
+        // A recalled draft has what the user took off, and mett's uploads
+        // of earlier attempts, to take off.
+        let to_take_off = recalled
+            && (!draft.drop_attachments.is_empty()
+                || self
+                    .uploads
+                    .lock()
+                    .expect("lock")
+                    .get(&key)
+                    .is_some_and(|uploads| !uploads.is_empty()));
         // Nothing of mett's there, and nothing to put on: done. (What an
         // earlier attempt attached comes off even if nothing is to go on
         // now.)
-        if base.is_none() && draft.attachments.is_empty() {
+        if base.is_none() && draft.attachments.is_empty() && !to_take_off {
             return Ok((id, base));
         }
         let present = match &base {
@@ -1074,9 +1072,14 @@ impl<A: Authenticator> GraphMailStore<A> {
                 Err(e) => return Err(self.give_up(draft, id, base, e).await),
             },
         };
-        let base = base.unwrap_or_else(|| present.iter().map(|a| a.id.to_string()).collect());
-        let recalled = is_recalled(draft, &id);
-        let key = (draft.origin.clone(), draft.attempt);
+        // A recalled draft's base is what it has (from this one listing,
+        // so that nothing added elsewhere meanwhile comes off), but what
+        // is to come off.
+        let base = if recalled {
+            self.recalled_base(draft, &present, base.as_deref().unwrap_or_default())
+        } else {
+            base.unwrap_or_else(|| present.iter().map(|a| a.id.to_string()).collect())
+        };
         for attachment in present.iter().filter(|a| !base.contains(&a.id.to_string())) {
             if let Err(e) = self.remove_attachment(&id, attachment.id.as_str()).await {
                 return Err(self.give_up(draft, id, Some(base), e).await);
@@ -1265,17 +1268,17 @@ impl<A: Authenticator> GraphMailStore<A> {
         }
     }
 
-    /// The base for [`Self::attach_all`] of the recalled `draft`, `id`
-    /// (whose base was `base`, before an earlier attempt): what it has now,
-    /// but the attachments of its own the user took off and mett's uploads
-    /// of earlier attempts, which come off. Others, even ones added
-    /// elsewhere since, stay.
-    async fn recalled_base(
+    /// The base for [`Self::attach_all`] of the recalled `draft`, which
+    /// has the attachments `present` (and had `before`, before an earlier
+    /// attempt): all of them, but those of its own the user took off and
+    /// mett's uploads of earlier attempts, which come off. Others, even
+    /// ones added elsewhere since, stay.
+    fn recalled_base(
         &self,
         draft: &Draft,
-        id: &MessageId,
-        base: Option<Vec<String>>,
-    ) -> Result<Option<Vec<String>>> {
+        present: &[Attachment],
+        before: &[String],
+    ) -> Vec<String> {
         let key = (draft.origin.clone(), draft.attempt);
         let uploads = self
             .uploads
@@ -1284,21 +1287,13 @@ impl<A: Authenticator> GraphMailStore<A> {
             .get(&key)
             .cloned()
             .unwrap_or_default();
-        // Nothing to take off: all it has is the base.
-        if uploads.is_empty() && draft.drop_attachments.is_empty() {
-            return Ok(None);
-        }
-        let before = base.unwrap_or_default();
-        let base = self
-            .list_attachments(id)
-            .await?
-            .into_iter()
+        present
+            .iter()
             .filter(|a| {
-                !draft.drop_attachments.contains(&a.id) && !uploads.iter().any(|u| u.is(a, &before))
+                !draft.drop_attachments.contains(&a.id) && !uploads.iter().any(|u| u.is(a, before))
             })
             .map(|a| a.id.to_string())
-            .collect();
-        Ok(Some(base))
+            .collect()
     }
 
     /// Forgets the uploads of `draft`, which is done with: sent, postponed,
