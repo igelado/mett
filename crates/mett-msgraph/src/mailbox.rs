@@ -73,6 +73,14 @@ struct Upload {
     /// Without an ID, it is known by its name and type.
     name: String,
     content_type: String,
+    /// What it held, to tell a file put in its place since.
+    digest: [u8; 32],
+}
+
+/// A file's contents, to tell two apart.
+fn digest(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).into()
 }
 
 impl Upload {
@@ -1108,6 +1116,7 @@ impl<A: Authenticator> GraphMailStore<A> {
                         id: None,
                         name: file.name.clone(),
                         content_type: file.content_type.clone(),
+                        digest: digest(&file.data),
                     });
             }
             match self.attach(&id, file).await {
@@ -1292,8 +1301,8 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// of its name and type may be it, or one added elsewhere (it may never
     /// have been made): it stays, as mett can't tell. If the file is still
     /// to go, it is attached again (it may then go twice). If the user took
-    /// it off, sending it could send what they didn't want: that fails,
-    /// for them to look in Outlook.
+    /// it off (or put another file in its place), sending it could send
+    /// what they didn't want: that fails, for them to look in Outlook.
     fn recalled_base(
         &self,
         draft: &Draft,
@@ -1314,12 +1323,15 @@ impl<A: Authenticator> GraphMailStore<A> {
                 .any(|u| u.id.as_deref() == Some(a.id.as_str()))
         };
         for upload in uploads.iter().filter(|u| u.id.is_none()) {
-            let taken_off = !draft
-                .attachments
-                .iter()
-                .any(|f| f.name == upload.name && f.content_type == upload.content_type);
+            // Taken off, or put in its place by a file of other contents:
+            // the one uploaded isn't to go.
+            let still_wanted = draft.attachments.iter().any(|f| {
+                f.name == upload.name
+                    && f.content_type == upload.content_type
+                    && digest(&f.data) == upload.digest
+            });
             let unsure = present.iter().any(|a| !known(a) && upload.is(a, before));
-            if taken_off && unsure {
+            if !still_wanted && unsure {
                 return Err(Error::Backend(format!(
                     "can't tell whether {} (taken off) is still on the message: \
                      check it in Drafts in Outlook",
