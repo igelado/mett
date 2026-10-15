@@ -429,6 +429,39 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         Ok(roles.folder(folder))
     }
 
+    async fn newest_unread(&self, folder: &FolderId) -> Result<Option<DateTime<Utc>>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Received {
+            received_date_time: String,
+        }
+        let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
+        url.query_pairs_mut()
+            .append_pair("$top", "1")
+            .append_pair("$select", "receivedDateTime")
+            // Graph wants the sorted property filtered too, first.
+            .append_pair(
+                "$filter",
+                "receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
+            )
+            .append_pair("$orderby", "receivedDateTime desc");
+        let page: Collection<Received> = self
+            .json(
+                self.request(Method::GET, url),
+                About::folder(folder.as_str()),
+            )
+            .await?;
+        page.value
+            .into_iter()
+            .next()
+            .map(|m| {
+                DateTime::parse_from_rfc3339(&m.received_date_time)
+                    .map(|t| t.with_timezone(&Utc))
+                    .map_err(|e| Error::Backend(format!("invalid receivedDateTime: {e}")))
+            })
+            .transpose()
+    }
+
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
         // Only the root is needed here, so other well-known folders failing
         // to resolve can't get in the way.

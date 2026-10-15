@@ -81,6 +81,13 @@ pub trait MailStore: Send + Sync {
     /// new mail reads these.
     fn folder(&self, id: &FolderId) -> impl Future<Output = Result<Folder>> + Send;
 
+    /// When the newest unread message in a folder arrived, if it has any:
+    /// mail that arrives later is new.
+    fn newest_unread(
+        &self,
+        folder: &FolderId,
+    ) -> impl Future<Output = Result<Option<DateTime<Utc>>>> + Send;
+
     /// Returns the folder with a well-known role, such as the Inbox.
     fn well_known_folder(
         &self,

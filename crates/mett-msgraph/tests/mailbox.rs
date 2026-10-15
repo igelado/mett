@@ -185,6 +185,45 @@ async fn lists_messages_changed_since_a_time() {
 }
 
 #[tokio::test]
+async fn finds_when_the_newest_unread_message_arrived() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .and(query_param(
+            "$filter",
+            "receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
+        ))
+        .and(query_param("$orderby", "receivedDateTime desc"))
+        .and(query_param("$top", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "receivedDateTime": "2024-05-01T10:00:00Z" }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/empty-id/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let newest = store
+        .newest_unread(&FolderId::new("inbox-id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        newest.map(|t| t.to_rfc3339()),
+        Some("2024-05-01T10:00:00+00:00".to_owned())
+    );
+    assert_eq!(
+        store
+            .newest_unread(&FolderId::new("empty-id"))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn does_not_cache_roles_after_a_failed_lookup() {
     let server = MockServer::start().await;
     mount_roles_with(&server, 503).await;

@@ -116,7 +116,16 @@ pub enum Event {
     OwnAddresses(Result<Vec<String>>),
     /// Outcome of [`Request::CheckMailboxes`]: each folder, or why it
     /// couldn't be read.
-    MailboxesChecked(Vec<(FolderPath, Result<Folder>)>),
+    MailboxesChecked(Vec<(FolderPath, Result<Checked>)>),
+}
+
+/// A mailbox, as checked for new mail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checked {
+    /// The folder, with its counts.
+    pub folder: Folder,
+    /// When its newest unread message arrived, if it has any.
+    pub newest_unread: Option<DateTime<Utc>>,
 }
 
 /// What a check of a folder for new mail found.
@@ -214,6 +223,18 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
                         found => found,
                     },
                     None => resolve(store, &path).await,
+                };
+                let found = match found {
+                    Ok(folder) => {
+                        store
+                            .newest_unread(&folder.id)
+                            .await
+                            .map(|newest_unread| Checked {
+                                folder,
+                                newest_unread,
+                            })
+                    }
+                    Err(e) => Err(e),
                 };
                 checked.push((path, found));
             }
@@ -424,8 +445,8 @@ mod tests {
         };
         let found: Vec<_> = checked
             .iter()
-            .map(|(path, folder)| {
-                let folder = folder.as_ref().ok();
+            .map(|(path, checked)| {
+                let folder = checked.as_ref().ok().map(|c| &c.folder);
                 (path, folder.map(|f| (f.id.as_str(), f.unread_count)))
             })
             .collect();
@@ -444,7 +465,10 @@ mod tests {
         else {
             panic!("expected MailboxesChecked");
         };
-        assert_eq!(checked[0].1.as_ref().unwrap().id, FolderId::new("arc"));
+        assert_eq!(
+            checked[0].1.as_ref().unwrap().folder.id,
+            FolderId::new("arc")
+        );
         // Moved to another parent: the folder now at the path is checked.
         let child = |id: &str, name: &str, parent: &str| {
             let mut folder = mock::folder(id, name, None);
@@ -470,11 +494,11 @@ mod tests {
             panic!("expected MailboxesChecked");
         };
         assert_eq!(
-            checked[0].1.as_ref().unwrap().id,
+            checked[0].1.as_ref().unwrap().folder.id,
             FolderId::new("shared-new")
         );
         assert_eq!(
-            checked[1].1.as_ref().unwrap().id,
+            checked[1].1.as_ref().unwrap().folder.id,
             FolderId::new("shared-new")
         );
     }

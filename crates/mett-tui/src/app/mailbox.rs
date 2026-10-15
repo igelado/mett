@@ -648,7 +648,6 @@ impl App {
             Ok(folder) => {
                 // An earlier folder change waiting for a sign-in is moot.
                 self.unswitched = None;
-                self.leaving_folder();
                 self.reset_folder();
                 self.previous = Some(std::mem::replace(&mut self.path, path));
                 self.status = format!("Loading {}...", folder.name);

@@ -207,7 +207,10 @@ keeps the store up to date with Graph delta queries.
   computer and the server may differ. Changes mett made while that page
   was on its way are laid over it, as for a listing. A page that is all
   new mail lists the folder again. The `mailboxes` are checked by reading
-  their counts.
+  their counts and when their newest unread message arrived
+  (`MailStore::newest_unread`): a mailbox has new mail when unread mail
+  arrived after the user last had it open, which reading mail can't
+  disturb, unlike comparing counts.
 
 ### 5.6 State machine for menus
 
