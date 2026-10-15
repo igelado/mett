@@ -160,6 +160,9 @@ pub struct App {
     pending: Option<Target>,
     /// Pending flag updates, so a failure can be undone in the index.
     flag_updates: HashMap<RequestId, MessageId>,
+    /// The message that last failed to open, so that opening it can be
+    /// retried.
+    unfetched: Option<MessageId>,
     next_request: u64,
     /// How many messages to request per page.
     page_size: u32,
@@ -196,6 +199,7 @@ impl App {
             save_failures: HashMap::new(),
             pending: None,
             flag_updates: HashMap::new(),
+            unfetched: None,
             next_request: 0,
             page_size,
         };
@@ -339,9 +343,9 @@ impl App {
         Vec::new()
     }
 
-    /// Retries what failed for want of a sign-in: opening the folder, or
-    /// listing the rest of it. Other requests are retried by repeating the
-    /// action that made them.
+    /// Retries what failed for want of a sign-in: opening the folder,
+    /// listing the rest of it, opening the selected message and saving
+    /// changes.
     fn retry(&mut self) -> Vec<Effect> {
         if self.folder.is_none() {
             if self.opening.is_none() {
@@ -349,7 +353,23 @@ impl App {
             }
             return Vec::new();
         }
-        self.retry_listing()
+        let mut effects = self.retry_listing();
+        // Messages whose changes failed to save are marked unread again;
+        // mark them read once more. (Their failures are cleared once that
+        // succeeds.)
+        let mut unsaved: Vec<MessageId> = self.save_failures.keys().cloned().collect();
+        unsaved.sort();
+        for message in unsaved {
+            effects.extend(self.mark_read(message));
+        }
+        // Open the message that failed to open, if it is still the one
+        // selected. (Opening another message forgets the failure.)
+        let failed = self.unfetched.take();
+        let selected = self.messages.get(self.selected).map(|s| &s.id);
+        if failed.is_some() && failed.as_ref() == selected && self.menu() == Menu::Index {
+            effects.extend(self.open_selected());
+        }
+        effects
     }
 
     fn on_index_action(&mut self, action: Action) -> Vec<Effect> {
@@ -458,6 +478,7 @@ impl App {
             return Vec::new();
         };
         let id = summary.id.clone();
+        self.unfetched = None;
         let fetch = self.request(Request::FetchMessage(id.clone()));
         self.screens.push(Screen::Pager(Pager {
             id,
@@ -551,7 +572,9 @@ impl App {
         let message = match result {
             Ok(message) => message,
             Err(e) => {
+                let failed = pager.id.clone();
                 self.screens.pop();
+                self.unfetched = Some(failed);
                 self.report(e);
                 return Vec::new();
             }
@@ -561,9 +584,12 @@ impl App {
         pager.layout(self.width);
         let message_id = message.summary.id.clone();
         pager.message = Some(message);
+        // Now that it has been shown, mark it read, as mutt does.
+        self.mark_read(message_id)
+    }
 
-        // Now that it has been shown, mark it read (as mutt does), updating
-        // the index straight away.
+    /// Marks a message read, updating the index straight away.
+    fn mark_read(&mut self, message_id: MessageId) -> Vec<Effect> {
         let Some(summary) = self.messages.iter_mut().find(|s| s.id == message_id) else {
             return Vec::new();
         };
@@ -1382,5 +1408,45 @@ mod tests {
             act(&mut app, Action::DisplayMessage).as_slice(),
             [Effect::Request(_, Request::OpenFolder(_))]
         ));
+    }
+
+    #[test]
+    fn retrying_after_a_sign_in_resends_what_failed() {
+        let mut app = loaded(2);
+        // Opening the first message works, but saving it as read fails…
+        let effects = open(&mut app, 1);
+        let [Effect::Request(update, Request::UpdateFlags(..))] = effects.as_slice() else {
+            panic!("expected a flag update, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: *update,
+            event: Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
+        }));
+        // …and opening the second one fails too.
+        act(&mut app, Action::Exit);
+        act(&mut app, Action::NextEntry);
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, Request::FetchMessage(_))] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("expired".into()))),
+        }));
+        assert_eq!(app.menu(), Menu::Index);
+        app.update(Msg::SignIn(finished(Err("expired".into()))));
+
+        let effects = act(&mut app, Action::Retry);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Request(_, Request::UpdateFlags(first, _)),
+                    Effect::Request(_, Request::FetchMessage(second)),
+                ] if first.as_str() == "m0" && second.as_str() == "m1"
+            ),
+            "{effects:?}"
+        );
+        assert_eq!(app.menu(), Menu::Pager);
     }
 }

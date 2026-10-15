@@ -1114,3 +1114,61 @@ async fn tells_the_prompter_when_a_sign_in_ends() {
     auth.access_token().await.unwrap();
     assert_eq!(*outcomes.0.lock().unwrap(), [true]);
 }
+
+/// A prompter that the test cancels by hand.
+#[derive(Clone, Default)]
+struct Cancellable(Arc<tokio::sync::Notify>);
+
+impl Prompter for Cancellable {
+    fn prompt(&self, _: SignInPrompt) {}
+
+    fn cancelled(&self) -> Cancelled<'_> {
+        Box::pin(self.0.notified())
+    }
+}
+
+#[tokio::test]
+async fn cancelling_while_confirming_the_user_keeps_nothing() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    // Confirming the user takes a while.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "userPrincipalName": "alice@contoso.com" }))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let prompter = Cancellable::default();
+    let auth = Arc::new(GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        prompter.clone(),
+    ));
+    let pending = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.access_token().await }
+    });
+    // Wait until the user is being confirmed, then cancel.
+    while !server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|r| r.url.path() == "/v1.0/me")
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    prompter.0.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("cancelling ends the sign-in at once")
+        .unwrap();
+    assert!(matches!(result, Err(Error::Auth(m)) if m.contains("cancelled")));
+    assert_eq!(stored(&store), None);
+}
