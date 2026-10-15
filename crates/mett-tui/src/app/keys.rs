@@ -891,4 +891,21 @@ mod tests {
         assert!(app.next_stroke().is_none(), "not before the folder is open");
         assert!(!app.after_load.is_empty(), "still waiting");
     }
+
+    #[test]
+    fn commands_keep_the_mailbox_s_addresses() {
+        let mut app = app();
+        app.update(Msg::Response(Response {
+            id: crate::worker::RequestId(999),
+            event: Event::OwnAddresses(Ok(vec!["Alias@Contoso.com".into()])),
+        }));
+        assert!(app.settings.me.contains(&"alias@contoso.com".to_owned()));
+        app.update(Msg::Configured(Reconfigured {
+            outcome: Ok(vec![]),
+            settings: Ok(Settings::default()),
+            key_commands: vec![],
+            pushed: vec![],
+        }));
+        assert!(app.settings.me.contains(&"alias@contoso.com".to_owned()));
+    }
 }

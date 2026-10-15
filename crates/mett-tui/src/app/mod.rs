@@ -376,6 +376,9 @@ pub struct App {
     discarding: HashMap<RequestId, mett_core::Draft>,
     /// Whether the mailbox has been asked for the user's own addresses.
     asked_addresses: bool,
+    /// The user's own addresses as the mailbox told them, kept apart from
+    /// the configured ones so that reconfiguring keeps them.
+    mailbox_addresses: Vec<String>,
     /// That request, while it is on its way.
     addresses_request: Option<RequestId>,
     /// A reply whose message has arrived, waiting for the user's own
@@ -547,6 +550,7 @@ impl App {
             reselect: None,
             discarding: HashMap::new(),
             asked_addresses: false,
+            mailbox_addresses: Vec::new(),
             addresses_request: None,
             awaiting_addresses: None,
             left_drafts: Vec::new(),
@@ -1307,12 +1311,11 @@ impl App {
                 }
                 let failed = match result {
                     Ok(addresses) => {
-                        for address in addresses {
-                            let address = address.to_lowercase();
-                            if !self.settings.me.contains(&address) {
-                                self.settings.me.push(address);
-                            }
-                        }
+                        self.mailbox_addresses = addresses
+                            .into_iter()
+                            .map(|address| address.to_lowercase())
+                            .collect();
+                        self.add_mailbox_addresses();
                         None
                     }
                     // Asked again by the next reply.
@@ -1687,9 +1690,20 @@ impl App {
 
     /// Takes in the settings after a `:` command changed them. The account
     /// stays the same.
+    /// Counts the addresses the mailbox reported as the user's own.
+    fn add_mailbox_addresses(&mut self) {
+        for address in &self.mailbox_addresses {
+            if !self.settings.me.contains(address) {
+                self.settings.me.push(address.clone());
+            }
+        }
+    }
+
     pub(super) fn apply_settings(&mut self, settings: Settings) {
         self.page_size = settings.page_size;
         self.settings = settings.compose;
+        // The configuration doesn't know what the mailbox told.
+        self.add_mailbox_addresses();
         self.mailbox_root = settings.folder;
         self.trash = settings.trash;
         self.delete = settings.delete;
