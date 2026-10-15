@@ -214,8 +214,9 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   `record` value is honoured with an explicit save.
 - **Postponing:** `postponed` pointing at `@drafts` stores drafts as server
   drafts, so they are visible in Outlook.
-- **Attachments** of up to 2.5 MB in all go with a new message in the
-  request that sends it. Larger ones, and those of replies and forwards, go
+- **Attachments** go with a new message in the request that sends it when
+  that request (attachments in base64, and the text) stays under 3.5 MB,
+  as Graph takes requests of up to 4 MB. Larger ones, and those of replies and forwards, go
   through a server draft: files over 3 MB are uploaded in pieces (an
   upload session), and Graph keeps a copy of the sent draft in Sent Items
   whatever `copy` says.

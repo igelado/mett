@@ -729,16 +729,19 @@ impl App {
             self.fail("Please wait: the message is still being sent or postponed.");
             return Vec::new();
         }
-        let draft = compose.draft.clone();
+        // What the actions need of the message, without copying its
+        // attachments.
+        let draft = &compose.draft;
+        let (recipients, subject) = (draft.has_recipients(), !draft.subject.is_empty());
         match action {
             Action::SendMessage => {
-                if !draft.has_recipients() {
+                if !recipients {
                     self.fail("No recipients are specified!");
                     return Vec::new();
                 }
                 // As in mutt, a subject left out is checked again when
                 // sending (it may have been cleared in the menu).
-                if draft.subject.is_empty() {
+                if !subject {
                     let prompt = "No subject, abort sending?".to_owned();
                     let quad = self.settings.abort_nosubject;
                     return match self.decide(quad, prompt, Question::AbortSendNoSubject) {
@@ -757,7 +760,7 @@ impl App {
                 }
             }
             Action::PostponeMessage => return self.deliver(Delivery::Postpone),
-            Action::EditMessage => return vec![Effect::Edit(draft.body)],
+            Action::EditMessage => return vec![Effect::Edit(draft.body.clone())],
             Action::EditTo | Action::EditCc | Action::EditBcc | Action::EditSubject => {
                 let question = match action {
                     Action::EditTo => Question::To,
@@ -765,7 +768,7 @@ impl App {
                     Action::EditBcc => Question::Bcc,
                     _ => Question::Subject,
                 };
-                let current = field(&draft, question);
+                let current = field(draft, question);
                 self.ask_line(question, &current);
             }
             Action::AttachFile => self.ask_attach_file(),

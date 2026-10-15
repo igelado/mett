@@ -378,6 +378,7 @@ fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     let terminal = ratatui::init();
     let result = runtime.block_on(run(terminal, store, session));
     ratatui::restore();
+    remove_viewed();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -747,9 +748,28 @@ fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     };
+    // Taken away when mett exits (the viewer may still need it until
+    // then), or now if it can't be opened.
+    VIEWED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.clone());
     let path = dir.join(name);
-    std::fs::write(&path, data)?;
-    open::that_detached(&path)
+    let opened = std::fs::write(&path, data).and_then(|()| open::that_detached(&path));
+    if opened.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    opened
+}
+
+/// The directories of attachments opened for viewing.
+static VIEWED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Removes the copies of attachments opened for viewing.
+fn remove_viewed() {
+    for dir in VIEWED.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// The configuration that `:` commands change.

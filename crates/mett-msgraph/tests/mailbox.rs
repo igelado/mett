@@ -1755,3 +1755,74 @@ async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
         .await;
     store.send(&forward).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_retry_without_files_takes_off_those_attached_before() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "a1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The send's answer is lost.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let mut reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    reply.attachments.push(attached("a.bin", 3));
+    let store = store(&server);
+    assert!(store.send(&reply).await.is_err());
+
+    // The file is taken off the message: the retry takes it off the draft.
+    reply.attachments.clear();
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a1", "name": "a.bin", "size": 3 }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/a1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store.send(&reply).await.unwrap();
+}
+
+#[test]
+fn a_long_body_counts_towards_the_request_size() {
+    let mut message = draft(None);
+    message.attachments.push(attached("a.bin", 2_400_000));
+    assert!(!mett_msgraph::needs_server_draft(&message));
+    message.body = "x".repeat(1_000_000);
+    assert!(mett_msgraph::needs_server_draft(&message));
+}

@@ -66,10 +66,10 @@ struct Kept {
     base: Option<Vec<String>>,
 }
 
-/// Raw attachments up to this size in all go with a new message in the
-/// request that sends or saves it; Graph takes requests of up to 4 MB,
-/// and the content grows by a third in base64.
-const INLINE_ATTACHMENTS: usize = 2_500_000;
+/// A new message whose request (with its attachments in base64) comes to
+/// at most this size is sent or saved in one; Graph takes requests of up
+/// to 4 MB, and this leaves room for the rest of the request.
+const INLINE_REQUEST: usize = 3_500_000;
 
 /// Attachments up to this size are added in one request; larger ones go up
 /// in pieces through an upload session, as Graph requires.
@@ -863,21 +863,21 @@ impl<A: Authenticator> GraphMailStore<A> {
                 })?;
         let id = MessageId::new(created.id);
         // Replace what Graph filled in (recipients, a quoted HTML body) with
-        // what the user wrote. A new draft has no attachments yet.
-        let (updated, base) = match draft.origin {
-            Some(_) => (self.update_draft(&id, draft).await, None),
-            None => (Ok(()), Some(Vec::new())),
+        // what the user wrote.
+        let updated = match draft.origin {
+            Some(_) => self.update_draft(&id, draft).await,
+            None => Ok(()),
         };
         match updated {
-            Ok(()) => self.attach_all(draft, id, base, true).await,
-            Err(e) => Err(self.give_up(draft, id, base, e).await),
+            Ok(()) => self.attach_all(draft, id, None, true).await,
+            Err(e) => Err(self.give_up(draft, id, None, e).await),
         }
     }
 
     /// Gives the server draft `id` `draft`'s attachments: what it has
     /// beyond `base` (an earlier attempt's) comes off, then `draft`'s go
-    /// on. Without `base`, what it has now is its base (nothing was
-    /// attached yet). A `fresh` draft with a base has just that.
+    /// on. Without `base`, mett has attached nothing to it yet, and what it
+    /// has now is its base (a `fresh` new message has none).
     async fn attach_all(
         &self,
         draft: &Draft,
@@ -885,14 +885,14 @@ impl<A: Authenticator> GraphMailStore<A> {
         base: Option<Vec<String>>,
         fresh: bool,
     ) -> Result<(MessageId, Option<Vec<String>>)> {
-        // Nothing to take off (mett attached nothing yet, or only to a
-        // draft that had none) and nothing to put on.
-        let untouched = base.as_ref().is_none_or(Vec::is_empty);
-        if untouched && draft.attachments.is_empty() {
+        // Nothing of mett's there, and nothing to put on: done. (What an
+        // earlier attempt attached comes off even if nothing is to go on
+        // now.)
+        if base.is_none() && draft.attachments.is_empty() {
             return Ok((id, base));
         }
         let present = match &base {
-            Some(_) if fresh => Vec::new(),
+            None if fresh && draft.origin.is_none() => Vec::new(),
             _ => match self.list_attachments(&id).await {
                 Ok(present) => present,
                 Err(e) => return Err(self.give_up(draft, id, base, e).await),
@@ -1107,8 +1107,20 @@ fn unsent(e: Error) -> Error {
 /// message, once sent, is always kept in Sent Items, and a failed attempt
 /// may leave its draft behind.
 pub fn needs_server_draft(draft: &Draft) -> bool {
-    let attached: usize = draft.attachments.iter().map(|a| a.data.len()).sum();
-    draft.origin.is_some() || attached > INLINE_ATTACHMENTS
+    if draft.origin.is_some() {
+        return true;
+    }
+    if draft.attachments.is_empty() {
+        return false;
+    }
+    // Base64 takes 4 bytes for every 3; names and addresses are short
+    // next to the 4 MB.
+    let encoded: usize = draft
+        .attachments
+        .iter()
+        .map(|a| a.data.len().div_ceil(3) * 4 + a.name.len() + a.content_type.len())
+        .sum();
+    encoded + draft.body.len() + draft.subject.len() > INLINE_REQUEST
 }
 
 /// A Graph `message` resource with `draft`'s content, and its attachments
