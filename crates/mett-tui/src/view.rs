@@ -458,9 +458,10 @@ fn index_status(app: &App, height: usize, width: usize) -> String {
         folder: app.folder.as_ref().map_or("", |f| f.name.as_str()),
         total: app.total_messages(),
         shown: app.limit.as_ref().map(|_| app.messages.len()),
-        new: app.messages.iter().filter(|m| !m.flags.read).count(),
+        // The whole folder, as in mutt, whatever the limit shows.
+        new: app.folder_messages().filter(|m| !m.flags.read).count(),
         deleted: app.deleted_count(),
-        flagged: app.messages.iter().filter(|m| m.flags.flagged).count(),
+        flagged: app.folder_messages().filter(|m| m.flags.flagged).count(),
         incoming: app.mailboxes_with_new_mail(),
         limit: app.limit.as_ref().map(|limit| limit.text.as_str()),
         incomplete: app.incomplete(),

@@ -35,6 +35,17 @@ pub struct Pattern {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatternError(pub String);
 
+impl PatternError {
+    /// Whether the pattern is one of mutt's that mett doesn't know (such
+    /// as `~T`), rather than a mistake.
+    pub fn unsupported(&self) -> bool {
+        self.0.ends_with(UNSUPPORTED)
+    }
+}
+
+/// How an error about a pattern mett doesn't know ends.
+const UNSUPPORTED: &str = " is not supported";
+
 impl fmt::Display for PatternError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -228,7 +239,7 @@ impl Parser<'_> {
             'F' => Expr::Flagged,
             'D' => Expr::Deleted,
             other => {
-                return Err(PatternError(format!("~{other} is not supported")));
+                return Err(PatternError(format!("~{other}{UNSUPPORTED}")));
             }
         })
     }

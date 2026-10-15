@@ -1786,6 +1786,11 @@ impl App {
             .find(|s| &s.id == id)
     }
 
+    /// Every message of the folder listed so far, shown or not.
+    pub fn folder_messages(&self) -> impl Iterator<Item = &MessageSummary> {
+        self.messages.iter().chain(&self.hidden)
+    }
+
     /// Whether part of the folder could not be listed. The index then
     /// shows only the messages loaded so far.
     pub fn incomplete(&self) -> bool {

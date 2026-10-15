@@ -319,8 +319,14 @@ impl Colors {
         if object == Object::Index {
             // A pattern mett doesn't know may be one of mutt's it doesn't
             // do yet.
-            let pattern = Pattern::parse(text)
-                .map_err(|e| ColorError::Unsupported(format!("color index {text}: {e}")))?;
+            let pattern = Pattern::parse(text).map_err(|e| {
+                let message = format!("color index {text}: {e}");
+                if e.unsupported() {
+                    ColorError::Unsupported(message)
+                } else {
+                    ColorError::Bad(message)
+                }
+            })?;
             // Given again, it takes its new colors and the last place.
             self.index.retain(|rule| rule.text != text);
             self.index.push(IndexRule {
@@ -579,6 +585,7 @@ mod tests {
             "status red",
             "status mauve blue",
             "index red blue",
+            "index red blue ~s(",
             "body red blue (",
             "status red blue extra",
         ] {

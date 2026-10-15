@@ -108,7 +108,7 @@ fn expand_chars(chars: &[char], values: &dyn Expandos, width: usize) -> String {
                     _ => None,
                 };
                 let value = values.expando(code, arg.as_deref());
-                out.push_str(&spec.apply(&value));
+                out.push_str(&spec.apply(&value, width));
             }
         }
     }
@@ -252,13 +252,14 @@ fn spec(chars: &[char], start: usize) -> (Spec, usize) {
 }
 
 impl Spec {
-    /// `value` cut to the maximum width, then padded to the minimum.
-    fn apply(self, value: &str) -> String {
+    /// `value` cut to the maximum width, then padded to the minimum (no
+    /// wider than the `line`, which is cut to it anyway).
+    fn apply(self, value: &str, line: usize) -> String {
         let value = match self.max {
             Some(max) => truncate(value, max),
             None => value.to_owned(),
         };
-        let gap = self.min.saturating_sub(value.width());
+        let gap = self.min.min(line).saturating_sub(value.width());
         if gap == 0 {
             return value;
         }
@@ -317,6 +318,8 @@ mod tests {
         assert_eq!(x("%4C|%-4C|%04C|%%"), "   7|7   |0007|%");
         assert_eq!(x("%-8.3n|%.2s|%5.5w|"), "Ali     |He| 宽字|");
         assert_eq!(x("%{%b %d} %q."), "date(%b %d) .");
+        // Padding is never wider than the line.
+        assert_eq!(x("%999999999C"), format!("{}7", " ".repeat(29)));
     }
 
     #[test]
