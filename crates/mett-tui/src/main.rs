@@ -765,8 +765,9 @@ fn read_attachment(path: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-/// How many files are being saved: mett waits for them before exiting, so
-/// none is left half written.
+/// How many files are being saved, or written for a viewer and opened:
+/// mett waits for them before exiting, so none is left half written (nor
+/// a viewer without its file).
 static SAVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Waits (a while) for the files being saved.
@@ -1096,8 +1097,11 @@ fn dispatch(
             }
             Effect::OpenFile { name, data } => {
                 let files = files.clone();
+                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::spawn(move || {
-                    if let Err(e) = open_file(&name, &data) {
+                    let opened = open_file(&name, &data);
+                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Err(e) = opened {
                         let _ = files.send(app::Msg::Failed(format!("Could not open {name}: {e}")));
                     }
                 });

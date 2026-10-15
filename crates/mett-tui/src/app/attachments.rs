@@ -28,6 +28,8 @@ pub struct AttachMenu {
     pub selected: usize,
     /// The request listing them, while it is pending.
     pub(super) listing: Option<RequestId>,
+    /// Listing them failed for want of a sign-in: a retry lists them.
+    pub(super) unlisted: bool,
 }
 
 impl AttachMenu {
@@ -90,6 +92,7 @@ pub(super) enum Use {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Fetching {
     pub(super) request: RequestId,
+    pub(super) message: MessageId,
     pub(super) attachment: Attachment,
     pub(super) to: Use,
 }
@@ -111,8 +114,36 @@ impl App {
             entries: Vec::new(),
             selected: 0,
             listing: Some(effect_id(&request)),
+            unlisted: false,
         }));
         vec![request]
+    }
+
+    /// Retries what failed for want of a sign-in: listing attachments,
+    /// and fetching the one asked for (if its menu is still there).
+    pub(super) fn retry_attachments(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let unlisted: Vec<usize> = (0..self.screens.len())
+            .filter(|&i| matches!(&self.screens[i], Screen::Attachments(m) if m.unlisted))
+            .collect();
+        for position in unlisted {
+            let Screen::Attachments(menu) = &self.screens[position] else {
+                unreachable!("found above");
+            };
+            let request = self.request(Request::ListAttachments(menu.message.clone()));
+            let Screen::Attachments(menu) = &mut self.screens[position] else {
+                unreachable!("found above");
+            };
+            menu.unlisted = false;
+            menu.listing = Some(effect_id(&request));
+            effects.push(request);
+        }
+        if let Some((message, attachment, to)) = self.unfetched_attachment.take()
+            && matches!(self.screens.last(), Some(Screen::Attachments(m)) if m.message == message)
+        {
+            effects.extend(self.fetch_attachment(message, attachment, to));
+        }
+        effects
     }
 
     /// Fills the attachment menu once its attachments are listed.
@@ -139,6 +170,11 @@ impl App {
                 self.fail("This message has no attachments.");
             }
             Ok(entries) => menu.entries = entries,
+            // Kept for a retry once the user signs in.
+            Err(e @ mett_core::Error::Auth(_)) => {
+                menu.unlisted = true;
+                self.report(e);
+            }
             Err(e) => {
                 self.screens.remove(position);
                 self.report(e);
@@ -225,9 +261,13 @@ impl App {
             self.fail("Please wait: an attachment is still being fetched.");
             return Vec::new();
         }
-        let request = self.request(Request::FetchAttachment(message, attachment.id.clone()));
+        let request = self.request(Request::FetchAttachment(
+            message.clone(),
+            attachment.id.clone(),
+        ));
         self.fetching = Some(Fetching {
             request: effect_id(&request),
+            message,
             attachment,
             to,
         });
@@ -254,12 +294,23 @@ impl App {
         id: RequestId,
         result: mett_core::Result<Vec<u8>>,
     ) -> Vec<Effect> {
-        let Some(Fetching { attachment, to, .. }) = self.fetching.take_if(|f| f.request == id)
+        let Some(Fetching {
+            message,
+            attachment,
+            to,
+            ..
+        }) = self.fetching.take_if(|f| f.request == id)
         else {
             return Vec::new();
         };
         let data = match result {
             Ok(data) => data,
+            // Fetched again once the user signs in.
+            Err(e @ mett_core::Error::Auth(_)) => {
+                self.unfetched_attachment = Some((message, attachment, to));
+                self.report(e);
+                return Vec::new();
+            }
             Err(e) => {
                 self.report(e);
                 return Vec::new();
@@ -648,6 +699,48 @@ mod tests {
             ])),
         );
         app
+    }
+
+    #[test]
+    fn attachments_are_listed_and_fetched_again_after_a_sign_in() {
+        let mut app = app();
+        let (id, _) = sent(&act(&mut app, Action::ViewAttachments));
+        respond(
+            &mut app,
+            id,
+            Event::AttachmentsListed(Err(mett_core::Error::Auth("expired".into()))),
+        );
+        assert!(matches!(app.screen(), Screen::Attachments(_)));
+        let failed = |app: &mut App| {
+            app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+                account: mett_core::AccountId::new("me@contoso.com"),
+                outcome: Err("expired".into()),
+            }));
+        };
+        failed(&mut app);
+        let (id, request) = sent(&act(&mut app, Action::Retry));
+        assert_eq!(request, Request::ListAttachments(MessageId::new("m0")));
+        respond(
+            &mut app,
+            id,
+            Event::AttachmentsListed(Ok(vec![attachment(
+                "a0",
+                "notes.txt",
+                "text/plain",
+                AttachmentKind::File,
+            )])),
+        );
+        let (id, _) = sent(&act(&mut app, Action::DisplayMessage));
+        respond(
+            &mut app,
+            id,
+            Event::AttachmentFetched(Err(mett_core::Error::Auth("expired".into()))),
+        );
+        failed(&mut app);
+        let (_, request) = sent(&act(&mut app, Action::Retry));
+        assert!(
+            matches!(request, Request::FetchAttachment(m, a) if m.as_str() == "m0" && a.as_str() == "a0")
+        );
     }
 
     #[test]

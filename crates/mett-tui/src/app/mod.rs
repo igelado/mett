@@ -599,6 +599,9 @@ pub struct App {
     page_size: u32,
     /// The attachment being fetched, and what for.
     fetching: Option<attachments::Fetching>,
+    /// The attachment that failed to be fetched for want of a sign-in,
+    /// and what for: a retry fetches it again.
+    unfetched_attachment: Option<(MessageId, mett_core::Attachment, attachments::Use)>,
     /// The file being read (to attach) or saved: keys wait for it, as in
     /// mutt, but `^G` gives up on it.
     file_wait: Option<(FileOp, std::path::PathBuf)>,
@@ -746,6 +749,7 @@ impl App {
             last_draft: 0,
             page_size: settings.page_size,
             fetching: None,
+            unfetched_attachment: None,
             file_wait: None,
             last_file_op: 0,
             unsaved: None,
@@ -1087,6 +1091,8 @@ impl App {
             .chain(self.discarding.keys().copied())
             .chain(self.browser_request())
             .chain(self.switching.as_ref().map(|(id, _)| *id))
+            .chain(self.attachments_request())
+            .chain(self.fetching.as_ref().map(|f| f.request))
             .collect()
     }
 
@@ -1134,6 +1140,7 @@ impl App {
         effects.extend(self.retry_saves());
         effects.extend(self.retry_transfers());
         effects.extend(self.retry_switch());
+        effects.extend(self.retry_attachments());
         // The folders are listed whether or not one is open.
         effects.extend(self.retry_browser());
         if self.folder.is_none() {
