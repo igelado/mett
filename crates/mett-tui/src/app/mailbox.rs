@@ -59,6 +59,13 @@ pub struct Browser {
     pub(super) purpose: Choose,
 }
 
+impl Browser {
+    /// Whether its folders are still being listed.
+    pub fn listing(&self) -> bool {
+        self.listing.is_some()
+    }
+}
+
 /// A folder in the browser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserEntry {
@@ -852,6 +859,15 @@ impl App {
         self.transfer_failures.retain(|(id, failed, place), _| {
             !(done.contains(id) && *failed == transfer && same_place(place))
         });
+        // Nor is it to be done again after a sign-in.
+        for (failed, retry) in &mut self.failed_transfers {
+            if *failed == transfer && transfer != Transfer::Purge && same_place(&destination(retry))
+            {
+                transfer_ids_mut_vec(retry).retain(|id| !done.contains(id));
+            }
+        }
+        self.failed_transfers
+            .retain(|(_, retry)| !transfer_ids(retry).is_empty());
         if let Some(e) = failure {
             // Whatever failed stays where it was, still marked; don't go
             // on as if the purge had worked (unless all of it is to retry
@@ -3266,5 +3282,37 @@ mod tests {
             ))),
         }));
         assert!(app.save_failures().is_empty(), "{:?}", app.save_failures());
+    }
+
+    #[test]
+    fn a_copy_to_the_same_folder_replaces_its_retry() {
+        let mut app = app(settings());
+        act(&mut app, Action::CopyMessage);
+        let (id, _) = sent(&answer(&mut app, "=Archive"));
+        signed_out(&mut app);
+        // The folder was found, but copying needed a sign-in.
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Transferred(Ok((
+                FolderId::new("arc"),
+                vec![("m0".into(), Err(Error::Auth("expired".into())))],
+            ))),
+        }));
+        app.sign_in = None;
+        app.selected = 0;
+        act(&mut app, Action::CopyMessage);
+        let (id, _) = sent(&answer(&mut app, "=@archive"));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Transferred(Ok((
+                FolderId::new("arc"),
+                vec![("m0".into(), Ok("c0".into()))],
+            ))),
+        }));
+        assert!(
+            !app.retry()
+                .iter()
+                .any(|e| matches!(e, Effect::Request(_, Request::Transfer { .. })))
+        );
     }
 }

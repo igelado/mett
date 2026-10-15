@@ -131,7 +131,12 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
 /// indented by depth.
 fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
     if browser.entries.is_empty() {
-        frame.render_widget(Paragraph::new("Listing folders..."), area);
+        let text = if browser.listing() {
+            "Listing folders..."
+        } else {
+            "No folders."
+        };
+        frame.render_widget(Paragraph::new(text), area);
         return "---mett: Folders---".into();
     }
     let height = usize::from(area.height).max(1);
@@ -836,5 +841,19 @@ mod tests {
         assert_eq!(lines[1], "   1 N     2/10     Inbox");
         assert_eq!(lines[2], "   2       0/0        Projects");
         assert_eq!(lines[6], "---mett: Folders [2]---");
+    }
+
+    #[test]
+    fn an_empty_folder_list_says_so() {
+        let mut app = app(1);
+        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: list,
+            event: Event::FoldersListed(Ok(Vec::new())),
+        }));
+        assert_eq!(screen(&app)[1], "No folders.");
     }
 }
