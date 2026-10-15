@@ -111,7 +111,9 @@ fn expand_chars(chars: &[char], values: &dyn Expandos, width: usize) -> String {
                     _ => None,
                 };
                 let value = values.expando(code, arg.as_deref());
-                out.push_str(&spec.apply(&value, width));
+                // Padding takes no more than what is left of the line.
+                let left = width.saturating_sub(out.width());
+                out.push_str(&spec.apply(&value, left));
             }
         }
     }
@@ -323,6 +325,8 @@ mod tests {
         assert_eq!(x("%{%b %d} %q."), "date(%b %d) .");
         // Padding is never wider than the line.
         assert_eq!(x("%999999999C"), format!("{}7", " ".repeat(29)));
+        // Nor than what is left of it: the value still shows.
+        assert_eq!(expand("A%5C", &Values, 5), "A   7");
     }
 
     #[test]
