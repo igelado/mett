@@ -280,6 +280,14 @@ async fn run<S: mett_core::MailStore + 'static>(
     // A save's sign-in failure may still be queued, behind its response
     // and the key that quit: take it in, so its window can offer a retry.
     while let Ok(event) = sign_in_rx.try_recv() {
+        // A sign-in that nothing left to save needs: the user has quit, so
+        // don't send them to the browser.
+        if matches!(event, SignInEvent::Prompt { .. }) && !app.saving() {
+            if let Some(cancel) = &cancel {
+                cancel.cancel();
+            }
+            continue;
+        }
         let effects = app.update(Msg::SignIn(event));
         dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
     }
