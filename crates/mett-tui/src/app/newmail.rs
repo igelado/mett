@@ -375,6 +375,27 @@ impl App {
             oldest.is_some_and(|oldest| m.received > oldest)
         };
         let listed: HashSet<&MessageId> = fresh.iter().map(|m| &m.id).collect();
+        // One missing that is as old as the page's last may be on the next
+        // page, or gone: the folder is listed again to tell (once, or
+        // every check would).
+        let tied: Vec<MessageId> = self
+            .messages
+            .iter()
+            .chain(&self.hidden)
+            .filter(|m| !listed.contains(&m.id) && !covered(m))
+            .filter(|m| (if m.draft { oldest_draft } else { oldest_sent }) == Some(m.received))
+            .filter(|m| !self.transferring(&m.id) && !self.tie_checked.contains(&m.id))
+            .map(|m| m.id.clone())
+            .collect();
+        if !tied.is_empty() {
+            self.tie_checked.extend(tied);
+            if unread {
+                self.announce(NEW_MAIL);
+            }
+            let effects = self.refresh();
+            self.known_before_refresh = Some(known);
+            return effects;
+        }
         let gone: HashSet<MessageId> = self
             .messages
             .iter()
@@ -701,8 +722,13 @@ impl App {
             .retain(|path, _| mailboxes.iter().any(|m| m.path == *path));
         // A check of the mailboxes as they were is left to answer to
         // nothing: the next one checks the new ones.
-        let paths = |list: &[MailboxEntry]| list.iter().map(|m| m.path.clone()).collect::<Vec<_>>();
-        if paths(&self.mailboxes) != paths(&mailboxes) {
+        // (So is one when checking is turned off, for any of them.)
+        let checked = |list: &[MailboxEntry]| {
+            list.iter()
+                .map(|m| (m.path.clone(), m.poll))
+                .collect::<Vec<_>>()
+        };
+        if checked(&self.mailboxes) != checked(&mailboxes) || self.sync_interval != interval {
             self.checking = None;
         }
         self.mailboxes = mailboxes;
@@ -857,6 +883,47 @@ mod tests {
             changed: page(Vec::new()),
         };
         respond(app, id, Event::FolderPolled(Ok(polled)))
+    }
+
+    #[test]
+    fn a_message_missing_at_the_page_s_end_has_the_folder_listed_once() {
+        let (mut app, _) = app();
+        // m0 is as old as m1, the page's last: on the next page, or gone.
+        app.messages.iter_mut().for_each(|m| {
+            if m.id.as_str() == "m0" {
+                m.received = DateTime::UNIX_EPOCH + TimeDelta::minutes(1);
+            }
+        });
+        let partial = |app: &mut App| {
+            let id = poll(app);
+            let polled = Polled {
+                newest: MessagePage {
+                    messages: vec![summary("m2", 2), summary("m1", 1)],
+                    next: Some(mett_core::PageCursor::new("in more")),
+                },
+                changed: page(Vec::new()),
+            };
+            respond(app, id, Event::FolderPolled(Ok(polled)))
+        };
+        let effects = partial(&mut app);
+        let (list, _) = requests(&effects)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::ListMessages { .. }))
+            .expect("the folder is listed again");
+        // Listed again, it is there: not again at every check.
+        let mut m0 = summary("m0", 1);
+        m0.received = DateTime::UNIX_EPOCH + TimeDelta::minutes(1);
+        respond(
+            &mut app,
+            list,
+            Event::MessagesListed(Ok(page(vec![summary("m2", 2), summary("m1", 1), m0]))),
+        );
+        let effects = partial(&mut app);
+        assert!(
+            !requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::ListMessages { .. }))
+        );
     }
 
     #[test]

@@ -539,6 +539,9 @@ pub struct App {
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
+    /// Messages missing from a check's page, as old as its last: the
+    /// folder was listed again once to tell whether they are gone.
+    tie_checked: HashSet<MessageId>,
     /// The request reading the mailboxes' counts.
     checking: Option<RequestId>,
     /// The unread mail the user has seen, by folder.
@@ -653,6 +656,7 @@ impl App {
             poll_since: None,
             poll_timer: 0,
             known_before_refresh: None,
+            tie_checked: HashSet::new(),
             checking: None,
             seen: HashMap::new(),
             poll_epoch: 0,
