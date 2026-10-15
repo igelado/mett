@@ -902,15 +902,33 @@ impl App {
                 if self.addresses_request == Some(id) {
                     self.addresses_request = None;
                 }
-                for address in result.unwrap_or_default() {
-                    let address = address.to_lowercase();
-                    if !self.settings.me.contains(&address) {
-                        self.settings.me.push(address);
+                let failed = match result {
+                    Ok(addresses) => {
+                        for address in addresses {
+                            let address = address.to_lowercase();
+                            if !self.settings.me.contains(&address) {
+                                self.settings.me.push(address);
+                            }
+                        }
+                        None
                     }
-                }
-                // A reply that waited for them can choose its recipients.
+                    // Asked again by the next reply.
+                    Err(e) => {
+                        self.asked_addresses = false;
+                        Some(e)
+                    }
+                };
+                // A reply that waited for them can choose its recipients,
+                // with the addresses the user configured if the mailbox
+                // couldn't tell.
                 if let Some((kind, message)) = self.awaiting_addresses.take() {
-                    return self.begin(kind, Some(message));
+                    let effects = self.begin(kind, Some(message));
+                    if let Some(e) = failed {
+                        self.status = format!(
+                            "Couldn't learn your own addresses ({e}); a reply to your own mail may need its recipients checked."
+                        );
+                    }
+                    return effects;
                 }
             }
             Event::KeptDiscarded(result) => {

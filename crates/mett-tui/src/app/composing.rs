@@ -140,7 +140,7 @@ impl App {
             && let Some(message) = &pager.message
         {
             let message = message.clone();
-            return self.begin(kind, Some(message));
+            return self.reply_when_ready(kind, message);
         }
         let Some(summary) = self.messages.get(self.selected) else {
             self.status = "No messages.".into();
@@ -153,6 +153,27 @@ impl App {
         vec![fetch]
     }
 
+    /// Starts a reply or forward to `message`. Whom a reply goes to depends
+    /// on which addresses are the user's: it waits for the mailbox to tell
+    /// (asking again if it couldn't before).
+    fn reply_when_ready(&mut self, kind: Kind, message: Message) -> Vec<Effect> {
+        if !matches!(kind, Kind::Reply | Kind::GroupReply) {
+            return self.begin(kind, Some(message));
+        }
+        let mut effects = Vec::new();
+        if self.addresses_request.is_none() && !self.asked_addresses {
+            self.asked_addresses = true;
+            let request = self.request(Request::OwnAddresses);
+            self.addresses_request = Some(effect_id(&request));
+            effects.push(request);
+        }
+        if self.addresses_request.is_some() {
+            self.awaiting_addresses = Some((kind, message));
+            return effects;
+        }
+        self.begin(kind, Some(message))
+    }
+
     /// Continues a reply or forward once `message` has been fetched.
     pub(super) fn on_compose_fetched(
         &mut self,
@@ -161,16 +182,7 @@ impl App {
         result: mett_core::Result<Message>,
     ) -> Vec<Effect> {
         match result {
-            // Whom a reply goes to depends on which addresses are the
-            // user's: wait for the mailbox to tell.
-            Ok(message)
-                if self.addresses_request.is_some()
-                    && matches!(kind, Kind::Reply | Kind::GroupReply) =>
-            {
-                self.awaiting_addresses = Some((kind, message));
-                Vec::new()
-            }
-            Ok(message) => self.begin(kind, Some(message)),
+            Ok(message) => self.reply_when_ready(kind, message),
             Err(e) => {
                 // Without a sign-in, the sign-in window's Retry starts the
                 // reply or forward again.
@@ -1756,6 +1768,54 @@ mod tests {
         }));
         assert!(app.input.is_some(), "the reply goes on");
         // Include the message (the default), then To.
+        key(&mut app, KeyCode::Enter);
+        let Some(Input::Line { editor, .. }) = &app.input else {
+            panic!("expected the To question, got {:?}", app.input);
+        };
+        assert_eq!(editor.text(), "bob@x.org");
+    }
+
+    #[test]
+    fn a_failed_address_lookup_is_tried_again_by_a_reply() {
+        let inbox = crate::config::mailbox::FolderPath::Named(vec!["Inbox".into()]);
+        let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
+        let (open, _) = request(&effects);
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let Effect::Request(addresses, _) = effects[1].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: addresses,
+            event: Event::OwnAddresses(Err(Error::Network("busy".into()))),
+        }));
+        let mut mine = original();
+        mine.summary.from = Some(Address::new("alias@contoso.com"));
+        mine.summary.to = vec![Address::new("bob@x.org")];
+        app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![mine.summary.clone()],
+                next: None,
+            })),
+        }));
+        let (fetch, _) = request(&act(&mut app, Action::Reply));
+        let effects = app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(mine)),
+        }));
+        let (again, asked) = request(&effects);
+        assert!(matches!(asked, Request::OwnAddresses), "asked again");
+        assert!(app.input.is_none(), "the reply waits");
+        app.update(Msg::Response(Response {
+            id: again,
+            event: Event::OwnAddresses(Ok(vec!["alias@contoso.com".into()])),
+        }));
         key(&mut app, KeyCode::Enter);
         let Some(Input::Line { editor, .. }) = &app.input else {
             panic!("expected the To question, got {:?}", app.input);
