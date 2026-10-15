@@ -211,8 +211,8 @@ keeps the store up to date with Graph delta queries.
   (`MailStore::newest_unread`): a mailbox has new mail when unread mail
   arrived after the user last had it open, which reading mail can't
   disturb, unlike comparing counts. What the user saw is the unread mail
-  the index showed (by its last-modified time) when they left the folder,
-  or that a check made while it was open found.
+  that reached the index (by its last-modified time) while the folder was
+  open.
 
 ### 5.6 State machine for menus
 

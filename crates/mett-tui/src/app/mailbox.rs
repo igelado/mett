@@ -648,14 +648,13 @@ impl App {
             Ok(folder) => {
                 // An earlier folder change waiting for a sign-in is moot.
                 self.unswitched = None;
-                self.leaving_folder();
+                self.see_index();
                 self.reset_folder();
                 self.previous = Some(std::mem::replace(&mut self.path, path));
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
-                let mut effects = self.list(Page::first(self.page_size));
-                effects.extend(self.visited());
-                effects
+                self.visited();
+                self.list(Page::first(self.page_size))
             }
             Err(e) => {
                 // Without a sign-in, the sign-in window's Retry opens it.
