@@ -626,7 +626,7 @@ impl App {
     ///
     /// The open folder stays until the new one is found, so that a bad
     /// name or a failure leaves the user where they were.
-    fn change_folder(&mut self, path: FolderPath) -> Vec<Effect> {
+    pub(super) fn change_folder(&mut self, path: FolderPath) -> Vec<Effect> {
         if self.folder.is_none() {
             self.reset_folder();
             self.path = path;
@@ -648,6 +648,7 @@ impl App {
             Ok(folder) => {
                 // An earlier folder change waiting for a sign-in is moot.
                 self.unswitched = None;
+                self.leaving_folder();
                 self.reset_folder();
                 self.previous = Some(std::mem::replace(&mut self.path, path));
                 self.status = format!("Loading {}...", folder.name);

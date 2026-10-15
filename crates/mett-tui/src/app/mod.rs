@@ -533,6 +533,9 @@ pub struct App {
     poll_since: Option<chrono::DateTime<chrono::Utc>>,
     /// Which timer for checks counts.
     poll_timer: u64,
+    /// Messages in the open folder the user read (less those set unread)
+    /// since its count was last checked.
+    reads_since_check: i64,
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
@@ -641,6 +644,7 @@ impl App {
             polling: None,
             poll_since: None,
             poll_timer: 0,
+            reads_since_check: 0,
             known_before_refresh: None,
             checking: None,
         };
@@ -1624,6 +1628,9 @@ impl App {
         update: FlagsUpdate,
         result: mett_core::Result<()>,
     ) -> Vec<Effect> {
+        if result.is_ok() {
+            self.read_saved(&message, update);
+        }
         // Sent for a message mett has no flags for (its folder wasn't
         // open): only the fields it changed are known.
         let Some(mut mailbox) = self.mailbox_flags.get(&message).copied() else {

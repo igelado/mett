@@ -378,6 +378,10 @@ impl App {
                     if open || unread == 0 {
                         state.new = false;
                     }
+                    // The count has the user's reads in it now.
+                    if open {
+                        self.reads_since_check = 0;
+                    }
                     state.folder = Some(folder);
                     state.error = None;
                 }
@@ -427,6 +431,34 @@ impl App {
             (Some(open), Some(found)) => open.id == found.id,
             (Some(_), None) => *path == self.path,
             (None, _) => false,
+        }
+    }
+
+    /// A change of read state was saved: until the next check, the open
+    /// mailbox's count is off by it.
+    pub(super) fn read_saved(&mut self, message: &MessageId, update: mett_core::FlagsUpdate) {
+        if self.summary(message).is_none() {
+            return;
+        }
+        match update.read {
+            Some(true) => self.reads_since_check += 1,
+            Some(false) => self.reads_since_check -= 1,
+            None => {}
+        }
+    }
+
+    /// The open folder is being left: its count, as last checked, takes
+    /// the user's reads since, so that new mail arriving later shows.
+    pub(super) fn leaving_folder(&mut self) {
+        let reads = std::mem::take(&mut self.reads_since_check);
+        let Some(open) = &self.folder else {
+            return;
+        };
+        for state in self.mailbox_state.values_mut() {
+            if let Some(folder) = state.folder.as_mut().filter(|f| f.id == open.id) {
+                let unread = i64::from(folder.unread_count) - reads;
+                folder.unread_count = u32::try_from(unread.max(0)).unwrap_or(u32::MAX);
+            }
         }
     }
 
@@ -950,6 +982,51 @@ mod tests {
             Event::FolderOpened(Ok(folder("work", "Work", 3))),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 0);
+    }
+
+    #[test]
+    fn mail_read_before_leaving_does_not_hide_new_mail() {
+        let (mut app, check) = app();
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), Ok(folder("in", "Inbox", 1))),
+                (work(), Ok(folder("work", "Work", 0))),
+            ]),
+        );
+        // m0 is read in the Inbox; then the user leaves for Work.
+        let effects = app.update_flags(
+            MessageId::new("m0"),
+            FlagsUpdate {
+                read: Some(true),
+                flagged: None,
+            },
+        );
+        let (write, _) = requests(&effects)[0].clone();
+        respond(&mut app, write, Event::FlagsUpdated(Ok(())));
+        app.change_folder(work());
+        let (switch, _) = app.switching.clone().unwrap();
+        respond(
+            &mut app,
+            switch,
+            Event::FolderOpened(Ok(folder("work", "Work", 0))),
+        );
+        // New mail in the Inbox brings its count back to 1.
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let (check, _) = requests(&effects)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+            .unwrap();
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), Ok(folder("in", "Inbox", 1))),
+                (work(), Ok(folder("work", "Work", 0))),
+            ]),
+        );
+        assert_eq!(app.status, "New mail in =@inbox.");
     }
 
     #[test]

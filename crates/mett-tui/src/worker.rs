@@ -202,8 +202,11 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
                 let found = match id {
                     // A folder deleted (or moved away) since is looked for
                     // by its path again.
+                    // So is one renamed since (another may have its name
+                    // now).
                     Some(id) => match store.folder(&id).await {
                         Err(Error::NotFound { .. }) => resolve(store, &path).await,
+                        Ok(folder) if !path.names(&folder.name) => resolve(store, &path).await,
                         found => found,
                     },
                     None => resolve(store, &path).await,
@@ -393,6 +396,19 @@ mod tests {
         assert_eq!(found[0], (&archive, Some(("arc", 1))));
         assert_eq!(found[1], (&inbox, Some(("in", 0))));
         assert!(matches!(checked[2].1, Err(Error::NotFound { .. })));
+        // Renamed: the folder now called Archive is the one checked.
+        let renamed = MemoryStore::new()
+            .with_folder(mock::folder("old", "Elsewhere", None))
+            .with_folder(mock::folder("arc", "Archive", None));
+        let Event::MailboxesChecked(checked) = serve(
+            &renamed,
+            Request::CheckMailboxes(vec![(archive, Some(FolderId::new("old")))]),
+        )
+        .await
+        else {
+            panic!("expected MailboxesChecked");
+        };
+        assert_eq!(checked[0].1.as_ref().unwrap().id, FolderId::new("arc"));
     }
 
     #[tokio::test]
