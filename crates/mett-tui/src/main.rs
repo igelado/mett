@@ -832,6 +832,9 @@ fn write_new(
 /// Writes `data` beside `path`, then puts it in its place: a failure
 /// leaves the file there as it was.
 fn replace_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    // A link is followed: the file it names is what is replaced.
+    let resolved = std::fs::canonicalize(path)?;
+    let path = resolved.as_path();
     static WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path
         .file_name()
@@ -1288,6 +1291,16 @@ mod tests {
             save_file(path.clone(), b"newer".to_vec(), true);
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
+        }
+        // Through a link, the file it names is replaced, and the link stays.
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.txt");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            save_file(link.clone(), b"linked".to_vec(), true);
+            assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "linked");
+            std::fs::remove_file(&link).unwrap();
         }
         // Nothing left beside it.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);

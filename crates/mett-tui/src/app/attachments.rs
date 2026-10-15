@@ -595,7 +595,9 @@ fn file_name(attachment: &Attachment) -> String {
     match (name, extension) {
         ("" | "." | "..", Some(extension)) => format!("item.{extension}"),
         ("" | "." | "..", None) => "attachment".into(),
-        (name, Some(extension)) if !name.contains('.') => format!("{name}.{extension}"),
+        (name, Some(extension)) if !name.to_lowercase().ends_with(&format!(".{extension}")) => {
+            format!("{name}.{extension}")
+        }
         (name, _) => name.to_owned(),
     }
 }
@@ -781,6 +783,16 @@ mod tests {
         assert_eq!(scroll(&app), 7);
         act(&mut app, Action::FirstEntry);
         assert_eq!(scroll(&app), 0);
+    }
+
+    #[test]
+    fn attached_items_are_named_by_their_kind() {
+        let item = |name: &str, content_type: &str| {
+            file_name(&attachment("i", name, content_type, AttachmentKind::Item))
+        };
+        assert_eq!(item("Budget v1.2", "message/rfc822"), "Budget v1.2.eml");
+        assert_eq!(item("Lunch.ICS", "text/calendar"), "Lunch.ICS");
+        assert_eq!(item("", "text/vcard"), "item.vcf");
     }
 
     #[test]
