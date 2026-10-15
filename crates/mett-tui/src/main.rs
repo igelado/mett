@@ -7,6 +7,7 @@
 
 mod account;
 mod action;
+mod alias;
 mod app;
 mod color;
 mod compose;
@@ -97,7 +98,23 @@ fn main() -> ExitCode {
     if !options.demo {
         let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
         let mut config = config::Config::new(home);
-        for file in config::locate(&options.files, &|name| std::env::var_os(name)) {
+        let env = |name: &str| std::env::var_os(name);
+        let files = config::locate(&options.files, &env);
+        // The user's own file is the one given (`-F`), or the last one
+        // read (not /etc/mettrc), or the one they would have.
+        let user_file = options
+            .files
+            .user_file
+            .clone()
+            .or_else(|| {
+                files
+                    .last()
+                    .filter(|file| *file != std::path::Path::new("/etc/mettrc"))
+                    .cloned()
+            })
+            .or_else(|| config::new_user_file(&env));
+        config.set_user_file(user_file);
+        for file in files {
             config.load_file(&file);
         }
         for warning in &config.warnings {
@@ -323,7 +340,17 @@ fn settings_keeping(
             .map_err(|e| format!("sort_aux: {e}"))?,
         ascii: config.flag("ascii_chars"),
     };
+    let alias_file = match config.string("alias_file") {
+        "" => config.user_file().map(std::path::Path::to_path_buf),
+        file => Some(std::path::PathBuf::from(file)),
+    };
     Ok(Settings {
+        aliases: config.aliases().to_vec(),
+        alias_file,
+        query: app::QuerySettings {
+            command: config.string("query_command").to_owned(),
+            directory: config.flag("msgraph_query_directory"),
+        },
         home: config.home().map(str::to_owned),
         page_size,
         mailboxes,
@@ -746,6 +773,42 @@ impl Deferred {
 /// The largest file Office365 takes as an attachment.
 const MAX_ATTACHMENT: u64 = 150 * 1024 * 1024;
 
+/// Appends `text` to the file at `path` (created if missing), on a line of
+/// its own even if the file doesn't end with a newline.
+fn append_line(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    // The end of the file, to tell whether its last command is over.
+    let length = file.metadata()?.len();
+    let mut tail = vec![0; usize::try_from(length.min(64)).unwrap_or(64)];
+    if !tail.is_empty() {
+        file.seek(SeekFrom::End(-i64::try_from(tail.len()).unwrap_or(64)))?;
+        file.read_exact(&mut tail)?;
+    }
+    let (line, newline) = match tail.strip_suffix(b"\n") {
+        // (A CRLF file reads as LF.)
+        Some(line) => (line.strip_suffix(b"\r").unwrap_or(line), true),
+        None => (tail.as_slice(), false),
+    };
+    // An odd number of backslashes at the end of the line carries the
+    // command on: an empty line ends it.
+    let continued = line.iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1;
+    let separator = match (newline || tail.is_empty(), continued) {
+        (true, false) => "",
+        (true, true) | (false, false) => "\n",
+        (false, true) => "\n\n",
+    };
+    file.write_all(format!("{separator}{text}").as_bytes())
+}
+
 /// Reads a file to attach, stopping past [`MAX_ATTACHMENT`]: one larger
 /// (or without end, such as `/dev/zero`) can't be sent.
 fn read_attachment(path: &std::path::Path) -> Result<Vec<u8>, String> {
@@ -1018,7 +1081,12 @@ fn run_command(
                 .iter()
                 .filter(|name| {
                     name.starts_with("msgraph_")
-                        && !["msgraph_page_size", "msgraph_sync_interval"].contains(*name)
+                        && ![
+                            "msgraph_page_size",
+                            "msgraph_sync_interval",
+                            "msgraph_query_directory",
+                        ]
+                        .contains(*name)
                 })
                 .map(|name| format!("{name}: takes effect when mett starts again")),
         );
@@ -1113,6 +1181,17 @@ fn dispatch(
                     if let Err(e) = opened {
                         let _ = files.send(app::Msg::Failed(format!("Could not open {name}: {e}")));
                     }
+                });
+            }
+            Effect::AppendFile { path, text } => {
+                let files = files.clone();
+                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let appended = append_line(&path, &text)
+                        .map(|()| path.clone())
+                        .map_err(|e| format!("{}: {e}", path.display()));
+                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = files.send(app::Msg::Appended(appended));
                 });
             }
             Effect::ReadFile(op, path) => {
@@ -1282,6 +1361,39 @@ mod tests {
         }
         // Nothing left beside it.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn appends_on_a_line_of_its_own() {
+        let dir = std::env::temp_dir().join(format!("mett-append-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mettrc");
+        std::fs::write(&path, "set a = b").unwrap();
+        append_line(&path, "alias x x@y\n").unwrap();
+        append_line(&path, "alias z z@y\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "set a = b\nalias x x@y\nalias z z@y\n"
+        );
+        // A line carried on is ended first.
+        let continued = dir.join("continued");
+        std::fs::write(&continued, "set a = b \\\n").unwrap();
+        append_line(&continued, "alias x x@y\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&continued).unwrap(),
+            "set a = b \\\n\nalias x x@y\n"
+        );
+        let crlf = dir.join("crlf");
+        std::fs::write(&crlf, "set a = b \\\r\n").unwrap();
+        append_line(&crlf, "alias x x@y\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&crlf).unwrap(),
+            "set a = b \\\r\n\nalias x x@y\n"
+        );
+        let new = dir.join("new/mettrc");
+        append_line(&new, "alias x x@y\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "alias x x@y\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
     use super::*;

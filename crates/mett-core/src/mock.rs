@@ -14,7 +14,7 @@ use crate::draft::{Draft, DraftOrigin};
 use crate::error::{Error, Result};
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor};
-use crate::message::{Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary};
+use crate::message::{Address, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary};
 use crate::ports::{MailSender, MailStore, MessagePage, Page};
 
 /// A [`MailStore`] and [`MailSender`] that keeps everything in memory.
@@ -213,6 +213,36 @@ impl MailStore for MemoryStore {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let state = self.state();
         Ok(state.folders.iter().map(|f| state.with_counts(f)).collect())
+    }
+
+    /// The senders and recipients of the stored mail.
+    async fn search_people(&self, text: &str) -> Result<Vec<Address>> {
+        let text = text.to_lowercase();
+        let state = self.state();
+        let mut found: Vec<Address> = Vec::new();
+        let people = state.messages.iter().flat_map(|m| {
+            m.summary
+                .from
+                .iter()
+                .chain(&m.summary.to)
+                .chain(&m.cc)
+                .chain(&m.bcc)
+        });
+        for person in people {
+            let matches = person.email.to_lowercase().contains(&text)
+                || person
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().contains(&text));
+            if matches
+                && !found
+                    .iter()
+                    .any(|f| f.email.eq_ignore_ascii_case(&person.email))
+            {
+                found.push(person.clone());
+            }
+        }
+        Ok(found)
     }
 
     async fn folder(&self, id: &FolderId) -> Result<Folder> {

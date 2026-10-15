@@ -38,6 +38,24 @@ impl LineEditor {
         self.graphemes.concat()
     }
 
+    /// The text before the cursor, and after it.
+    pub fn split_at_cursor(&self) -> (String, String) {
+        (
+            self.graphemes[..self.cursor].concat(),
+            self.graphemes[self.cursor..].concat(),
+        )
+    }
+
+    /// An editor holding `before` then `after`, with the cursor between
+    /// them.
+    pub fn with_cursor(before: &str, after: &str) -> Self {
+        let mut editor = Self::new(before);
+        editor
+            .graphemes
+            .extend(after.graphemes(true).map(str::to_owned));
+        editor
+    }
+
     /// Applies a key press.
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

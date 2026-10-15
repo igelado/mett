@@ -120,6 +120,7 @@ const fn var(name: &'static str, kind: Kind, default: &'static str) -> Var {
 pub const VARS: &[Var] = &[
     var("abort_nosubject", Kind::Quad, "ask-yes"),
     var("abort_unmodified", Kind::Quad, "yes"),
+    var("alias_file", Kind::Path, ""),
     var("ascii_chars", Kind::Bool, "no"),
     var("askbcc", Kind::Bool, "no"),
     var("askcc", Kind::Bool, "no"),
@@ -167,6 +168,7 @@ pub const VARS: &[Var] = &[
     ),
     var("postpone", Kind::Quad, "ask-yes"),
     var("postponed", Kind::Path, "~/postponed"),
+    var("query_command", Kind::Path, ""),
     var("quote_regex", Kind::String, "^([ \t]*[|>:}#])+"),
     var("realname", Kind::String, ""),
     var("record", Kind::Path, "~/sent"),

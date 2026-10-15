@@ -28,6 +28,8 @@ pub enum Menu {
     Help,
     /// The attachment menu.
     Attach,
+    /// Addresses to choose from (mutt's query and alias menus).
+    Query,
 }
 
 impl Menu {
@@ -42,6 +44,7 @@ impl Menu {
             Menu::Browser => "browser",
             Menu::Help => "help",
             Menu::Attach => "attach",
+            Menu::Query => "query",
         }
     }
 
@@ -56,9 +59,12 @@ impl Menu {
             Menu::Browser,
             Menu::Help,
             Menu::Attach,
+            Menu::Query,
         ]
         .into_iter()
         .find(|m| m.name() == name)
+        // mutt's alias menu is mett's query menu.
+        .or((name == "alias").then_some(Menu::Query))
     }
 
     /// Whether the generic menu's bindings apply here. As in mutt, they
@@ -343,6 +349,8 @@ impl Keymap {
             (Key::char('/'), Search),
             (Key::char('n'), SearchNext),
             (Key::char('v'), ViewAttachments),
+            (Key::char('Q'), Query),
+            (Key::char('a'), CreateAlias),
             (Key::ctrl('n'), NextThread),
             (Key::ctrl('p'), PreviousThread),
         ];
@@ -504,6 +512,29 @@ impl Keymap {
         ];
         for (key, action) in attach {
             keymap.bind_action(Menu::Attach, *key, *action);
+        }
+
+        let query: &[(Key, Action)] = &[
+            (Key::char('q'), Exit),
+            (Key::new(Esc), Exit),
+            (Key::char('j'), NextEntry),
+            (Key::new(Down), NextEntry),
+            (Key::char('k'), PreviousEntry),
+            (Key::new(Up), PreviousEntry),
+            (Key::char('='), FirstEntry),
+            (Key::new(Home), FirstEntry),
+            (Key::char('*'), LastEntry),
+            (Key::new(End), LastEntry),
+            (Key::char('z'), NextPage),
+            (Key::new(PageDown), NextPage),
+            (Key::char('Z'), PreviousPage),
+            (Key::new(PageUp), PreviousPage),
+            (Key::new(Enter), DisplayMessage),
+            (Key::char(' '), DisplayMessage),
+            (Key::char('m'), Mail),
+        ];
+        for (key, action) in query {
+            keymap.bind_action(Menu::Query, *key, *action);
         }
 
         keymap

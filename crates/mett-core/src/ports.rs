@@ -14,7 +14,7 @@ use crate::draft::Draft;
 use crate::error::Result;
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor};
-use crate::message::{FlagsUpdate, Message, MessageSummary};
+use crate::message::{Address, FlagsUpdate, Message, MessageSummary};
 
 /// How many unread messages [`MailStore::recent_unread`] returns at most.
 pub const RECENT_UNREAD: usize = 250;
@@ -75,6 +75,14 @@ pub trait MailStore: Send + Sync {
     /// them (say, aliases): mail from them is the user's. Backends that
     /// can't tell return none.
     fn own_addresses(&self) -> impl Future<Output = Result<Vec<String>>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
+    /// People whose name or address matches `text`: those the user works
+    /// with, and the organisation's directory, as far as the backend can
+    /// tell. Backends without either find no one.
+    fn search_people(&self, text: &str) -> impl Future<Output = Result<Vec<Address>>> + Send {
+        let _ = text;
         std::future::ready(Ok(Vec::new()))
     }
 

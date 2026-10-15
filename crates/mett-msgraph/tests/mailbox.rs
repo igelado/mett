@@ -1893,3 +1893,108 @@ fn a_long_body_counts_towards_the_request_size() {
     message.body = "x".repeat(1_000_000);
     assert!(mett_msgraph::needs_server_draft(&message));
 }
+
+#[tokio::test]
+async fn searches_people_and_the_directory() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/people"))
+        .and(query_param("$search", "\"car\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{
+                "displayName": "Carol Jones",
+                "scoredEmailAddresses": [{ "address": "carol@z.org" }],
+            }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/users"))
+        .and(header("consistencylevel", "eventual"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "displayName": "Carol Jones", "mail": "carol@z.org" },
+                { "displayName": "Carlos", "mail": "carlos@z.org" },
+                { "displayName": "No Mail", "mail": null },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let found: Vec<String> = store(&server)
+        .search_people("car")
+        .await
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        found,
+        ["Carol Jones <carol@z.org>", "Carlos <carlos@z.org>"]
+    );
+
+    // Without the directory, the people the user works with.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/people"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/users"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    assert!(
+        store(&server)
+            .search_people("car")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Without the people the user works with, the directory.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/people"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/users"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "displayName": "Carlos", "mail": "carlos@z.org" }],
+        })))
+        .mount(&server)
+        .await;
+    let found: Vec<String> = store(&server)
+        .search_people("car")
+        .await
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(found, ["Carlos <carlos@z.org>"]);
+
+    // A broken request is said, not taken for a refusal.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/people"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    assert!(store(&server).search_people("car").await.is_err());
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/people"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    // Neither: why.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/users"))
+        .respond_with(ResponseTemplate::new(403))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    assert!(store(&server).search_people("car").await.is_err());
+}

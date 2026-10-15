@@ -27,7 +27,6 @@ const MAX_SOURCE_DEPTH: usize = 16;
 /// warning rather than rejected.
 const NOT_YET_SUPPORTED: &[&str] = &[
     "account-hook",
-    "alias",
     "alternative_order",
     "append-hook",
     "attachments",
@@ -64,7 +63,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "spam",
     "subjectrx",
     "subscribe",
-    "unalias",
     "unalternative_order",
     "unattachments",
     "unauto_view",
@@ -136,6 +134,8 @@ pub struct Config {
     alternates: Vec<String>,
     /// `color` and `mono`.
     colors: crate::color::Palette,
+    /// `alias`, in the order given.
+    aliases: Vec<crate::alias::Alias>,
     /// `mailboxes`, in the order given.
     mailboxes: Vec<Mailbox>,
     /// `bind` and `macro` commands not yet taken by the key bindings.
@@ -156,6 +156,8 @@ pub struct Config {
     /// prompt (a mettrc has no one to show it to).
     answers: Vec<String>,
     home: Option<String>,
+    /// See [`Config::set_user_file`].
+    user_file: Option<PathBuf>,
 }
 
 /// Where a command came from, for messages and relative `source` paths.
@@ -174,6 +176,7 @@ impl Config {
             errors: Vec::new(),
             alternates: Vec::new(),
             colors: crate::color::Palette::default(),
+            aliases: Vec::new(),
             mailboxes: Vec::new(),
             key_commands: Vec::new(),
             pushed: Vec::new(),
@@ -183,11 +186,23 @@ impl Config {
             assigned: Default::default(),
             answers: Vec::new(),
             home,
+            user_file: None,
         };
         for var in VARS {
             config.reset(var);
         }
         config
+    }
+
+    /// The user's own mettrc, which `alias_file` defaults to, as mutt's
+    /// does to the muttrc.
+    pub fn set_user_file(&mut self, file: Option<PathBuf>) {
+        self.user_file = file;
+    }
+
+    /// See [`Self::set_user_file`].
+    pub fn user_file(&self) -> Option<&Path> {
+        self.user_file.as_deref()
     }
 
     /// The home directory, for `~` in file names.
@@ -247,6 +262,11 @@ impl Config {
     /// How each part of the screen is drawn (`color`, `mono`).
     pub fn colors(&self) -> &crate::color::Palette {
         &self.colors
+    }
+
+    /// The aliases (`alias`).
+    pub fn aliases(&self) -> &[crate::alias::Alias] {
+        &self.aliases
     }
 
     /// The mailboxes to check for new mail (`mailboxes`).
@@ -331,6 +351,11 @@ impl Config {
         lines.extend(
             user.into_iter()
                 .map(|(name, value)| format!("set {name}={}", Value::Str(value.clone()))),
+        );
+        lines.extend(
+            self.aliases
+                .iter()
+                .map(|a| crate::alias::line(&a.key, &a.value)),
         );
         lines.extend(self.mailboxes.iter().map(|mailbox| {
             let mut line = "mailboxes".to_owned();
@@ -459,6 +484,15 @@ impl Config {
                         })
                     }
                 }
+                "alias" => self.alias(args),
+                "unalias" => self.each(args, |c, key| {
+                    if key == "*" {
+                        c.aliases.clear();
+                    } else {
+                        c.aliases.retain(|a| !crate::alias::same_key(&a.key, key));
+                    }
+                    Ok(())
+                }),
                 "mailboxes" => self.add_mailboxes(args),
                 "unmailboxes" => self.each(args, |c, path| {
                     if path == "*" {
@@ -540,6 +574,40 @@ impl Config {
             }
         }
         Ok(patterns)
+    }
+
+    /// `alias [-group NAME ...] KEY ADDRESS[, ADDRESS ...]`: the addresses
+    /// may span several words. An alias given again takes its new
+    /// addresses (mett has no address groups yet).
+    fn alias(&mut self, args: &[Word]) -> Result<(), String> {
+        let mut words = args.iter();
+        let mut key = None;
+        while let Some(word) = words.next() {
+            let word = self.expand(word)?;
+            if word == "-group" {
+                words.next();
+                continue;
+            }
+            key = Some(word);
+            break;
+        }
+        let key = key.ok_or("alias: expected a name and addresses")?;
+        if !crate::alias::valid_key(&key) {
+            return Err(format!("alias: {key:?} is not a name"));
+        }
+        // The quotes stay, as mutt keeps them: `"Doe, Jane" <jane@x.org>`
+        // is one address.
+        let value = words
+            .map(|word| word.expand_kept(&Expand { config: self }))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" ");
+        if value.trim().is_empty() {
+            return Err(format!("alias {key}: expected addresses"));
+        }
+        self.aliases
+            .retain(|a| !crate::alias::same_key(&a.key, &key));
+        self.aliases.push(crate::alias::Alias { key, value });
+        Ok(())
     }
 
     /// `mailboxes [-label NAME | -nolabel] [-notify | -nonotify] [-poll |
@@ -909,6 +977,21 @@ pub struct Files {
 
 /// The files to read, in order (`docs/CONFIG-OFFICE365.md` §1): the system
 /// file, then the first user file found.
+/// Where a user without a mettrc gets one, when mett writes to it
+/// (`alias_file`): `$XDG_CONFIG_HOME/mett/mettrc`, or
+/// `~/.config/mett/mettrc`.
+pub fn new_user_file(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            env("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+        .map(|c| c.join("mett/mettrc"))
+}
+
 pub fn locate(files: &Files, env: &dyn Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let system = PathBuf::from("/etc/mettrc");
@@ -1245,6 +1328,83 @@ mod tests {
     }
 
     #[test]
+    fn keeps_aliases() {
+        let mut config = load(
+            "alias bob Bob Smith <bob@x.org>\nalias -group g team bob, jane@x.org\nalias BOB \"Bob S\" <bob@y.org>\n",
+        );
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        let aliases: Vec<_> = config
+            .aliases()
+            .iter()
+            .map(|a| (a.key.as_str(), a.value.as_str()))
+            .collect();
+        assert_eq!(
+            aliases,
+            [
+                ("team", "bob, jane@x.org"),
+                ("BOB", "\"Bob S\" <bob@y.org>")
+            ]
+        );
+        let again = load(&config.dump().join("\n"));
+        assert_eq!(again.aliases(), config.aliases());
+        assert!(config.run_line("alias bob@x.org x").is_err());
+        assert!(config.run_line("alias foo;bar x@y").is_err());
+        // The name's quotes stay before an address in a variable.
+        config.run_line("set my_addr = '<dj@x.org>'").unwrap();
+        config.run_line(r#"alias dj "Doe, J" $my_addr"#).unwrap();
+        assert_eq!(
+            crate::alias::find(config.aliases(), "dj").unwrap().value,
+            r#""Doe, J" <dj@x.org>"#
+        );
+        config.run_line("unalias dj").unwrap();
+        // Quoted, a variable's quotes stay inside.
+        config.run_line(r#"set my_name = "Doe, \"J\"""#).unwrap();
+        config.run_line(r#"alias dq "$my_name" <q@x.org>"#).unwrap();
+        assert_eq!(
+            crate::alias::find(config.aliases(), "dq").unwrap().value,
+            r#""Doe, \"J\"" <q@x.org>"#
+        );
+        config.run_line("unalias dq").unwrap();
+        // Quoted names keep their quotes; a quoted list is the list.
+        config
+            .run_line(r#"alias jane "Doe, Jane" <jane@x.org>, 'Al "B" @ Sales' <al@x.org>"#)
+            .unwrap();
+        // With its address in the same word, too.
+        config
+            .run_line(r#"alias carol "Jones, Carol"<carol@z.org>"#)
+            .unwrap();
+        let value = |key: &str| {
+            crate::alias::find(config.aliases(), key)
+                .unwrap()
+                .value
+                .clone()
+        };
+        assert_eq!(
+            value("jane"),
+            r#""Doe, Jane" <jane@x.org>, "Al \"B\" @ Sales" <al@x.org>"#
+        );
+        assert_eq!(value("carol"), r#""Jones, Carol"<carol@z.org>"#);
+        config.run_line("alias pals bob, jane").unwrap();
+        // What a mettrc would read otherwise is escaped when written.
+        config
+            .run_line(r#"alias odd "A\$B; #c" <a\$b@x.org>"#)
+            .unwrap();
+        assert_eq!(
+            crate::alias::find(config.aliases(), "odd").unwrap().value,
+            r#""A$B; #c" <a$b@x.org>"#
+        );
+        config.run_line(r#"alias ctl "a\nb" <c@d.org>"#).unwrap();
+        // A dump reads back as it was.
+        let again = load(&config.dump().join("\n"));
+        assert_eq!(again.aliases(), config.aliases());
+        assert!(config.run_line("alias lonely").is_err());
+        config.run_line("unalias bob").unwrap();
+        assert_eq!(config.aliases().len(), 6);
+        config.run_line("unalias *").unwrap();
+        assert!(config.aliases().is_empty());
+    }
+
+    #[test]
     fn keeps_mailboxes_with_their_options() {
         let mut config = load(
             "set folder=msgraph://a@b.c/ spoolfile==@inbox\n\
@@ -1288,6 +1448,21 @@ mod tests {
         assert_eq!(config.quad("abort_unmodified"), Quad::No);
         assert_eq!(config.quad("abort_nosubject"), Quad::AskNo);
         assert!(load("set include=maybe\n").errors.len() == 1);
+    }
+
+    #[test]
+    fn a_new_user_file_goes_in_the_config_directory() {
+        let env = |name: &str| (name == "HOME").then(|| OsString::from("/home/a"));
+        assert_eq!(
+            new_user_file(&env),
+            Some(PathBuf::from("/home/a/.config/mett/mettrc"))
+        );
+        let env = |name: &str| match name {
+            "HOME" => Some(OsString::from("/home/a")),
+            "XDG_CONFIG_HOME" => Some(OsString::from("/x")),
+            _ => None,
+        };
+        assert_eq!(new_user_file(&env), Some(PathBuf::from("/x/mett/mettrc")));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::mailbox::Choose;
 use super::{App, Effect, Screen, effect_id};
 use crate::action::Action;
+use crate::alias;
 use crate::compose::{self, Kind};
 use crate::config::Quad;
 use crate::lineedit::{LineEditor, Outcome};
@@ -91,6 +92,12 @@ pub enum Question {
     SaveAttachment,
     /// Whether to replace a file that is there.
     Overwrite,
+    /// What to query for (`Q`).
+    Query,
+    /// The name of an alias being made (`a`).
+    AliasName,
+    /// The address of an alias being made.
+    AliasAddress,
 }
 
 impl Question {
@@ -110,7 +117,7 @@ pub struct Composing {
     kind: Kind,
     /// The message replied to or forwarded.
     original: Option<Message>,
-    draft: Draft,
+    pub(super) draft: Draft,
     use_reply_to: bool,
     include: bool,
     /// What is left to do before the compose menu.
@@ -452,6 +459,21 @@ impl App {
                     self.input = None;
                     return self.open_browser(Choose::Answer(question, typed));
                 }
+                // In an address question, Tab completes an alias and ^T
+                // queries, as in mutt.
+                if App::takes_addresses(question) {
+                    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                    // What is before the cursor is completed (the rest of
+                    // its entry replaced, once one is chosen).
+                    if key.code == KeyCode::Tab {
+                        let (typed, rest) = editor.split_at_cursor();
+                        return self.complete_alias(question, typed, rest);
+                    }
+                    if control && key.code == KeyCode::Char('t') {
+                        let (typed, rest) = editor.split_at_cursor();
+                        return self.query_for(question, typed, rest);
+                    }
+                }
                 // Space on an empty line, or on a mailbox offered, offers
                 // the next one with new mail, as in mutt.
                 let typed = editor.text();
@@ -516,7 +538,11 @@ impl App {
                 self.question_message = None;
             }
             Question::Search | Question::Limit | Question::Command | Question::AttachFile => {}
-            Question::SaveAttachment => {}
+            Question::SaveAttachment | Question::Query => {}
+            Question::AliasName | Question::AliasAddress => {
+                self.new_alias = None;
+                self.alias_key = None;
+            }
             Question::Overwrite => {
                 self.unsaved = None;
             }
@@ -541,13 +567,22 @@ impl App {
         if question == Question::SaveAttachment {
             return self.answer_save_attachment(text);
         }
+        match question {
+            Question::Query => return self.start_query(&text, super::query::Purpose::Mail),
+            Question::AliasName => return self.answer_alias_name(text),
+            Question::AliasAddress => return self.answer_alias_address(text),
+            _ => {}
+        }
+        // Aliases stand for their addresses.
+        let parsed = alias::expand(&text, &self.aliases)
+            .and_then(|expanded| Address::parse_list(&expanded).map_err(|e| e.to_string()));
         let setting_up = self.composing.is_some();
         let Some(draft) = self.draft_mut() else {
             return Vec::new();
         };
         match question {
             Question::To | Question::Cc | Question::Bcc => {
-                let list = match Address::parse_list(&text) {
+                let list = match parsed {
                     Ok(list) => list,
                     Err(e) => {
                         // Ask again, keeping what was typed, and say why on
@@ -627,7 +662,10 @@ impl App {
             | Question::Limit
             | Question::Command
             | Question::AttachFile
-            | Question::SaveAttachment => {}
+            | Question::SaveAttachment
+            | Question::Query
+            | Question::AliasName
+            | Question::AliasAddress => {}
         }
         self.advance()
     }

@@ -22,7 +22,7 @@ open.workspace = true
 ratatui.workspace = true
 regex.workspace = true
 reqwest.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 url.workspace = true
