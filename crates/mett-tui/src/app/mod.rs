@@ -837,7 +837,15 @@ impl App {
                 self.opening = None;
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
-                return self.list(Page::first(self.page_size));
+                let mut effects = self.list(Page::first(self.page_size));
+                // Before the user can reply: their own addresses, so that a
+                // reply to their own mail goes to its recipients (the
+                // sign-in name may not be one of them).
+                if !self.asked_addresses {
+                    self.asked_addresses = true;
+                    effects.push(self.request(Request::OwnAddresses));
+                }
+                return effects;
             }
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
@@ -854,13 +862,6 @@ impl App {
                         // was reported while the folder was loading.
                         if self.status.starts_with("Loading ") {
                             self.status.clear();
-                        }
-                        // Once the user can reply: their own addresses, so
-                        // that a reply to their own mail goes to its
-                        // recipients (the sign-in name may not be one).
-                        if !self.asked_addresses {
-                            self.asked_addresses = true;
-                            effects.push(self.request(Request::OwnAddresses));
                         }
                     }
                     effects.extend(self.apply_pending());
@@ -1197,7 +1198,12 @@ mod tests {
             id: *open,
             event: Event::FolderOpened(Ok(folder)),
         }));
-        let [Effect::Request(list, Request::ListMessages { .. })] = effects.as_slice() else {
+        // The user's own addresses are asked for alongside.
+        let [
+            Effect::Request(list, Request::ListMessages { .. }),
+            Effect::Request(_, Request::OwnAddresses),
+        ] = effects.as_slice()
+        else {
             panic!("expected ListMessages, got {effects:?}");
         };
         app.update(Msg::Response(Response {
@@ -1582,11 +1588,7 @@ mod tests {
         assert!(
             matches!(
                 effects.as_slice(),
-                [
-                    // Asked once the whole folder is listed.
-                    Effect::Request(_, Request::OwnAddresses),
-                    Effect::Request(_, Request::FetchMessage(id)),
-                ] if id.as_str() == "m1"
+                [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m1"
             ),
             "{effects:?}"
         );
@@ -2192,9 +2194,19 @@ mod tests {
 
     #[test]
     fn the_mailbox_tells_the_users_own_addresses_once() {
-        let (mut app, second) = loading_more(1);
-        let effects = deliver_last_page(&mut app, second, Vec::new());
-        let [Effect::Request(id, Request::OwnAddresses)] = effects.as_slice() else {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        // Asked as soon as the folder opens, before any reply can be made.
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Some(Effect::Request(id, _)) = effects
+            .iter()
+            .find(|e| matches!(e, Effect::Request(_, Request::OwnAddresses)))
+        else {
             panic!("expected OwnAddresses, got {effects:?}");
         };
         app.update(Msg::Response(Response {
