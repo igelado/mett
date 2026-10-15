@@ -329,6 +329,7 @@ impl App {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);
                 self.clamp_scroll();
+                self.clamp_sign_in_scroll();
                 Vec::new()
             }
         }
@@ -454,17 +455,15 @@ impl App {
                 return vec![Effect::Copy(text)];
             }
             Action::NextLine | Action::PreviousLine => {
-                // The window covers all but the help line, and has a
-                // border above and below its text.
-                let room = self.body_height + CHROME_ROWS - 1 - 2;
-                let last = window.rows(self.width).len().saturating_sub(room);
+                self.clamp_sign_in_scroll();
                 if let Some(window) = &mut self.sign_in {
                     window.scroll = if action == Action::NextLine {
-                        (window.scroll + 1).min(last)
+                        window.scroll + 1
                     } else {
                         window.scroll.saturating_sub(1)
                     };
                 }
+                self.clamp_sign_in_scroll();
             }
             Action::Retry if failed => {
                 self.sign_in = None;
@@ -510,6 +509,19 @@ impl App {
             self.retry()
         } else {
             Vec::new()
+        }
+    }
+
+    /// Keeps the sign-in window's scroll position within its text, which
+    /// a taller or wider terminal makes shorter.
+    fn clamp_sign_in_scroll(&mut self) {
+        // The window covers all but the help line, and has a border above
+        // and below its text.
+        let room = (self.body_height + CHROME_ROWS).saturating_sub(3);
+        let width = self.width;
+        if let Some(window) = &mut self.sign_in {
+            let last = window.rows(width).len().saturating_sub(room);
+            window.scroll = window.scroll.min(last);
         }
     }
 
@@ -1887,5 +1899,27 @@ mod tests {
         assert_eq!(app.status, "Sign-in cancelled.");
         app.update(Msg::SignIn(finished(Ok(()))));
         assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn the_sign_in_window_scroll_follows_resizes() {
+        let (mut app, _) = App::new(40, 6);
+        let url = format!("https://login.example/authorize?{}", "x".repeat(400));
+        app.update(Msg::SignIn(SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        for _ in 0..30 {
+            act(&mut app, Action::NextLine);
+        }
+        let deep = app.sign_in.as_ref().unwrap().scroll;
+        assert!(deep > 0);
+        app.update(Msg::Resize {
+            width: 40,
+            height: 60,
+        });
+        assert_eq!(app.sign_in.as_ref().unwrap().scroll, 0, "it all fits now");
     }
 }

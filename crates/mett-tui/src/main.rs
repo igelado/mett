@@ -277,7 +277,14 @@ async fn run<S: mett_core::MailStore + 'static>(
     // reach the mailbox, rather than cancelling them by exiting.
     // The outcome is reported after the terminal is restored, so a change
     // that couldn't be saved isn't lost silently.
-    if app.saving() {
+    // A save's sign-in failure may still be queued, behind its response
+    // and the key that quit: take it in, so its window can offer a retry.
+    while let Ok(event) = sign_in_rx.try_recv() {
+        let effects = app.update(Msg::SignIn(event));
+        dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+    }
+    let unsaved = !app.save_failures().is_empty();
+    if app.saving() || (unsaved && app.sign_in.is_some()) {
         app.status = "Saving changes...".into();
         let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
         loop {
