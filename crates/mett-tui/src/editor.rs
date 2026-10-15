@@ -37,11 +37,18 @@ impl Editor {
 
     /// Lets the user edit `text` and returns the result. The caller hands
     /// the terminal over first.
+    ///
+    /// If the editor fails, the file is kept, since it may hold what the
+    /// user wrote, and the error says where it is.
     pub fn edit(&self, text: &str) -> Result<String, String> {
         let path = self.create(text)?;
-        let result = self.run(&path);
-        let _ = fs::remove_file(&path);
-        result
+        match self.run(&path) {
+            Ok(text) => {
+                let _ = fs::remove_file(&path);
+                Ok(text)
+            }
+            Err(e) => Err(format!("{e}; the message is kept in {}", path.display())),
+        }
     }
 
     /// Writes `text` to a new temporary file that only the user can read.
@@ -105,8 +112,9 @@ impl Editor {
 mod tests {
     use super::*;
 
-    fn tmpdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mett-editor-{}", std::process::id()));
+    /// A directory of its own for test `name`.
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mett-editor-{name}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -122,7 +130,7 @@ mod tests {
 
     #[test]
     fn edits_through_a_private_temporary_file() {
-        let dir = tmpdir();
+        let dir = tmpdir("private");
         // An "editor" that appends a line, and records the file's mode.
         let editor = Editor::new(
             "f() { echo world >> \"$1\"; stat -c %a \"$1\" > \"$1.mode\"; }; f",
@@ -141,13 +149,17 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_failing_editor() {
-        let editor = Editor::new("false", "", &|_| None);
-        assert!(
-            editor
-                .edit("x")
-                .unwrap_err()
-                .contains("Error running \"false\"")
+    fn keeps_the_text_when_the_editor_fails() {
+        let dir = tmpdir("failing");
+        let editor = Editor::new(
+            "f() { echo more >> \"$1\"; exit 3; }; f",
+            dir.to_str().unwrap(),
+            &|_| None,
         );
+        let error = editor.edit("text\n").unwrap_err();
+        assert!(error.contains("Error running"), "{error}");
+        let kept = error.rsplit("kept in ").next().unwrap();
+        assert_eq!(fs::read_to_string(kept).unwrap(), "text\nmore\n");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

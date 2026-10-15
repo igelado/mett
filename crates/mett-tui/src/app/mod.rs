@@ -395,10 +395,13 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Effect> {
-        // Any new action in a menu replaces a pending move; the sign-in
-        // window's keys don't move anywhere, so leave it.
+        // Any new action in a menu replaces a pending move, and a reply or
+        // forward still waiting for its message: the user has moved on,
+        // perhaps to another message. The sign-in window's keys don't
+        // move anywhere, so leave them.
         if self.menu() != Menu::SignIn {
             self.pending = None;
+            self.compose_fetch = None;
             // What the user does next may need a sign-in that fails; show
             // that.
             self.dismissed = false;

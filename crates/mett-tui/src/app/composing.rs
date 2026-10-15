@@ -118,9 +118,6 @@ impl App {
     /// whole selected message, which is fetched first unless the pager
     /// already shows it.
     pub(super) fn start_compose(&mut self, kind: Kind) -> Vec<Effect> {
-        // A message still being fetched for an earlier reply mustn't take
-        // over this one when it arrives.
-        self.compose_fetch = None;
         if kind == Kind::New {
             return self.begin(kind, None);
         }
@@ -136,6 +133,7 @@ impl App {
         };
         let fetch = self.request(Request::FetchMessage(summary.id.clone()));
         self.compose_fetch = Some((effect_id(&fetch), kind));
+        self.status = "Fetching message...".into();
         vec![fetch]
     }
 
@@ -826,6 +824,19 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert_eq!(prompt(&app), "To: ");
+    }
+
+    #[test]
+    fn moving_on_forgets_a_reply_still_being_fetched() {
+        let mut app = app(settings());
+        let (fetch, _) = request(&act(&mut app, Action::Reply));
+        act(&mut app, Action::NextEntry);
+        let effects = app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(original())),
+        }));
+        assert!(effects.is_empty());
+        assert!(app.input.is_none(), "no reply was started");
     }
 
     #[test]
