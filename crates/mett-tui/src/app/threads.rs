@@ -540,6 +540,20 @@ mod tests {
     }
 
     #[test]
+    fn an_escape_long_ago_leaves_the_next_key_alone() {
+        let mut app = app();
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        if let Some((_, when)) = &mut app.escape
+            && let Some(earlier) = when.checked_sub(std::time::Duration::from_secs(5))
+        {
+            *when = earlier;
+        }
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('v'))));
+        // `v`, not `Esc v`: the thread isn't collapsed.
+        assert_eq!(shown(&app)[0], "a0");
+    }
+
+    #[test]
     fn an_escape_is_forgotten_when_another_menu_takes_over() {
         let mut app = app();
         app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));

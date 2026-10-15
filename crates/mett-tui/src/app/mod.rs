@@ -384,10 +384,10 @@ pub struct App {
     redraw: bool,
     /// Keys to play once the folder is listed.
     after_load: Vec<Stroke>,
-    /// Escape was typed where it does nothing by itself, in this menu:
-    /// with the next key there, it is Meta and that key (`Esc v`), as in
-    /// mutt.
-    escape: Option<Menu>,
+    /// Escape was typed where it does nothing by itself, in this menu, and
+    /// when: with the next key there, soon after, it is Meta and that key
+    /// (`Esc v`), as in mutt.
+    escape: Option<(Menu, std::time::Instant)>,
     /// The user cancelled the sign-in in progress: the outcome it still
     /// reports isn't shown.
     cancelled: bool,

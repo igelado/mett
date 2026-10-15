@@ -37,6 +37,9 @@ pub struct Reconfigured {
     pub pushed: Vec<String>,
 }
 
+/// How soon after Escape a key is Meta and that key.
+const ESCAPE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl App {
     /// Handles a key press: as typed, while a question is asked; otherwise
     /// through the key bindings of the current menu.
@@ -58,12 +61,17 @@ impl App {
         // Escape where it is bound to nothing starts Meta and the next key,
         // for terminals that send them apart.
         if key == Key::new(KeyCode::Esc) && self.keymap.lookup(menu, key).is_none() {
-            self.escape = Some(menu);
+            self.escape = Some((menu, std::time::Instant::now()));
             return Vec::new();
         }
         // Only in the menu it was typed in: another may have taken over
         // since (the sign-in window, say).
-        if self.escape.take() == Some(menu)
+        // A key long after it is a key of its own, as with curses'
+        // ESCDELAY.
+        if self
+            .escape
+            .take()
+            .is_some_and(|(at, when)| at == menu && when.elapsed() < ESCAPE_DELAY)
             && let KeyCode::Char(c) = event.code
         {
             key = Key::alt(c);
