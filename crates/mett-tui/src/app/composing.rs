@@ -257,7 +257,8 @@ impl App {
             }
             (Kind::Forward, Some(message)) => {
                 draft.origin = Some(DraftOrigin::Forward(message.summary.id.clone()));
-                draft.subject = compose::expand(&settings.forward_format, message);
+                draft.subject =
+                    compose::expand(&settings.forward_format, message, &settings.date_format);
             }
             _ => {}
         }
