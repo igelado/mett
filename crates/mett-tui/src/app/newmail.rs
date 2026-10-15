@@ -385,9 +385,16 @@ impl App {
         // The selected message, or the one that took its place.
         let selected = self.messages.get(self.selected).map(|m| m.id.clone());
         // The others may have changed elsewhere (read in Outlook, say).
-        // The changes are newer than the newest page when they disagree.
-        let updates: HashMap<&MessageId, &MessageSummary> =
-            fresh.iter().chain(&changes).map(|m| (&m.id, m)).collect();
+        // When both have a message, it comes as it was last changed.
+        let mut updates: HashMap<&MessageId, &MessageSummary> = HashMap::new();
+        for message in fresh.iter().chain(&changes) {
+            match updates.get(&message.id) {
+                Some(earlier) if earlier.modified >= message.modified => {}
+                _ => {
+                    updates.insert(&message.id, message);
+                }
+            }
+        }
         for summary in self.messages.iter_mut().chain(&mut self.hidden) {
             if let Some(update) = updates.get(&summary.id) {
                 *summary = (*update).clone();
@@ -1708,6 +1715,22 @@ mod tests {
         respond(&mut app, id, Event::FolderPolled(Ok(polled)));
         assert!(app.messages[0].flags.read);
         assert_ne!(app.status, NEW_MAIL);
+    }
+
+    #[test]
+    fn a_known_message_in_both_lists_comes_as_last_changed() {
+        let (mut app, _) = app();
+        let id = poll(&mut app);
+        let mut read = summary("m1", 1);
+        read.flags.read = true;
+        read.modified = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(9));
+        // The changes saw it before it was read.
+        let polled = Polled {
+            newest: page(vec![summary("m2", 2), read, summary("m0", 0)]),
+            changed: page(vec![summary("m1", 1)]),
+        };
+        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        assert!(app.messages[1].flags.read);
     }
 
     #[test]
