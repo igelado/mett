@@ -873,8 +873,8 @@ impl App {
                     compose.unauthorized = delivery;
                 }
                 // Replies, forwards and messages with large attachments go
-                // through a server draft.
-                compose.left_draft |= mett_msgraph::needs_server_draft(&compose.draft);
+                // through a server draft, as does one the store kept.
+                compose.left_draft |= kept || mett_msgraph::needs_server_draft(&compose.draft);
                 // A lost response doesn't mean nothing happened.
                 let failure = match (delivery, &e) {
                     (Some(Delivery::Send), mett_core::Error::Network(_)) if saved_copy => format!(
