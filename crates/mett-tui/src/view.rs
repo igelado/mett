@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
-use crate::app::{App, Browser, Compose, Input, Pager, Row, Screen, SignIn, highlighted};
+use crate::app::{App, Browser, Compose, Help, Input, Pager, Row, Screen, SignIn, highlighted};
 use crate::keymap::{Keymap, Menu};
 use crate::text::{fit, truncate, wrap_all};
 
@@ -37,6 +37,14 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
             (Action::NextPage, "NextPg"),
             (Action::NextEntry, "Next"),
             (Action::PreviousEntry, "Prev"),
+        ],
+    ),
+    (
+        Menu::Help,
+        &[
+            (Action::Exit, "Exit"),
+            (Action::NextPage, "NextPg"),
+            (Action::PreviousPage, "PrevPg"),
         ],
     ),
     (
@@ -88,7 +96,8 @@ pub struct Overlay {
 
 /// Draws the whole screen, and returns text that the main loop should print
 /// over it, if any.
-pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> {
+pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
+    let keymap = &app.keymap;
     let [help, body, status, message] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -109,6 +118,7 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
         Screen::Pager(pager) => render_pager(app, pager, frame, body),
         Screen::Compose(compose) => render_compose(compose, frame, body),
         Screen::Browser(browser) => render_browser(browser, frame, body),
+        Screen::Help(help) => render_help(app, help, frame, body),
     };
     frame.render_widget(Paragraph::new(status_line).style(REVERSED), status);
     match &app.input {
@@ -124,6 +134,20 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
         return render_sign_in(window, keymap, frame, below_help);
     }
     None
+}
+
+/// Draws the help screen and returns its status line.
+fn render_help(app: &App, help: &Help, frame: &mut Frame, area: Rect) -> String {
+    let width = usize::from(area.width);
+    let lines: Vec<Line> = app
+        .help_lines(help.menu)
+        .iter()
+        .skip(help.scroll)
+        .take(usize::from(area.height))
+        .map(|line| Line::raw(truncate(line, width)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    format!("---mett: Help for {}---", help.menu.name())
 }
 
 /// Draws the folder browser and returns its status line. Each line is like
@@ -588,7 +612,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                render(app, &Keymap::mutt_defaults(), frame);
+                render(app, frame);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -745,7 +769,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, 16)).unwrap();
         let mut overlay = None;
         terminal
-            .draw(|frame| overlay = render(&app, &Keymap::mutt_defaults(), frame))
+            .draw(|frame| overlay = render(&app, frame))
             .unwrap();
         let link = overlay.take().expect("the link fits");
         assert_eq!(link.text, url);
@@ -756,7 +780,7 @@ mod tests {
         // A link that doesn't fit isn't handed over.
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, 5)).unwrap();
         terminal
-            .draw(|frame| overlay = render(&app, &Keymap::mutt_defaults(), frame))
+            .draw(|frame| overlay = render(&app, frame))
             .unwrap();
         assert!(overlay.is_none());
     }

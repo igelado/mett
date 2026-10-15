@@ -197,6 +197,16 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The character the escape `\\c` stands for, reading what follows
+    /// if it needs to (`\\Cx`).
+    fn escaped(&mut self, c: char) -> Result<char, SyntaxError> {
+        // `\C` needs a key on the same line: the newline ends the command.
+        if matches!(c, 'c' | 'C') && matches!(self.chars.peek(), Some('\n') | None) {
+            return Err(self.error("\\C needs a key"));
+        }
+        Ok(escape(c, &mut || self.bump()))
+    }
+
     fn bump(&mut self) -> Option<char> {
         let c = self.chars.next()?;
         if c == '\n' {
@@ -244,7 +254,10 @@ impl<'a> Lexer<'a> {
                     match self.bump() {
                         // A trailing backslash continues the command.
                         Some('\n') => {}
-                        Some(c) => word.push_char(escaped(c)),
+                        Some(c) => {
+                            let c = self.escaped(c)?;
+                            word.push_char(c);
+                        }
                         None => return Err(self.error("backslash at end of file")),
                     }
                 }
@@ -307,7 +320,10 @@ impl<'a> Lexer<'a> {
                 Some('"') => return Ok(()),
                 Some('\\') => match self.bump() {
                     Some('\n') => {}
-                    Some(c) => word.push_char(escaped(c)),
+                    Some(c) => {
+                        let c = self.escaped(c)?;
+                        word.push_char(c);
+                    }
                     None => return Err(self.error("unterminated double quote")),
                 },
                 Some('`') => {
@@ -384,12 +400,26 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// The character a backslash escape stands for.
-fn escaped(c: char) -> char {
+/// The character a backslash escape stands for, as in mutt: `\\n`, `\\r`,
+/// `\\t`, `\\f`, `\\e` (Esc) and `\\Cx` (Control-x); any other
+/// character stands for itself.
+fn escape(c: char, next: &mut dyn FnMut() -> Option<char>) -> char {
     match c {
         'n' => '\n',
         'r' => '\r',
         't' => '\t',
+        'f' => '\u{c}',
+        'e' | 'E' => '\u{1b}',
+        'c' | 'C' => match next() {
+            // Control-x is x with bit 6 cleared: ^A is 1, ^[ is Esc; ^? is
+            // DEL.
+            Some('?') => '\u{7f}',
+            Some(x) if x.is_ascii() && x.to_ascii_uppercase() as u8 >= b'@' => {
+                char::from(x.to_ascii_uppercase() as u8 & 0x1f)
+            }
+            Some(x) => x,
+            None => c,
+        },
         c => c,
     }
 }
@@ -564,5 +594,27 @@ mod tests {
         );
         assert!(commands[1].is_ok());
         assert!(matches!(&commands[2], Err(e) if e.line == 3));
+    }
+
+    #[test]
+    fn control_escapes_cover_punctuation() {
+        let control = |x: char| {
+            let mut next = Some(x);
+            escape('C', &mut || next.take())
+        };
+        assert_eq!(control('a'), '\u{1}');
+        assert_eq!(control('['), '\u{1b}');
+        assert_eq!(control('_'), '\u{1f}');
+        assert_eq!(control('?'), '\u{7f}');
+    }
+
+    #[test]
+    fn a_control_escape_at_the_end_of_a_line_spares_the_next() {
+        let commands = lex("bind index \\C\nset resolve=no\n");
+        assert!(matches!(&commands[0], Err(e) if e.line == 1 && e.message.contains("\\C")));
+        assert!(
+            matches!(&commands[1], Ok(c) if c.line == 2 && c.words.len() == 2),
+            "{commands:?}"
+        );
     }
 }

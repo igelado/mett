@@ -83,6 +83,8 @@ pub enum Question {
     Search,
     /// What to limit the index to (`l`).
     Limit,
+    /// A mettrc command (`:`).
+    Command,
 }
 
 impl Question {
@@ -460,7 +462,7 @@ impl App {
                 self.unbrowsed = None;
                 self.question_message = None;
             }
-            Question::Search | Question::Limit => {}
+            Question::Search | Question::Limit | Question::Command => {}
             _ => self.composing = None,
         }
         Vec::new()
@@ -472,6 +474,9 @@ impl App {
         }
         if matches!(question, Question::Search | Question::Limit) {
             return self.answer_search(question, text);
+        }
+        if question == Question::Command {
+            return self.answer_command(text);
         }
         let setting_up = self.composing.is_some();
         let Some(draft) = self.draft_mut() else {
@@ -555,7 +560,8 @@ impl App {
             | Question::SaveTo
             | Question::CopyTo
             | Question::Search
-            | Question::Limit => {}
+            | Question::Limit
+            | Question::Command => {}
         }
         self.advance()
     }
