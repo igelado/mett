@@ -113,7 +113,9 @@ pub trait MailStore: Send + Sync {
 /// Sends mail.
 pub trait MailSender: Send + Sync {
     /// Sends `draft`, keeping a copy in the sent-items folder if
-    /// [`Draft::save_copy`] asks for one.
+    /// [`Draft::save_copy`] asks for one. (A backend may keep one
+    /// regardless for some messages: Office365 always does for replies and
+    /// forwards.)
     fn send(&self, draft: &Draft) -> impl Future<Output = Result<()>> + Send;
 
     /// Deletes what earlier attempts to send or save `draft` (the same

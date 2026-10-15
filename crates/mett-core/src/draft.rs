@@ -32,6 +32,7 @@ pub struct Draft {
     /// The message this one replies to or forwards.
     pub origin: Option<DraftOrigin>,
     /// Whether to keep a copy in the sent-items folder (mutt's `copy`).
+    /// Office365 keeps one of a reply or forward whatever this says.
     pub save_copy: bool,
     /// Tells this message apart from others answering the same message:
     /// the same for every attempt to send or postpone one composed

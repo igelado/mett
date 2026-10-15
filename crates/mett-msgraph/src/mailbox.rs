@@ -672,20 +672,11 @@ impl<A: Authenticator> GraphMailStore<A> {
         let Some(id) = self.kept.lock().expect("lock").remove(&key) else {
             return Ok(());
         };
-        let url = self.url(&["me", "messages", id.as_str()]);
-        let deleted = self
-            .send(
-                self.request(Method::DELETE, url),
-                About::message(id.as_str()),
-            )
-            .await;
-        match deleted {
-            Ok(_) | Err(Error::NotFound { .. }) => Ok(()),
-            Err(e) => {
-                self.keep(origin, draft, id);
-                Err(e)
-            }
+        let deleted = self.delete_draft(&id).await;
+        if deleted.is_err() {
+            self.keep(origin, draft, id);
         }
+        deleted
     }
 
     /// Remembers a server draft kept after an attempt whose outcome is
@@ -701,14 +692,23 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// linger in Drafts, and returns whether it is gone. Failing to is not
     /// worth reporting over the error that caused it.
     async fn discard(&self, id: &MessageId) -> bool {
-        let url = self.url(&["me", "messages", id.as_str()]);
-        let deleted = self
-            .send(
-                self.request(Method::DELETE, url),
-                About::message(id.as_str()),
-            )
-            .await;
-        matches!(deleted, Ok(_) | Err(Error::NotFound { .. }))
+        self.delete_draft(id).await.is_ok()
+    }
+
+    /// Deletes a server draft for good where Graph can (DELETE would only
+    /// move it to Deleted Items); elsewhere it goes to Deleted Items. One
+    /// that is gone already is as good as deleted.
+    async fn delete_draft(&self, id: &MessageId) -> Result<()> {
+        let request = if self.cloud == Cloud::Global {
+            let url = self.url(&["me", "messages", id.as_str(), "permanentDelete"]);
+            self.request(Method::POST, url)
+        } else {
+            self.request(Method::DELETE, self.url(&["me", "messages", id.as_str()]))
+        };
+        match self.send(request, About::message(id.as_str())).await {
+            Ok(_) | Err(Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 

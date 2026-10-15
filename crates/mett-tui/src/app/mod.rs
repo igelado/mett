@@ -270,7 +270,7 @@ pub struct App {
     /// A message being set up for the compose menu.
     composing: Option<Composing>,
     /// The request fetching a message to reply to or forward.
-    compose_fetch: Option<(RequestId, Kind)>,
+    compose_fetch: Option<(RequestId, Kind, MessageId)>,
     /// The reply or forward whose message couldn't be fetched for want of
     /// a sign-in, to start again on Retry.
     compose_unfetched: Option<(MessageId, Kind)>,
@@ -283,12 +283,13 @@ pub struct App {
     /// background, and where it was: the selection goes back to it (or
     /// near where it was, if it is gone) as the listing comes in.
     reselect: Option<(MessageId, usize)>,
-    /// Requests deleting drafts of messages the user gave up on; quitting
-    /// waits for them.
-    discarding: HashSet<RequestId>,
+    /// Requests deleting drafts of messages the user gave up on, with the
+    /// message; quitting waits for them.
+    discarding: HashMap<RequestId, mett_core::Draft>,
     /// Drafts of messages the user gave up on that couldn't be deleted,
-    /// reported on exit like changes that couldn't be saved.
-    left_drafts: Vec<String>,
+    /// reported on exit like changes that couldn't be saved; with the
+    /// message, if deleting it again after a sign-in may work.
+    left_drafts: Vec<(String, Option<mett_core::Draft>)>,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -360,7 +361,7 @@ impl App {
             settings: settings.compose,
             relist_on_return: false,
             reselect: None,
-            discarding: HashSet::new(),
+            discarding: HashMap::new(),
             left_drafts: Vec::new(),
             path,
             opening: None,
@@ -621,7 +622,8 @@ impl App {
             .chain(fetching)
             .chain(self.flag_updates.keys().copied())
             .chain(self.delivery_request())
-            .chain(self.compose_fetch.map(|(id, _)| id))
+            .chain(self.compose_fetch.as_ref().map(|(id, _, _)| *id))
+            .chain(self.discarding.keys().copied())
             .collect()
     }
 
@@ -653,10 +655,13 @@ impl App {
     /// changes.
     fn retry(&mut self) -> Vec<Effect> {
         if self.quit {
-            return self.retry_saves();
+            let mut effects = self.retry_saves();
+            effects.extend(self.retry_discards());
+            return effects;
         }
         // Everything that failed is retried, not just the first thing.
         let mut effects = self.retry_delivery();
+        effects.extend(self.retry_discards());
         effects.extend(self.retry_compose_fetch());
         if self.folder.is_none() {
             if self.opening.is_none() {
@@ -856,19 +861,24 @@ impl App {
                 }
             },
             Event::MessageFetched(result)
-                if self.compose_fetch.is_some_and(|(request, _)| request == id) =>
+                if self
+                    .compose_fetch
+                    .as_ref()
+                    .is_some_and(|(request, _, _)| *request == id) =>
             {
-                let (_, kind) = self.compose_fetch.take().expect("checked above");
-                return self.on_compose_fetched(kind, result);
+                let (_, kind, message) = self.compose_fetch.take().expect("checked above");
+                return self.on_compose_fetched(kind, message, result);
             }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::Sent(result) => return self.on_delivered(id, result),
             Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
             Event::KeptDiscarded(result) => {
-                self.discarding.remove(&id);
+                let draft = self.discarding.remove(&id);
                 if let Err(e) = result {
                     let left = format!("A draft of the message is left in Drafts: {e}");
-                    self.left_drafts.push(left.clone());
+                    // Retry deletes it once signed in.
+                    let retry = draft.filter(|_| matches!(e, Error::Auth(_)));
+                    self.left_drafts.push((left.clone(), retry));
                     self.status = left;
                 }
             }
@@ -1067,12 +1077,26 @@ impl App {
         }
     }
 
+    /// Deletes again the drafts that couldn't be deleted for want of a
+    /// sign-in.
+    fn retry_discards(&mut self) -> Vec<Effect> {
+        let (retry, left): (Vec<_>, Vec<_>) = std::mem::take(&mut self.left_drafts)
+            .into_iter()
+            .partition(|(_, draft)| draft.is_some());
+        self.left_drafts = left;
+        retry
+            .into_iter()
+            .filter_map(|(_, draft)| draft)
+            .flat_map(|draft| self.discard_kept(draft))
+            .collect()
+    }
+
     /// Changes that could not be saved, one per message.
     pub fn save_failures(&self) -> Vec<String> {
         let mut failures: Vec<_> = self
             .save_failures
             .values()
-            .chain(&self.left_drafts)
+            .chain(self.left_drafts.iter().map(|(left, _)| left))
             .cloned()
             .collect();
         failures.sort();

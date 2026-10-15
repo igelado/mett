@@ -146,16 +146,18 @@ impl App {
             self.status = "No messages.".into();
             return Vec::new();
         };
-        let fetch = self.request(Request::FetchMessage(summary.id.clone()));
-        self.compose_fetch = Some((effect_id(&fetch), kind));
+        let id = summary.id.clone();
+        let fetch = self.request(Request::FetchMessage(id.clone()));
+        self.compose_fetch = Some((effect_id(&fetch), kind, id));
         self.status = "Fetching message...".into();
         vec![fetch]
     }
 
-    /// Continues a reply or forward once its message has been fetched.
+    /// Continues a reply or forward once `message` has been fetched.
     pub(super) fn on_compose_fetched(
         &mut self,
         kind: Kind,
+        message: mett_core::MessageId,
         result: mett_core::Result<Message>,
     ) -> Vec<Effect> {
         match result {
@@ -164,10 +166,7 @@ impl App {
                 // Without a sign-in, the sign-in window's Retry starts the
                 // reply or forward again.
                 if matches!(e, mett_core::Error::Auth(_)) {
-                    self.compose_unfetched = self
-                        .messages
-                        .get(self.selected)
-                        .map(|m| (m.id.clone(), kind));
+                    self.compose_unfetched = Some((message, kind));
                 }
                 self.report(e);
                 Vec::new()
@@ -253,7 +252,10 @@ impl App {
                     let Some(original) = &composing.original else {
                         continue;
                     };
-                    if !compose::has_distinct_reply_to(original) {
+                    // A reply to one's own message goes to its recipients.
+                    if !compose::has_distinct_reply_to(original)
+                        || compose::from_me(original, &self.settings)
+                    {
                         continue;
                     }
                     let prompt = format!("Reply to {}?", Address::format_list(&original.reply_to));
@@ -461,11 +463,7 @@ impl App {
                 // Given up on: so is a draft a failed attempt left.
                 return match self.screens.pop() {
                     Some(Screen::Compose(compose)) if compose.left_draft => {
-                        let request = self.request(Request::DiscardKept(compose.draft));
-                        if let Effect::Request(id, _) = &request {
-                            self.discarding.insert(*id);
-                        }
-                        vec![request]
+                        self.discard_kept(compose.draft)
                     }
                     _ => Vec::new(),
                 };
@@ -500,6 +498,16 @@ impl App {
             Some(copy) => self.answer(Question::Copy, copy),
             None => Vec::new(),
         }
+    }
+
+    /// Deletes what failed attempts to send or postpone `draft` left
+    /// behind.
+    pub(super) fn discard_kept(&mut self, draft: Draft) -> Vec<Effect> {
+        let request = self.request(Request::DiscardKept(draft.clone()));
+        if let Effect::Request(id, _) = &request {
+            self.discarding.insert(*id, draft);
+        }
+        vec![request]
     }
 
     /// Gives up on the message being set up.
@@ -1141,6 +1149,42 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_left_for_want_of_a_sign_in_is_deleted_on_retry() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        if let Some(Screen::Compose(compose)) = app.screens.last_mut() {
+            compose.draft.origin = Some(DraftOrigin::Reply("m1".into()));
+        }
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Network("timed out".into()))),
+        }));
+        act(&mut app, Action::Exit);
+        let (id, _) = request(&key(&mut app, KeyCode::Char('n')));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::KeptDiscarded(Err(Error::Auth("expired".into()))),
+        }));
+        assert_eq!(app.save_failures().len(), 1);
+        let effects = act(&mut app, Action::Retry);
+        let (id, request) = request(&effects);
+        assert!(matches!(request, Request::DiscardKept(d) if d.body == "text"));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::KeptDiscarded(Ok(())),
+        }));
+        assert!(app.save_failures().is_empty());
+    }
+
+    #[test]
     fn leaving_the_compose_menu_asks_whether_to_postpone() {
         let mut app = app(settings());
         act(&mut app, Action::Mail);
@@ -1376,6 +1420,30 @@ mod tests {
         }));
         let (_, again) = request(&act(&mut app, Action::Retry));
         assert_eq!(again, Request::FetchMessage("m1".into()));
+    }
+
+    #[test]
+    fn a_reply_retried_after_the_index_moved_is_not_to_another_message() {
+        let mut app = app(settings());
+        let (fetch, _) = request(&act(&mut app, Action::Reply));
+        // A background listing puts another message where m1 was.
+        let other = mock::message("m0", "in", "Newer", DateTime::UNIX_EPOCH);
+        app.messages.insert(0, other.summary);
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Err(Error::Auth("expired".into()))),
+        }));
+        let effects = act(&mut app, Action::Retry);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Request(_, Request::FetchMessage(id)) if id.as_str() == "m0")),
+            "{effects:?}"
+        );
     }
 
     #[test]

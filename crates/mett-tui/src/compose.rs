@@ -278,6 +278,16 @@ pub fn signed(mut body: String, settings: &Settings) -> String {
     body
 }
 
+/// Whether the user sent `message` (going by its sender, not its
+/// Reply-To).
+pub fn from_me(message: &Message, settings: &Settings) -> bool {
+    message
+        .summary
+        .from
+        .as_ref()
+        .is_some_and(|a| settings.is_me(a))
+}
+
 /// The recipients of a reply to `message`: `(to, cc)`.
 ///
 /// A reply goes to the `Reply-To:` addresses if `use_reply_to` (and there
@@ -296,10 +306,9 @@ pub fn reply_recipients(
     } else {
         summary.from.iter().cloned().collect()
     };
-    // A reply to one's own message (by its sender, not its Reply-To,
-    // which may point at the user) goes to its recipients instead.
-    let from_me = summary.from.as_ref().is_some_and(|a| settings.is_me(a));
-    if from_me && to.iter().all(|a| settings.is_me(a)) {
+    // A reply to one's own message goes to its recipients instead, whatever
+    // its Reply-To says, as in mutt.
+    if from_me(message, settings) {
         // Leave the user out too (unless `metoo`): to the other To:
         // recipients, else the Cc: ones, else the one Bcc: recipient (a
         // sent copy has them), else back to the user. Several blind
@@ -555,6 +564,11 @@ mod tests {
         assert_eq!(to, ["carol@x.org"], "without me");
         let cc: Vec<_> = cc.iter().map(|a| a.email.as_str()).collect();
         assert_eq!(cc, ["dave@x.org", "BOB@x.org"]);
+        // Its Reply-To doesn't matter: as in mutt, to its recipients.
+        let mut with_reply_to = message.clone();
+        with_reply_to.reply_to = vec![Address::new("list@x.org")];
+        let (to, _) = reply_recipients(&with_reply_to, true, false, &settings());
+        assert_eq!(to[0].email, "carol@x.org");
         // Sent to myself, copying others: to them.
         message.summary.to = vec![Address::new("me@contoso.com")];
         let (to, _) = reply_recipients(&message, true, false, &settings());

@@ -108,7 +108,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `include` | quadoption | Quote the message in replies. |
 | | `attribution`, `indent_string` | string | The line before quoted text (`On %d, %n wrote:`), and the prefix of quoted lines (`> `). |
 | | `forward_format` | string | Subject of forwarded messages (`[%a: %s]`). |
-| | `reply_to` | quadoption | Reply to the `Reply-To:` address rather than the sender. |
+| | `reply_to` | quadoption | Reply to the `Reply-To:` address rather than the sender. (Not asked for one's own messages, whose replies go to their recipients.) |
 | | `fast_reply`, `askcc`, `askbcc` | boolean | Skip the recipient and subject questions when replying; ask for `Cc:` and `Bcc:`. |
 | | `metoo` | boolean | Keep one's own address in group replies. (A reply to one's own message goes to its other recipients, or to its one `Bcc:` recipient; several `Bcc:` recipients are never shown to each other.) |
 | | `sig_dashes` | boolean | Put `-- ` before the signature. |

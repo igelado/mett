@@ -46,6 +46,7 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
             (Action::Exit, "Abort"),
             (Action::EditTo, "To"),
             (Action::EditCc, "CC"),
+            (Action::EditBcc, "Bcc"),
             (Action::EditSubject, "Subj"),
             (Action::EditMessage, "Edit"),
             (Action::PostponeMessage, "Postpone"),
@@ -685,8 +686,8 @@ mod tests {
         app.update(Msg::Edited(Ok("x".repeat(2048))));
         let lines = sized_screen(&app, WIDTH, 12);
         assert_eq!(
-            lines[0],
-            "y:Send  q:Abort  t:To  c:CC  s:Subj  e:Edit  P:Postpone"
+            sized_screen(&app, 80, 12)[0],
+            "y:Send  q:Abort  t:To  c:CC  b:Bcc  s:Subj  e:Edit  P:Postpone"
         );
         assert_eq!(lines[2], "      To: bob@x.org");
         assert_eq!(lines[5], " Subject:");

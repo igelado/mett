@@ -927,8 +927,8 @@ async fn discards_the_server_draft_when_sending_fails() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1"))
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -988,8 +988,8 @@ async fn keeps_the_server_draft_when_the_send_outcome_is_unknown() {
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1"))
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
         .respond_with(ResponseTemplate::new(204))
         .expect(0)
         .mount(&server)
@@ -1042,8 +1042,8 @@ async fn keeps_the_server_draft_when_its_update_outcome_is_unknown() {
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1"))
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
         .respond_with(ResponseTemplate::new(204))
         .expect(0)
         .mount(&server)
@@ -1193,8 +1193,8 @@ async fn a_draft_that_cannot_be_deleted_is_kept_for_the_next_attempt() {
         .expect(2)
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1"))
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
         .respond_with(denied())
         .mount(&server)
         .await;
@@ -1271,8 +1271,8 @@ async fn giving_up_deletes_the_kept_draft() {
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1"))
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -1283,4 +1283,35 @@ async fn giving_up_deletes_the_kept_draft() {
     store.discard_kept(&reply).await.unwrap();
     // Nothing kept any more.
     store.discard_kept(&reply).await.unwrap();
+}
+
+#[tokio::test]
+async fn national_clouds_delete_drafts_into_deleted_items() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": { "code": "ErrorInvalidRecipients", "message": "bad recipient" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let settings = AuthSettings {
+        cloud: mett_msgraph::Cloud::UsGov,
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth));
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
 }
