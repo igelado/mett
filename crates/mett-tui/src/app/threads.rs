@@ -57,6 +57,9 @@ pub struct Threaded {
     /// For a collapsed thread's first message, how many messages are
     /// folded under it.
     pub folded: usize,
+    /// For a collapsed thread's first message, whether unread mail is
+    /// folded under it.
+    pub folded_unread: bool,
 }
 
 impl App {
@@ -90,7 +93,7 @@ impl App {
         let threaded = self.threaded();
         let ids: Vec<MessageId> = all.iter().map(|m| m.id.clone()).collect();
         let mut slots: Vec<Option<MessageSummary>> = all.into_iter().map(Some).collect();
-        let mut folded_under: HashMap<MessageId, usize> = HashMap::new();
+        let mut folded_under: HashMap<MessageId, (usize, bool)> = HashMap::new();
         self.threads.clear();
         for node in nodes {
             let message = slots[node.index].take().expect("each message once");
@@ -106,19 +109,23 @@ impl App {
                         root: root.clone(),
                         key,
                         folded: 0,
+                        folded_unread: false,
                     },
                 );
             }
             if fold {
-                *folded_under.entry(root).or_default() += 1;
+                let (count, unread) = folded_under.entry(root).or_default();
+                *count += 1;
+                *unread |= !message.flags.read;
                 self.folded.push(message);
             } else {
                 self.messages.push(message);
             }
         }
-        for (root, count) in folded_under {
+        for (root, (count, unread)) in folded_under {
             if let Some(threaded) = self.threads.get_mut(&root) {
                 threaded.folded = count;
+                threaded.folded_unread = unread;
             }
         }
         // (Collapsed threads hidden by a limit stay collapsed; the folder's
@@ -425,6 +432,25 @@ mod tests {
         assert_eq!(shown(&app)[0], "a0");
         assert!(shown(&app).len() > 2);
         assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0 (1)"]);
+    }
+
+    #[test]
+    fn escape_then_v_collapses_too() {
+        let mut app = app();
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('v'))));
+        assert_eq!(shown(&app)[0], "a0 (2)");
+    }
+
+    #[test]
+    fn a_collapsed_thread_tells_of_its_unread_mail() {
+        let mut app = app();
+        for m in &mut app.messages {
+            m.flags.read = m.id.as_str() != "a2";
+        }
+        act(&mut app, Action::CollapseThread);
+        assert!(app.thread_of(&MessageId::new("a0")).unwrap().folded_unread);
+        assert!(!app.thread_of(&MessageId::new("b0")).unwrap().folded_unread);
     }
 
     #[test]

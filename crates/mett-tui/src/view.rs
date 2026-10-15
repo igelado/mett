@@ -424,6 +424,18 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
         .skip(first)
         .take(height)
         .map(|(i, message)| {
+            // A collapsed thread with unread mail folded into it shows as
+            // unread.
+            let thread = app.thread_of(&message.id);
+            let folded_unread;
+            let message = if thread.is_some_and(|t| t.folded_unread) && message.flags.read {
+                let mut shown = message.clone();
+                shown.flags.read = false;
+                folded_unread = shown;
+                &folded_unread
+            } else {
+                message
+            };
             let deleted = app.is_deleted(&message.id);
             let entry = Entry {
                 number: i + 1,
@@ -433,7 +445,7 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
                 total,
                 date_format: &app.display.date_format,
                 position: None,
-                thread: app.thread_of(&message.id),
+                thread,
             };
             // Padded to the right edge, so that the row's colors cover it.
             let mut text = format::expand(&app.display.index_format, &entry, width);

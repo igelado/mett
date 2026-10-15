@@ -51,8 +51,19 @@ impl App {
             };
             return self.on_key(event);
         }
-        let key = Key::from(event);
+        let mut key = Key::from(event);
         let menu = self.menu();
+        // Escape where it is bound to nothing starts Meta and the next key,
+        // for terminals that send them apart.
+        if key == Key::new(KeyCode::Esc) && self.keymap.lookup(menu, key).is_none() {
+            self.escape = true;
+            return Vec::new();
+        }
+        if std::mem::take(&mut self.escape)
+            && let KeyCode::Char(c) = event.code
+        {
+            key = Key::alt(c);
+        }
         let binding = self.keymap.lookup(menu, key).or_else(|| {
             ctrl_j
                 .then(|| self.keymap.lookup(menu, Key::new(KeyCode::Enter)))

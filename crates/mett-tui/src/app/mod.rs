@@ -382,6 +382,9 @@ pub struct App {
     redraw: bool,
     /// Keys to play once the folder is listed.
     after_load: Vec<Stroke>,
+    /// Escape was typed where it does nothing by itself: with the next
+    /// key, it is Meta and that key (`Esc v`), as in mutt.
+    escape: bool,
     /// The user cancelled the sign-in in progress: the outcome it still
     /// reports isn't shown.
     cancelled: bool,
@@ -617,6 +620,7 @@ impl App {
             played: 0,
             redraw: false,
             after_load: Vec::new(),
+            escape: false,
             cancelled: false,
             dismissed: false,
             input: None,
@@ -1913,7 +1917,10 @@ impl App {
         let Some((id, at)) = &self.reselect else {
             return;
         };
-        if let Some(found) = self.messages.iter().position(|m| &m.id == id) {
+        // Shown, or folded into a collapsed thread that is.
+        let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+        let found = shown(id).or_else(|| self.thread_of(id).and_then(|t| shown(&t.root)));
+        if let Some(found) = found {
             self.selected = found;
         } else if done {
             self.selected = (*at).min(self.messages.len().saturating_sub(1));
