@@ -205,10 +205,13 @@ pub struct App {
     pub quit: bool,
     /// The sign-in window, if it is open.
     pub sign_in: Option<SignIn>,
-    /// The user cancelled a sign-in or closed its failure window, so
-    /// failures that still arrive from it aren't shown again. Cleared by
-    /// the next prompt or the user's next action.
-    quiet_failures: bool,
+    /// The user cancelled the sign-in in progress: the outcome it still
+    /// reports isn't shown.
+    cancelled: bool,
+    /// The user closed a sign-in failure window: failures that arrive
+    /// late, from requests that were waiting on the same sign-in, aren't
+    /// shown either. Cleared by the next prompt or the user's next action.
+    dismissed: bool,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -264,7 +267,8 @@ impl App {
             status: "Opening folder...".into(),
             quit: false,
             sign_in: None,
-            quiet_failures: false,
+            cancelled: false,
+            dismissed: false,
             path,
             opening: None,
             width: usize::from(width),
@@ -337,7 +341,7 @@ impl App {
             self.pending = None;
             // What the user does next may need a sign-in that fails; show
             // that.
-            self.quiet_failures = false;
+            self.dismissed = false;
         }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
@@ -349,7 +353,10 @@ impl App {
     fn on_sign_in(&mut self, event: SignInEvent) -> Vec<Effect> {
         match event {
             SignInEvent::Prompt { account, prompt } => {
-                self.quiet_failures = false;
+                // Sign-ins happen one at a time, so a cancelled one has
+                // reported back before another prompts.
+                self.cancelled = false;
+                self.dismissed = false;
                 let effects = match &prompt {
                     // The browser flow needs the browser: open it straight
                     // away. The device code flow is for when there is none.
@@ -370,11 +377,13 @@ impl App {
                 // Just close the window: the status line may already show
                 // how the request that needed the sign-in went.
                 self.sign_in = None;
+                self.cancelled = false;
                 Vec::new()
             }
             SignInEvent::Finished {
                 outcome: Err(_), ..
-            } if self.quiet_failures => {
+            } if self.cancelled || self.dismissed => {
+                self.cancelled = false;
                 self.sign_in = None;
                 Vec::new()
             }
@@ -403,14 +412,14 @@ impl App {
         match action {
             Action::Exit if failed => {
                 self.sign_in = None;
-                self.quiet_failures = true;
+                self.dismissed = true;
                 // The user gave up: don't let a retry that was waiting
                 // start another sign-in.
                 self.retry_after.clear();
             }
             Action::Exit => {
                 self.sign_in = None;
-                self.quiet_failures = true;
+                self.cancelled = true;
                 // Don't let a retry that was waiting start another sign-in.
                 self.retry_after.clear();
                 self.status = "Sign-in cancelled.".into();
@@ -451,8 +460,14 @@ impl App {
             Action::Retry if failed => {
                 self.sign_in = None;
                 // Requests that needed the sign-in may not have reported
-                // back yet: retry them once they have.
-                self.retry_after = self.in_flight();
+                // back yet: retry them once they have. When quitting, only
+                // saving changes matters, and only their responses are
+                // still handled.
+                self.retry_after = if self.quit {
+                    self.flag_updates.keys().copied().collect()
+                } else {
+                    self.in_flight()
+                };
                 return self.retry();
             }
             _ => {}
@@ -493,6 +508,9 @@ impl App {
     /// listing the rest of it, opening the selected message and saving
     /// changes.
     fn retry(&mut self) -> Vec<Effect> {
+        if self.quit {
+            return self.retry_saves();
+        }
         if self.folder.is_none() {
             if self.opening.is_none() {
                 return self.open_folder();
@@ -500,22 +518,28 @@ impl App {
             return Vec::new();
         }
         let mut effects = self.retry_listing();
-        // Messages whose changes failed to save are marked unread again;
-        // mark them read once more. (Their failures are cleared once that
-        // succeeds.)
-        let mut unsaved: Vec<MessageId> = self.save_failures.keys().cloned().collect();
-        unsaved.sort();
-        for message in unsaved {
-            effects.extend(self.mark_read(message));
-        }
+        effects.extend(self.retry_saves());
         // Open the message that failed to open, if it is still the one
-        // selected. (Opening another message forgets the failure.)
+        // selected. (Opening another message forgets the failure.) The
+        // screen, not the menu: another sign-in window may be over it.
         let failed = self.unfetched.take();
         let selected = self.messages.get(self.selected).map(|s| &s.id);
-        if failed.is_some() && failed.as_ref() == selected && self.menu() == Menu::Index {
+        if failed.is_some() && failed.as_ref() == selected && self.screen() == &Screen::Index {
             effects.extend(self.open_selected());
         }
         effects
+    }
+
+    /// Saves again the changes that failed to save. Messages whose changes
+    /// failed are marked unread again; mark them read once more. (Their
+    /// failures are cleared once that succeeds.)
+    fn retry_saves(&mut self) -> Vec<Effect> {
+        let mut unsaved: Vec<MessageId> = self.save_failures.keys().cloned().collect();
+        unsaved.sort();
+        unsaved
+            .into_iter()
+            .flat_map(|message| self.mark_read(message))
+            .collect()
     }
 
     fn on_index_action(&mut self, action: Action) -> Vec<Effect> {
@@ -1752,5 +1776,69 @@ mod tests {
         act(&mut app, Action::NextEntry);
         app.update(Msg::SignIn(finished(Err("unavailable".into()))));
         assert!(app.sign_in.is_some());
+    }
+
+    #[test]
+    fn a_cancelled_sign_in_stays_quiet_after_other_keys() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        act(&mut app, Action::Exit);
+        // A key before the cancellation is reported.
+        act(&mut app, Action::NextEntry);
+        app.update(Msg::SignIn(finished(Err("sign-in cancelled".into()))));
+        assert_eq!(app.sign_in, None);
+        // A later failure is shown.
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(app.sign_in.is_some());
+    }
+
+    #[test]
+    fn retrying_while_quitting_waits_only_for_saves() {
+        let (mut app, list) = loading_more(1);
+        let effects = open(&mut app, 1);
+        let [Effect::Request(update, _)] = effects.as_slice() else {
+            panic!("expected a flag update, got {effects:?}");
+        };
+        act(&mut app, Action::Exit);
+        act(&mut app, Action::Quit);
+        assert!(app.quit);
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        act(&mut app, Action::Retry);
+        assert!(!app.retry_after.contains(&list), "listing isn't waited for");
+        let effects = app.update(Msg::Response(Response {
+            id: *update,
+            event: Event::FlagsUpdated(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::UpdateFlags(..))]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_is_retried_under_a_new_sign_in_window() {
+        let mut app = loaded(1);
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, _)] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        act(&mut app, Action::Retry);
+        // Another sign-in starts before the fetch reports its failure.
+        app.update(Msg::SignIn(browser_prompt()));
+        let effects = app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::FetchMessage(_))]
+            ),
+            "{effects:?}"
+        );
     }
 }
