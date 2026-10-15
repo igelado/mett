@@ -90,7 +90,7 @@ colors of `normal`, `indicator`, `status` (and the help line), `error`,
 `quote_regex`), `signature` and `attachment`; `index` takes a pattern (the
 last that matches counts), and `header` and `body` a regular expression.
 Colors are `default`, the eight basic colors (with `bright` for the light
-ones), `colorN` and `#rrggbb`; attributes are `bold`, `underline`,
+ones), `colorN` and `"#rrggbb"` (quoted, as `#` otherwise starts a comment); attributes are `bold`, `underline`,
 `reverse`, `standout`, `blink`, `italic` and `none`. `uncolor` removes
 `index`, `header` and `body` rules (`*` for all) or sets an object back to
 its default. As in mutt, `mono` and `unmono` set the attributes used

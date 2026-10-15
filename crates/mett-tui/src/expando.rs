@@ -181,6 +181,8 @@ impl Expandos for Status<'_> {
     fn is_set(&self, code: char) -> bool {
         match code {
             'M' => self.shown.is_some(),
+            // `%r` shows `-` when nothing changed.
+            'r' => self.changed,
             code => crate::format::truthy(&self.expando(code, None)),
         }
     }
@@ -294,6 +296,12 @@ mod tests {
             line,
             format!("-*-mett: Inbox [Msgs:5 Del:1]{}(all)---", "-".repeat(13))
         );
+        // Nothing changed: `%?r?` takes its else.
+        let clean = Status {
+            changed: false,
+            ..status
+        };
+        assert_eq!(expand("%?r?changed&clean?", &clean, 20), "clean");
         // Shown directly, a count of none is 0.
         assert_eq!(expand("New:%n Del:%d", &status, 20), "New:0 Del:1");
     }

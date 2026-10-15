@@ -1218,6 +1218,13 @@ mod tests {
         assert_ne!(config.colors().color, crate::color::Colors::default());
         assert_ne!(config.colors().mono, crate::color::Colors::default());
         assert!(load("color status mauve blue\n").errors[0].contains("mauve"));
+        // A color by its RGB value is quoted: `#` starts a comment.
+        let rgb = load("color status '#ff0000' default\n");
+        assert!(rgb.errors.is_empty(), "{:?}", rgb.errors);
+        assert_eq!(
+            rgb.colors().color.status.fg,
+            Some(ratatui::style::Color::Rgb(255, 0, 0))
+        );
     }
 
     #[test]
