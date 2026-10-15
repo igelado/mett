@@ -146,6 +146,7 @@ impl Keymap {
             (Key::char('q'), Exit),
             (Key::new(Esc), Exit),
             (Key::char('o'), OpenBrowser),
+            (Key::char('c'), CopyLink),
             (Key::new(Enter), Retry),
             (Key::char('j'), NextLine),
             (Key::new(Down), NextLine),

@@ -13,7 +13,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::action::Action;
-use crate::app::{App, Pager, Screen, SignIn};
+use crate::app::{App, Pager, Row, Screen, SignIn};
 use crate::keymap::{Keymap, Menu};
 use crate::text::{fit, truncate, wrap_all};
 
@@ -50,8 +50,21 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
 
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
-/// Draws the whole screen.
-pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) {
+/// Text to print over the drawn screen, starting at a cell, and left for
+/// the terminal to wrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    /// The column.
+    pub x: u16,
+    /// The row.
+    pub y: u16,
+    /// The text.
+    pub text: String,
+}
+
+/// Draws the whole screen, and returns text that the main loop should print
+/// over it, if any.
+pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> {
     let [help, body, status, message] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -79,14 +92,20 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) {
     if let Some(window) = &app.sign_in {
         let [_, below_help] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
-        render_sign_in(window, keymap, frame, below_help);
+        return render_sign_in(window, keymap, frame, below_help);
     }
+    None
 }
 
 /// Draws the sign-in window across the middle of `area`. It spans the
 /// whole width, without side borders, so that the sign-in link can be
 /// copied from the terminal without stray characters.
-fn render_sign_in(window: &SignIn, keymap: &Keymap, frame: &mut Frame, area: Rect) {
+fn render_sign_in(
+    window: &SignIn,
+    keymap: &Keymap,
+    frame: &mut Frame,
+    area: Rect,
+) -> Option<Overlay> {
     let rows = window.rows(usize::from(area.width));
     let height = usize::from(area.height);
     // Without room for everything, show what fits from the scroll
@@ -99,11 +118,16 @@ fn render_sign_in(window: &SignIn, keymap: &Keymap, frame: &mut Frame, area: Rec
             .scroll
             .min(rows.len().saturating_sub(height.saturating_sub(2)))
     };
+    let shown = rows.len().saturating_sub(top).min(height.saturating_sub(2));
+    let link_rows: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].1 == Row::Link)
+        .collect();
+    let link: String = link_rows.iter().map(|&i| rows[i].0.as_str()).collect();
     let visible: Vec<Line> = rows
         .into_iter()
         .skip(top)
-        .map(|(row, bold)| {
-            let style = if bold {
+        .map(|(row, kind)| {
+            let style = if kind == Row::Code {
                 Style::new().add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
@@ -131,6 +155,18 @@ fn render_sign_in(window: &SignIn, keymap: &Keymap, frame: &mut Frame, area: Rec
         ),
         popup,
     );
+    // The link, if it is all on screen, for the main loop to print again
+    // as one line that the terminal wraps: then copying it from the screen
+    // gives the link without line breaks.
+    let (&first, &last) = (link_rows.first()?, link_rows.last()?);
+    if first < top || last >= top + shown {
+        return None;
+    }
+    Some(Overlay {
+        x: popup.x,
+        y: popup.y + 1 + u16::try_from(first - top).ok()?,
+        text: link,
+    })
 }
 
 /// `q:Quit  j:Next  …`, from the current key bindings.
@@ -337,7 +373,9 @@ mod tests {
     fn sized_screen(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| render(app, &Keymap::mutt_defaults(), frame))
+            .draw(|frame| {
+                render(app, &Keymap::mutt_defaults(), frame);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -471,5 +509,34 @@ mod tests {
         let shown = screen(&app).join("\n");
         assert!(shown.contains("end"), "{shown}");
         assert!(shown.contains("Waiting for you to sign in..."), "{shown}");
+    }
+
+    #[test]
+    fn the_sign_in_link_is_handed_over_whole() {
+        let mut app = app(1);
+        let url = format!("https://login.example/authorize?{}end", "x".repeat(80));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 16)).unwrap();
+        let mut overlay = None;
+        terminal
+            .draw(|frame| overlay = render(&app, &Keymap::mutt_defaults(), frame))
+            .unwrap();
+        let link = overlay.take().expect("the link fits");
+        assert_eq!(link.text, url);
+        assert_eq!(link.x, 0);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, link.y)].symbol(), "h", "where the link starts");
+
+        // A link that doesn't fit isn't handed over.
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 5)).unwrap();
+        terminal
+            .draw(|frame| overlay = render(&app, &Keymap::mutt_defaults(), frame))
+            .unwrap();
+        assert!(overlay.is_none());
     }
 }

@@ -1232,3 +1232,71 @@ async fn reports_a_sign_in_confirmed_later_as_finished() {
     assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
     assert_eq!(*outcomes.0.lock().unwrap(), [false, false, true]);
 }
+
+/// Cancels each sign-in when prompted, and reports each ending on a
+/// channel.
+#[derive(Clone)]
+struct Ending {
+    prompts: Arc<Mutex<usize>>,
+    cancel: Arc<tokio::sync::Notify>,
+    ended: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl Prompter for Ending {
+    fn prompt(&self, _: SignInPrompt) {
+        *self.prompts.lock().unwrap() += 1;
+        self.cancel.notify_one();
+    }
+
+    fn finished(&self, _: Result<(), &Error>) {
+        let _ = self.ended.send(());
+        // Give the test's retry time to start while this call finishes.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    fn cancelled(&self) -> Cancelled<'_> {
+        Box::pin(self.cancel.notified())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_as_soon_as_a_sign_in_ends_signs_in_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending"))
+        .mount(&server)
+        .await;
+    let (ended, mut endings) = tokio::sync::mpsc::unbounded_channel();
+    let prompter = Ending {
+        prompts: Arc::default(),
+        cancel: Arc::default(),
+        ended,
+    };
+    let auth = Arc::new(GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        prompter.clone(),
+    ));
+    let first = tokio::spawn({
+        let auth = Arc::clone(&auth);
+        async move { auth.access_token().await }
+    });
+    // The user retries the moment the failure is reported, while the first
+    // call may still be finishing.
+    endings.recv().await.unwrap();
+    let retry = auth.access_token().await;
+    assert!(first.await.unwrap().is_err());
+    assert!(retry.is_err());
+    assert_eq!(
+        *prompter.prompts.lock().unwrap(),
+        2,
+        "the retry asked again"
+    );
+}

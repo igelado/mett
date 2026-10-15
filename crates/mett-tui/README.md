@@ -79,7 +79,9 @@ revoke your sessions (in the Microsoft 365 account settings, *Sign out
 everywhere*) while mett is running, wait for the access token to expire
 (about an hour) and open a message.
 
-In the sign-in window, `o` opens the sign-in page in the browser (again),
+The link is printed so that the terminal wraps it, so selecting it copies
+it in one piece. In the sign-in window, `c` copies it to the clipboard, and
+`o` opens the sign-in page in the browser (again),
 and `q` or `Esc` cancels the sign-in. If signing in fails, the window shows
 why: `Enter` tries again and `q` closes it. `Enter` in an empty index also
 retries opening the folder.
@@ -97,7 +99,7 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 |------|------|
 | Index | `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
-| Sign-in window | `o`: open the sign-in page in a browser. `q`/`Esc`: cancel, or close after a failure. `Enter`: try again after a failure. `j`/`k` or arrows: scroll, when the terminal is too small to show it all. |
+| Sign-in window | `o`: open the sign-in page in a browser. `c`: copy the link (or the device code) to the clipboard, in terminals that support OSC 52 (in tmux, `set -g set-clipboard on`). `q`/`Esc`: cancel, or close after a failure. `Enter`: try again after a failure. `j`/`k` or arrows: scroll, when the terminal is too small to show it all. |
 
 Check that:
 

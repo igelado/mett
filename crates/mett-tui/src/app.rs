@@ -61,6 +61,8 @@ pub enum Effect {
     OpenUrl(String),
     /// Cancel the sign-in in progress.
     CancelSignIn,
+    /// Put the text on the clipboard, through the terminal.
+    Copy(String),
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -119,19 +121,30 @@ pub struct SignIn {
     pub scroll: usize,
 }
 
+/// What a row of the sign-in window shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    /// Text.
+    Text,
+    /// The device code, highlighted.
+    Code,
+    /// Part of the sign-in link.
+    Link,
+}
+
 impl SignIn {
-    /// The window's text wrapped to `width`, with whether each row is
-    /// highlighted. The keys are on the help line.
-    pub fn rows(&self, width: usize) -> Vec<(String, bool)> {
-        let mut lines: Vec<(String, bool)> = Vec::new();
+    /// The window's text wrapped to `width`, with what each row shows. The
+    /// keys are on the help line.
+    pub fn rows(&self, width: usize) -> Vec<(String, Row)> {
+        let mut lines: Vec<(String, Row)> = Vec::new();
         match &self.prompt {
             Some(SignInPrompt::OpenBrowser { url }) => {
                 lines.push((
                     "Sign in in your browser. If it did not open, visit:".into(),
-                    false,
+                    Row::Text,
                 ));
-                lines.push((String::new(), false));
-                lines.push((url.to_string(), false));
+                lines.push((String::new(), Row::Text));
+                lines.push((url.to_string(), Row::Link));
             }
             Some(SignInPrompt::EnterCode {
                 verification_uri,
@@ -142,28 +155,36 @@ impl SignIn {
                     format!(
                         "To sign in, visit {verification_uri} on any device and enter the code:"
                     ),
-                    false,
+                    Row::Text,
                 ));
-                lines.push((String::new(), false));
-                lines.push((format!("    {user_code}"), true));
+                lines.push((String::new(), Row::Text));
+                lines.push((format!("    {user_code}"), Row::Code));
             }
             None => {}
         }
         if !lines.is_empty() {
-            lines.push((String::new(), false));
+            lines.push((String::new(), Row::Text));
         }
         lines.push(match &self.failure {
-            Some(failure) => (format!("Sign-in failed: {failure}"), false),
-            None => ("Waiting for you to sign in...".into(), false),
+            Some(failure) => (format!("Sign-in failed: {failure}"), Row::Text),
+            None => ("Waiting for you to sign in...".into(), Row::Text),
         });
         lines
             .into_iter()
-            .flat_map(|(line, bold)| {
+            .flat_map(|(line, kind)| {
                 text::wrap(&line, width)
                     .into_iter()
-                    .map(move |row| (row, bold))
+                    .map(move |row| (row, kind))
             })
             .collect()
+    }
+
+    /// What `c` copies: the sign-in link, or the device code.
+    fn copyable(&self) -> Option<String> {
+        match self.prompt.as_ref()? {
+            SignInPrompt::OpenBrowser { url } => Some(url.to_string()),
+            SignInPrompt::EnterCode { user_code, .. } => Some(user_code.clone()),
+        }
     }
 }
 
@@ -402,6 +423,15 @@ impl App {
                 };
                 return vec![Effect::OpenUrl(url)];
             }
+            Action::CopyLink => {
+                let Some(text) = window.copyable() else {
+                    return Vec::new();
+                };
+                // The terminal may not allow it, and can't say whether it
+                // did.
+                self.status = "Copied to the clipboard, if your terminal allows it.".into();
+                return vec![Effect::Copy(text)];
+            }
             Action::NextLine | Action::PreviousLine => {
                 // The window covers all but the help line, and has a
                 // border above and below its text.
@@ -521,6 +551,7 @@ impl App {
             | Action::NextLine
             | Action::PreviousLine
             | Action::OpenBrowser
+            | Action::CopyLink
             | Action::Retry => {}
         }
         Vec::new()
@@ -561,6 +592,7 @@ impl App {
             | Action::LastEntry
             | Action::DisplayMessage
             | Action::OpenBrowser
+            | Action::CopyLink
             | Action::Retry => {}
         }
         Vec::new()
@@ -1446,6 +1478,10 @@ mod tests {
         assert_eq!(
             act(&mut app, Action::OpenBrowser),
             [Effect::OpenUrl("https://login.example/authorize".into())]
+        );
+        assert_eq!(
+            act(&mut app, Action::CopyLink),
+            [Effect::Copy("https://login.example/authorize".into())]
         );
         app.update(Msg::SignIn(finished(Ok(()))));
         assert_eq!(app.sign_in, None);

@@ -1689,6 +1689,7 @@ dependencies = [
 name = "mett-tui"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "mett-core",
  "mett-msgraph",

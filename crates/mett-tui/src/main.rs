@@ -239,7 +239,7 @@ async fn run<S: mett_core::MailStore + 'static>(
     dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
 
     while !app.quit {
-        terminal.draw(|frame| view::render(&app, &keymap, frame))?;
+        draw(&mut terminal, &app, &keymap)?;
         let msg = tokio::select! {
             // Without input mett can't be used or quit, so a terminal read
             // error ends it (and the terminal is restored).
@@ -283,7 +283,7 @@ async fn run<S: mett_core::MailStore + 'static>(
         // A failed sign-in stays up even with nothing left pending, so the
         // user can retry the change it held up.
         while app.saving() || app.sign_in.is_some() {
-            terminal.draw(|frame| view::render(&app, &keymap, frame))?;
+            draw(&mut terminal, &app, &keymap)?;
             let msg = tokio::select! {
                 // Saving may need the user to sign in: the sign-in window
                 // still works, and only it takes keys.
@@ -339,6 +339,42 @@ async fn run<S: mett_core::MailStore + 'static>(
     Ok(())
 }
 
+/// Draws the screen, then prints the view's overlay, if any, as plain text
+/// that the terminal wraps by itself.
+fn draw(terminal: &mut DefaultTerminal, app: &App, keymap: &Keymap) -> std::io::Result<()> {
+    use std::io::Write;
+
+    use ratatui::crossterm::{cursor, queue, style};
+
+    let mut overlay = None;
+    terminal.draw(|frame| overlay = view::render(app, keymap, frame))?;
+    if let Some(overlay) = overlay {
+        // The cells already hold the same text, so ratatui's next draw,
+        // which compares against what it drew, leaves this alone.
+        let mut out = std::io::stdout();
+        queue!(
+            out,
+            cursor::MoveTo(overlay.x, overlay.y),
+            style::Print(&overlay.text)
+        )?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// Puts `text` on the clipboard with the OSC 52 escape sequence, which
+/// many terminals (and tmux, with `set-clipboard on`) support.
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    use base64::Engine;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut out = std::io::stdout();
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()
+}
+
 /// How long to wait for pending changes when quitting.
 const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -365,6 +401,11 @@ fn dispatch(
             Effect::CancelSignIn => {
                 if let Some(cancel) = cancel {
                     cancel.cancel();
+                }
+            }
+            Effect::Copy(text) => {
+                if let Err(e) = copy_to_clipboard(&text) {
+                    app.status = format!("Could not copy: {e}");
                 }
             }
         }

@@ -15,6 +15,7 @@ path = "src/main.rs"
 mett-core = { workspace = true, features = ["mock"] }
 mett-msgraph.workspace = true
 
+base64.workspace = true
 chrono.workspace = true
 open.workspace = true
 ratatui.workspace = true

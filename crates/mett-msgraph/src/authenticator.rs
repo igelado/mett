@@ -240,8 +240,8 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
-    /// Signs in interactively, unless the user cancels, and tells the
-    /// prompter how it ended.
+    /// Signs in interactively, unless the user cancels. The caller tells
+    /// the prompter how it ended.
     ///
     /// The user can cancel until the sign-in has been confirmed to be for
     /// this account, which covers all the waiting. Neither step changes any
@@ -257,13 +257,11 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
             } => Some(checked),
             () = self.prompter.cancelled() => None,
         };
-        let result = match checked {
+        match checked {
             None => Err(mett_core::Error::Auth("sign-in cancelled".into())),
             Some(Err(e)) => Err(e),
             Some(Ok((tokens, identity))) => self.settle(state, tokens, None, identity).await,
-        };
-        self.prompter.finished(result.as_ref().map(|_| ()));
-        result
+        }
     }
 
     /// Removes `token` from the store if it is still the stored one, and
@@ -450,6 +448,9 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         let result = self.sign_in_and_confirm(&mut state).await;
         let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
         state.failed_sign_in = result.as_ref().err().map(|e| (number, e.clone()));
+        // Only now tell the user: a retry they start from here on counts
+        // as a new request, not one that was waiting for this sign-in.
+        self.prompter.finished(result.as_ref().map(|_| ()));
         result
     }
 }
