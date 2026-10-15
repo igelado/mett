@@ -1309,6 +1309,11 @@ mod tests {
         // The new copy comes first: still on b.
         relisted(&mut app, &["new", "a", "b", "c"]);
         assert_eq!(app.messages[app.selected].id.as_str(), "b");
+        // A second refresh before the first is listed keeps the place.
+        let first = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
+        assert!(!first.is_empty());
+        relisted(&mut app, &["new", "a", "b", "c"]);
+        assert_eq!(app.messages[app.selected].id.as_str(), "b");
         // b is gone: the message now where it was.
         relisted(&mut app, &["new", "a", "c"]);
         assert_eq!(app.messages[app.selected].id.as_str(), "c");

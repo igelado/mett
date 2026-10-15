@@ -987,10 +987,13 @@ impl App {
     /// Lists the open folder again in the background, staying on the
     /// selected message.
     fn refresh(&mut self) -> Vec<Effect> {
-        let selected = self
-            .messages
-            .get(self.selected)
-            .map(|m| (m.id.clone(), self.selected));
+        // A refresh still on its way (the user hasn't moved since, or it
+        // would be forgotten) knows better than the index it cleared.
+        let selected = self.reselect.clone().or_else(|| {
+            self.messages
+                .get(self.selected)
+                .map(|m| (m.id.clone(), self.selected))
+        });
         let effects = self.relist();
         self.reselect = selected;
         effects
