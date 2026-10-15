@@ -176,6 +176,15 @@ pub struct Status<'a> {
 }
 
 impl Expandos for Status<'_> {
+    /// As in mutt, `%?M?` says whether there is a limit, even one that
+    /// shows nothing.
+    fn is_set(&self, code: char) -> bool {
+        match code {
+            'M' => self.shown.is_some(),
+            code => crate::format::truthy(&self.expando(code, None)),
+        }
+    }
+
     fn expando(&self, code: char, _arg: Option<&str>) -> String {
         let count = |n: usize| if n == 0 { String::new() } else { n.to_string() };
         match code {
@@ -274,6 +283,25 @@ mod tests {
             line,
             format!("-*-mett: Inbox [Msgs:5 Del:1]{}(all)---", "-".repeat(13))
         );
+    }
+
+    #[test]
+    fn an_empty_limit_still_shows_its_count() {
+        let status = Status {
+            folder: "Inbox",
+            total: 5,
+            shown: Some(0),
+            new: 0,
+            deleted: 0,
+            flagged: 0,
+            incoming: 0,
+            limit: Some("~F"),
+            incomplete: false,
+            changed: false,
+            position: "all",
+        };
+        let line = expand("%?M?%M/?%m%?V? [Limit: %V]?", &status, 50);
+        assert_eq!(line, "0/5 [Limit: ~F]");
     }
 
     #[test]

@@ -27,6 +27,12 @@ pub trait Expandos {
     /// The text of expando `code`; `arg` is the `strftime` format of a
     /// date expando (`{`, `[` or `(`). Unknown expandos are empty.
     fn expando(&self, code: char, arg: Option<&str>) -> String;
+
+    /// Whether `%?code?` takes its `then` part: by default, when the
+    /// expando isn't empty or zero.
+    fn is_set(&self, code: char) -> bool {
+        truthy(&self.expando(code, None))
+    }
 }
 
 /// Expands `format` for a line `width` cells wide.
@@ -58,8 +64,7 @@ fn expand_chars(chars: &[char], values: &dyn Expandos, width: usize) -> String {
                     out.push('%');
                     continue;
                 };
-                let value = values.expando(code, None);
-                let part = if truthy(&value) { then } else { otherwise };
+                let part = if values.is_set(code) { then } else { otherwise };
                 out.push_str(&expand_chars(part, values, width));
                 i = next;
             }
@@ -171,7 +176,7 @@ fn skip_expando(chars: &[char], start: usize) -> usize {
 
 /// Whether a conditional's expando counts as true: not empty, and not
 /// zero.
-fn truthy(value: &str) -> bool {
+pub fn truthy(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && value.parse::<i64>().ok().is_none_or(|n| n != 0)
 }

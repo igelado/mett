@@ -12,6 +12,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
@@ -553,17 +554,24 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
                 );
             }
             let row_text = &text[range.clone()];
-            let mut spans = Vec::new();
-            let mut start = 0;
-            for end in 1..=marks.len() {
-                let boundary = end == marks.len() || marks[end] != marks[start];
-                if boundary && row_text.is_char_boundary(start) && row_text.is_char_boundary(end) {
-                    spans.push(Span::styled(
-                        row_text[start..end].to_owned(),
-                        marks[start].unwrap_or(style),
-                    ));
-                    start = end;
+            // Runs of one style, cut only between graphemes (a match in
+            // part of one colors all of it), so that each is drawn whole.
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run: Option<(usize, Style)> = None;
+            for (at, grapheme) in row_text.grapheme_indices(true) {
+                let marked = marks[at..at + grapheme.len()].iter().find_map(|m| *m);
+                let this = marked.unwrap_or(style);
+                match run {
+                    Some((_, current)) if current == this => {}
+                    Some((start, current)) => {
+                        spans.push(Span::styled(row_text[start..at].to_owned(), current));
+                        run = Some((at, this));
+                    }
+                    None => run = Some((at, this)),
                 }
+            }
+            if let Some((start, current)) = run {
+                spans.push(Span::styled(row_text[start..].to_owned(), current));
             }
             Line::from(spans).style(style)
         })
@@ -782,6 +790,7 @@ mod tests {
                 "color quoted1 magenta default",
                 "color signature blue default",
                 "color body brightwhite default wor..",
+                "color body red default afe",
             ],
         );
         app.update(Msg::Resize {
@@ -794,7 +803,7 @@ mod tests {
         };
         let mut message = mock::message("m0", "in", "Hi", received(0));
         message.summary.from = Some(Address::new("alice@contoso.com"));
-        message.body.content = "> a\n>> b\nhello world\n-- \nAlice".into();
+        message.body.content = "> a\n>> b\nhello world\ncafe\u{301} ok\n-- \nAlice".into();
         app.update(Msg::Response(Response {
             id: fetch,
             event: Event::MessageFetched(Ok(message)),
@@ -816,6 +825,11 @@ mod tests {
             "matched by the body rule"
         );
         assert_eq!(buffer[(0, row("Alice"))].fg, Color::Blue);
+        // A match in part of a grapheme colors all of it, drawn whole.
+        let cafe = row("caf");
+        assert_eq!(buffer[(3, cafe)].symbol(), "e\u{301}");
+        assert_eq!(buffer[(3, cafe)].fg, Color::Red);
+        assert_eq!(buffer[(4, cafe)].symbol(), " ");
     }
 
     #[test]
