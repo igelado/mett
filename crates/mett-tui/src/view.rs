@@ -728,10 +728,8 @@ mod tests {
         for command in commands {
             let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
             let (name, args) = words.split_first().unwrap();
-            match name.as_str() {
-                "color" => app.display.colors.color(args).unwrap(),
-                _ => app.display.colors.mono(args).unwrap(),
-            }
+            assert_eq!(name, "color");
+            app.display.colors.color(args).unwrap();
         }
     }
 

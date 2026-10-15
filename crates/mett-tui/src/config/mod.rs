@@ -135,7 +135,7 @@ pub struct Config {
     /// `alternates`: regular expressions for the user's other addresses.
     alternates: Vec<String>,
     /// `color` and `mono`.
-    colors: crate::color::Colors,
+    colors: crate::color::Palette,
     /// `mailboxes`, in the order given.
     mailboxes: Vec<Mailbox>,
     /// `bind` and `macro` commands not yet taken by the key bindings.
@@ -173,7 +173,7 @@ impl Config {
             user: HashMap::new(),
             errors: Vec::new(),
             alternates: Vec::new(),
-            colors: crate::color::Colors::default(),
+            colors: crate::color::Palette::default(),
             mailboxes: Vec::new(),
             key_commands: Vec::new(),
             pushed: Vec::new(),
@@ -240,7 +240,7 @@ impl Config {
     }
 
     /// How each part of the screen is drawn (`color`, `mono`).
-    pub fn colors(&self) -> &crate::color::Colors {
+    pub fn colors(&self) -> &crate::color::Palette {
         &self.colors
     }
 
@@ -415,11 +415,23 @@ impl Config {
                         .iter()
                         .map(|word| self.expand(word))
                         .collect::<Result<Vec<_>, _>>();
-                    words.and_then(|words| match name.as_str() {
-                        "color" => self.colors.color(&words),
-                        "mono" => self.colors.mono(&words),
-                        "unmono" => self.colors.unmono(&words),
-                        _ => self.colors.uncolor(&words),
+                    words.and_then(|words| {
+                        let palette = &mut self.colors;
+                        let result = match name.as_str() {
+                            "color" => palette.color.color(&words),
+                            "mono" => palette.mono.mono(&words),
+                            "uncolor" => palette.color.uncolor(&words),
+                            _ => palette.mono.uncolor(&words),
+                        };
+                        match result {
+                            Ok(()) => Ok(()),
+                            // As other things mett doesn't do yet.
+                            Err(crate::color::ColorError::Unsupported(what)) => {
+                                self.warn_once("color", &what, format!("{what}; ignored"));
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string().replacen("uncolor", name.as_str(), 1)),
+                        }
                     })
                 }
                 "mailboxes" => self.add_mailboxes(args),
@@ -1174,6 +1186,18 @@ mod tests {
         // The dump reads back to the same settings.
         let again = load(&dump.join("\n"));
         assert_eq!(again.dump(), dump);
+    }
+
+    #[test]
+    fn colors_mett_does_not_do_yet_are_warnings() {
+        let config = load(
+            "color compose header red default\ncolor index red default ~T\ncolor status red blue\nmono status bold\n",
+        );
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
+        assert_ne!(config.colors().color, crate::color::Colors::default());
+        assert_ne!(config.colors().mono, crate::color::Colors::default());
+        assert!(load("color status mauve blue\n").errors[0].contains("mauve"));
     }
 
     #[test]

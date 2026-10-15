@@ -68,8 +68,8 @@ fn expand_chars(chars: &[char], values: &dyn Expandos, width: usize) -> String {
                 let rest = chars.get(i + 2..).unwrap_or(&[]);
                 return match fill {
                     '|' => {
-                        let used = out.width();
-                        out.extend(std::iter::repeat_n(pad, width.saturating_sub(used)));
+                        let gap = width.saturating_sub(out.width());
+                        out.push_str(&filler(pad, gap));
                         out
                     }
                     _ => {
@@ -183,8 +183,7 @@ fn justify(left: String, right: String, pad: char, width: usize, soft: bool) -> 
     let (left_width, right_width) = (left.width(), right.width());
     if left_width + right_width <= width {
         let gap = width - left_width - right_width;
-        let fill: String = std::iter::repeat_n(pad, gap).collect();
-        return format!("{left}{fill}{right}");
+        return format!("{left}{}{right}", filler(pad, gap));
     }
     if soft {
         let right = truncate(&right, width);
@@ -193,6 +192,17 @@ fn justify(left: String, right: String, pad: char, width: usize, soft: bool) -> 
     } else {
         format!("{left}{right}")
     }
+}
+
+/// `pad` repeated to fill `cells` terminal cells (and a space if a wide
+/// `pad` leaves one over).
+fn filler(pad: char, cells: usize) -> String {
+    let each = unicode_width::UnicodeWidthChar::width(pad)
+        .unwrap_or(1)
+        .max(1);
+    let mut fill: String = std::iter::repeat_n(pad, cells / each).collect();
+    fill.extend(std::iter::repeat_n(' ', cells % each));
+    fill
 }
 
 /// An expando's `-0WIDTH.MAX`.
@@ -320,6 +330,12 @@ mod tests {
     fn fills_the_line() {
         assert_eq!(x("%n%>-%C"), format!("Alice{}7", "-".repeat(24)));
         assert_eq!(x("%n%|."), format!("Alice{}", ".".repeat(25)));
+        // Wide fill characters take two cells.
+        assert_eq!(x("%n%>界%C"), format!("Alice{}7", "界".repeat(12)));
+        assert_eq!(
+            expand("%n%>界%C", &Values, 31),
+            format!("Alice{} 7", "界".repeat(12))
+        );
         let long = "x".repeat(28);
         // Without room, the right side is cut, or the left with `%*`.
         assert_eq!(

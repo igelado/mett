@@ -183,7 +183,7 @@ impl Expandos for Status<'_> {
             'd' => count(self.deleted),
             'F' => count(self.flagged),
             'f' => self.folder.to_owned(),
-            'h' => std::env::var("HOSTNAME").unwrap_or_default(),
+            'h' => hostname(),
             'I' => if self.incomplete { "1" } else { "" }.to_owned(),
             'M' => self.shown.map(|n| n.to_string()).unwrap_or_default(),
             'm' => self.total.to_string(),
@@ -195,6 +195,21 @@ impl Expandos for Status<'_> {
             _ => String::new(),
         }
     }
+}
+
+/// The computer's name, as `%h` shows it: without its domain.
+fn hostname() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let name = ["/proc/sys/kernel/hostname", "/etc/hostname"]
+            .iter()
+            .find_map(|file| std::fs::read_to_string(file).ok())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_default();
+        let name = name.trim();
+        name.split('.').next().unwrap_or(name).to_owned()
+    })
+    .clone()
 }
 
 /// Where a view of `len` rows, `height` of them shown from `top`, is, as

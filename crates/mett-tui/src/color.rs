@@ -48,8 +48,38 @@ pub enum Object {
 /// How many `quoted` levels there are (`quoted` to `quoted9`).
 const QUOTED_LEVELS: usize = 10;
 
+/// Why a color command couldn't be used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColorError {
+    /// It is wrong: a bad color, a bad regular expression, missing words.
+    Bad(String),
+    /// It is mutt's, but mett doesn't do it yet (an object such as
+    /// `sidebar_new`, or a pattern mett doesn't know): it is ignored.
+    Unsupported(String),
+}
+
+impl std::fmt::Display for ColorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColorError::Bad(e) | ColorError::Unsupported(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for ColorError {
+    fn from(e: String) -> Self {
+        ColorError::Bad(e)
+    }
+}
+
+impl From<&str> for ColorError {
+    fn from(e: &str) -> Self {
+        ColorError::Bad(e.to_owned())
+    }
+}
+
 impl Object {
-    fn parse(name: &str) -> Result<Self, String> {
+    fn parse(name: &str) -> Result<Self, ColorError> {
         let name = name.to_ascii_lowercase();
         Ok(match name.as_str() {
             "normal" => Self::Normal,
@@ -71,7 +101,11 @@ impl Object {
             "quoted" => Self::Quoted(0),
             _ => match name.strip_prefix("quoted").and_then(|n| n.parse().ok()) {
                 Some(level) if level < QUOTED_LEVELS => Self::Quoted(level),
-                _ => return Err(format!("{name}: no such object")),
+                _ => {
+                    return Err(ColorError::Unsupported(format!(
+                        "color object {name} is not supported yet"
+                    )));
+                }
             },
         })
     }
@@ -220,7 +254,7 @@ impl Colors {
     }
 
     /// `color OBJECT [ATTRIBUTE ...] FOREGROUND BACKGROUND [EXPRESSION]`.
-    pub fn color(&mut self, args: &[String]) -> Result<(), String> {
+    pub fn color(&mut self, args: &[String]) -> Result<(), ColorError> {
         let (object, rest) = args
             .split_first()
             .ok_or("color: expected an object, colors and maybe a pattern")?;
@@ -255,29 +289,21 @@ impl Colors {
     }
 
     /// `mono OBJECT ATTRIBUTE [EXPRESSION]`: like `color`, for terminals
-    /// without colors. As in mutt on a terminal with colors, it is checked
-    /// but changes nothing.
-    pub fn mono(&self, args: &[String]) -> Result<(), String> {
+    /// without colors (see [`Palette`]).
+    pub fn mono(&mut self, args: &[String]) -> Result<(), ColorError> {
         let [object, attr, rest @ ..] = args else {
             return Err("mono: expected an object and an attribute".into());
         };
         let object = Object::parse(object)?;
         if attribute(attr).is_none() {
-            return Err(format!("mono: {attr}: no such attribute"));
+            return Err(format!("mono: {attr}: no such attribute").into());
         }
+        let style = with_attribute(Style::new(), attr);
         match (rest, object.matches()) {
-            ([], false) => Ok(()),
-            ([expression], true) => Self::default().set(object, Style::new(), Some(expression)),
+            ([], false) => self.set(object, style, None),
+            ([expression], true) => self.set(object, style, Some(expression)),
             _ => Err("mono: expected an object, an attribute and maybe an expression".into()),
         }
-    }
-
-    /// `unmono OBJECT [* | EXPRESSION ...]`: undoes `mono`, which changes
-    /// nothing; checked all the same.
-    pub fn unmono(&self, args: &[String]) -> Result<(), String> {
-        Self::default()
-            .uncolor(args)
-            .map_err(|e| e.replacen("uncolor", "unmono", 1))
     }
 
     fn set(
@@ -285,13 +311,16 @@ impl Colors {
         object: Object,
         style: Style,
         expression: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ColorError> {
         let Some(text) = expression else {
             *self.plain_mut(object) = style;
             return Ok(());
         };
         if object == Object::Index {
-            let pattern = Pattern::parse(text).map_err(|e| format!("color index: {e}"))?;
+            // A pattern mett doesn't know may be one of mutt's it doesn't
+            // do yet.
+            let pattern = Pattern::parse(text)
+                .map_err(|e| ColorError::Unsupported(format!("color index {text}: {e}")))?;
             // Given again, it takes its new colors and the last place.
             self.index.retain(|rule| rule.text != text);
             self.index.push(IndexRule {
@@ -323,18 +352,18 @@ impl Colors {
     /// `uncolor OBJECT [* | EXPRESSION ...]`: for `index`, `header` and
     /// `body`, forgets the rules for the expressions (`*` for all); other
     /// objects go back to their default.
-    pub fn uncolor(&mut self, args: &[String]) -> Result<(), String> {
+    pub fn uncolor(&mut self, args: &[String]) -> Result<(), ColorError> {
         let (object, expressions) = args.split_first().ok_or("uncolor: expected an object")?;
         let object = Object::parse(object)?;
         if !object.matches() {
             if !expressions.is_empty() {
-                return Err(format!("uncolor: {} takes no expression", args[0]));
+                return Err(format!("uncolor: {} takes no expression", args[0]).into());
             }
             *self.plain_mut(object) = *Colors::default().plain_mut(object);
             return Ok(());
         }
         if expressions.is_empty() {
-            return Err(format!("uncolor: {}: expected * or an expression", args[0]));
+            return Err(format!("uncolor: {}: expected * or an expression", args[0]).into());
         }
         let all = expressions.iter().any(|e| e == "*");
         let keep = |text: &String| !all && !expressions.contains(text);
@@ -373,6 +402,40 @@ impl Colors {
         let level = depth.saturating_sub(1).min(QUOTED_LEVELS - 1);
         self.normal.patch(self.quoted[level])
     }
+}
+
+/// The colors for terminals with colors (`color`) and without (`mono`),
+/// as mutt keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Palette {
+    /// What `color` sets.
+    pub color: Colors,
+    /// What `mono` sets.
+    pub mono: Colors,
+}
+
+impl Palette {
+    /// The colors to draw with.
+    pub fn active(&self, mono_terminal: bool) -> &Colors {
+        if mono_terminal {
+            &self.mono
+        } else {
+            &self.color
+        }
+    }
+}
+
+/// Whether the terminal shows no colors, going by the environment: `NO_COLOR`
+/// asks for none, and some terminal types have none.
+pub fn mono_terminal(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if env("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    let term = env("TERM").unwrap_or_default();
+    term == "dumb"
+        || term.ends_with("-mono")
+        || term.ends_with("-m")
+        || matches!(term.as_str(), "vt100" | "vt102" | "vt220")
 }
 
 /// A color by name, and whether it is a `bright` one (bold, in mutt).
@@ -477,26 +540,45 @@ mod tests {
             .unwrap();
         assert_eq!(colors.header_style("Subject: hi").fg, Some(Color::Yellow));
         assert_eq!(colors.header_style("From: a").fg, None);
-        // `mono` is for terminals without colors.
-        colors.mono(&words("body underline http://\\S+")).unwrap();
-        colors.mono(&words("indicator underline")).unwrap();
-        assert!(colors.body.is_empty());
-        assert!(!colors.indicator.add_modifier.contains(Modifier::UNDERLINED));
-        colors.unmono(&words("indicator")).unwrap();
-        assert!(colors.unmono(&words("index")).is_err());
-        assert!(colors.mono(&words("body underline (")).is_err());
+        // `mono` is for terminals without colors: its own palette.
+        let mut mono = Colors::default();
+        mono.mono(&words("body underline http://\\S+")).unwrap();
+        mono.mono(&words("indicator underline")).unwrap();
+        assert_eq!(mono.body.len(), 1);
+        assert_eq!(
+            mono.indicator,
+            Style::new().add_modifier(Modifier::UNDERLINED)
+        );
+        assert!(mono.mono(&words("body underline (")).is_err());
+        let palette = Palette {
+            color: colors.clone(),
+            mono,
+        };
+        assert_eq!(palette.active(false), &colors);
+        assert!(mono_terminal(
+            &|name| (name == "TERM").then(|| "vt100".into())
+        ));
+        assert!(!mono_terminal(
+            &|name| (name == "TERM").then(|| "xterm-256color".into())
+        ));
     }
 
     #[test]
     fn rejects_mistakes() {
         let mut colors = Colors::default();
+        assert!(matches!(
+            colors.color(&words("sidebar_new red blue")),
+            Err(ColorError::Unsupported(_))
+        ));
+        assert!(matches!(
+            colors.color(&words("index red blue ~Q")),
+            Err(ColorError::Unsupported(_))
+        ));
         for bad in [
             "",
-            "nothing red blue",
             "status red",
             "status mauve blue",
             "index red blue",
-            "index red blue ~Q",
             "body red blue (",
             "status red blue extra",
         ] {

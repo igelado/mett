@@ -91,10 +91,13 @@ colors of `normal`, `indicator`, `status` (and the help line), `error`,
 last that matches counts), and `header` and `body` a regular expression.
 Colors are `default`, the eight basic colors (with `bright` for the light
 ones), `colorN` and `#rrggbb`; attributes are `bold`, `underline`,
-`reverse`, `standout`, `blink`, `italic` and `none`. `mono` adds an
-attribute, and `uncolor` removes `index`, `header` and `body` rules (`*`
-for all) or sets an object back to its default. `tree`, `tilde` and
-`markers` are accepted but not drawn yet.
+`reverse`, `standout`, `blink`, `italic` and `none`. `uncolor` removes
+`index`, `header` and `body` rules (`*` for all) or sets an object back to
+its default. As in mutt, `mono` and `unmono` set the attributes used
+instead on a terminal without colors (`TERM` such as `vt100` or `dumb`,
+or `NO_COLOR` set). Objects and patterns mett doesn't do yet (such as
+`color compose ...` or `color index ... ~T`) are ignored with a warning.
+`tree`, `tilde` and `markers` are accepted but not drawn yet.
 
 `mett -D` prints every setting after reading the configuration, which is a
 quick way to check it:

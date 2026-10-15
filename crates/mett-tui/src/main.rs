@@ -311,7 +311,10 @@ fn settings_keeping(
         status_format: config.string("status_format").to_owned(),
         date_format: config.string("date_format").to_owned(),
         quote,
-        colors: config.colors().clone(),
+        colors: config
+            .colors()
+            .active(color::mono_terminal(&|name| std::env::var(name).ok()))
+            .clone(),
     };
     Ok(Settings {
         page_size,
