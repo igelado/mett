@@ -672,6 +672,46 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_next_entry_survives_its_message_going() {
+        let settings = Settings {
+            ordering: Ordering {
+                sort: Sort::parse("subject", true).unwrap(),
+                ..Ordering::default()
+            },
+            ..Settings::default()
+        };
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let (mut app, effects) = App::open(80, 24, inbox, settings);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![named("a"), named("b")],
+                next: Some(mett_core::PageCursor::new("in next")),
+            })),
+        }));
+        let Effect::Request(next, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        act(&mut app, Action::LastEntry);
+        act(&mut app, Action::NextEntry);
+        // b goes (moved elsewhere, say) before the next page comes.
+        app.remove_messages(&std::collections::HashSet::from([MessageId::new("b")]));
+        page(&mut app, next, vec![named("c"), named("d")]);
+        assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    }
+
+    #[test]
     fn a_pending_move_from_a_folded_message_goes_after_its_thread() {
         let mut app = app();
         act(&mut app, Action::CollapseAll);

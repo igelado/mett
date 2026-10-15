@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use mett_core::{Error, FlagsUpdate, Folder, FolderId, MessageId, Page};
 
 use super::composing::{Input, Question};
-use super::{App, Effect, Screen, effect_id};
+use super::{App, Effect, Screen, Target, effect_id};
 use crate::action::Action;
 use crate::config::Quad;
 use crate::config::mailbox::{FolderPath, MailboxError, configured_path};
@@ -996,6 +996,27 @@ impl App {
             .iter()
             .filter(|m| gone.contains(&m.id))
             .count();
+        // A pending move from a message that goes counts from the message
+        // before it (or the top), not from the end it can no longer find.
+        if let Some(Target::After(anchor, steps)) = &self.pending
+            && gone.contains(anchor)
+        {
+            let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+            let at = shown(anchor).or_else(|| self.thread_of(anchor).and_then(|t| shown(&t.root)));
+            if let Some(at) = at {
+                let steps = *steps;
+                self.pending = Some(
+                    match self.messages[..=at]
+                        .iter()
+                        .rev()
+                        .find(|m| !gone.contains(&m.id))
+                    {
+                        Some(kept) => Target::After(kept.id.clone(), steps),
+                        None => Target::Entry(steps - 1),
+                    },
+                );
+            }
+        }
         self.messages.retain(|m| !gone.contains(&m.id));
         self.hidden.retain(|m| !gone.contains(&m.id));
         self.folded.retain(|m| !gone.contains(&m.id));
