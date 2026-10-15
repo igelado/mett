@@ -9,12 +9,12 @@ use mett_core::{Address, MessageSummary};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
-use crate::app::{App, Browser, Compose, Input, Pager, Row, Screen, SignIn};
+use crate::app::{App, Browser, Compose, Input, Pager, Row, Screen, SignIn, highlighted};
 use crate::keymap::{Keymap, Menu};
 use crate::text::{fit, truncate, wrap_all};
 
@@ -430,10 +430,14 @@ fn index_status(app: &App) -> String {
         0 => String::new(),
         n => format!(" Del:{n}"),
     };
-    format!(
-        "-*-mett: {folder} [Msgs:{} New:{new}{deleted}]{incomplete}---",
-        app.messages.len()
-    )
+    let (count, limit) = match &app.limit {
+        Some(limit) => (
+            format!("{}/{}", app.messages.len(), app.total_messages()),
+            format!(" [Limit: {}]", limit.text),
+        ),
+        None => (app.messages.len().to_string(), String::new()),
+    };
+    format!("-*-mett: {folder} [Msgs:{count} New:{new}{deleted}]{limit}{incomplete}---")
 }
 
 /// Draws the pager body and returns its status line.
@@ -455,11 +459,28 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     let height = usize::from(area.height);
     let last_top = lines.len().saturating_sub(height);
     let top = pager.scroll.min(last_top);
+    // The last search's match, where the rows are the app's.
+    let found = if pager.rows_width == Some(width) {
+        highlighted(pager)
+    } else {
+        Vec::new()
+    };
     let visible: Vec<Line> = lines
         .iter()
+        .enumerate()
         .skip(top)
         .take(height)
-        .map(|l| Line::raw(l.as_str()))
+        .map(|(row, l)| match found.iter().find(|(r, _)| *r == row) {
+            Some((_, range)) => Line::from(vec![
+                Span::raw(&l[..range.start]),
+                Span::styled(
+                    &l[range.clone()],
+                    Style::new().add_modifier(Modifier::REVERSED),
+                ),
+                Span::raw(&l[range.end..]),
+            ]),
+            None => Line::raw(l.as_str()),
+        })
         .collect();
     frame.render_widget(Paragraph::new(visible), area);
 

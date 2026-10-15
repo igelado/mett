@@ -116,6 +116,8 @@ impl Keymap {
             (Key::char('C'), CopyMessage),
             (Key::char('c'), ChangeFolder),
             (Key::char('y'), BrowseMailboxes),
+            (Key::char('/'), Search),
+            (Key::char('n'), SearchNext),
         ];
 
         let index: &[(Key, Action)] = &[
@@ -140,6 +142,7 @@ impl Keymap {
             (Key::char('r'), Reply),
             (Key::char('g'), GroupReply),
             (Key::char('f'), Forward),
+            (Key::char('l'), Limit),
         ];
         for (key, action) in index.iter().chain(mailbox) {
             keymap.bind(Menu::Index, *key, *action);

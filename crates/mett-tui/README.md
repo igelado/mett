@@ -7,7 +7,8 @@ Architecture (`docs/DESIGN.md` §5.2):
   `app/composing.rs` has the steps of writing a message.
 - **`compose.rs`:** how replies and forwards are built (quoting,
   attribution, recipients, signature); **`lineedit.rs`:** the line editor
-  for questions such as `To:`; **`editor.rs`:** runs the external editor.
+  for questions such as `To:`; **`editor.rs`:** runs the external editor;
+  **`pattern.rs`:** mutt's patterns, for searching and limiting.
 - **`view.rs`:** draws the model with [ratatui](https://ratatui.rs).
 - **`action.rs` and `keymap.rs`:** mutt-style named actions, and key bindings
   for each menu (the Command pattern, §5.3).
@@ -119,7 +120,7 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 |------|------|
 | Index | `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
-| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `s`/`C`: move or copy to another folder. `c`: open another folder. `y`: the folder browser. |
+| Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `s`/`C`: move or copy to another folder. `c`: open another folder. `y`: the folder browser. |
 | Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
 | Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. |
 | Questions | Type the answer and press `Enter`; `Esc` or `^G` gives up. The usual line-editing keys work (`^A`, `^E`, `^U`, `^K`, `^W`, arrows). Yes/no questions take `y`, `n`, or `Enter` for the suggested answer. |
