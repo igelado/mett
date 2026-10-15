@@ -259,6 +259,9 @@ pub struct App {
     compose_fetch: Option<(RequestId, Kind)>,
     /// How to write messages.
     settings: crate::compose::Settings,
+    /// The open folder gained a message while a pager was open: list it
+    /// again once back in the index.
+    relist_on_return: bool,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -325,6 +328,7 @@ impl App {
             composing: None,
             compose_fetch: None,
             settings: settings.compose,
+            relist_on_return: false,
             path,
             opening: None,
             width: usize::from(width),
@@ -560,6 +564,7 @@ impl App {
             .chain(self.listing)
             .chain(fetching)
             .chain(self.flag_updates.keys().copied())
+            .chain(self.delivery_request())
             .collect()
     }
 
@@ -592,6 +597,10 @@ impl App {
     fn retry(&mut self) -> Vec<Effect> {
         if self.quit {
             return self.retry_saves();
+        }
+        let delivery = self.retry_delivery();
+        if !delivery.is_empty() {
+            return delivery;
         }
         if self.folder.is_none() {
             if self.opening.is_none() {
@@ -673,6 +682,10 @@ impl App {
             Action::Quit => self.quit = true,
             Action::Exit => {
                 self.screens.pop();
+                if self.relist_on_return && self.screen() == &Screen::Index {
+                    self.relist_on_return = false;
+                    return self.relist();
+                }
             }
             // As in mutt, j and k in the pager show the next or previous
             // message.

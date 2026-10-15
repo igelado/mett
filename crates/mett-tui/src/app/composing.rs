@@ -102,6 +102,11 @@ pub struct Compose {
     pub draft: Draft,
     /// The request sending or postponing it, while it is pending.
     pub delivery: Option<(RequestId, Delivery)>,
+    /// Sending or postponing it failed for want of a sign-in: the sign-in
+    /// window's Retry tries again.
+    pub(super) unauthorized: Option<Delivery>,
+    /// It forwards a message with attachments, which go with it.
+    pub forwarded_attachments: bool,
 }
 
 /// What happens to a finished message.
@@ -363,8 +368,13 @@ impl App {
                     Ok(list) => list,
                     Err(e) => {
                         // Ask again, keeping what was typed.
-                        self.status = e.to_string();
+                        // Ask again, keeping what was typed, and say why on
+                        // the line itself, where the question hides the
+                        // status.
                         self.ask_line(question, &text);
+                        if let Some(Input::Line { prompt, .. }) = &mut self.input {
+                            *prompt = format!("{e}. {prompt}");
+                        }
                         return Vec::new();
                     }
                 };
@@ -476,9 +486,16 @@ impl App {
 
     fn open_compose_menu(&mut self) -> Vec<Effect> {
         if let Some(composing) = self.composing.take() {
+            let forwarded_attachments = composing.kind == Kind::Forward
+                && composing
+                    .original
+                    .as_ref()
+                    .is_some_and(|m| m.summary.has_attachments);
             self.screens.push(Screen::Compose(Compose {
                 draft: composing.draft,
                 delivery: None,
+                unauthorized: None,
+                forwarded_attachments,
             }));
         }
         Vec::new()
@@ -568,6 +585,7 @@ impl App {
             return Vec::new();
         };
         let delivery = compose.delivery.take().map(|(_, d)| d);
+        compose.unauthorized = None;
         match result {
             Ok(()) => {
                 self.screens.remove(position);
@@ -582,12 +600,45 @@ impl App {
                     _ => WellKnownFolder::SentItems,
                 };
                 if self.folder.as_ref().and_then(|f| f.well_known) == Some(landed_in) {
-                    return self.relist();
+                    // Not under a pager, whose message and position would
+                    // no longer match the index: once back in the index.
+                    if self.screen() == &Screen::Index {
+                        return self.relist();
+                    }
+                    self.relist_on_return = true;
                 }
             }
-            Err(e) => self.report(e),
+            Err(e) => {
+                if matches!(e, mett_core::Error::Auth(_)) {
+                    compose.unauthorized = delivery;
+                }
+                self.report(e);
+            }
         }
         Vec::new()
+    }
+
+    /// Sends or postpones again the message whose delivery failed for want
+    /// of a sign-in.
+    pub(super) fn retry_delivery(&mut self) -> Vec<Effect> {
+        let Some(Screen::Compose(compose)) = self.screens.last_mut() else {
+            return Vec::new();
+        };
+        match compose.unauthorized.take() {
+            Some(delivery) => self.deliver(delivery),
+            None => Vec::new(),
+        }
+    }
+
+    /// The request sending or postponing a message, while it is pending.
+    pub(super) fn delivery_request(&self) -> Option<RequestId> {
+        self.screens.iter().find_map(|s| match s {
+            Screen::Compose(Compose {
+                delivery: Some((id, _)),
+                ..
+            }) => Some(*id),
+            _ => None,
+        })
     }
 
     /// Whether a message is being sent or postponed.
@@ -886,8 +937,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::Mail);
         answer(&mut app, "bob");
-        assert_eq!(app.status, "bad address \"bob\"");
-        assert_eq!(prompt(&app), "To: bob");
+        assert_eq!(prompt(&app), "bad address \"bob\". To: bob");
     }
 
     #[test]
@@ -1000,5 +1050,53 @@ mod tests {
             "{effects:?}"
         );
         assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn a_send_that_needed_a_sign_in_is_retried() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, sent) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Auth("expired".into()))),
+        }));
+        let (_, again) = request(&act(&mut app, Action::Retry));
+        assert_eq!(again, sent);
+    }
+
+    #[test]
+    fn sent_items_is_listed_again_once_the_pager_closes() {
+        let mut app = app(settings());
+        app.folder = Some(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
+        ));
+        let (fetch, _) = request(&act(&mut app, Action::DisplayMessage));
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(original())),
+        }));
+        app.settings.include = Quad::No;
+        app.settings.fast_reply = true;
+        act(&mut app, Action::Reply);
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        let effects = app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Ok(())),
+        }));
+        assert!(effects.is_empty(), "not under the pager");
+        assert_eq!(app.messages.len(), 1);
+        let effects = act(&mut app, Action::Exit);
+        assert!(matches!(request(&effects).1, Request::ListMessages { .. }));
     }
 }

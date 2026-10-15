@@ -174,8 +174,16 @@ fn render_compose(compose: &Compose, frame: &mut Frame, area: Rect) -> String {
         ))
         .style(REVERSED),
     );
+    let mut parts = 1;
+    if compose.forwarded_attachments {
+        parts += 1;
+        lines.push(Line::raw(truncate(
+            "- A     2 <the forwarded message's attachments>",
+            width,
+        )));
+    }
     frame.render_widget(Paragraph::new(lines), area);
-    format!("-- mett: Compose  [Approx. msg size: {size}   Atts: 1]---")
+    format!("-- mett: Compose  [Approx. msg size: {size}   Atts: {parts}]---")
 }
 
 /// A size the way mutt shows it: `0.5K`, `12K`, `1.2M`.
@@ -697,5 +705,31 @@ mod tests {
         assert_eq!(format_size(100), "0.1K");
         assert_eq!(format_size(20 * 1024), "20K");
         assert_eq!(format_size(3 * 1024 * 1024 / 2), "1.5M");
+    }
+
+    #[test]
+    fn a_forward_shows_the_attachments_it_carries() {
+        let mut app = app(1);
+        app.update(Msg::Action(Action::Forward));
+        let effects = app.update(Msg::Action(Action::Forward));
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        let mut message = mock::message("m0", "in", "Subject 0", received(0));
+        message.summary.has_attachments = true;
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(message)),
+        }));
+        let key = |code| Msg::Key(ratatui::crossterm::event::KeyEvent::from(code));
+        for c in "bob@x.org".chars() {
+            app.update(key(ratatui::crossterm::event::KeyCode::Char(c)));
+        }
+        app.update(key(ratatui::crossterm::event::KeyCode::Enter));
+        app.update(key(ratatui::crossterm::event::KeyCode::Enter));
+        app.update(Msg::Edited(Ok("see below".into())));
+        let lines = sized_screen(&app, WIDTH, 13);
+        assert_eq!(lines[9], "- A     2 <the forwarded message's attachments>");
+        assert!(lines[11].contains("Atts: 2"), "{lines:#?}");
     }
 }
