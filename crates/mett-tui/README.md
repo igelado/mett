@@ -97,7 +97,7 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 |------|------|
 | Index | `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
-| Sign-in window | `o`: open the sign-in page in a browser. `q`/`Esc`: cancel, or close after a failure. `Enter`: try again after a failure. |
+| Sign-in window | `o`: open the sign-in page in a browser. `q`/`Esc`: cancel, or close after a failure. `Enter`: try again after a failure. `j`/`k` or arrows: scroll, when the terminal is too small to show it all. |
 
 Check that:
 

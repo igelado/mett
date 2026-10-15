@@ -6,7 +6,6 @@
 
 use chrono::Local;
 use mett_core::{Address, MessageSummary};
-use mett_msgraph::SignInPrompt;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -74,10 +73,13 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) {
     };
     frame.render_widget(Paragraph::new(status_line).style(REVERSED), status);
     frame.render_widget(Paragraph::new(app.status.as_str()), message);
-    // The window may cover the whole screen: on a small terminal, the
-    // sign-in instructions matter more than the index behind them.
+    // The window may cover everything but the help line, which lists its
+    // keys: on a small terminal, the sign-in instructions matter more than
+    // the index behind them.
     if let Some(window) = &app.sign_in {
-        render_sign_in(window, keymap, frame, frame.area());
+        let [_, below_help] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+        render_sign_in(window, keymap, frame, below_help);
     }
 }
 
@@ -85,83 +87,44 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) {
 /// whole width, without side borders, so that the sign-in link can be
 /// copied from the terminal without stray characters.
 fn render_sign_in(window: &SignIn, keymap: &Keymap, frame: &mut Frame, area: Rect) {
-    let key = |action| {
-        keymap
-            .key_for(Menu::SignIn, action)
-            .map(|key| key.to_string())
+    let rows = window.rows(usize::from(area.width));
+    let height = usize::from(area.height);
+    // Without room for everything, show what fits from the scroll
+    // position, and say how to scroll.
+    let fits = rows.len() + 2 <= height;
+    let top = if fits {
+        0
+    } else {
+        window
+            .scroll
+            .min(rows.len().saturating_sub(height.saturating_sub(2)))
     };
-    let mut lines: Vec<String> = Vec::new();
-    let mut code = None;
-    match &window.prompt {
-        Some(SignInPrompt::OpenBrowser { url }) => {
-            lines.push("Sign in in your browser. If it did not open, visit:".into());
-            lines.push(String::new());
-            lines.push(url.to_string());
-        }
-        Some(SignInPrompt::EnterCode {
-            verification_uri,
-            user_code,
-            ..
-        }) => {
-            lines.push(format!(
-                "To sign in, visit {verification_uri} on any device and enter the code:"
-            ));
-            lines.push(String::new());
-            code = Some(lines.len());
-            lines.push(format!("    {user_code}"));
-        }
-        None => {}
-    }
-    if !lines.is_empty() {
-        lines.push(String::new());
-    }
-    let mut hints = Vec::new();
-    match &window.failure {
-        Some(failure) => {
-            lines.push(format!("Sign-in failed: {failure}"));
-            if let Some(retry) = key(Action::Retry) {
-                hints.push(format!("{retry} to try again"));
-            }
-            if let Some(close) = key(Action::Exit) {
-                hints.push(format!("{close} to close this window"));
-            }
-        }
-        None => {
-            lines.push("Waiting for you to sign in...".into());
-            if let Some(open) = key(Action::OpenBrowser) {
-                hints.push(format!("{open} to open the page in a browser"));
-            }
-            if let Some(cancel) = key(Action::Exit) {
-                hints.push(format!("{cancel} to cancel"));
-            }
+    let visible: Vec<Line> = rows
+        .into_iter()
+        .skip(top)
+        .map(|(row, bold)| {
+            let style = if bold {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            Line::styled(row, style)
+        })
+        .collect();
+    let mut title = format!(" Sign in to {} ", window.account);
+    if !fits {
+        let key = |action| keymap.key_for(Menu::SignIn, action);
+        if let (Some(down), Some(up)) = (key(Action::NextLine), key(Action::PreviousLine)) {
+            title.push_str(&format!("({down}/{up} to scroll) "));
         }
     }
-    if !hints.is_empty() {
-        lines.push(format!("Press {}.", hints.join(", ")));
-    }
-
-    let width = usize::from(area.width);
-    let mut rows: Vec<Line> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let style = if Some(i) == code {
-            Style::new().add_modifier(Modifier::BOLD)
-        } else {
-            Style::new()
-        };
-        rows.extend(
-            wrap_all(std::slice::from_ref(line), width)
-                .into_iter()
-                .map(|row| Line::styled(row, style)),
-        );
-    }
-    let title = format!(" Sign in to {} ", window.account);
-    let height = u16::try_from(rows.len() + 2).unwrap_or(u16::MAX);
+    let height = u16::try_from(visible.len() + 2).unwrap_or(u16::MAX);
     let [popup] = Layout::vertical([Constraint::Length(height)])
         .flex(Flex::Center)
         .areas(area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(rows).block(
+        Paragraph::new(visible).block(
             Block::new()
                 .borders(Borders::TOP | Borders::BOTTOM)
                 .title(title),
@@ -307,6 +270,7 @@ mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use mett_core::mock;
     use mett_core::{MessagePage, WellKnownFolder};
+    use mett_msgraph::SignInPrompt;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use unicode_width::UnicodeWidthStr;
@@ -476,7 +440,10 @@ mod tests {
             "{lines:#?}"
         );
         assert!(window.contains("    ABCD-EFGH"), "{lines:#?}");
-        assert!(window.contains("Press o to open the page"), "{lines:#?}");
+        assert!(
+            window.contains("Waiting for you to sign in..."),
+            "{lines:#?}"
+        );
 
         app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
             account: mett_core::AccountId::new("alice@contoso.com"),
@@ -484,5 +451,25 @@ mod tests {
         }));
         let window = sized_screen(&app, 60, 12).join("\n");
         assert!(window.contains("Sign-in failed: denied"), "{window}");
+    }
+
+    #[test]
+    fn a_long_sign_in_link_can_be_scrolled_into_view() {
+        let mut app = app(1);
+        let url = format!("https://login.example/authorize?{}end", "x".repeat(400));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        let lines = screen(&app);
+        assert!(lines[1].contains("j/k to scroll"), "{lines:#?}");
+        for _ in 0..20 {
+            app.update(Msg::Action(Action::NextLine));
+        }
+        let shown = screen(&app).join("\n");
+        assert!(shown.contains("end"), "{shown}");
+        assert!(shown.contains("Waiting for you to sign in..."), "{shown}");
     }
 }

@@ -5,7 +5,7 @@
 //! to a [`Msg`]; side effects come back as [`Effect`]s for the main loop to
 //! carry out. This keeps the UI logic testable without a terminal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 use mett_msgraph::SignInPrompt;
@@ -114,6 +114,57 @@ pub struct SignIn {
     pub prompt: Option<SignInPrompt>,
     /// Why the sign-in failed, once it has.
     pub failure: Option<String>,
+    /// How far the window's text is scrolled, for terminals too small to
+    /// show it all.
+    pub scroll: usize,
+}
+
+impl SignIn {
+    /// The window's text wrapped to `width`, with whether each row is
+    /// highlighted. The keys are on the help line.
+    pub fn rows(&self, width: usize) -> Vec<(String, bool)> {
+        let mut lines: Vec<(String, bool)> = Vec::new();
+        match &self.prompt {
+            Some(SignInPrompt::OpenBrowser { url }) => {
+                lines.push((
+                    "Sign in in your browser. If it did not open, visit:".into(),
+                    false,
+                ));
+                lines.push((String::new(), false));
+                lines.push((url.to_string(), false));
+            }
+            Some(SignInPrompt::EnterCode {
+                verification_uri,
+                user_code,
+                ..
+            }) => {
+                lines.push((
+                    format!(
+                        "To sign in, visit {verification_uri} on any device and enter the code:"
+                    ),
+                    false,
+                ));
+                lines.push((String::new(), false));
+                lines.push((format!("    {user_code}"), true));
+            }
+            None => {}
+        }
+        if !lines.is_empty() {
+            lines.push((String::new(), false));
+        }
+        lines.push(match &self.failure {
+            Some(failure) => (format!("Sign-in failed: {failure}"), false),
+            None => ("Waiting for you to sign in...".into(), false),
+        });
+        lines
+            .into_iter()
+            .flat_map(|(line, bold)| {
+                text::wrap(&line, width)
+                    .into_iter()
+                    .map(move |row| (row, bold))
+            })
+            .collect()
+    }
 }
 
 /// The whole UI state.
@@ -163,8 +214,9 @@ pub struct App {
     /// The message that last failed to open, so that opening it can be
     /// retried.
     unfetched: Option<MessageId>,
-    /// The user asked to retry before the failed request reported back.
-    retry_when_reported: bool,
+    /// When the user asks to retry, the requests that had not reported
+    /// back yet; what failed among them is retried once they all have.
+    retry_after: HashSet<RequestId>,
     next_request: u64,
     /// How many messages to request per page.
     page_size: u32,
@@ -202,7 +254,7 @@ impl App {
             pending: None,
             flag_updates: HashMap::new(),
             unfetched: None,
-            retry_when_reported: false,
+            retry_after: HashSet::new(),
             next_request: 0,
             page_size,
         };
@@ -270,7 +322,7 @@ impl App {
         match event {
             SignInEvent::Prompt { account, prompt } => {
                 self.sign_in_cancelled = false;
-                self.retry_when_reported = false;
+                self.retry_after.clear();
                 let effects = match &prompt {
                     // The browser flow needs the browser: open it straight
                     // away. The device code flow is for when there is none.
@@ -281,6 +333,7 @@ impl App {
                     account,
                     prompt: Some(prompt),
                     failure: None,
+                    scroll: 0,
                 });
                 effects
             }
@@ -309,6 +362,7 @@ impl App {
                     account,
                     prompt: None,
                     failure: None,
+                    scroll: 0,
                 });
                 window.failure = Some(e);
                 Vec::new()
@@ -339,34 +393,54 @@ impl App {
                 };
                 return vec![Effect::OpenUrl(url)];
             }
+            Action::NextLine | Action::PreviousLine => {
+                // The window covers all but the help line, and has a
+                // border above and below its text.
+                let room = self.body_height + CHROME_ROWS - 1 - 2;
+                let last = window.rows(self.width).len().saturating_sub(room);
+                if let Some(window) = &mut self.sign_in {
+                    window.scroll = if action == Action::NextLine {
+                        (window.scroll + 1).min(last)
+                    } else {
+                        window.scroll.saturating_sub(1)
+                    };
+                }
+            }
             Action::Retry if failed => {
                 self.sign_in = None;
-                let effects = self.retry();
-                // The request that failed may not have reported back yet:
-                // retry once it does.
-                self.retry_when_reported = effects.is_empty() && self.awaiting_responses();
-                return effects;
+                // Requests that needed the sign-in may not have reported
+                // back yet: retry them once they have.
+                self.retry_after = self.in_flight();
+                return self.retry();
             }
             _ => {}
         }
         Vec::new()
     }
 
-    /// Whether requests that [`Self::retry`] can repeat are still waiting
-    /// for their responses.
-    fn awaiting_responses(&self) -> bool {
-        let fetching = matches!(self.screen(), Screen::Pager(Pager { message: None, .. }));
-        self.opening.is_some()
-            || self.listing.is_some()
-            || fetching
-            || !self.flag_updates.is_empty()
+    /// The requests that [`Self::retry`] can repeat and that are still
+    /// waiting for their responses.
+    fn in_flight(&self) -> HashSet<RequestId> {
+        let fetching = match self.screen() {
+            Screen::Pager(Pager {
+                message: None,
+                request,
+                ..
+            }) => Some(*request),
+            _ => None,
+        };
+        self.opening
+            .into_iter()
+            .chain(self.listing)
+            .chain(fetching)
+            .chain(self.flag_updates.keys().copied())
+            .collect()
     }
 
-    /// Retries, if the user asked to before the failed requests reported
-    /// back and they all have now.
-    fn retry_if_requested(&mut self) -> Vec<Effect> {
-        if self.retry_when_reported && !self.awaiting_responses() {
-            self.retry_when_reported = false;
+    /// Retries once the last of the requests that were pending when the
+    /// user asked to retry has reported back.
+    fn retry_if_requested(&mut self, id: RequestId) -> Vec<Effect> {
+        if self.retry_after.remove(&id) && self.retry_after.is_empty() {
             self.retry()
         } else {
             Vec::new()
@@ -523,8 +597,9 @@ impl App {
     }
 
     fn on_response(&mut self, response: Response) -> Vec<Effect> {
+        let id = response.id;
         let mut effects = self.handle_response(response);
-        effects.extend(self.retry_if_requested());
+        effects.extend(self.retry_if_requested(id));
         effects
     }
 
@@ -1552,6 +1627,40 @@ mod tests {
                     Effect::Request(_, Request::ListMessages { .. }),
                     Effect::Request(_, Request::FetchMessage(_)),
                 ]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn retry_resends_failures_at_once_and_waits_for_the_rest() {
+        let (mut app, list) = loading_more(1);
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, _)] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        // The fetch has failed; the page hasn't reported back yet.
+        app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("denied".into()))),
+        }));
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        let effects = act(&mut app, Action::Retry);
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::FetchMessage(_))]
+            ),
+            "{effects:?}"
+        );
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::ListMessages { .. })]
             ),
             "{effects:?}"
         );

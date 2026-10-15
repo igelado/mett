@@ -1205,3 +1205,29 @@ async fn requests_waiting_on_a_cancelled_sign_in_do_not_prompt_again() {
     assert!(auth.access_token().await.is_err());
     assert_eq!(recorder.0.prompts.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn reports_a_sign_in_confirmed_later_as_finished() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    // Graph can't confirm the user at first.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    me(&server, "a1", "alice@contoso.com").await;
+
+    let outcomes = Outcomes::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        outcomes.clone(),
+    );
+    assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
+    assert_eq!(*outcomes.0.lock().unwrap(), [false, true]);
+}

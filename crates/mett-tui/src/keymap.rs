@@ -147,6 +147,10 @@ impl Keymap {
             (Key::new(Esc), Exit),
             (Key::char('o'), OpenBrowser),
             (Key::new(Enter), Retry),
+            (Key::char('j'), NextLine),
+            (Key::new(Down), NextLine),
+            (Key::char('k'), PreviousLine),
+            (Key::new(Up), PreviousLine),
         ];
         for (key, action) in sign_in {
             keymap.bind(Menu::SignIn, *key, *action);

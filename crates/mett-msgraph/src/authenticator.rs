@@ -371,6 +371,13 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                 Ok(token) => token,
                 Err(e) => return state.unexpired_access().ok_or(e),
             };
+            // Tokens not from the store come from an interactive sign-in,
+            // which was reported as failed when it couldn't be confirmed:
+            // report that it succeeded after all.
+            if stored.is_none() {
+                state.failed_sign_in = None;
+                self.prompter.finished(Ok(()));
+            }
             // The check may have taken a while; if the token is no longer
             // usable, continue with the confirmed refresh token below.
             if state.usable(&token, Utc::now()) {
