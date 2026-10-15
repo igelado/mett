@@ -11,6 +11,7 @@ mod app;
 mod config;
 mod demo;
 mod keymap;
+mod signin;
 mod text;
 mod view;
 mod worker;
@@ -25,6 +26,7 @@ use tokio::sync::mpsc;
 use crate::app::{App, Effect, Msg};
 use crate::config::mailbox::FolderPath;
 use crate::keymap::{Key, Keymap};
+use crate::signin::{CancelHandle, SignInEvent, TuiPrompter};
 use crate::worker::{Request, RequestId};
 
 const USAGE: &str = "usage: mett [-n] [-F <file>] [-D] [--demo]
@@ -127,23 +129,50 @@ fn main() -> ExitCode {
         let Some(runtime) = runtime() else {
             return ExitCode::FAILURE;
         };
-        // Sign in before the TUI takes over the terminal, so that the
-        // browser link or device code can be seen.
-        let mailbox = match runtime.block_on(account::connect(&config, &spoolfile)) {
+        // Signing in happens in the TUI, in the sign-in window, when the
+        // folder is first opened.
+        let (events, sign_in) = mpsc::unbounded_channel();
+        let (prompter, cancel) = TuiPrompter::new(spoolfile.account.clone(), events);
+        let mailbox = match account::mailbox(&config, &spoolfile, prompter) {
             Ok(mailbox) => mailbox,
             Err(e) => {
                 eprintln!("mett: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        return start(&runtime, Arc::new(mailbox), spoolfile.folder, page_size);
+        let session = Session {
+            folder: spoolfile.folder,
+            page_size,
+            sign_in,
+            cancel: Some(cancel),
+        };
+        return start(&runtime, Arc::new(mailbox), session);
     }
 
     let Some(runtime) = runtime() else {
         return ExitCode::FAILURE;
     };
-    let inbox = FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new());
-    start(&runtime, Arc::new(demo::mailbox()), inbox, app::PAGE_SIZE)
+    // The demo mailbox never signs in, so nothing is ever sent here.
+    let (_, sign_in) = mpsc::unbounded_channel();
+    let session = Session {
+        folder: FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new()),
+        page_size: app::PAGE_SIZE,
+        sign_in,
+        cancel: None,
+    };
+    start(&runtime, Arc::new(demo::mailbox()), session)
+}
+
+/// What the TUI works with, besides the mailbox.
+struct Session {
+    /// The folder to open.
+    folder: FolderPath,
+    /// How many messages to list per request.
+    page_size: u32,
+    /// Events from the mailbox's sign-in.
+    sign_in: mpsc::UnboundedReceiver<SignInEvent>,
+    /// Cancels the sign-in in progress, for mailboxes that sign in.
+    cancel: Option<CancelHandle>,
 }
 
 fn runtime() -> Option<tokio::runtime::Runtime> {
@@ -156,16 +185,15 @@ fn runtime() -> Option<tokio::runtime::Runtime> {
     }
 }
 
-/// Runs the TUI on `store`, opening `folder`.
+/// Runs the TUI on `store`.
 fn start<S: mett_core::MailStore + 'static>(
     runtime: &tokio::runtime::Runtime,
     store: Arc<S>,
-    folder: FolderPath,
-    page_size: u32,
+    session: Session,
 ) -> ExitCode {
     // `init` also restores the terminal if mett panics.
     let terminal = ratatui::init();
-    let result = runtime.block_on(run(terminal, store, folder, page_size));
+    let result = runtime.block_on(run(terminal, store, session));
     ratatui::restore();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -179,9 +207,14 @@ fn start<S: mett_core::MailStore + 'static>(
 async fn run<S: mett_core::MailStore + 'static>(
     mut terminal: DefaultTerminal,
     store: Arc<S>,
-    folder: FolderPath,
-    page_size: u32,
+    session: Session,
 ) -> std::io::Result<()> {
+    let Session {
+        folder,
+        page_size,
+        sign_in: mut sign_in_rx,
+        cancel,
+    } = session;
     let keymap = Keymap::mutt_defaults();
 
     let (request_tx, request_rx) = mpsc::unbounded_channel::<(RequestId, Request)>();
@@ -203,7 +236,7 @@ async fn run<S: mett_core::MailStore + 'static>(
 
     let size = terminal.size()?;
     let (mut app, effects) = App::open(size.width, size.height, folder, page_size);
-    dispatch(&request_tx, effects);
+    dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
 
     while !app.quit {
         terminal.draw(|frame| view::render(&app, &keymap, frame))?;
@@ -229,6 +262,7 @@ async fn run<S: mett_core::MailStore + 'static>(
                 },
             },
             Some(response) = response_rx.recv() => Msg::Response(response),
+            Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
             else => break,
         };
         if matches!(msg, Msg::Action(_)) {
@@ -236,7 +270,7 @@ async fn run<S: mett_core::MailStore + 'static>(
             app.status.clear();
         }
         let effects = app.update(msg);
-        dispatch(&request_tx, effects);
+        dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
     }
 
     // Give pending changes (such as marking a message read) a moment to
@@ -279,9 +313,31 @@ async fn run<S: mett_core::MailStore + 'static>(
 /// How long to wait for pending changes when quitting.
 const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn dispatch(requests: &mpsc::UnboundedSender<(RequestId, Request)>, effects: Vec<Effect>) {
-    for Effect::Request(id, request) in effects {
-        // The worker only stops when this sender is dropped.
-        let _ = requests.send((id, request));
+/// Carries out `effects`.
+fn dispatch(
+    app: &mut App,
+    requests: &mpsc::UnboundedSender<(RequestId, Request)>,
+    cancel: Option<&CancelHandle>,
+    effects: Vec<Effect>,
+) {
+    for effect in effects {
+        match effect {
+            Effect::Request(id, request) => {
+                // The worker only stops when this sender is dropped.
+                let _ = requests.send((id, request));
+            }
+            // The browser's output would garble the screen; `open` sends
+            // it nowhere.
+            Effect::OpenUrl(url) => {
+                if let Err(e) = open::that_detached(&url) {
+                    app.status = format!("Could not open a browser: {e}");
+                }
+            }
+            Effect::CancelSignIn => {
+                if let Some(cancel) = cancel {
+                    cancel.cancel();
+                }
+            }
+        }
     }
 }

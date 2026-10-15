@@ -18,6 +18,6 @@ mod token_store;
 
 pub use authenticator::GraphAuthenticator;
 pub use mailbox::GraphMailStore;
-pub use prompt::{Prompter, SignInPrompt};
+pub use prompt::{Cancelled, Prompter, SignInPrompt};
 pub use settings::{AuthFlow, AuthSettings, Cloud, DEFAULT_SCOPES, UnknownCloud};
 pub use token_store::{FileStore, KeyringStore, MemoryStore, TokenStore, TokenStoreError};

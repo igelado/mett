@@ -218,9 +218,21 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
+    /// Signs in interactively, unless the user cancels, and tells the
+    /// prompter how it ended.
     async fn sign_in_and_confirm(&self, state: &mut State) -> Result<AccessToken> {
-        let tokens = self.sign_in().await?;
-        self.confirm(state, tokens, None).await
+        let result = async {
+            let tokens = tokio::select! {
+                tokens = self.sign_in() => tokens?,
+                () = self.prompter.cancelled() => {
+                    return Err(mett_core::Error::Auth("sign-in cancelled".into()));
+                }
+            };
+            self.confirm(state, tokens, None).await
+        }
+        .await;
+        self.prompter.finished(result.as_ref().map(|_| ()));
+        result
     }
 
     /// Removes `token` from the store if it is still the stored one, and

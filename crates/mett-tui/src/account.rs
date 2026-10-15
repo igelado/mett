@@ -1,21 +1,22 @@
 //! Connecting to an Office365 account from the configuration: building the
 //! sign-in settings and token store from the `msgraph_*` variables
-//! (`docs/CONFIG-OFFICE365.md` §4) and signing in.
+//! (`docs/CONFIG-OFFICE365.md` §4).
 
 use std::sync::Arc;
 
-use mett_core::Authenticator;
 use mett_msgraph::{
     AuthFlow, AuthSettings, FileStore, GraphAuthenticator, GraphMailStore, KeyringStore,
-    SignInPrompt, TokenStore, TokenStoreError,
+    TokenStore, TokenStoreError,
 };
 use url::Url;
 
 use crate::config::mailbox::MailboxUrl;
 use crate::config::{Config, Value};
+use crate::signin::TuiPrompter;
 
-/// The mailbox, signed in.
-pub type Mailbox = GraphMailStore<GraphAuthenticator<AnyStore, fn(SignInPrompt)>>;
+/// An Office365 mailbox. It signs in when first used, prompting through
+/// the TUI's sign-in window.
+pub type Mailbox = GraphMailStore<GraphAuthenticator<AnyStore, TuiPrompter>>;
 
 /// The token store chosen by `msgraph_token_store`.
 pub enum AnyStore {
@@ -144,22 +145,14 @@ pub fn token_store(config: &Config, url: &MailboxUrl) -> Result<AnyStore, String
     }
 }
 
-/// Shows a sign-in prompt in the terminal, opening the browser if needed.
-fn prompt(prompt: SignInPrompt) {
-    match prompt {
-        SignInPrompt::OpenBrowser { url } => {
-            eprintln!("Opening your browser to sign in. If it doesn't open, visit:\n  {url}");
-            if let Err(e) = open::that_detached(url.as_str()) {
-                eprintln!("(could not open a browser: {e})");
-            }
-        }
-        SignInPrompt::EnterCode { message, .. } => eprintln!("{message}"),
-    }
-}
-
-/// Signs in to the account in `url` and returns its mailbox. Sign-in
-/// happens here, before the TUI starts, so its prompts are visible.
-pub async fn connect(config: &Config, url: &MailboxUrl) -> Result<Mailbox, String> {
+/// The mailbox of the account in `url`, from the configuration. Nothing is
+/// sent until it is used: the first request signs in, prompting through
+/// `prompter`.
+pub fn mailbox(
+    config: &Config,
+    url: &MailboxUrl,
+    prompter: TuiPrompter,
+) -> Result<Mailbox, String> {
     if !config.string("msgraph_oauth_refresh_command").is_empty() {
         return Err("msgraph_oauth_refresh_command is not supported yet".into());
     }
@@ -170,12 +163,8 @@ pub async fn connect(config: &Config, url: &MailboxUrl) -> Result<Mailbox, Strin
         settings.clone(),
         http.clone(),
         Arc::new(store),
-        prompt as fn(SignInPrompt),
+        prompter,
     ));
-    eprintln!("Signing in to {}...", url.account);
-    auth.access_token()
-        .await
-        .map_err(|e| format!("signing in to {}: {e}", url.account))?;
     Ok(GraphMailStore::new(http, &settings, auth))
 }
 

@@ -58,6 +58,8 @@ actions! {
     Exit => "exit", "Leave the current menu";
     NextLine => "next-line", "Scroll down one line";
     PreviousLine => "previous-line", "Scroll up one line";
+    OpenBrowser => "open-browser", "Open the sign-in page in a browser";
+    Retry => "retry", "Try signing in again";
 }
 
 #[cfg(test)]

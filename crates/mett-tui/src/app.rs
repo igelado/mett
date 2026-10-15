@@ -7,11 +7,13 @@
 
 use std::collections::HashMap;
 
-use mett_core::{Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
+use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
+use mett_msgraph::SignInPrompt;
 
 use crate::action::Action;
 use crate::config::mailbox::FolderPath;
 use crate::keymap::Menu;
+use crate::signin::SignInEvent;
 use crate::text;
 use crate::worker::{Event, Request, RequestId, Response};
 
@@ -39,6 +41,8 @@ pub enum Msg {
     Action(Action),
     /// The worker answered a request.
     Response(Response),
+    /// The authenticator needs the user, or finished signing in.
+    SignIn(SignInEvent),
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -53,6 +57,10 @@ pub enum Msg {
 pub enum Effect {
     /// Send `Request` to the worker.
     Request(RequestId, Request),
+    /// Open a URL in the user's browser.
+    OpenUrl(String),
+    /// Cancel the sign-in in progress.
+    CancelSignIn,
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -96,6 +104,18 @@ impl Pager {
     }
 }
 
+/// The sign-in window, shown over the current screen while the user has
+/// to sign in, or after a sign-in failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignIn {
+    /// The account being signed in to.
+    pub account: AccountId,
+    /// What the user has to do, once known.
+    pub prompt: Option<SignInPrompt>,
+    /// Why the sign-in failed, once it has.
+    pub failure: Option<String>,
+}
+
 /// The whole UI state.
 #[derive(Debug)]
 pub struct App {
@@ -111,6 +131,15 @@ pub struct App {
     pub status: String,
     /// Set when the user quits.
     pub quit: bool,
+    /// The sign-in window, if it is open.
+    pub sign_in: Option<SignIn>,
+    /// The user cancelled the sign-in in progress, so its failure needn't
+    /// be shown.
+    sign_in_cancelled: bool,
+    /// The folder to open, kept so that opening it can be retried.
+    path: FolderPath,
+    /// The request opening the folder, while it is pending.
+    opening: Option<RequestId>,
     /// Terminal width, in cells.
     pub width: usize,
     /// Rows available for the index or pager body.
@@ -155,6 +184,10 @@ impl App {
             selected: 0,
             status: "Opening folder...".into(),
             quit: false,
+            sign_in: None,
+            sign_in_cancelled: false,
+            path,
+            opening: None,
             width: usize::from(width),
             body_height: body_height(height),
             listing: None,
@@ -166,12 +199,23 @@ impl App {
             next_request: 0,
             page_size,
         };
-        let effect = app.request(Request::OpenFolder(path));
-        (app, vec![effect])
+        let effects = app.open_folder();
+        (app, effects)
+    }
+
+    /// Opens (or retries opening) the configured folder.
+    fn open_folder(&mut self) -> Vec<Effect> {
+        let effect = self.request(Request::OpenFolder(self.path.clone()));
+        self.opening = Some(effect_id(&effect));
+        self.status = "Opening folder...".into();
+        vec![effect]
     }
 
     /// The menu for the current screen, which selects the key bindings.
     pub fn menu(&self) -> Menu {
+        if self.sign_in.is_some() {
+            return Menu::SignIn;
+        }
         match self.screen() {
             Screen::Index => Menu::Index,
             Screen::Pager(_) => Menu::Pager,
@@ -190,6 +234,7 @@ impl App {
         match msg {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
+            Msg::SignIn(event) => self.on_sign_in(event),
             Msg::Resize { width, height } => {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);
@@ -210,7 +255,101 @@ impl App {
         match self.menu() {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
+            Menu::SignIn => self.on_sign_in_action(action),
         }
+    }
+
+    fn on_sign_in(&mut self, event: SignInEvent) -> Vec<Effect> {
+        match event {
+            SignInEvent::Prompt { account, prompt } => {
+                self.sign_in_cancelled = false;
+                let effects = match &prompt {
+                    // The browser flow needs the browser: open it straight
+                    // away. The device code flow is for when there is none.
+                    SignInPrompt::OpenBrowser { url } => vec![Effect::OpenUrl(url.to_string())],
+                    SignInPrompt::EnterCode { .. } => Vec::new(),
+                };
+                self.sign_in = Some(SignIn {
+                    account,
+                    prompt: Some(prompt),
+                    failure: None,
+                });
+                effects
+            }
+            SignInEvent::Finished {
+                outcome: Ok(()), ..
+            } => {
+                if self.sign_in.take().is_some() {
+                    self.status = "Signed in.".into();
+                }
+                Vec::new()
+            }
+            SignInEvent::Finished {
+                outcome: Err(_), ..
+            } if self.sign_in_cancelled => {
+                self.sign_in_cancelled = false;
+                self.sign_in = None;
+                Vec::new()
+            }
+            SignInEvent::Finished {
+                account,
+                outcome: Err(e),
+            } => {
+                // It can fail before showing a prompt.
+                let window = self.sign_in.get_or_insert(SignIn {
+                    account,
+                    prompt: None,
+                    failure: None,
+                });
+                window.failure = Some(e);
+                Vec::new()
+            }
+        }
+    }
+
+    fn on_sign_in_action(&mut self, action: Action) -> Vec<Effect> {
+        let Some(window) = &self.sign_in else {
+            return Vec::new();
+        };
+        let failed = window.failure.is_some();
+        match action {
+            Action::Exit if failed => self.sign_in = None,
+            Action::Exit => {
+                self.sign_in = None;
+                self.sign_in_cancelled = true;
+                self.status = "Sign-in cancelled.".into();
+                return vec![Effect::CancelSignIn];
+            }
+            Action::OpenBrowser => {
+                let url = match &window.prompt {
+                    Some(SignInPrompt::OpenBrowser { url }) => url.to_string(),
+                    Some(SignInPrompt::EnterCode {
+                        verification_uri, ..
+                    }) => verification_uri.clone(),
+                    None => return Vec::new(),
+                };
+                return vec![Effect::OpenUrl(url)];
+            }
+            Action::Retry if failed => {
+                self.sign_in = None;
+                return self.retry();
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Retries what failed for want of a sign-in: opening the folder, or
+    /// listing the rest of it. Other requests are retried by repeating the
+    /// action that made them.
+    fn retry(&mut self) -> Vec<Effect> {
+        if self.folder.is_none() {
+            if self.opening.is_none() {
+                return self.open_folder();
+            }
+            return Vec::new();
+        }
+        self.retry_listing()
     }
 
     fn on_index_action(&mut self, action: Action) -> Vec<Effect> {
@@ -240,8 +379,16 @@ impl App {
                 }
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
+            // Opening the folder failed: try again.
+            Action::DisplayMessage if self.folder.is_none() && self.opening.is_none() => {
+                return self.open_folder();
+            }
             Action::DisplayMessage => return self.open_selected(),
-            Action::Exit | Action::NextLine | Action::PreviousLine => {}
+            Action::Exit
+            | Action::NextLine
+            | Action::PreviousLine
+            | Action::OpenBrowser
+            | Action::Retry => {}
         }
         Vec::new()
     }
@@ -277,7 +424,11 @@ impl App {
             Action::PreviousLine => self.scroll_by(-1),
             Action::NextPage => self.scroll_by(page as isize),
             Action::PreviousPage => self.scroll_by(-(page as isize)),
-            Action::FirstEntry | Action::LastEntry | Action::DisplayMessage => {}
+            Action::FirstEntry
+            | Action::LastEntry
+            | Action::DisplayMessage
+            | Action::OpenBrowser
+            | Action::Retry => {}
         }
         Vec::new()
     }
@@ -322,7 +473,9 @@ impl App {
 
     fn on_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
+            Event::FolderOpened(_) if self.opening != Some(id) => {}
             Event::FolderOpened(Ok(folder)) => {
+                self.opening = None;
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
                 return self.list(Page::first(self.page_size));
@@ -373,7 +526,10 @@ impl App {
                     }
                 }
             }
-            Event::FolderOpened(Err(e)) => self.report(e),
+            Event::FolderOpened(Err(e)) => {
+                self.opening = None;
+                self.report(e);
+            }
             Event::MessagesListed(_) => {}
         }
         Vec::new()
@@ -486,9 +642,10 @@ impl App {
             return Vec::new();
         }
         self.selected = selected;
-        match self.menu() {
-            Menu::Index => Vec::new(),
-            Menu::Pager => {
+        // The screen, not the menu: the sign-in window may be over it.
+        match self.screen() {
+            Screen::Index => Vec::new(),
+            Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()
             }
@@ -525,9 +682,12 @@ impl App {
     }
 }
 
+/// The ID of a request effect.
 fn effect_id(effect: &Effect) -> RequestId {
-    let Effect::Request(id, _) = effect;
-    *id
+    match effect {
+        Effect::Request(id, _) => *id,
+        _ => unreachable!("not a request: {effect:?}"),
+    }
 }
 
 fn body_height(height: u16) -> usize {
@@ -617,13 +777,17 @@ mod tests {
     #[test]
     fn keeps_listing_until_the_last_page() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open, _) = effects[0].clone();
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let folder = mock::folder("in", "Inbox", None);
         let effects = app.update(Msg::Response(Response {
             id: open,
             event: Event::FolderOpened(Ok(folder)),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -709,12 +873,16 @@ mod tests {
     #[test]
     fn finishing_the_listing_keeps_an_error_reported_meanwhile() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -722,11 +890,15 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
 
         // An error is reported while the second page is loading…
         let effects = open(&mut app, 1);
-        let Effect::Request(update, _) = effects[0].clone();
+        let Effect::Request(update, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: update,
             event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
@@ -745,12 +917,16 @@ mod tests {
     #[test]
     fn a_failed_page_leaves_the_index_incomplete_until_retried() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -758,7 +934,9 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: second,
             event: Event::MessagesListed(Err(Error::Network("offline".into()))),
@@ -788,12 +966,16 @@ mod tests {
     #[test]
     fn the_pager_also_retries_a_failed_page() {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -801,7 +983,9 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: second,
             event: Event::MessagesListed(Err(Error::Network("offline".into()))),
@@ -862,12 +1046,16 @@ mod tests {
     /// still loading; returns the app and that request.
     fn loading_more(n: usize) -> (App, RequestId) {
         let (mut app, effects) = App::new(80, 23);
-        let Effect::Request(open_inbox, _) = effects[0].clone();
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         }));
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: first,
             event: Event::MessagesListed(Ok(MessagePage {
@@ -875,7 +1063,9 @@ mod tests {
                 next: Some(PageCursor::new("c")),
             })),
         }));
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         (app, second)
     }
 
@@ -955,7 +1145,9 @@ mod tests {
         assert!(!app.saving());
         let effects = open(&mut app, 1);
         assert!(app.saving());
-        let Effect::Request(update, _) = effects[0].clone();
+        let Effect::Request(update, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: update,
             event: Event::FlagsUpdated(Ok(())),
@@ -967,7 +1159,9 @@ mod tests {
     fn a_failed_flag_update_marks_the_message_unread_again() {
         let mut app = loaded(1);
         let effects = open(&mut app, 1);
-        let Effect::Request(update, _) = effects[0].clone();
+        let Effect::Request(update, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         app.update(Msg::Response(Response {
             id: update,
             event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
@@ -980,10 +1174,14 @@ mod tests {
     fn shows_the_fetched_message_and_ignores_stale_ones() {
         let mut app = loaded(2);
         let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(first, _) = effects[0].clone();
+        let Effect::Request(first, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         // Move on to the next message before the first one arrives.
         let effects = act(&mut app, Action::NextEntry);
-        let Effect::Request(second, _) = effects[0].clone();
+        let Effect::Request(second, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
 
         app.update(Msg::Response(Response {
             id: first,
@@ -1005,7 +1203,9 @@ mod tests {
     fn a_failed_fetch_returns_to_the_index_and_leaves_it_unread() {
         let mut app = loaded(1);
         let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone();
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let effects = app.update(Msg::Response(Response {
             id: fetch,
             event: Event::MessageFetched(Err(Error::Network("offline".into()))),
@@ -1053,7 +1253,9 @@ mod tests {
             height: 8,
         });
         let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone();
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
         let mut message = message("m0", 0);
         message.body.content = "x".repeat(100);
         app.update(Msg::Response(Response {
@@ -1067,5 +1269,118 @@ mod tests {
             act(&mut app, Action::NextLine);
         }
         assert_eq!(pager(&app).scroll, rows - 5, "every row is reachable");
+    }
+
+    fn finished(outcome: Result<(), String>) -> SignInEvent {
+        SignInEvent::Finished {
+            account: AccountId::new("alice@contoso.com"),
+            outcome,
+        }
+    }
+
+    fn browser_prompt() -> SignInEvent {
+        SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: "https://login.example/authorize".parse().unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_sign_in_window_opens_the_browser_and_closes_once_signed_in() {
+        let (mut app, _) = App::new(80, 23);
+        let effects = app.update(Msg::SignIn(browser_prompt()));
+        assert_eq!(
+            effects,
+            [Effect::OpenUrl("https://login.example/authorize".into())]
+        );
+        assert_eq!(app.menu(), Menu::SignIn);
+        // o opens it again.
+        assert_eq!(
+            act(&mut app, Action::OpenBrowser),
+            [Effect::OpenUrl("https://login.example/authorize".into())]
+        );
+        app.update(Msg::SignIn(finished(Ok(()))));
+        assert_eq!(app.sign_in, None);
+        assert_eq!(app.menu(), Menu::Index);
+        assert_eq!(app.status, "Signed in.");
+    }
+
+    #[test]
+    fn the_device_code_window_opens_the_page_only_when_asked() {
+        let (mut app, _) = App::new(80, 23);
+        let effects = app.update(Msg::SignIn(SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::EnterCode {
+                verification_uri: "https://microsoft.com/devicelogin".into(),
+                user_code: "ABCD".into(),
+                message: "Enter ABCD".into(),
+            },
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(
+            act(&mut app, Action::OpenBrowser),
+            [Effect::OpenUrl("https://microsoft.com/devicelogin".into())]
+        );
+    }
+
+    #[test]
+    fn cancelling_closes_the_window_without_reporting_a_failure() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        assert_eq!(act(&mut app, Action::Exit), [Effect::CancelSignIn]);
+        assert_eq!(app.sign_in, None);
+        app.update(Msg::SignIn(finished(Err("sign-in cancelled".into()))));
+        assert_eq!(app.sign_in, None);
+        assert_eq!(app.status, "Sign-in cancelled.");
+    }
+
+    #[test]
+    fn a_failed_sign_in_can_be_retried() {
+        let (mut app, effects) = App::new(80, 23);
+        let [Effect::Request(first, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
+        };
+        // The sign-in fails before any prompt, and so does the request.
+        app.update(Msg::SignIn(finished(Err("bad app".into()))));
+        app.update(Msg::Response(Response {
+            id: *first,
+            event: Event::FolderOpened(Err(Error::Auth("bad app".into()))),
+        }));
+        let window = app.sign_in.as_ref().expect("the failure is shown");
+        assert_eq!(window.failure.as_deref(), Some("bad app"));
+        assert_eq!(window.prompt, None);
+
+        // Retrying closes the window and opens the folder again.
+        let effects = act(&mut app, Action::Retry);
+        let [Effect::Request(second, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
+        };
+        assert_eq!(app.sign_in, None);
+        assert_eq!(app.status, "Opening folder...");
+        app.update(Msg::Response(Response {
+            id: *second,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        assert_eq!(app.folder.as_ref().unwrap().name, "Inbox");
+    }
+
+    #[test]
+    fn enter_in_an_empty_index_retries_opening_the_folder() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        // Pressing Enter while the folder is still opening does nothing.
+        assert!(act(&mut app, Action::DisplayMessage).is_empty());
+        app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::FolderOpened(Err(Error::Network("offline".into()))),
+        }));
+        assert!(matches!(
+            act(&mut app, Action::DisplayMessage).as_slice(),
+            [Effect::Request(_, Request::OpenFolder(_))]
+        ));
     }
 }

@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use mett_core::{AccountId, Authenticator, Error};
 use mett_msgraph::{
-    AuthFlow, AuthSettings, GraphAuthenticator, MemoryStore, SignInPrompt, TokenStore,
+    AuthFlow, AuthSettings, Cancelled, GraphAuthenticator, MemoryStore, Prompter, SignInPrompt,
+    TokenStore,
 };
 use serde_json::json;
 use url::Url;
@@ -1014,4 +1015,102 @@ async fn a_rejected_token_is_refreshed_on_the_next_call() {
     assert_eq!(first.secret(), "a1");
     auth.token_rejected(&first).await;
     assert_eq!(auth.access_token().await.unwrap().secret(), "a2");
+}
+
+/// A prompter that records what it was told, and cancels the sign-in as
+/// soon as it shows a prompt.
+#[derive(Clone, Default)]
+struct Recorder(Arc<Recorded>);
+
+#[derive(Default)]
+struct Recorded {
+    prompts: Mutex<Vec<SignInPrompt>>,
+    outcomes: Mutex<Vec<Result<(), String>>>,
+    cancel: tokio::sync::Notify,
+}
+
+impl Prompter for Recorder {
+    fn prompt(&self, prompt: SignInPrompt) {
+        self.0.prompts.lock().unwrap().push(prompt);
+        self.0.cancel.notify_one();
+    }
+
+    fn finished(&self, outcome: Result<(), &Error>) {
+        self.0
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(outcome.map_err(ToString::to_string));
+    }
+
+    fn cancelled(&self) -> Cancelled<'_> {
+        Box::pin(self.0.cancel.notified())
+    }
+}
+
+#[tokio::test]
+async fn the_user_can_cancel_an_interactive_sign_in() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    // The user never enters the code.
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending"))
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    let recorder = Recorder::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        recorder.clone(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(5), auth.access_token())
+        .await
+        .expect("cancelling ends the sign-in");
+    assert!(matches!(result, Err(Error::Auth(m)) if m.contains("cancelled")));
+    assert_eq!(recorder.0.prompts.lock().unwrap().len(), 1);
+    assert_eq!(
+        *recorder.0.outcomes.lock().unwrap(),
+        [Err("authentication failed: sign-in cancelled".to_owned())]
+    );
+    assert_eq!(stored(&store), None);
+}
+
+/// Records outcomes without ever cancelling.
+#[derive(Clone, Default)]
+struct Outcomes(Arc<Mutex<Vec<bool>>>);
+
+impl Prompter for Outcomes {
+    fn prompt(&self, _: SignInPrompt) {}
+
+    fn finished(&self, outcome: Result<(), &Error>) {
+        self.0.lock().unwrap().push(outcome.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn tells_the_prompter_when_a_sign_in_ends() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    me(&server, "a1", "alice@contoso.com").await;
+
+    let store = Arc::new(MemoryStore::default());
+    let outcomes = Outcomes::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::clone(&store),
+        outcomes.clone(),
+    );
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
+    // A cached token needs no sign-in, so nothing more is reported.
+    auth.access_token().await.unwrap();
+    assert_eq!(*outcomes.0.lock().unwrap(), [true]);
 }
