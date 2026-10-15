@@ -434,7 +434,11 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
                 date_format: &app.display.date_format,
                 position: None,
             };
-            let line = Line::raw(format::expand(&app.display.index_format, &entry, width));
+            // Padded to the right edge, so that the row's colors cover it.
+            let mut text = format::expand(&app.display.index_format, &entry, width);
+            let used = text.width();
+            text.push_str(&" ".repeat(width.saturating_sub(used)));
+            let line = Line::raw(text);
             if i == app.selected {
                 line.style(colors.indicator)
             } else {
@@ -768,6 +772,8 @@ mod tests {
         );
         let buffer = styles(&app);
         assert_eq!(buffer[(5, 1)].bg, Color::Yellow, "the selected entry");
+        let right = buffer.area.width - 1;
+        assert_eq!(buffer[(right, 1)].bg, Color::Yellow, "to the right edge");
         assert_eq!(buffer[(5, 2)].fg, Color::Red, "the flagged one");
         assert_eq!(buffer[(5, 3)].fg, Color::Reset);
         assert_eq!(buffer[(0, 6)].bg, Color::Blue);
