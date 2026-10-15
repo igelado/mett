@@ -688,6 +688,7 @@ impl App {
         self.hidden.clear();
         self.folded.clear();
         self.threads.clear();
+        self.threaded_count = 0;
         self.collapsed.clear();
         self.positions.clear();
         self.limit = None;

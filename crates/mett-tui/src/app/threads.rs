@@ -250,6 +250,9 @@ impl App {
             self.fail("Threading is not enabled.");
             return Some(Vec::new());
         }
+        // Messages listed since the threads were last built are threaded
+        // first.
+        self.thread_listed();
         // In the pager, from the message it shows (the index may have been
         // listed again meanwhile).
         if let Some(Screen::Pager(pager)) = self.screens.last() {
@@ -636,8 +639,11 @@ mod tests {
                 next: Some(mett_core::PageCursor::new("in more")),
             })),
         }));
-        // Three of the two threaded so far: listed, not threaded yet.
+        // Three of the two threaded so far: listed, not threaded yet…
         assert!(app.thread_of(&MessageId::new("b0")).is_none());
+        // …until a thread action needs them.
+        act(&mut app, Action::NextThread);
+        assert!(app.thread_of(&MessageId::new("b0")).is_some());
         let Effect::Request(more, _) = effects[0].clone() else {
             panic!("expected a request, got {effects:?}");
         };
@@ -703,7 +709,19 @@ mod tests {
             panic!("expected a request, got {effects:?}");
         };
         act(&mut app, Action::NextEntry);
-        page(&mut app, next, vec![named("a"), named("c")]);
+        // d comes first, but the last page may hold what goes between.
+        let effects = app.update(Msg::Response(Response {
+            id: next,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![named("d")],
+                next: Some(mett_core::PageCursor::new("in more")),
+            })),
+        }));
+        assert_eq!(app.messages[app.selected].id.as_str(), "b");
+        let Effect::Request(more, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        page(&mut app, more, vec![named("a"), named("c")]);
         assert_eq!(app.messages[app.selected].id.as_str(), "c");
     }
 

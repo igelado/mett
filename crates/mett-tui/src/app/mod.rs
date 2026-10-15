@@ -1894,6 +1894,7 @@ impl App {
         self.hidden.clear();
         self.folded.clear();
         self.threads.clear();
+        self.threaded_count = 0;
         self.positions.clear();
         self.selected = 0;
         self.pending = None;
@@ -1983,8 +1984,12 @@ impl App {
         let Some(target) = self.pending.clone() else {
             return Vec::new();
         };
-        let last = self.messages.len().saturating_sub(1);
         let loading = self.listing.is_some();
+        // The next thread needs the threads of what was listed.
+        if target == Target::NextThread {
+            self.thread_listed();
+        }
+        let last = self.messages.len().saturating_sub(1);
         let selected = match target {
             Target::NextThread => match self.next_thread_root() {
                 Some(next) => next,
@@ -2000,8 +2005,12 @@ impl App {
                 let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
                 let from = shown(&message)
                     .or_else(|| self.thread_of(&message).and_then(|t| shown(&t.root)));
+                // What comes after it is settled while the folder loads
+                // only if the index is in the order pages come in (by date):
+                // otherwise a later page may put a message in between.
+                let settled = !loading || self.ordering.sort.method == crate::sort::Method::Date;
                 match from.map(|from| from + steps) {
-                    Some(entry) if entry < self.messages.len() => entry,
+                    Some(entry) if entry < self.messages.len() && settled => entry,
                     _ if loading => return Vec::new(),
                     _ => last,
                 }
