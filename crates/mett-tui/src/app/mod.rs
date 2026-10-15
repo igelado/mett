@@ -356,6 +356,8 @@ pub struct App {
     /// The last error reported on the message line, so that the view can
     /// tell it from other messages.
     pub error: Option<String>,
+    /// `alternates`, compiled: the index asks for every row.
+    alternates: Vec<regex::Regex>,
     /// Keys and functions a macro or `push` queued, played before new
     /// input.
     strokes: VecDeque<Stroke>,
@@ -590,6 +592,7 @@ impl App {
             keymap: Keymap::mutt_defaults(),
             display: settings.display,
             error: None,
+            alternates: compile_alternates(&settings.compose.alternates),
             strokes: VecDeque::new(),
             sign_in_strokes: VecDeque::new(),
             configuring: 0,
@@ -1810,6 +1813,7 @@ impl App {
 
     pub(super) fn apply_settings(&mut self, settings: Settings) {
         self.page_size = settings.page_size;
+        self.alternates = compile_alternates(&settings.compose.alternates);
         self.settings = settings.compose;
         // The configuration doesn't know what the mailbox told.
         self.add_mailbox_addresses();
@@ -2020,7 +2024,11 @@ impl App {
 
     /// Whether the user sent mail from `address`.
     pub fn is_me(&self, address: &mett_core::Address) -> bool {
-        self.settings.is_me(address)
+        self.settings.me.contains(&address.email.to_lowercase())
+            || self
+                .alternates
+                .iter()
+                .any(|alternate| alternate.is_match(&address.email))
     }
 }
 
@@ -2046,6 +2054,20 @@ fn effect_id(effect: &Effect) -> RequestId {
         Effect::Request(id, _) => *id,
         _ => unreachable!("not a request: {effect:?}"),
     }
+}
+
+/// `alternates` as regular expressions, ignoring case (those that don't
+/// compile were reported when they were set, and match nothing).
+fn compile_alternates(alternates: &[String]) -> Vec<regex::Regex> {
+    alternates
+        .iter()
+        .filter_map(|alternate| {
+            regex::RegexBuilder::new(alternate)
+                .case_insensitive(true)
+                .build()
+                .ok()
+        })
+        .collect()
 }
 
 fn body_height(height: u16) -> usize {

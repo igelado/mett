@@ -411,28 +411,43 @@ impl Config {
                     }
                 }),
                 "color" | "mono" | "uncolor" | "unmono" => {
-                    let words = args
-                        .iter()
-                        .map(|word| self.expand(word))
-                        .collect::<Result<Vec<_>, _>>();
-                    words.and_then(|words| {
-                        let palette = &mut self.colors;
-                        let result = match name.as_str() {
-                            "color" => palette.color.color(&words),
-                            "mono" => palette.mono.mono(&words),
-                            "uncolor" => palette.color.uncolor(&words),
-                            _ => palette.mono.uncolor(&words),
-                        };
-                        match result {
-                            Ok(()) => Ok(()),
-                            // As other things mett doesn't do yet.
-                            Err(crate::color::ColorError::Unsupported(what)) => {
-                                self.warn_once("color", &what, format!("{what}; ignored"));
-                                Ok(())
+                    // An object mett doesn't do yet is ignored before the
+                    // rest is expanded, so its backticks never run.
+                    let object = args.first().map(|word| self.expand(word)).transpose();
+                    let unsupported = match &object {
+                        Ok(Some(object)) => match crate::color::object_supported(object) {
+                            Err(crate::color::ColorError::Unsupported(what)) => Some(what),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(what) = unsupported {
+                        self.warn_once("color", &what, format!("{what}; ignored"));
+                        Ok(())
+                    } else {
+                        let words = args
+                            .iter()
+                            .map(|word| self.expand(word))
+                            .collect::<Result<Vec<_>, _>>();
+                        words.and_then(|words| {
+                            let palette = &mut self.colors;
+                            let result = match name.as_str() {
+                                "color" => palette.color.color(&words),
+                                "mono" => palette.mono.mono(&words),
+                                "uncolor" => palette.color.uncolor(&words),
+                                _ => palette.mono.uncolor(&words),
+                            };
+                            match result {
+                                Ok(()) => Ok(()),
+                                // As other things mett doesn't do yet.
+                                Err(crate::color::ColorError::Unsupported(what)) => {
+                                    self.warn_once("color", &what, format!("{what}; ignored"));
+                                    Ok(())
+                                }
+                                Err(e) => Err(e.to_string().replacen("uncolor", name.as_str(), 1)),
                             }
-                            Err(e) => Err(e.to_string().replacen("uncolor", name.as_str(), 1)),
-                        }
-                    })
+                        })
+                    }
                 }
                 "mailboxes" => self.add_mailboxes(args),
                 "unmailboxes" => self.each(args, |c, path| {
@@ -1198,6 +1213,18 @@ mod tests {
         assert_ne!(config.colors().color, crate::color::Colors::default());
         assert_ne!(config.colors().mono, crate::color::Colors::default());
         assert!(load("color status mauve blue\n").errors[0].contains("mauve"));
+    }
+
+    #[test]
+    fn ignored_colors_never_run_their_backticks() {
+        let marker = std::env::temp_dir().join(format!("mett-color-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let config = load(&format!(
+            "color sidebar_new red `touch {}`\n",
+            marker.display()
+        ));
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert!(!marker.exists(), "an ignored backtick ran");
     }
 
     #[test]

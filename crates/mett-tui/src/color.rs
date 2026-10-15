@@ -410,6 +410,11 @@ impl Colors {
     }
 }
 
+/// Whether `name` is an object mett can color.
+pub fn object_supported(name: &str) -> Result<(), ColorError> {
+    Object::parse(name).map(drop)
+}
+
 /// The colors for terminals with colors (`color`) and without (`mono`),
 /// as mutt keeps them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
