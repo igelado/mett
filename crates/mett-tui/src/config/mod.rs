@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
 use lexer::{Command, Expander, Lexer, Word};
-pub use vars::{Kind, VARS, Value};
+pub use vars::{Kind, Quad, VARS, Value};
 
 /// How deeply `source` may nest, to stop loops.
 const MAX_SOURCE_DEPTH: usize = 16;
@@ -147,6 +147,19 @@ impl Config {
         match self.get(name) {
             Some(Value::Str(s)) => s,
             _ => "",
+        }
+    }
+
+    /// The value of a known boolean variable.
+    pub fn flag(&self, name: &str) -> bool {
+        self.get(name) == Some(&Value::Bool(true))
+    }
+
+    /// The value of a known quad-option, or `no`.
+    pub fn quad(&self, name: &str) -> Quad {
+        match self.get(name) {
+            Some(Value::Quad(q)) => *q,
+            _ => Quad::No,
         }
     }
 
@@ -347,6 +360,10 @@ impl Config {
                     self.values.insert(var.name, Value::Bool(true));
                     Ok(())
                 }
+                Some(var) if var.kind == Kind::Quad => {
+                    self.values.insert(var.name, Value::Quad(Quad::Yes));
+                    Ok(())
+                }
                 Some(var) => Err(format!("{}: needs a value", var.name)),
                 None => self.unknown_variable(arg),
             }
@@ -380,6 +397,7 @@ impl Config {
         };
         let value = match var.kind {
             Kind::Bool => Value::Bool(false),
+            Kind::Quad => Value::Quad(Quad::No),
             Kind::Number => Value::Number(0),
             Kind::String | Kind::Path => Value::Str(String::new()),
         };
@@ -394,7 +412,15 @@ impl Config {
                 self.values.insert(var.name, Value::Bool(!current));
                 Ok(())
             }
-            Some(var) => Err(format!("{}: only booleans can be toggled", var.name)),
+            Some(var) if var.kind == Kind::Quad => {
+                let current = self.quad(var.name);
+                self.values.insert(var.name, Value::Quad(current.toggled()));
+                Ok(())
+            }
+            Some(var) => Err(format!(
+                "{}: only booleans and quad-options can be toggled",
+                var.name
+            )),
             None => self.unknown_variable(name),
         }
     }
@@ -463,8 +489,10 @@ impl Config {
     }
 }
 
+/// Whether `name` takes the `no` and `inv` prefixes: booleans and
+/// quad-options do.
 fn is_bool(name: &str) -> bool {
-    vars::find(name).is_some_and(|v| v.kind == Kind::Bool)
+    vars::find(name).is_some_and(|v| matches!(v.kind, Kind::Bool | Kind::Quad))
 }
 
 /// Expansion for the lexer: configuration variables first, then the
@@ -748,6 +776,19 @@ mod tests {
         // The dump reads back to the same settings.
         let again = load(&dump.join("\n"));
         assert_eq!(again.dump(), dump);
+    }
+
+    #[test]
+    fn sets_unsets_and_toggles_quad_options() {
+        let config = load("set include=ask-no\nset copy\nunset postpone\ntoggle reply_to\n");
+        assert_eq!(config.quad("include"), Quad::AskNo);
+        assert_eq!(config.quad("copy"), Quad::Yes);
+        assert_eq!(config.quad("postpone"), Quad::No);
+        assert_eq!(config.quad("reply_to"), Quad::AskNo);
+        let config = load("set noabort_unmodified invabort_nosubject\n");
+        assert_eq!(config.quad("abort_unmodified"), Quad::No);
+        assert_eq!(config.quad("abort_nosubject"), Quad::AskNo);
+        assert!(load("set include=maybe\n").errors.len() == 1);
     }
 
     #[test]

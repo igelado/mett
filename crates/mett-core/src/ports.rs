@@ -9,6 +9,7 @@ use std::future::Future;
 
 use chrono::{DateTime, TimeDelta, Utc};
 
+use crate::draft::Draft;
 use crate::error::Result;
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{FolderId, MessageId, PageCursor};
@@ -103,6 +104,17 @@ pub trait MailStore: Send + Sync {
     /// Deletes a message permanently. To move it to the trash instead, use
     /// [`MailStore::move_message`].
     fn delete_message(&self, id: &MessageId) -> impl Future<Output = Result<()>> + Send;
+
+    /// Saves `draft` in the drafts folder (mutt's `postponed`) and returns
+    /// the saved message's identifier.
+    fn save_draft(&self, draft: &Draft) -> impl Future<Output = Result<MessageId>> + Send;
+}
+
+/// Sends mail.
+pub trait MailSender: Send + Sync {
+    /// Sends `draft`, keeping a copy in the sent-items folder if
+    /// [`Draft::save_copy`] asks for one.
+    fn send(&self, draft: &Draft) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// An OAuth2 access token.

@@ -17,6 +17,44 @@ pub enum Kind {
     String,
     /// A file or mailbox path: a leading `~` is expanded when it is set.
     Path,
+    /// A quad-option: `yes`, `no`, `ask-yes` or `ask-no`.
+    Quad,
+}
+
+/// A quad-option's value: do it, don't, or ask with a default answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quad {
+    /// Always.
+    Yes,
+    /// Never.
+    No,
+    /// Ask, suggesting yes.
+    AskYes,
+    /// Ask, suggesting no.
+    AskNo,
+}
+
+impl Quad {
+    /// The same option with the opposite answer, as `toggle` does.
+    pub fn toggled(self) -> Self {
+        match self {
+            Quad::Yes => Quad::No,
+            Quad::No => Quad::Yes,
+            Quad::AskYes => Quad::AskNo,
+            Quad::AskNo => Quad::AskYes,
+        }
+    }
+}
+
+impl fmt::Display for Quad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Quad::Yes => "yes",
+            Quad::No => "no",
+            Quad::AskYes => "ask-yes",
+            Quad::AskNo => "ask-no",
+        })
+    }
 }
 
 /// A variable's value.
@@ -28,6 +66,8 @@ pub enum Value {
     Number(i64),
     /// A string or path.
     Str(String),
+    /// A quad-option.
+    Quad(Quad),
 }
 
 impl fmt::Display for Value {
@@ -37,6 +77,7 @@ impl fmt::Display for Value {
             Value::Bool(true) => f.write_str("yes"),
             Value::Bool(false) => f.write_str("no"),
             Value::Number(n) => write!(f, "{n}"),
+            Value::Quad(q) => write!(f, "{q}"),
             // Escaped so that reading it back gives the same text: no
             // expansion, no command substitution, and newlines kept.
             Value::Str(s) => {
@@ -77,11 +118,22 @@ const fn var(name: &'static str, kind: Kind, default: &'static str) -> Var {
 
 /// Every variable mett knows, sorted by name.
 pub const VARS: &[Var] = &[
+    var("abort_nosubject", Kind::Quad, "ask-yes"),
+    var("abort_unmodified", Kind::Quad, "yes"),
+    var("askbcc", Kind::Bool, "no"),
+    var("askcc", Kind::Bool, "no"),
+    var("attribution", Kind::String, "On %d, %n wrote:"),
+    var("copy", Kind::Quad, "yes"),
     var("editor", Kind::Path, ""),
+    var("fast_reply", Kind::Bool, "no"),
     var("folder", Kind::Path, "~/Mail"),
+    var("forward_format", Kind::String, "[%a: %s]"),
     var("from", Kind::String, ""),
+    var("include", Kind::Quad, "ask-yes"),
+    var("indent_string", Kind::String, "> "),
     var("mail_check", Kind::Number, "5"),
     var("mbox", Kind::Path, "~/mbox"),
+    var("metoo", Kind::Bool, "no"),
     var("msgraph_auth_flow", Kind::String, "auth-code"),
     var("msgraph_client_id", Kind::String, ""),
     var("msgraph_cloud", Kind::String, "global"),
@@ -100,12 +152,16 @@ pub const VARS: &[Var] = &[
     var("msgraph_tenant", Kind::String, ""),
     var("msgraph_token_file", Kind::Path, ""),
     var("msgraph_token_store", Kind::String, "keyring"),
+    var("postpone", Kind::Quad, "ask-yes"),
     var("postponed", Kind::Path, "~/postponed"),
     var("realname", Kind::String, ""),
     var("record", Kind::Path, "~/sent"),
+    var("reply_to", Kind::Quad, "ask-yes"),
+    var("sig_dashes", Kind::Bool, "yes"),
     var("signature", Kind::Path, "~/.signature"),
     var("spoolfile", Kind::Path, ""),
     var("timeout", Kind::Number, "600"),
+    var("tmpdir", Kind::Path, ""),
     var("trash", Kind::Path, ""),
     var("use_from", Kind::Bool, "yes"),
 ];
@@ -133,6 +189,16 @@ pub fn parse(var: &Var, text: &str, home: Option<&str>) -> Result<Value, String>
             .map_err(|_| format!("{}: expected a number, got {text:?}", var.name)),
         Kind::String => Ok(Value::Str(text.to_owned())),
         Kind::Path => Ok(Value::Str(expand_home(text, home))),
+        Kind::Quad => match text.to_ascii_lowercase().as_str() {
+            "yes" | "true" | "on" => Ok(Value::Quad(Quad::Yes)),
+            "no" | "false" | "off" => Ok(Value::Quad(Quad::No)),
+            "ask-yes" => Ok(Value::Quad(Quad::AskYes)),
+            "ask-no" => Ok(Value::Quad(Quad::AskNo)),
+            _ => Err(format!(
+                "{}: expected yes, no, ask-yes or ask-no, got {text:?}",
+                var.name
+            )),
+        },
     }
 }
 
@@ -174,6 +240,9 @@ mod tests {
         let number = find("timeout").unwrap();
         assert_eq!(parse(number, "30", None), Ok(Value::Number(30)));
         assert!(parse(number, "soon", None).is_err());
+        let quad = find("include").unwrap();
+        assert_eq!(parse(quad, "Ask-No", None), Ok(Value::Quad(Quad::AskNo)));
+        assert!(parse(quad, "maybe", None).is_err());
         let path = find("signature").unwrap();
         assert_eq!(
             parse(path, "~/.sig", Some("/home/a")),

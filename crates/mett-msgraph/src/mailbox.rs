@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    AccessToken, Address, Authenticator, Body, BodyKind, Error, Flags, FlagsUpdate, Folder,
-    FolderId, MailStore, Message, MessageId, MessagePage, MessageSummary, Page, PageCursor, Result,
-    WellKnownFolder,
+    AccessToken, Address, Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags,
+    FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId, MessagePage,
+    MessageSummary, Page, PageCursor, Result, WellKnownFolder,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -425,7 +425,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         let mut url = self.url(&["me", "messages", id.as_str()]);
         url.query_pairs_mut().append_pair(
             "$select",
-            &format!("{SUMMARY_FIELDS},ccRecipients,internetMessageId,body"),
+            &format!("{SUMMARY_FIELDS},ccRecipients,replyTo,internetMessageId,body"),
         );
         let request = self
             .request(Method::GET, url)
@@ -485,6 +485,123 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .await
             .map(drop)
     }
+
+    async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
+        match &draft.origin {
+            // A plain draft is created with its content in one request.
+            None => {
+                let url = self.url(&["me", "messages"]);
+                let created: IdOnly = self
+                    .json(
+                        self.request(Method::POST, url).json(&message_json(draft)),
+                        About::MAILBOX,
+                    )
+                    .await?;
+                Ok(MessageId::new(created.id))
+            }
+            Some(origin) => self.answer(origin, draft).await,
+        }
+    }
+}
+
+impl<A: Authenticator> MailSender for GraphMailStore<A> {
+    async fn send(&self, draft: &Draft) -> Result<()> {
+        let Some(origin) = &draft.origin else {
+            let url = self.url(&["me", "sendMail"]);
+            let body = json!({
+                "message": message_json(draft),
+                "saveToSentItems": draft.save_copy,
+            });
+            return self
+                .send(self.request(Method::POST, url).json(&body), About::MAILBOX)
+                .await
+                .map(drop);
+        };
+        // Replies and forwards go through a server draft, so that Graph
+        // threads them under the original and keeps a forwarded message's
+        // attachments. Sending a draft always keeps a copy in Sent Items.
+        let id = self.answer(origin, draft).await?;
+        let url = self.url(&["me", "messages", id.as_str(), "send"]);
+        let sent = self
+            .send(self.request(Method::POST, url), About::message(id.as_str()))
+            .await;
+        if sent.is_err() {
+            self.discard(&id).await;
+        }
+        sent.map(drop)
+    }
+}
+
+impl<A: Authenticator> GraphMailStore<A> {
+    /// Creates a server draft that replies to or forwards the original, with
+    /// `draft`'s content, and returns its ID.
+    async fn answer(&self, origin: &DraftOrigin, draft: &Draft) -> Result<MessageId> {
+        let (original, action) = match origin {
+            DraftOrigin::Reply(id) => (id, "createReply"),
+            DraftOrigin::Forward(id) => (id, "createForward"),
+        };
+        let url = self.url(&["me", "messages", original.as_str(), action]);
+        let created: IdOnly = self
+            .json(
+                self.request(Method::POST, url),
+                About::message(original.as_str()),
+            )
+            .await?;
+        let id = MessageId::new(created.id);
+        // Replace what Graph filled in (recipients, a quoted HTML body) with
+        // what the user wrote.
+        let url = self.url(&["me", "messages", id.as_str()]);
+        let updated = self
+            .send(
+                self.request(Method::PATCH, url).json(&message_json(draft)),
+                About::message(id.as_str()),
+            )
+            .await;
+        if let Err(e) = updated {
+            self.discard(&id).await;
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// Deletes a server draft that could not be completed, so it doesn't
+    /// linger in Drafts. Failing to is not worth reporting over the error
+    /// that caused it.
+    async fn discard(&self, id: &MessageId) {
+        let url = self.url(&["me", "messages", id.as_str()]);
+        let _ = self
+            .send(
+                self.request(Method::DELETE, url),
+                About::message(id.as_str()),
+            )
+            .await;
+    }
+}
+
+/// A Graph `message` resource with `draft`'s content.
+fn message_json(draft: &Draft) -> serde_json::Value {
+    let recipients = |list: &[Address]| -> Vec<serde_json::Value> {
+        list.iter()
+            .map(|a| {
+                let mut address = json!({ "address": a.email });
+                if let Some(name) = a.name.as_deref().filter(|n| !n.is_empty()) {
+                    address["name"] = json!(name);
+                }
+                json!({ "emailAddress": address })
+            })
+            .collect()
+    };
+    let mut message = json!({
+        "subject": draft.subject,
+        "body": { "contentType": "Text", "content": draft.body },
+        "toRecipients": recipients(&draft.to),
+        "ccRecipients": recipients(&draft.cc),
+        "bccRecipients": recipients(&draft.bcc),
+    });
+    if let Some(from) = &draft.from {
+        message["from"] = recipients(std::slice::from_ref(from)).remove(0);
+    }
+    message
 }
 
 impl<A> GraphMailStore<A> {
@@ -666,6 +783,8 @@ struct GraphMessage {
     to_recipients: Vec<Recipient>,
     #[serde(default)]
     cc_recipients: Vec<Recipient>,
+    #[serde(default)]
+    reply_to: Vec<Recipient>,
     /// Missing, or a placeholder, for unsent drafts.
     sent_date_time: Option<String>,
     #[serde(default)]
@@ -724,6 +843,11 @@ impl GraphMessage {
         Ok(Message {
             summary,
             cc: rest.cc.into_iter().map(Recipient::into_address).collect(),
+            reply_to: rest
+                .reply_to
+                .into_iter()
+                .map(Recipient::into_address)
+                .collect(),
             internet_message_id: rest.internet_message_id,
             body: rest.body.map_or(
                 Body {
@@ -774,6 +898,7 @@ impl GraphMessage {
         };
         let rest = Rest {
             cc: self.cc_recipients,
+            reply_to: self.reply_to,
             internet_message_id: self.internet_message_id,
             body: self.body,
         };
@@ -784,6 +909,7 @@ impl GraphMessage {
 /// The parts of a [`GraphMessage`] that only a full [`Message`] needs.
 struct Rest {
     cc: Vec<Recipient>,
+    reply_to: Vec<Recipient>,
     internet_message_id: Option<String>,
     body: Option<ItemBody>,
 }

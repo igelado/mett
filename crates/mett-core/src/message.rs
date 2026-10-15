@@ -41,6 +41,107 @@ impl fmt::Display for Address {
     }
 }
 
+/// Why an address list could not be parsed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("bad address {0:?}")]
+pub struct AddressError(pub String);
+
+impl Address {
+    /// Parses a comma-separated list of addresses, as typed in a `To:`
+    /// prompt: `alice@contoso.com`, `Alice <alice@contoso.com>` or
+    /// `"Example, Alice" <alice@contoso.com>`. Empty entries are skipped.
+    pub fn parse_list(text: &str) -> Result<Vec<Address>, AddressError> {
+        split_list(text)
+            .into_iter()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(Address::parse)
+            .collect()
+    }
+
+    /// Parses one address (see [`Address::parse_list`]).
+    pub fn parse(entry: &str) -> Result<Address, AddressError> {
+        let bad = || AddressError(entry.to_owned());
+        let entry = entry.trim();
+        let (name, email) = match entry.rfind('<') {
+            Some(open) => {
+                let email = entry[open + 1..].strip_suffix('>').ok_or_else(bad)?;
+                let name = entry[..open].trim();
+                let name = match name.strip_prefix('"') {
+                    Some(quoted) => unquote(quoted.strip_suffix('"').ok_or_else(bad)?),
+                    None => name.to_owned(),
+                };
+                (Some(name).filter(|n| !n.is_empty()), email.trim())
+            }
+            None => (None, entry),
+        };
+        let valid = email.split_once('@').is_some_and(|(user, domain)| {
+            !user.is_empty()
+                && !domain.is_empty()
+                && !domain.contains('@')
+                && !email.contains(|c: char| c.is_whitespace() || "<>\",;".contains(c))
+        });
+        if !valid {
+            return Err(bad());
+        }
+        Ok(Address {
+            name,
+            email: email.to_owned(),
+        })
+    }
+
+    /// Formats addresses as a comma-separated list that
+    /// [`Address::parse_list`] reads back, quoting names where needed.
+    pub fn format_list(addresses: &[Address]) -> String {
+        addresses
+            .iter()
+            .map(|a| match a.name.as_deref().filter(|n| !n.is_empty()) {
+                Some(name) if name.contains(['"', ',', ';', '<', '>', '@', '\\']) => {
+                    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{escaped}\" <{}>", a.email)
+                }
+                _ => a.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Splits an address list at commas outside quotes and angle brackets.
+fn split_list(text: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let (mut start, mut quoted, mut angle, mut escaped) = (0, false, false, false);
+    for (i, c) in text.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' if !angle => quoted = !quoted,
+            '<' if !quoted => angle = true,
+            '>' if !quoted => angle = false,
+            ',' if !quoted && !angle => {
+                entries.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&text[start..]);
+    entries
+}
+
+/// Undoes backslash escapes in a quoted name.
+fn unquote(quoted: &str) -> String {
+    let mut out = String::new();
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Message state flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -118,6 +219,9 @@ pub struct Message {
     pub summary: MessageSummary,
     /// The `Cc:` recipients.
     pub cc: Vec<Address>,
+    /// The `Reply-To:` addresses, if the sender asked for replies to go
+    /// elsewhere.
+    pub reply_to: Vec<Address>,
     /// The `Message-ID:` header, if present.
     pub internet_message_id: Option<String>,
     /// The body.
@@ -136,6 +240,49 @@ mod tests {
             "Alice <a@b.c>"
         );
         assert_eq!(Address::new("a@b.c").with_name("").to_string(), "a@b.c");
+    }
+
+    #[test]
+    fn parses_address_lists() {
+        let list = Address::parse_list(
+            r#"alice@contoso.com, Bob Smith <bob@fabrikam.com>,, "Doe, Jane \"JD\"" <jane@x.org>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            list,
+            [
+                Address::new("alice@contoso.com"),
+                Address::new("bob@fabrikam.com").with_name("Bob Smith"),
+                Address::new("jane@x.org").with_name(r#"Doe, Jane "JD""#),
+            ]
+        );
+        assert_eq!(Address::parse_list("  ").unwrap(), []);
+        assert_eq!(
+            Address::parse("<carol@x.org>").unwrap(),
+            Address::new("carol@x.org")
+        );
+        for bad in [
+            "alice",
+            "a@b@c",
+            "Bob <bob@x",
+            "x y@z",
+            "\"Bob <b@x>",
+            "@x",
+            "a@",
+        ] {
+            assert!(Address::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn formatted_lists_parse_back() {
+        let list = vec![
+            Address::new("alice@contoso.com"),
+            Address::new("jane@x.org").with_name(r#"Doe, Jane "JD" \o/"#),
+            Address::new("bob@x.org").with_name("Bob"),
+        ];
+        let text = Address::format_list(&list);
+        assert_eq!(Address::parse_list(&text).unwrap(), list);
     }
 
     #[test]
