@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
-use crate::draft::Draft;
+use crate::draft::{Draft, DraftOrigin};
 use crate::error::{Error, Result};
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{FolderId, MessageId, PageCursor};
@@ -107,6 +107,15 @@ impl State {
             .id
             .clone();
         let id = self.fresh_id(&MessageId::new(which.as_str()));
+        // A forward carries the original's attachments along, as Graph's
+        // createForward does.
+        let has_attachments = match &draft.origin {
+            Some(DraftOrigin::Forward(original)) => self
+                .messages
+                .iter()
+                .any(|m| &m.summary.id == original && m.summary.has_attachments),
+            _ => false,
+        };
         self.messages.push(Message {
             summary: MessageSummary {
                 id: id.clone(),
@@ -119,7 +128,7 @@ impl State {
                     read: true,
                     flagged: false,
                 },
-                has_attachments: false,
+                has_attachments,
             },
             cc: draft.cc.clone(),
             bcc: draft.bcc.clone(),
@@ -341,6 +350,45 @@ mod tests {
             FolderId::new("drafts")
         );
         assert!(store.send(&Draft::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_forward_keeps_the_original_s_attachments() {
+        let mut original = message("m4", "in", "report", at(4));
+        original.summary.has_attachments = true;
+        let store = store().with_message(original).with_folder(folder(
+            "drafts",
+            "Drafts",
+            Some(WellKnownFolder::Drafts),
+        ));
+        let forward = Draft {
+            to: vec![crate::Address::new("bob@x.org")],
+            subject: "Fwd: report".into(),
+            origin: Some(DraftOrigin::Forward(MessageId::new("m4"))),
+            ..Draft::default()
+        };
+        let id = store.save_draft(&forward).await.unwrap();
+        assert!(
+            store
+                .fetch_message(&id)
+                .await
+                .unwrap()
+                .summary
+                .has_attachments
+        );
+        let reply = Draft {
+            origin: Some(DraftOrigin::Reply(MessageId::new("m4"))),
+            ..forward
+        };
+        let id = store.save_draft(&reply).await.unwrap();
+        assert!(
+            !store
+                .fetch_message(&id)
+                .await
+                .unwrap()
+                .summary
+                .has_attachments
+        );
     }
 
     #[tokio::test]
