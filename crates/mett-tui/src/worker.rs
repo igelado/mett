@@ -202,11 +202,15 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
                 let found = match id {
                     // A folder deleted (or moved away) since is looked for
                     // by its path again.
-                    // So is one renamed since (another may have its name
-                    // now).
+                    // So is one renamed or moved since (another may be at
+                    // its path now).
                     Some(id) => match store.folder(&id).await {
                         Err(Error::NotFound { .. }) => resolve(store, &path).await,
-                        Ok(folder) if !path.names(&folder.name) => resolve(store, &path).await,
+                        Ok(folder) => match at_path(store, &path, &folder).await {
+                            Ok(true) => Ok(folder),
+                            Ok(false) => resolve(store, &path).await,
+                            Err(e) => Err(e),
+                        },
                         found => found,
                     },
                     None => resolve(store, &path).await,
@@ -262,6 +266,38 @@ async fn transfer<S: MailStore>(
         results.push((id.clone(), result));
     }
     Ok((folder.id, results))
+}
+
+/// Whether `folder` is still at `path`: its name and its parents' match
+/// the path's, up to the top of the mailbox or the well-known folder the
+/// path starts from.
+async fn at_path<S: MailStore>(store: &S, path: &FolderPath, folder: &Folder) -> Result<bool> {
+    let (names, start) = match path {
+        FolderPath::Root => return Ok(true),
+        FolderPath::WellKnown(which, rest) => (rest.as_slice(), Some(*which)),
+        FolderPath::Named(names) => (names.as_slice(), None),
+    };
+    let mut current = folder.clone();
+    for (i, name) in names.iter().enumerate().rev() {
+        if !FolderPath::Named(vec![name.clone()]).names(&current.name) {
+            return Ok(false);
+        }
+        if i > 0 {
+            let Some(parent) = current.parent.clone() else {
+                return Ok(false);
+            };
+            current = store.folder(&parent).await?;
+        }
+    }
+    match start {
+        // A well-known folder keeps its ID.
+        Some(_) if names.is_empty() => Ok(true),
+        Some(which) => {
+            let start = store.well_known_folder(which).await?;
+            Ok(current.parent.as_ref() == Some(&start.id))
+        }
+        None => Ok(current.parent.is_none()),
+    }
 }
 
 /// Finds the folder at `path`: a well-known folder, possibly followed by
@@ -409,6 +445,38 @@ mod tests {
             panic!("expected MailboxesChecked");
         };
         assert_eq!(checked[0].1.as_ref().unwrap().id, FolderId::new("arc"));
+        // Moved to another parent: the folder now at the path is checked.
+        let child = |id: &str, name: &str, parent: &str| {
+            let mut folder = mock::folder(id, name, None);
+            folder.parent = Some(FolderId::new(parent));
+            folder
+        };
+        let moved = tree()
+            .with_folder(child("shared-old", "Shared", "arc"))
+            .with_folder(child("shared-new", "Shared", "proj"));
+        let path = FolderPath::WellKnown(
+            WellKnownFolder::Inbox,
+            vec!["Projects".into(), "Shared".into()],
+        );
+        let Event::MailboxesChecked(checked) = serve(
+            &moved,
+            Request::CheckMailboxes(vec![
+                (path.clone(), Some(FolderId::new("shared-old"))),
+                (path, Some(FolderId::new("shared-new"))),
+            ]),
+        )
+        .await
+        else {
+            panic!("expected MailboxesChecked");
+        };
+        assert_eq!(
+            checked[0].1.as_ref().unwrap().id,
+            FolderId::new("shared-new")
+        );
+        assert_eq!(
+            checked[1].1.as_ref().unwrap().id,
+            FolderId::new("shared-new")
+        );
     }
 
     #[tokio::test]

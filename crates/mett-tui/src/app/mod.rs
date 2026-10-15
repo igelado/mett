@@ -536,6 +536,8 @@ pub struct App {
     /// Messages in the open folder the user read (less those set unread)
     /// since its count was last checked.
     reads_since_check: i64,
+    /// The folders of messages whose flag changes are on their way.
+    flag_folders: HashMap<MessageId, mett_core::FolderId>,
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
@@ -645,6 +647,7 @@ impl App {
             poll_since: None,
             poll_timer: 0,
             reads_since_check: 0,
+            flag_folders: HashMap::new(),
             known_before_refresh: None,
             checking: None,
         };
@@ -1515,6 +1518,7 @@ impl App {
             return Vec::new();
         };
         let before = summary.flags;
+        let folder = summary.folder.clone();
         let mut flags = before;
         if let Some(sent) = in_flight {
             sent.apply(&mut flags);
@@ -1524,6 +1528,8 @@ impl App {
             return Vec::new();
         }
         summary.flags = flags;
+        // Where it is, should the user leave the folder before it is saved.
+        self.flag_folders.insert(message_id.clone(), folder);
         // What the mailbox has, as far as mett knows, while changes are
         // on their way.
         self.mailbox_flags
