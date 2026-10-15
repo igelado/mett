@@ -268,6 +268,8 @@ impl Colors {
         // As in mutt, the pattern is one word: quoted, if it has spaces.
         let (fg, bg, expression) = match (rest, object.matches()) {
             ([fg, bg], false) => (fg, bg, None),
+            // Without a pattern, every entry of the index.
+            ([fg, bg], true) if object == Object::Index => (fg, bg, Some("~A")),
             ([fg, bg, expression], true) => (fg, bg, Some(expression.as_str())),
             ([_, _, _, _, ..], true) => {
                 return Err("color: too many arguments (quote a pattern with spaces)".into());
@@ -305,6 +307,7 @@ impl Colors {
         let style = with_attribute(Style::new(), attr);
         match (rest, object.matches()) {
             ([], false) => self.set(object, style, None),
+            ([], true) if object == Object::Index => self.set(object, style, Some("~A")),
             ([expression], true) => self.set(object, style, Some(expression)),
             ([_, _, ..], true) => {
                 Err("mono: too many arguments (quote a pattern with spaces)".into())
@@ -409,11 +412,18 @@ impl Colors {
         self.normal.patch(style)
     }
 
-    /// The style for quoted text `depth` levels deep (1 or more); levels
-    /// beyond `quoted9` take the deepest set, as in mutt.
+    /// The style for quoted text `depth` levels deep (1 or more): its own
+    /// `quotedN` if set, or else the nearest one set above it (down to
+    /// `quoted`), as in mutt.
     pub fn quoted_style(&self, depth: usize) -> Style {
         let level = depth.saturating_sub(1).min(QUOTED_LEVELS - 1);
-        self.normal.patch(self.quoted[level])
+        let style = self.quoted[..=level]
+            .iter()
+            .rev()
+            .find(|style| **style != Style::new())
+            .copied()
+            .unwrap_or_default();
+        self.normal.patch(style)
     }
 }
 
@@ -547,7 +557,17 @@ mod tests {
         );
         colors.color(&words("quoted1 color130 default")).unwrap();
         assert_eq!(colors.quoted_style(2).fg, Some(Color::Indexed(130)));
-        assert_eq!(colors.quoted_style(20).fg, None, "quoted9 is unset");
+        // Deeper levels unset take the nearest set above them.
+        assert_eq!(colors.quoted_style(20).fg, Some(Color::Indexed(130)));
+        assert_eq!(colors.quoted_style(1).fg, None, "quoted is unset");
+        let mut base = Colors::default();
+        base.color(&words("quoted green default")).unwrap();
+        assert_eq!(base.quoted_style(3).fg, Some(Color::Green));
+        // An index rule without a pattern is for every entry.
+        base.color(&words("index red default")).unwrap();
+        base.mono(&words("index bold")).unwrap();
+        assert_eq!(base.index.len(), 1);
+        assert_eq!(base.index[0].text, "~A");
         colors.color(&words("index red default ~N")).unwrap();
         colors.color(&words("index green default ~F")).unwrap();
         colors.color(&words("index red default ~N")).unwrap();
@@ -601,7 +621,7 @@ mod tests {
             "",
             "status red",
             "status mauve blue",
-            "index red blue",
+            "body red blue",
             "index red blue ~s(",
             "body red blue (",
             "status red blue extra",
