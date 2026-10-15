@@ -591,10 +591,14 @@ impl App {
                 self.sign_in = None;
                 // Requests that needed the sign-in may not have reported
                 // back yet: retry them once they have. When quitting, only
-                // saving changes matters, and only their responses are
-                // still handled.
+                // saving changes and deleting drafts matter, and only their
+                // responses are still handled.
                 self.retry_after = if self.quit {
-                    self.flag_updates.keys().copied().collect()
+                    self.flag_updates
+                        .keys()
+                        .chain(self.discarding.keys())
+                        .copied()
+                        .collect()
                 } else {
                     self.in_flight()
                 };

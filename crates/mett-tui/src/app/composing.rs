@@ -1185,6 +1185,42 @@ mod tests {
     }
 
     #[test]
+    fn retrying_while_quitting_waits_for_a_draft_being_deleted() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        if let Some(Screen::Compose(compose)) = app.screens.last_mut() {
+            compose.draft.origin = Some(DraftOrigin::Reply("m1".into()));
+        }
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Network("timed out".into()))),
+        }));
+        act(&mut app, Action::Exit);
+        let (discard, _) = request(&key(&mut app, KeyCode::Char('n')));
+        app.quit = true;
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        // Retry before the delete reports back: it is retried once it has.
+        act(&mut app, Action::Retry);
+        let effects = app.update(Msg::Response(Response {
+            id: discard,
+            event: Event::KeptDiscarded(Err(Error::Auth("expired".into()))),
+        }));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Request(_, Request::DiscardKept(_)))),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
     fn leaving_the_compose_menu_asks_whether_to_postpone() {
         let mut app = app(settings());
         act(&mut app, Action::Mail);
