@@ -681,7 +681,7 @@ impl App {
         self.screens.truncate(1);
         self.polling = None;
         self.known_before_refresh = None;
-        self.tie_checked.clear();
+        self.tie_check = None;
         self.reselect = None;
         self.folder = None;
         self.messages.clear();

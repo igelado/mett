@@ -539,9 +539,9 @@ pub struct App {
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
-    /// Messages missing from a check's page, as old as its last: the
-    /// folder was listed again once to tell whether they are gone.
-    tie_checked: HashSet<MessageId>,
+    /// The request asking whether messages missing from a check's page,
+    /// as old as its last, are still in the folder (on the next page).
+    tie_check: Option<(RequestId, mett_core::FolderId)>,
     /// The request reading the mailboxes' counts.
     checking: Option<RequestId>,
     /// The unread mail the user has seen, by folder.
@@ -656,7 +656,7 @@ impl App {
             poll_since: None,
             poll_timer: 0,
             known_before_refresh: None,
-            tie_checked: HashSet::new(),
+            tie_check: None,
             checking: None,
             seen: HashMap::new(),
             poll_epoch: 0,
@@ -1347,6 +1347,7 @@ impl App {
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::FoldersListed(result) => return self.on_folders_listed(id, result),
             Event::MailboxesChecked(checked) => return self.on_mailboxes_checked(id, checked),
+            Event::StillThere(result) => return self.on_still_there(id, result),
             Event::Transferred(result) => {
                 // The messages leave the index, or it is listed again; the
                 // new IDs matter to changes still to make, or that failed.

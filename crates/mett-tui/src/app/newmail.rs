@@ -376,25 +376,27 @@ impl App {
         };
         let listed: HashSet<&MessageId> = fresh.iter().map(|m| &m.id).collect();
         // One missing that is as old as the page's last may be on the next
-        // page, or gone: the folder is listed again to tell (once, or
-        // every check would).
+        // page, or gone: asked about.
         let tied: Vec<MessageId> = self
             .messages
             .iter()
             .chain(&self.hidden)
             .filter(|m| !listed.contains(&m.id) && !covered(m))
             .filter(|m| (if m.draft { oldest_draft } else { oldest_sent }) == Some(m.received))
-            .filter(|m| !self.transferring(&m.id) && !self.tie_checked.contains(&m.id))
+            .filter(|m| !self.transferring(&m.id))
             .map(|m| m.id.clone())
             .collect();
-        if !tied.is_empty() {
-            self.tie_checked.extend(tied);
-            if unread {
-                self.announce(NEW_MAIL);
-            }
-            let effects = self.refresh();
-            self.known_before_refresh = Some(known);
-            return effects;
+        let mut effects = Vec::new();
+        if let Some(open) = self.folder.as_ref().map(|f| f.id.clone())
+            && !tied.is_empty()
+            && self.tie_check.is_none()
+        {
+            let request = self.request(Request::StillThere {
+                folder: open.clone(),
+                ids: tied,
+            });
+            self.tie_check = Some((effect_id(&request), open));
+            effects.push(request);
         }
         let gone: HashSet<MessageId> = self
             .messages
@@ -439,6 +441,31 @@ impl App {
         if unread {
             self.announce(NEW_MAIL);
         }
+        effects
+    }
+
+    /// Takes out of the index the messages a check found gone from the
+    /// folder (see [`Request::StillThere`]).
+    pub(super) fn on_still_there(
+        &mut self,
+        id: RequestId,
+        result: mett_core::Result<Vec<MessageId>>,
+    ) -> Vec<Effect> {
+        let Some((_, folder)) = self.tie_check.take_if(|(request, _)| *request == id) else {
+            return Vec::new();
+        };
+        // (A failure is asked about again at the next check.)
+        let Ok(gone) = result else {
+            return Vec::new();
+        };
+        if self.folder.as_ref().is_none_or(|f| f.id != folder) {
+            return Vec::new();
+        }
+        let gone: HashSet<MessageId> = gone
+            .into_iter()
+            .filter(|id| !self.transferring(id))
+            .collect();
+        self.remove_messages(&gone);
         Vec::new()
     }
 
@@ -886,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_missing_at_the_page_s_end_has_the_folder_listed_once() {
+    fn a_message_missing_at_the_page_s_end_is_asked_about() {
         let (mut app, _) = app();
         // m0 is as old as m1, the page's last: on the next page, or gone.
         app.messages.iter_mut().for_each(|m| {
@@ -905,25 +932,26 @@ mod tests {
             };
             respond(app, id, Event::FolderPolled(Ok(polled)))
         };
+        let still_there = |effects: &[Effect]| {
+            requests(effects)
+                .into_iter()
+                .find(|(_, r)| matches!(r, Request::StillThere { ids, .. } if ids == &[MessageId::new("m0")]))
+                .map(|(id, _)| id)
+        };
+        // There still: kept, and asked about again at the next check.
         let effects = partial(&mut app);
-        let (list, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::ListMessages { .. }))
-            .expect("the folder is listed again");
-        // Listed again, it is there: not again at every check.
-        let mut m0 = summary("m0", 1);
-        m0.received = DateTime::UNIX_EPOCH + TimeDelta::minutes(1);
+        let check = still_there(&effects).expect("m0 is asked about");
+        respond(&mut app, check, Event::StillThere(Ok(Vec::new())));
+        assert_eq!(ids(&app), ["m2", "m1", "m0"]);
+        // Gone since: taken out.
+        let effects = partial(&mut app);
+        let check = still_there(&effects).expect("m0 is asked about again");
         respond(
             &mut app,
-            list,
-            Event::MessagesListed(Ok(page(vec![summary("m2", 2), summary("m1", 1), m0]))),
+            check,
+            Event::StillThere(Ok(vec![MessageId::new("m0")])),
         );
-        let effects = partial(&mut app);
-        assert!(
-            !requests(&effects)
-                .iter()
-                .any(|(_, r)| matches!(r, Request::ListMessages { .. }))
-        );
+        assert_eq!(ids(&app), ["m2", "m1"]);
     }
 
     #[test]

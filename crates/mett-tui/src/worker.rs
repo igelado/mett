@@ -83,6 +83,14 @@ pub enum Request {
     /// new mail: by ID, where the folder was found before, or else by
     /// path.
     CheckMailboxes(Vec<(FolderPath, Option<FolderId>, Option<DateTime<Utc>>)>),
+    /// Find which of `ids` are no longer in `folder` (deleted, or moved
+    /// away).
+    StillThere {
+        /// The folder.
+        folder: FolderId,
+        /// The messages.
+        ids: Vec<MessageId>,
+    },
 }
 
 /// The outcome of a [`Request`].
@@ -120,6 +128,8 @@ pub enum Event {
     /// Outcome of [`Request::CheckMailboxes`]: each folder, or why it
     /// couldn't be read.
     MailboxesChecked(Vec<(FolderPath, Result<Checked>)>),
+    /// Outcome of [`Request::StillThere`]: the messages gone.
+    StillThere(Result<Vec<MessageId>>),
 }
 
 /// A mailbox, as checked for new mail.
@@ -208,6 +218,22 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
         Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
         Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
+        Request::StillThere { folder, ids } => {
+            let mut gone = Vec::new();
+            let mut failed = None;
+            for id in ids {
+                match store.fetch_message(&id).await {
+                    Err(Error::NotFound { .. }) => gone.push(id),
+                    Ok(message) if message.summary.folder != folder => gone.push(id),
+                    Ok(_) => {}
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            Event::StillThere(failed.map_or(Ok(gone), Err))
+        }
         Request::CheckMailboxes(mailboxes) => {
             Event::MailboxesChecked(check_mailboxes(store, mailboxes).await)
         }
@@ -500,6 +526,24 @@ mod tests {
             .with_folder(mock::folder("arc", "Archive", None))
     }
 
+    #[tokio::test]
+    async fn tells_which_messages_left_a_folder() {
+        let store = MemoryStore::new()
+            .with_folder(mock::folder("in", "Inbox", None))
+            .with_message(mock::message("m1", "in", "Hi", DateTime::UNIX_EPOCH));
+        let event = serve(
+            &store,
+            Request::StillThere {
+                folder: FolderId::new("in"),
+                ids: vec![MessageId::new("m1"), MessageId::new("m2")],
+            },
+        )
+        .await;
+        let Event::StillThere(Ok(gone)) = event else {
+            panic!("expected the messages gone, got {event:?}");
+        };
+        assert_eq!(gone, [MessageId::new("m2")]);
+    }
     #[tokio::test]
     async fn runs_a_few_at_a_time_in_order() {
         use std::sync::atomic::{AtomicUsize, Ordering};
