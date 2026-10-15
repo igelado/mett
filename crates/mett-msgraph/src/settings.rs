@@ -168,12 +168,7 @@ impl AuthSettings {
             .login_url
             .clone()
             .unwrap_or_else(|| self.cloud.login_url());
-        let mut url = base;
-        url.path_segments_mut()
-            .expect("login URL can be a base")
-            .pop_if_empty()
-            .extend([self.tenant(), "oauth2", "v2.0", name]);
-        url
+        with_segments(base, &[self.tenant(), "oauth2", "v2.0", name])
     }
 
     /// The URL of a Graph v1.0 API path, such as `me`.
@@ -182,12 +177,7 @@ impl AuthSettings {
             .graph_url
             .clone()
             .unwrap_or_else(|| self.cloud.graph_url());
-        let mut url = base;
-        url.path_segments_mut()
-            .expect("Graph URL can be a base")
-            .pop_if_empty()
-            .extend(["v1.0", path]);
-        url
+        with_segments(base, &["v1.0", path])
     }
 
     /// The `scope` parameter: Graph scopes are qualified with the cloud's
@@ -206,6 +196,16 @@ impl AuthSettings {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// `url` with `segments` added to its path (escaped, so IDs containing `/`
+/// or `+` are safe).
+pub(crate) fn with_segments(mut url: Url, segments: &[&str]) -> Url {
+    url.path_segments_mut()
+        .expect("HTTP URLs can be a base")
+        .pop_if_empty()
+        .extend(segments);
+    url
 }
 
 #[cfg(test)]

@@ -72,15 +72,12 @@ impl MemoryStore {
             .attachments
             .entry(MessageId::new(message))
             .or_default();
-        let attachment = Attachment {
-            id: AttachmentId::new(format!("{message}-a{}", list.len())),
-            name: name.to_owned(),
-            content_type: content_type.to_owned(),
-            size: data.len() as u64,
-            inline: false,
-            kind: AttachmentKind::File,
-        };
-        list.push((attachment, data.to_vec()));
+        list.push(file(
+            format!("{message}-a{}", list.len()),
+            name,
+            content_type,
+            data,
+        ));
         if let Ok(message) = state.message_mut(&MessageId::new(message)) {
             message.summary.has_attachments = true;
         }
@@ -101,6 +98,10 @@ impl MemoryStore {
 }
 
 impl State {
+    fn well_known(&self, which: WellKnownFolder) -> Option<&Folder> {
+        self.folders.iter().find(|f| f.well_known == Some(which))
+    }
+
     fn folder(&self, id: &FolderId) -> Result<&Folder> {
         self.folders
             .iter()
@@ -129,11 +130,7 @@ impl State {
     /// Office365 does.
     fn check_recalled(&self, draft: &Draft) -> Result<()> {
         // Still in Drafts: one moved elsewhere isn't recalled any more.
-        let drafts = self
-            .folders
-            .iter()
-            .find(|f| f.well_known == Some(WellKnownFolder::Drafts))
-            .map(|f| &f.id);
+        let drafts = self.well_known(WellKnownFolder::Drafts).map(|f| &f.id);
         match &draft.origin {
             Some(DraftOrigin::Recalled(id))
                 if !self
@@ -163,9 +160,7 @@ impl State {
     /// Stores `draft` as a message in the well-known folder `which`.
     fn store_draft(&mut self, draft: &Draft, which: WellKnownFolder) -> Result<MessageId> {
         let folder = self
-            .folders
-            .iter()
-            .find(|f| f.well_known == Some(which))
+            .well_known(which)
             .ok_or_else(|| Error::not_found("folder", which))?
             .id
             .clone();
@@ -186,16 +181,13 @@ impl State {
         };
         let forwarded = matches!(&draft.origin, Some(DraftOrigin::Forward(original))
             if self.messages.iter().any(|m| &m.summary.id == original && m.summary.has_attachments));
-        for file in &draft.attachments {
-            let attachment = Attachment {
-                id: AttachmentId::new(format!("{id}-a{}", attachments.len())),
-                name: file.name.clone(),
-                content_type: file.content_type.clone(),
-                size: file.data.len() as u64,
-                inline: false,
-                kind: AttachmentKind::File,
-            };
-            attachments.push((attachment, file.data.clone()));
+        for f in &draft.attachments {
+            attachments.push(file(
+                format!("{id}-a{}", attachments.len()),
+                &f.name,
+                &f.content_type,
+                &f.data,
+            ));
         }
         let has_attachments = forwarded || !attachments.is_empty();
         if !attachments.is_empty() {
@@ -229,6 +221,18 @@ impl State {
             },
         });
         Ok(id)
+    }
+
+    /// Removes message `id` and its attachments, and returns whether it was
+    /// there.
+    fn remove(&mut self, id: &MessageId) -> bool {
+        let before = self.messages.len();
+        self.messages.retain(|m| &m.summary.id != id);
+        let removed = self.messages.len() != before;
+        if removed {
+            self.attachments.remove(id);
+        }
+        removed
     }
 
     fn message_mut(&mut self, id: &MessageId) -> Result<&mut Message> {
@@ -303,9 +307,7 @@ impl MailStore for MemoryStore {
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
         let state = self.state();
         state
-            .folders
-            .iter()
-            .find(|f| f.well_known == Some(which))
+            .well_known(which)
             .map(|f| state.with_counts(f))
             .ok_or_else(|| Error::not_found("folder", which))
     }
@@ -438,13 +440,9 @@ impl MailStore for MemoryStore {
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
-        let mut state = self.state();
-        let before = state.messages.len();
-        state.messages.retain(|m| &m.summary.id != id);
-        if state.messages.len() == before {
+        if !self.state().remove(id) {
             return Err(Error::not_found("message", id));
         }
-        state.attachments.remove(id);
         Ok(())
     }
 
@@ -454,12 +452,8 @@ impl MailStore for MemoryStore {
         let id = state.store_draft(draft, WellKnownFolder::Drafts)?;
         // A recalled draft is postponed again as itself.
         match &draft.origin {
-            Some(DraftOrigin::Recalled(old))
-                if state.messages.iter().any(|m| &m.summary.id == old) =>
-            {
+            Some(DraftOrigin::Recalled(old)) if state.remove(old) => {
                 let old = old.clone();
-                state.messages.retain(|m| m.summary.id != old);
-                state.attachments.remove(&old);
                 for message in state.messages.iter_mut().filter(|m| m.summary.id == id) {
                     message.summary.id = old.clone();
                 }
@@ -490,12 +484,24 @@ impl MailSender for MemoryStore {
             state.store_draft(draft, WellKnownFolder::SentItems)?;
         }
         if let Some(id) = recalled {
-            state.messages.retain(|m| m.summary.id != id);
-            state.attachments.remove(&id);
+            state.remove(&id);
         }
         state.sent.push(draft.clone());
         Ok(())
     }
+}
+
+/// A file attachment `id` with its content.
+fn file(id: String, name: &str, content_type: &str, data: &[u8]) -> (Attachment, Vec<u8>) {
+    let attachment = Attachment {
+        id: AttachmentId::new(id),
+        name: name.to_owned(),
+        content_type: content_type.to_owned(),
+        size: data.len() as u64,
+        inline: false,
+        kind: AttachmentKind::File,
+    };
+    (attachment, data.to_vec())
 }
 
 /// Listing order: newest first, with ties broken by ID.
@@ -574,6 +580,22 @@ mod tests {
             .with_message(message("m3", "in", "third", at(3)))
     }
 
+    /// [`store`], with Drafts and Sent Items.
+    fn store_with_drafts() -> MemoryStore {
+        store()
+            .with_folder(folder("drafts", "Drafts", Some(WellKnownFolder::Drafts)))
+            .with_folder(folder("sent", "Sent", Some(WellKnownFolder::SentItems)))
+    }
+
+    async fn has_attachments(store: &MemoryStore, id: &MessageId) -> bool {
+        store
+            .fetch_message(id)
+            .await
+            .unwrap()
+            .summary
+            .has_attachments
+    }
+
     fn subjects(page: &MessagePage) -> Vec<&str> {
         page.messages.iter().map(|m| m.subject.as_str()).collect()
     }
@@ -600,9 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn sends_and_saves_drafts() {
-        let store = store()
-            .with_folder(folder("drafts", "Drafts", Some(WellKnownFolder::Drafts)))
-            .with_folder(folder("sent", "Sent", Some(WellKnownFolder::SentItems)));
+        let store = store_with_drafts();
         let draft = Draft {
             to: vec![crate::Address::new("bob@x.org")],
             subject: "hi".into(),
@@ -627,9 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_recalled_draft_is_postponed_and_sent_as_itself() {
-        let store = store()
-            .with_folder(folder("drafts", "Drafts", Some(WellKnownFolder::Drafts)))
-            .with_folder(folder("sent", "Sent", Some(WellKnownFolder::SentItems)));
+        let store = store_with_drafts();
         let draft = Draft {
             to: vec![crate::Address::new("bob@x.org")],
             subject: "hi".into(),
@@ -641,14 +659,7 @@ mod tests {
             ..Draft::default()
         };
         let id = store.save_draft(&draft).await.unwrap();
-        assert!(
-            store
-                .fetch_message(&id)
-                .await
-                .unwrap()
-                .summary
-                .has_attachments
-        );
+        assert!(has_attachments(&store, &id).await);
         let recalled = Draft {
             attachments: Vec::new(),
             subject: "hi again".into(),
@@ -665,14 +676,7 @@ mod tests {
             ..recalled.clone()
         };
         assert_eq!(store.save_draft(&bare).await.unwrap(), id);
-        assert!(
-            !store
-                .fetch_message(&id)
-                .await
-                .unwrap()
-                .summary
-                .has_attachments
-        );
+        assert!(!has_attachments(&store, &id).await);
         store.send(&recalled).await.unwrap();
         let listed = store.list_messages(&drafts, Page::first(10)).await.unwrap();
         assert!(listed.messages.is_empty());
@@ -702,27 +706,13 @@ mod tests {
             ..Draft::default()
         };
         let id = store.save_draft(&forward).await.unwrap();
-        assert!(
-            store
-                .fetch_message(&id)
-                .await
-                .unwrap()
-                .summary
-                .has_attachments
-        );
+        assert!(has_attachments(&store, &id).await);
         let reply = Draft {
             origin: Some(DraftOrigin::Reply(MessageId::new("m4"))),
             ..forward
         };
         let id = store.save_draft(&reply).await.unwrap();
-        assert!(
-            !store
-                .fetch_message(&id)
-                .await
-                .unwrap()
-                .summary
-                .has_attachments
-        );
+        assert!(!has_attachments(&store, &id).await);
     }
 
     #[tokio::test]
@@ -797,13 +787,7 @@ mod tests {
         let store = store();
         let id = MessageId::new("m1");
         store
-            .update_flags(
-                &id,
-                FlagsUpdate {
-                    read: Some(true),
-                    flagged: None,
-                },
-            )
+            .update_flags(&id, FlagsUpdate::read(true))
             .await
             .unwrap();
         let flags = store.fetch_message(&id).await.unwrap().summary.flags;
@@ -834,13 +818,7 @@ mod tests {
         assert_eq!(counts(inbox().await.unwrap()), (3, 3));
 
         store
-            .update_flags(
-                &MessageId::new("m1"),
-                FlagsUpdate {
-                    read: Some(true),
-                    flagged: None,
-                },
-            )
+            .update_flags(&MessageId::new("m1"), FlagsUpdate::read(true))
             .await
             .unwrap();
         assert_eq!(counts(inbox().await.unwrap()), (3, 2));
@@ -871,7 +849,7 @@ mod tests {
     async fn lists_changes_since_a_time() {
         let store = store();
         let inbox = FolderId::new("in");
-        let late = mock_message_at("late", at(-60));
+        let late = message("late", "in", "late", at(-60));
         store.deliver(late, at(50));
         let changed = store
             .changed_messages(&inbox, at(40), Page::first(10))
@@ -879,13 +857,7 @@ mod tests {
             .unwrap();
         assert_eq!(subjects(&changed), ["late"]);
         store
-            .update_flags(
-                &MessageId::new("m1"),
-                FlagsUpdate {
-                    read: Some(true),
-                    flagged: None,
-                },
-            )
+            .update_flags(&MessageId::new("m1"), FlagsUpdate::read(true))
             .await
             .unwrap();
         let changed = store
@@ -893,10 +865,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(changed.messages[0].id, MessageId::new("m1"));
-    }
-
-    fn mock_message_at(subject: &str, received: DateTime<Utc>) -> Message {
-        message(subject, "in", subject, received)
     }
 
     #[tokio::test]

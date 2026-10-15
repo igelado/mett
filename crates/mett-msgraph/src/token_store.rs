@@ -109,10 +109,7 @@ impl TokenStore for KeyringStore {
         account: &AccountId,
         token: &str,
     ) -> Result<Option<String>, TokenStoreError> {
-        match self.load(account)? {
-            Some(stored) if stored == token => Ok(None),
-            other => Ok(other),
-        }
+        Ok(self.load(account)?.filter(|stored| stored != token))
     }
 }
 
@@ -247,16 +244,15 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
     // applies, which reusing an existing file would not.
     let random = crate::pkce::random_token().map_err(io::Error::other)?;
     let tmp = sibling(path, ".", &format!(".{random}.tmp"));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-
-    let result = options.open(&tmp).and_then(|mut file| {
-        file.write_all(data)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)
-    });
+    let result = private_options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut file| {
+            file.write_all(data)?;
+            file.sync_all()?;
+            fs::rename(&tmp, path)
+        });
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -285,13 +281,22 @@ fn lock_file(path: &Path) -> io::Result<fs::File> {
     if let Some(dir) = parent_dir(path) {
         create_private_dir(dir)?;
     }
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options.open(path)?;
+    let file = private_options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
     file.lock()?;
     Ok(file)
+}
+
+/// Options that create a file readable only by the user.
+fn private_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
 }
 
 /// The directory containing `path`, or `None` for a bare file name (which
@@ -371,6 +376,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn file_store_round_trips_privately() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = temp_dir("filestore");
         let store = FileStore::new(dir.join("sub/alice.tokens"));
         let account = AccountId::new("alice@contoso.com");
@@ -380,15 +387,11 @@ mod tests {
         store.save(&account, "r2").unwrap();
         assert_eq!(store.load(&account).unwrap().as_deref(), Some("r2"));
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir.join("sub/alice.tokens"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
+        let mode = fs::metadata(dir.join("sub/alice.tokens"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
 
         store.clear(&account).unwrap();
         store.clear(&account).unwrap();

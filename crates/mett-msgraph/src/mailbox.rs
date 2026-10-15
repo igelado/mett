@@ -5,7 +5,7 @@
 //! refreshing and signing in happen transparently.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 
-use crate::settings::{AuthSettings, Cloud};
+use crate::settings::{AuthSettings, Cloud, with_segments};
 
 /// Upper bound on each Graph request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,7 +53,7 @@ pub struct GraphMailStore<A> {
     /// whose outcome is unknown, by what they answer and the composed
     /// message they hold ([`Draft::attempt`]): sending or postponing that
     /// message again updates the draft rather than making another.
-    kept: Mutex<HashMap<(Option<DraftOrigin>, u64), Kept>>,
+    kept: Mutex<HashMap<DraftKey, Kept>>,
     /// The files mett uploaded to recalled drafts, by the same key, until
     /// they are known to be gone or the message is done with: a retry
     /// takes them off (to put on again what is still to go), and leaves
@@ -64,6 +64,11 @@ pub struct GraphMailStore<A> {
 /// A composed message, as backends tell its attempts apart: what it answers
 /// or recalls, and its [`Draft::attempt`].
 type DraftKey = (Option<DraftOrigin>, u64);
+
+/// `draft`'s [`DraftKey`].
+fn key(draft: &Draft) -> DraftKey {
+    (draft.origin.clone(), draft.attempt)
+}
 
 /// A file mett uploaded (or may have: the answer can be lost).
 #[derive(Clone, Debug)]
@@ -95,17 +100,14 @@ impl Upload {
     fn is(&self, attachment: &Attachment) -> bool {
         match &self.id {
             Some(uploaded) => *uploaded == attachment.id.as_str(),
-            None => !self.prior.contains(&attachment.id.to_string()) && self.looks_like(attachment),
+            None => {
+                !self.prior.contains(&attachment.id.to_string())
+                    && self.name == attachment.name
+                    && self
+                        .content_type
+                        .eq_ignore_ascii_case(&attachment.content_type)
+            }
         }
-    }
-
-    /// Whether this upload, whose answer was lost, may be `attachment`.
-    fn looks_like(&self, attachment: &Attachment) -> bool {
-        self.id.is_none()
-            && self.name == attachment.name
-            && self
-                .content_type
-                .eq_ignore_ascii_case(&attachment.content_type)
     }
 }
 
@@ -169,14 +171,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             http,
             base: settings.graph_api(""),
             cloud: settings.cloud,
-            canonical: {
-                let mut url = settings.cloud.graph_url();
-                url.path_segments_mut()
-                    .expect("Graph URL can be a base")
-                    .pop_if_empty()
-                    .extend(["v1.0", ""]);
-                url
-            },
+            canonical: with_segments(settings.cloud.graph_url(), &["v1.0", ""]),
             auth,
             roles: Mutex::new(None),
             root: Mutex::new(None),
@@ -188,30 +183,25 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// The URL of `segments` below the Graph root. Segments are escaped, so
     /// IDs containing `/` or `+` are safe.
     fn url(&self, segments: &[&str]) -> Url {
-        let mut url = self.base.clone();
-        url.path_segments_mut()
-            .expect("Graph URL can be a base")
-            .pop_if_empty()
-            .extend(segments);
-        url
+        with_segments(self.base.clone(), segments)
+    }
+
+    /// The uploads of each attempt.
+    fn uploads(&self) -> MutexGuard<'_, HashMap<DraftKey, Vec<Upload>>> {
+        self.uploads.lock().expect("lock")
+    }
+
+    /// The server drafts kept.
+    fn kept(&self) -> MutexGuard<'_, HashMap<DraftKey, Kept>> {
+        self.kept.lock().expect("lock")
     }
 
     /// Sends `request` for `about` (the object it concerns, named in a
     /// "not found" error).
     async fn send(&self, request: RequestBuilder, about: About<'_>) -> Result<reqwest::Response> {
-        self.send_with_token(request, about)
+        self.send_with(request, about, |e| e)
             .await
             .map(|(response, _)| response)
-    }
-
-    /// Like [`Self::send`], also returning the token the response was
-    /// obtained with.
-    async fn send_with_token(
-        &self,
-        request: RequestBuilder,
-        about: About<'_>,
-    ) -> Result<(reqwest::Response, AccessToken)> {
-        self.send_with(request, about, |e| e).await
     }
 
     /// Sends a request that hands a message over to be sent. Failing
@@ -222,8 +212,9 @@ impl<A: Authenticator> GraphMailStore<A> {
         self.send_with(request, about, unsent).await.map(drop)
     }
 
-    /// Like [`Self::send_with_token`], passing errors from before the
-    /// request is made (or after Graph refused it) through `before`.
+    /// Like [`Self::send`], also returning the token the response was
+    /// obtained with, and passing errors from before the request is made
+    /// (or after Graph refused it) through `before`.
     async fn send_with(
         &self,
         request: RequestBuilder,
@@ -271,6 +262,11 @@ impl<A: Authenticator> GraphMailStore<A> {
         }
     }
 
+    /// GETs `url`, for `about`.
+    async fn get<T: DeserializeOwned>(&self, url: Url, about: About<'_>) -> Result<T> {
+        self.json(self.request(Method::GET, url), about).await
+    }
+
     async fn json<T: DeserializeOwned>(
         &self,
         request: RequestBuilder,
@@ -287,15 +283,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         about: About<'_>,
         before: fn(Error) -> Error,
     ) -> Result<T> {
-        let body = self
-            .send_with(request, about, before)
-            .await?
-            .0
-            .bytes()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?;
-        serde_json::from_slice(&body)
-            .map_err(|e| Error::Backend(format!("unexpected response from Graph: {e}")))
+        decode(self.send_with(request, about, before).await?.0).await
     }
 
     fn request(&self, method: Method, url: Url) -> RequestBuilder {
@@ -318,9 +306,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         }
         let mut url = self.url(&["me", "mailFolders", ROOT]);
         url.query_pairs_mut().append_pair("$select", "id");
-        let root: IdOnly = self
-            .json(self.request(Method::GET, url), About::folder(ROOT))
-            .await?;
+        let root: IdOnly = self.get(url, About::folder(ROOT)).await?;
         let root = Some(FolderId::new(root.id));
         *self.root.lock().unwrap_or_else(|e| e.into_inner()) = Some(root.clone());
         Ok(root)
@@ -417,14 +403,8 @@ impl<A: Authenticator> GraphMailStore<A> {
         let request = self
             .request(Method::POST, self.url(&["$batch"]))
             .json(&json!({ "requests": requests }));
-        let (response, token) = self.send_with_token(request, About::MAILBOX).await?;
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?;
-        let batch = serde_json::from_slice(&body)
-            .map_err(|e| Error::Backend(format!("unexpected response from Graph: {e}")))?;
-        Ok((batch, token))
+        let (response, token) = self.send_with(request, About::MAILBOX, |e| e).await?;
+        Ok((decode(response).await?, token))
     }
 }
 
@@ -436,9 +416,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         let mut url = self.url(&["me"]);
         url.query_pairs_mut()
             .append_pair("$select", "mail,userPrincipalName,proxyAddresses");
-        let me: Me = self
-            .json(self.request(Method::GET, url), About::MAILBOX)
-            .await?;
+        let me: Me = self.get(url, About::MAILBOX).await?;
         // `proxyAddresses` holds every alias, as `SMTP:` (the primary one)
         // or `smtp:`; other kinds (`x500:`, `sip:`) aren't mail addresses.
         let aliases = me.proxy_addresses.into_iter().filter_map(|proxy| {
@@ -497,9 +475,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         // Either search may be refused (the app may not have its
         // permission): the other's results are what there is.
         let refused = |e: &Error| matches!(e, Error::Auth(_));
-        let people = self
-            .json::<Collection<Person>>(self.request(Method::GET, url), About::MAILBOX)
-            .await;
+        let people = self.get::<Collection<Person>>(url, About::MAILBOX).await;
         let people_refused = match people {
             Ok(people) => {
                 for person in people.value {
@@ -559,8 +535,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         while let Some((mut url, parent)) = pending.pop() {
             loop {
                 let about = parent.as_deref().map_or(About::MAILBOX, About::folder);
-                let page: Collection<GraphFolder> =
-                    self.json(self.request(Method::GET, url), about).await?;
+                let page: Collection<GraphFolder> = self.get(url, about).await?;
                 for folder in page.value {
                     if folder.child_folder_count > 0 {
                         let children =
@@ -587,13 +562,11 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             Some(roles) => roles,
             None => Arc::new(Roles {
                 root: self.root().await?,
-                well_known: HashMap::new(),
+                ..Default::default()
             }),
         };
         let url = self.url(&["me", "mailFolders", id.as_str()]);
-        let folder: GraphFolder = self
-            .json(self.request(Method::GET, url), About::folder(id.as_str()))
-            .await?;
+        let folder: GraphFolder = self.get(url, About::folder(id.as_str())).await?;
         Ok(roles.folder(folder))
     }
 
@@ -628,12 +601,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .append_pair("$orderby", "lastModifiedDateTime desc");
         let mut recent = Vec::new();
         loop {
-            let page: Collection<Modified> = self
-                .json(
-                    self.request(Method::GET, url),
-                    About::folder(folder.as_str()),
-                )
-                .await?;
+            let page: Collection<Modified> = self.get(url, About::folder(folder.as_str())).await?;
             for m in page.value {
                 let at = DateTime::parse_from_rfc3339(&m.last_modified_date_time)
                     .map_err(|e| Error::Backend(format!("invalid lastModifiedDateTime: {e}")))?;
@@ -656,15 +624,10 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         // to resolve can't get in the way.
         let roles = Roles {
             root: self.root().await?,
-            well_known: HashMap::new(),
+            ..Default::default()
         };
         let url = self.url(&["me", "mailFolders", which.as_str()]);
-        let folder: GraphFolder = self
-            .json(
-                self.request(Method::GET, url),
-                About::folder(which.as_str()),
-            )
-            .await?;
+        let folder: GraphFolder = self.get(url, About::folder(which.as_str())).await?;
         Ok(Folder {
             well_known: Some(which),
             ..roles.folder(folder)
@@ -729,31 +692,11 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn move_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
-        let url = self.url(&["me", "messages", id.as_str(), "move"]);
-        let body = MoveRequest {
-            destination_id: to.as_str(),
-        };
-        let moved: IdOnly = self
-            .json(
-                self.request(Method::POST, url).json(&body),
-                About::message(id.as_str()),
-            )
-            .await?;
-        Ok(MessageId::new(moved.id))
+        self.relocate(id, to, "move").await
     }
 
     async fn copy_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
-        let url = self.url(&["me", "messages", id.as_str(), "copy"]);
-        let body = MoveRequest {
-            destination_id: to.as_str(),
-        };
-        let copied: IdOnly = self
-            .json(
-                self.request(Method::POST, url).json(&body),
-                About::message(id.as_str()),
-            )
-            .await?;
-        Ok(MessageId::new(copied.id))
+        self.relocate(id, to, "copy").await
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
@@ -775,7 +718,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         if needs_server_draft(draft) || self.has_kept(draft) {
             // Postponed: what mett attached is the draft's own now.
-            let saved = self.server_draft(draft).await;
+            let saved = self.server_draft(draft).await.map(|(id, _)| id);
             if saved.is_ok() {
                 self.forget_uploads(draft);
             }
@@ -802,12 +745,8 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .append_pair("$expand", "microsoft.graph.itemAttachment/item($select=id)");
         let mut attachments = Vec::new();
         loop {
-            let page: Collection<GraphAttachment> = self
-                .json(
-                    self.request(Method::GET, url),
-                    About::message(message.as_str()),
-                )
-                .await?;
+            let page: Collection<GraphAttachment> =
+                self.get(url, About::message(message.as_str())).await?;
             attachments.extend(page.value.into_iter().map(GraphAttachment::into_attachment));
             match page.next_link {
                 Some(next) => url = self.next_page_url(&next)?,
@@ -845,6 +784,22 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
 }
 
 impl<A: Authenticator> GraphMailStore<A> {
+    /// Moves or copies (`action`) message `id` to folder `to`, returning
+    /// the ID it has there.
+    async fn relocate(&self, id: &MessageId, to: &FolderId, action: &str) -> Result<MessageId> {
+        let url = self.url(&["me", "messages", id.as_str(), action]);
+        let body = MoveRequest {
+            destination_id: to.as_str(),
+        };
+        let relocated: IdOnly = self
+            .json(
+                self.request(Method::POST, url).json(&body),
+                About::message(id.as_str()),
+            )
+            .await?;
+        Ok(MessageId::new(relocated.id))
+    }
+
     /// A page of a folder's message summaries, sorted by `order` and, on
     /// the first page, filtered by `filter`.
     async fn messages_page(
@@ -884,12 +839,7 @@ impl<A: Authenticator> GraphMailStore<A> {
                 url
             }
         };
-        let page: Collection<GraphMessage> = self
-            .json(
-                self.request(Method::GET, url),
-                About::folder(folder.as_str()),
-            )
-            .await?;
+        let page: Collection<GraphMessage> = self.get(url, About::folder(folder.as_str())).await?;
         Ok(MessagePage {
             messages: page
                 .value
@@ -906,8 +856,23 @@ impl<A: Authenticator> GraphMailStore<A> {
 }
 
 impl<A: Authenticator> MailSender for GraphMailStore<A> {
+    /// Deletes the server draft kept for `draft`, if any. It is kept still
+    /// if that fails.
     async fn discard_kept(&self, draft: &Draft) -> Result<()> {
-        self.discard_kept_draft(draft).await
+        let Some(Kept { id, base }) = self.kept().remove(&key(draft)) else {
+            return Ok(());
+        };
+        // A recalled postponed message stays in Drafts (with what the
+        // attempts put on it).
+        if is_recalled(draft, &id) {
+            self.forget_uploads(draft);
+            return Ok(());
+        }
+        let deleted = self.delete_draft(&id).await;
+        if deleted.is_err() {
+            self.keep(draft, id, base);
+        }
+        deleted
     }
 
     fn keeps_draft(&self, draft: &Draft) -> bool {
@@ -919,10 +884,7 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         // behind.
         if !needs_server_draft(draft) && !self.has_kept(draft) {
             let url = self.url(&["me", "sendMail"]);
-            let body = json!({
-                "message": message_json(draft, true),
-                "saveToSentItems": draft.save_copy,
-            });
+            let body = send_mail_json(draft);
             return self
                 .hand_over(self.request(Method::POST, url).json(&body), About::MAILBOX)
                 .await;
@@ -933,7 +895,7 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         // pieces. Sending a draft always keeps a copy in Sent Items.
         // Failing before the send request leaves nothing sent, whatever
         // became of the draft.
-        let (id, base) = self.server_draft_kept(draft).await.map_err(unsent)?;
+        let (id, base) = self.server_draft(draft).await.map_err(unsent)?;
         let url = self.url(&["me", "messages", id.as_str(), "send"]);
         let sent = self
             .hand_over(self.request(Method::POST, url), About::message(id.as_str()))
@@ -963,19 +925,13 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
 
 impl<A: Authenticator> GraphMailStore<A> {
     /// Creates a server draft with `draft`'s content and attachments, which
-    /// replies to or forwards the original if it does, and returns its ID.
-    async fn server_draft(&self, draft: &Draft) -> Result<MessageId> {
-        self.server_draft_kept(draft).await.map(|(id, _)| id)
-    }
-
-    /// [`Self::server_draft`], with what to keep of it should sending it
-    /// fail.
-    async fn server_draft_kept(&self, draft: &Draft) -> Result<(MessageId, Option<Vec<String>>)> {
+    /// replies to or forwards the original if it does, and returns its ID,
+    /// with what to keep of it should sending it fail.
+    async fn server_draft(&self, draft: &Draft) -> Result<(MessageId, Option<Vec<String>>)> {
         // A draft kept after an earlier attempt gets the new content (and
         // its attachments again); if it is gone (it was sent after all, or
         // deleted), a new one is made.
-        let key = (draft.origin.clone(), draft.attempt);
-        let kept = self.kept.lock().expect("lock").remove(&key);
+        let kept = self.kept().remove(&key(draft));
         if let Some(Kept { id, base }) = kept {
             match self.update_draft(&id, draft).await {
                 Ok(()) => return self.attach_all(draft, id, base, false).await,
@@ -1061,15 +1017,13 @@ impl<A: Authenticator> GraphMailStore<A> {
         fresh: bool,
     ) -> Result<(MessageId, Option<Vec<String>>)> {
         let recalled = is_recalled(draft, &id);
-        let key = (draft.origin.clone(), draft.attempt);
+        let key = key(draft);
         // A recalled draft has what the user took off, and mett's uploads
         // of earlier attempts, to take off.
         let to_take_off = recalled
             && (!draft.drop_attachments.is_empty()
                 || self
-                    .uploads
-                    .lock()
-                    .expect("lock")
+                    .uploads()
                     .get(&key)
                     .is_some_and(|uploads| !uploads.is_empty()));
         // Nothing of mett's there, and nothing to put on: done. (What an
@@ -1104,7 +1058,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             // its ID: an upload whose answer was lost is never matched by
             // name here, so it still stops a send it may be part of).
             if recalled
-                && let Some(uploads) = self.uploads.lock().expect("lock").get_mut(&key)
+                && let Some(uploads) = self.uploads().get_mut(&key)
                 && let Some(at) = uploads
                     .iter()
                     .position(|u| u.id.as_deref() == Some(attachment.id.as_str()))
@@ -1115,26 +1069,19 @@ impl<A: Authenticator> GraphMailStore<A> {
         for file in &draft.attachments {
             // Remembered before it is sent: the answer may be lost.
             if recalled {
-                self.uploads
-                    .lock()
-                    .expect("lock")
-                    .entry(key.clone())
-                    .or_default()
-                    .push(Upload {
-                        id: None,
-                        name: file.name.clone(),
-                        content_type: file.content_type.clone(),
-                        digest: digest(&file.data),
-                        prior: present.iter().map(|a| a.id.to_string()).collect(),
-                    });
+                self.uploads().entry(key.clone()).or_default().push(Upload {
+                    id: None,
+                    name: file.name.clone(),
+                    content_type: file.content_type.clone(),
+                    digest: digest(&file.data),
+                    prior: present.iter().map(|a| a.id.to_string()).collect(),
+                });
             }
             match self.attach(&id, file).await {
                 Ok(uploaded) => {
                     if recalled
                         && let Some(upload) = self
-                            .uploads
-                            .lock()
-                            .expect("lock")
+                            .uploads()
                             .get_mut(&key)
                             .and_then(|uploads| uploads.last_mut())
                     {
@@ -1146,7 +1093,7 @@ impl<A: Authenticator> GraphMailStore<A> {
                     // leaves it unknown.
                     if recalled
                         && !matches!(e, Error::Network(_))
-                        && let Some(uploads) = self.uploads.lock().expect("lock").get_mut(&key)
+                        && let Some(uploads) = self.uploads().get_mut(&key)
                     {
                         uploads.pop();
                     }
@@ -1189,19 +1136,12 @@ impl<A: Authenticator> GraphMailStore<A> {
         message: &MessageId,
         file: &OutgoingAttachment,
     ) -> Result<Option<String>> {
-        use base64::Engine;
-
         if file.data.len() < SMALL_ATTACHMENT {
             let url = self.url(&["me", "messages", message.as_str(), "attachments"]);
-            let body = json!({
-                "@odata.type": "#microsoft.graph.fileAttachment",
-                "name": file.name,
-                "contentType": file.content_type,
-                "contentBytes": base64::engine::general_purpose::STANDARD.encode(&file.data),
-            });
             let response = self
                 .send(
-                    self.request(Method::POST, url).json(&body),
+                    self.request(Method::POST, url)
+                        .json(&file_attachment_json(file)),
                     About::message(message.as_str()),
                 )
                 .await?;
@@ -1312,14 +1252,7 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// it off (or put another file in its place), sending it could send
     /// what they didn't want: that fails, for them to look in Outlook.
     fn recalled_base(&self, draft: &Draft, present: &[Attachment]) -> Result<Vec<String>> {
-        let key = (draft.origin.clone(), draft.attempt);
-        let uploads = self
-            .uploads
-            .lock()
-            .expect("lock")
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
+        let uploads = self.uploads().get(&key(draft)).cloned().unwrap_or_default();
         let known = |a: &Attachment| {
             uploads
                 .iter()
@@ -1365,10 +1298,7 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// Forgets the uploads of `draft`, which is done with: sent, postponed,
     /// or given up.
     fn forget_uploads(&self, draft: &Draft) {
-        self.uploads
-            .lock()
-            .expect("lock")
-            .remove(&(draft.origin.clone(), draft.attempt));
+        self.uploads().remove(&key(draft));
     }
 
     /// Gives a server draft `draft`'s content.
@@ -1383,41 +1313,15 @@ impl<A: Authenticator> GraphMailStore<A> {
         .map(drop)
     }
 
-    /// Deletes the server draft kept for `draft`, if any. It is kept still
-    /// if that fails.
-    async fn discard_kept_draft(&self, draft: &Draft) -> Result<()> {
-        let key = (draft.origin.clone(), draft.attempt);
-        let Some(Kept { id, base }) = self.kept.lock().expect("lock").remove(&key) else {
-            return Ok(());
-        };
-        // A recalled postponed message stays in Drafts (with what the
-        // attempts put on it).
-        if is_recalled(draft, &id) {
-            self.forget_uploads(draft);
-            return Ok(());
-        }
-        let deleted = self.delete_draft(&id).await;
-        if deleted.is_err() {
-            self.keep(draft, id, base);
-        }
-        deleted
-    }
-
     /// Whether a server draft is kept for `draft`.
     fn has_kept(&self, draft: &Draft) -> bool {
-        self.kept
-            .lock()
-            .expect("lock")
-            .contains_key(&(draft.origin.clone(), draft.attempt))
+        self.kept().contains_key(&key(draft))
     }
 
     /// Remembers a server draft kept after an attempt whose outcome is
     /// unknown, with the attachments it added.
     fn keep(&self, draft: &Draft, id: MessageId, base: Option<Vec<String>>) {
-        self.kept
-            .lock()
-            .expect("lock")
-            .insert((draft.origin.clone(), draft.attempt), Kept { id, base });
+        self.kept().insert(key(draft), Kept { id, base });
     }
 
     /// Deletes a server draft of `draft` that could not be completed, so
@@ -1484,7 +1388,6 @@ fn unsent(e: Error) -> Error {
     }
 }
 
-/// A Graph `message` resource with `draft`'s content.
 /// Whether `draft` goes through a server draft: it answers a message, or
 /// its attachments are too large to go with it in one request. Such a
 /// message, once sent, is always kept in Sent Items, and a failed attempt
@@ -1508,11 +1411,27 @@ pub fn needs_server_draft(draft: &Draft) -> bool {
     }
     // Otherwise, the request as sent: escaping may make the text much
     // larger.
-    let request = json!({
+    serde_json::to_vec(&send_mail_json(draft)).map_or(true, |bytes| bytes.len() > INLINE_REQUEST)
+}
+
+/// A `sendMail` request for `draft`, which goes with its attachments.
+fn send_mail_json(draft: &Draft) -> serde_json::Value {
+    json!({
         "message": message_json(draft, true),
         "saveToSentItems": draft.save_copy,
-    });
-    serde_json::to_vec(&request).map_or(true, |bytes| bytes.len() > INLINE_REQUEST)
+    })
+}
+
+/// A Graph `fileAttachment` resource for `file`.
+fn file_attachment_json(file: &OutgoingAttachment) -> serde_json::Value {
+    use base64::Engine;
+
+    json!({
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": file.name,
+        "contentType": file.content_type,
+        "contentBytes": base64::engine::general_purpose::STANDARD.encode(&file.data),
+    })
 }
 
 /// A Graph `message` resource with `draft`'s content, and its attachments
@@ -1540,20 +1459,7 @@ fn message_json(draft: &Draft, attachments: bool) -> serde_json::Value {
         message["from"] = recipients(std::slice::from_ref(from)).remove(0);
     }
     if attachments && !draft.attachments.is_empty() {
-        use base64::Engine;
-
-        message["attachments"] = draft
-            .attachments
-            .iter()
-            .map(|file| {
-                json!({
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": file.name,
-                    "contentType": file.content_type,
-                    "contentBytes": base64::engine::general_purpose::STANDARD.encode(&file.data),
-                })
-            })
-            .collect();
+        message["attachments"] = draft.attachments.iter().map(file_attachment_json).collect();
     }
     message
 }
@@ -1625,6 +1531,16 @@ impl<'a> About<'a> {
             id,
         }
     }
+}
+
+/// The JSON body of a successful Graph response.
+async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| Error::Network(e.to_string()))?;
+    serde_json::from_slice(&body)
+        .map_err(|e| Error::Backend(format!("unexpected response from Graph: {e}")))
 }
 
 /// Maps an unsuccessful Graph response to a port error.
@@ -1867,13 +1783,9 @@ impl GraphMessage {
         let (summary, rest) = self.split()?;
         Ok(Message {
             summary,
-            cc: rest.cc.into_iter().map(Recipient::into_address).collect(),
-            bcc: rest.bcc.into_iter().map(Recipient::into_address).collect(),
-            reply_to: rest
-                .reply_to
-                .into_iter()
-                .map(Recipient::into_address)
-                .collect(),
+            cc: addresses(rest.cc),
+            bcc: addresses(rest.bcc),
+            reply_to: addresses(rest.reply_to),
             internet_message_id: rest.internet_message_id,
             body: rest.body.map_or(
                 Body {
@@ -1911,11 +1823,7 @@ impl GraphMessage {
             folder: FolderId::new(self.parent_folder_id),
             subject: self.subject.unwrap_or_default(),
             from: self.from.map(Recipient::into_address),
-            to: self
-                .to_recipients
-                .into_iter()
-                .map(Recipient::into_address)
-                .collect(),
+            to: addresses(self.to_recipients),
             received,
             flags: Flags {
                 read: self.is_read,
@@ -1925,16 +1833,8 @@ impl GraphMessage {
             // Without a sent date, it is listed with the drafts, whatever
             // Graph calls it.
             draft: unsent,
-            delivered: self
-                .received_date_time
-                .as_deref()
-                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| t.with_timezone(&Utc)),
-            modified: self
-                .last_modified_date_time
-                .as_deref()
-                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| t.with_timezone(&Utc)),
+            delivered: parse_time(self.received_date_time.as_deref()),
+            modified: parse_time(self.last_modified_date_time.as_deref()),
             thread: self.conversation_id.map(|conversation| ThreadPosition {
                 conversation,
                 path: self
@@ -1953,6 +1853,20 @@ impl GraphMessage {
         };
         Ok((summary, rest))
     }
+}
+
+/// Graph's recipients as addresses.
+fn addresses(recipients: Vec<Recipient>) -> Vec<Address> {
+    recipients
+        .into_iter()
+        .map(Recipient::into_address)
+        .collect()
+}
+
+/// A Graph timestamp, if there is one and it parses.
+fn parse_time(time: Option<&str>) -> Option<DateTime<Utc>> {
+    time.and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// A message's path in its conversation, from Outlook's conversation

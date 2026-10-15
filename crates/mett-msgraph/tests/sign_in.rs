@@ -12,7 +12,7 @@ use mett_msgraph::{
 use serde_json::json;
 use url::Url;
 use wiremock::matchers::{body_string_contains, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
 
 const TOKEN_PATH: &str = "/contoso.com/oauth2/v2.0/token";
 const DEVICE_PATH: &str = "/contoso.com/oauth2/v2.0/devicecode";
@@ -30,6 +30,16 @@ fn settings(server: &MockServer, flow: AuthFlow) -> AuthSettings {
         graph_url: Some(url),
         ..AuthSettings::new(account(), "client-id")
     }
+}
+
+/// A request to the token endpoint.
+fn token_endpoint() -> MockBuilder {
+    Mock::given(method("POST")).and(path(TOKEN_PATH))
+}
+
+/// A request to the token endpoint whose body contains `body`.
+fn token_request(body: &str) -> MockBuilder {
+    token_endpoint().and(body_string_contains(body))
 }
 
 fn tokens(access: &str, refresh: &str) -> ResponseTemplate {
@@ -78,9 +88,7 @@ async fn device_sign_in(server: &MockServer, access: &str) {
         .respond_with(device_code_response(900))
         .mount(server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("device_code=dev-code"))
+    token_request("device_code=dev-code")
         .respond_with(tokens(access, "r-new"))
         .with_priority(2)
         .mount(server)
@@ -105,6 +113,21 @@ fn authenticator<P: Fn(SignInPrompt) + Send + Sync>(
     )
 }
 
+/// A device code authenticator in which no sign-in prompt may appear.
+fn device_auth(
+    server: &MockServer,
+    store: &Arc<MemoryStore>,
+) -> GraphAuthenticator<MemoryStore, impl Fn(SignInPrompt) + Send + Sync> {
+    authenticator(settings(server, AuthFlow::DeviceCode), store, no_prompts())
+}
+
+/// A store holding the refresh token `refresh`.
+fn store_with(refresh: &str) -> Arc<MemoryStore> {
+    let store = Arc::new(MemoryStore::default());
+    store.save(&account(), refresh).unwrap();
+    store
+}
+
 fn stored(store: &MemoryStore) -> Option<String> {
     store.load(&account()).unwrap()
 }
@@ -112,9 +135,7 @@ fn stored(store: &MemoryStore) -> Option<String> {
 #[tokio::test]
 async fn uses_and_rotates_the_stored_refresh_token() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("grant_type=refresh_token"))
+    token_request("grant_type=refresh_token")
         .and(body_string_contains("refresh_token=r0"))
         .and(body_string_contains("client_id=client-id"))
         .respond_with(tokens("a1", "r1"))
@@ -123,13 +144,8 @@ async fn uses_and_rotates_the_stored_refresh_token() {
         .await;
     me(&server, "a1", "alice@contoso.com").await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     // The second call is served from the cache: the mock expects one request.
     assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
@@ -140,16 +156,12 @@ async fn uses_and_rotates_the_stored_refresh_token() {
 #[tokio::test]
 async fn falls_back_to_device_code_when_the_refresh_token_is_revoked() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("grant_type=refresh_token"))
+    token_request("grant_type=refresh_token")
         .respond_with(oauth_error("invalid_grant"))
         .mount(&server)
         .await;
     // The first poll is still pending; the next one succeeds.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("device_code=dev-code"))
+    token_request("device_code=dev-code")
         .respond_with(oauth_error("authorization_pending"))
         .up_to_n_times(1)
         .with_priority(1)
@@ -158,8 +170,7 @@ async fn falls_back_to_device_code_when_the_refresh_token_is_revoked() {
     device_sign_in(&server, "a2").await;
     me(&server, "a2", "Alice@Contoso.com").await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "revoked").unwrap();
+    let store = store_with("revoked");
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&prompts);
     let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, move |p| {
@@ -178,19 +189,13 @@ async fn falls_back_to_device_code_when_the_refresh_token_is_revoked() {
 #[tokio::test]
 async fn keeps_the_refresh_token_on_transient_errors() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(oauth_error("temporarily_unavailable"))
         .mount(&server)
         .await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     // Reported as a network problem, so the UI retries instead of asking
     // the user to sign in again.
@@ -241,8 +246,7 @@ async fn gives_up_when_the_device_code_expires() {
         .mount(&server)
         .await;
     // The poll request stalls for longer than the device code is valid.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(oauth_error("authorization_pending").set_delay(Duration::from_secs(30)))
         .mount(&server)
         .await;
@@ -294,9 +298,7 @@ fn browser(code: &'static str, stale_first: bool) -> impl Fn(SignInPrompt) + Sen
 
 async fn auth_code_sign_in(stale_first: bool) {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("grant_type=authorization_code"))
+    token_request("grant_type=authorization_code")
         .and(body_string_contains("code=the-code"))
         .and(body_string_contains("code_verifier="))
         .and(body_string_contains(
@@ -343,8 +345,7 @@ async fn reports_an_unreachable_identity_platform_as_a_network_error() {
         ..AuthSettings::new(account(), "client-id")
     };
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
+    let store = store_with("r0");
     let auth = authenticator(settings, &store, no_prompts());
 
     assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
@@ -355,13 +356,8 @@ async fn reports_an_unreachable_identity_platform_as_a_network_error() {
 #[tokio::test]
 async fn sign_out_forgets_the_refresh_token() {
     let server = MockServer::start().await;
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     auth.sign_out().await.unwrap();
     assert_eq!(stored(&store), None);
@@ -371,8 +367,7 @@ async fn sign_out_forgets_the_refresh_token() {
 async fn uses_a_still_valid_token_when_refresh_fails_transiently() {
     let server = MockServer::start().await;
     // The first refresh issues a token inside the 5-minute refresh margin…
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "a-short",
             "refresh_token": "r1",
@@ -383,21 +378,15 @@ async fn uses_a_still_valid_token_when_refresh_fails_transiently() {
         .mount(&server)
         .await;
     // …and the next refresh fails transiently.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(oauth_error("temporarily_unavailable"))
         .with_priority(2)
         .mount(&server)
         .await;
     me(&server, "a-short", "alice@contoso.com").await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
@@ -446,9 +435,7 @@ async fn gets_a_new_access_token_when_graph_rejects_the_new_one() {
         .mount(&server)
         .await;
     // …so mett refreshes with the sign-in's refresh token and checks again.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-new"))
+    token_request("refresh_token=r-new")
         .respond_with(tokens("a5b", "r-new"))
         .mount(&server)
         .await;
@@ -548,8 +535,7 @@ async fn keeps_working_in_memory_when_tokens_cannot_be_stored() {
 #[tokio::test]
 async fn sign_out_keeps_state_when_the_stored_token_cannot_be_removed() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(tokens("a1", "r0"))
         .mount(&server)
         .await;
@@ -576,21 +562,15 @@ async fn sign_out_keeps_state_when_the_stored_token_cannot_be_removed() {
 #[tokio::test]
 async fn throttled_token_requests_are_transient() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(ResponseTemplate::new(429).set_body_json(json!({
             "error": "too_many_requests",
         })))
         .mount(&server)
         .await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     assert_eq!(stored(&store).as_deref(), Some("r0"));
@@ -599,9 +579,7 @@ async fn throttled_token_requests_are_transient() {
 #[tokio::test]
 async fn keeps_polling_after_a_transient_device_code_poll_failure() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("device_code=dev-code"))
+    token_request("device_code=dev-code")
         .respond_with(ResponseTemplate::new(503))
         .up_to_n_times(1)
         .with_priority(1)
@@ -619,17 +597,14 @@ async fn keeps_polling_after_a_transient_device_code_poll_failure() {
 #[tokio::test]
 async fn signs_in_again_when_the_refresh_token_needs_consent() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("grant_type=refresh_token"))
+    token_request("grant_type=refresh_token")
         .respond_with(oauth_error("consent_required"))
         .mount(&server)
         .await;
     device_sign_in(&server, "a8").await;
     me(&server, "a8", "alice@contoso.com").await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "needs-consent").unwrap();
+    let store = store_with("needs-consent");
     let auth = authenticator(settings(&server, AuthFlow::DeviceCode), &store, |_| {});
 
     assert_eq!(auth.access_token().await.unwrap().secret(), "a8");
@@ -645,9 +620,7 @@ async fn confirms_with_a_refreshed_token_after_the_unconfirmed_one_expires() {
         .mount(&server)
         .await;
     // The sign-in issues an access token that is already expired…
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("device_code=dev-code"))
+    token_request("device_code=dev-code")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "a-old",
             "refresh_token": "r-signin",
@@ -664,9 +637,7 @@ async fn confirms_with_a_refreshed_token_after_the_unconfirmed_one_expires() {
         .await;
     // …so the next call refreshes with the sign-in's refresh token and
     // confirms with the new access token.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-signin"))
+    token_request("refresh_token=r-signin")
         .respond_with(tokens("a-fresh", "r-fresh"))
         .mount(&server)
         .await;
@@ -688,20 +659,14 @@ async fn confirms_with_a_refreshed_token_after_the_unconfirmed_one_expires() {
 #[tokio::test]
 async fn rejects_a_refreshed_token_for_another_user() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(tokens("a-other", "r-other"))
         .mount(&server)
         .await;
     me(&server, "a-other", "former-alice@contoso.com").await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     let err = auth.access_token().await.unwrap_err();
     assert!(
@@ -740,15 +705,11 @@ impl TokenStore for ReplacedStore {
 #[tokio::test]
 async fn uses_a_newer_stored_token_after_a_stale_one_is_rejected() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-stale"))
+    token_request("refresh_token=r-stale")
         .respond_with(oauth_error("invalid_grant"))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-newer"))
+    token_request("refresh_token=r-newer")
         .respond_with(tokens("a-newer", "r-newer"))
         .mount(&server)
         .await;
@@ -780,8 +741,7 @@ async fn keeps_using_a_token_without_refresh_token_until_it_expires() {
         .mount(&server)
         .await;
     // No refresh token (no offline_access), and inside the refresh margin.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "a-only",
             "expires_in": 120,
@@ -805,8 +765,7 @@ async fn keeps_using_a_token_without_refresh_token_until_it_expires() {
 #[tokio::test]
 async fn clears_the_stored_token_on_a_late_identity_mismatch() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(tokens("a-x", "r-x"))
         .mount(&server)
         .await;
@@ -820,13 +779,8 @@ async fn clears_the_stored_token_on_a_late_identity_mismatch() {
         .await;
     me(&server, "a-x", "mallory@contoso.com").await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     assert_eq!(stored(&store).as_deref(), Some("r0"));
@@ -837,8 +791,7 @@ async fn clears_the_stored_token_on_a_late_identity_mismatch() {
 #[tokio::test]
 async fn uses_the_cached_token_while_a_refreshed_one_is_unconfirmed() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "a-short",
             "refresh_token": "r1",
@@ -848,8 +801,7 @@ async fn uses_the_cached_token_while_a_refreshed_one_is_unconfirmed() {
         .with_priority(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(tokens("a-next", "r2"))
         .with_priority(2)
         .mount(&server)
@@ -862,13 +814,8 @@ async fn uses_the_cached_token_while_a_refreshed_one_is_unconfirmed() {
         .mount(&server)
         .await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     assert_eq!(auth.access_token().await.unwrap().secret(), "a-short");
     // a-short is inside the refresh margin; the refreshed a-next can't be
@@ -879,9 +826,7 @@ async fn uses_the_cached_token_while_a_refreshed_one_is_unconfirmed() {
 #[tokio::test]
 async fn keeps_a_replacement_token_after_an_identity_mismatch() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-stale"))
+    token_request("refresh_token=r-stale")
         .respond_with(tokens("a-other", "r-other"))
         .mount(&server)
         .await;
@@ -904,9 +849,7 @@ async fn keeps_a_replacement_token_after_an_identity_mismatch() {
     );
 
     // The next call uses r-newer instead of prompting.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-newer"))
+    token_request("refresh_token=r-newer")
         .respond_with(tokens("a-newer", "r-newer"))
         .mount(&server)
         .await;
@@ -919,9 +862,7 @@ async fn tries_a_replacement_token_when_an_unconfirmed_refresh_is_rejected() {
     let server = MockServer::start().await;
     // A refresh from r-stale issues an already-expired token that Graph
     // can't confirm; refreshing it later is rejected.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-stale"))
+    token_request("refresh_token=r-stale")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "a-old",
             "refresh_token": "r-rotated",
@@ -935,16 +876,12 @@ async fn tries_a_replacement_token_when_an_unconfirmed_refresh_is_rejected() {
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-rotated"))
+    token_request("refresh_token=r-rotated")
         .respond_with(oauth_error("invalid_grant"))
         .mount(&server)
         .await;
     // Another instance stored r-newer, which works.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .and(body_string_contains("refresh_token=r-newer"))
+    token_request("refresh_token=r-newer")
         .respond_with(tokens("a-newer", "r-newer"))
         .mount(&server)
         .await;
@@ -966,19 +903,13 @@ async fn tries_a_replacement_token_when_an_unconfirmed_refresh_is_rejected() {
 #[tokio::test]
 async fn request_timeouts_are_transient() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(ResponseTemplate::new(408))
         .mount(&server)
         .await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     assert!(matches!(auth.access_token().await, Err(Error::Network(_))));
     assert_eq!(stored(&store).as_deref(), Some("r0"));
@@ -987,15 +918,13 @@ async fn request_timeouts_are_transient() {
 #[tokio::test]
 async fn a_rejected_token_is_refreshed_on_the_next_call() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(tokens("a1", "r1"))
         .up_to_n_times(1)
         .with_priority(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(tokens("a2", "r2"))
         .with_priority(2)
         .mount(&server)
@@ -1003,13 +932,8 @@ async fn a_rejected_token_is_refreshed_on_the_next_call() {
     me(&server, "a1", "alice@contoso.com").await;
     me(&server, "a2", "alice@contoso.com").await;
 
-    let store = Arc::new(MemoryStore::default());
-    store.save(&account(), "r0").unwrap();
-    let auth = authenticator(
-        settings(&server, AuthFlow::DeviceCode),
-        &store,
-        no_prompts(),
-    );
+    let store = store_with("r0");
+    let auth = device_auth(&server, &store);
 
     let first = auth.access_token().await.unwrap();
     assert_eq!(first.secret(), "a1");
@@ -1057,8 +981,7 @@ async fn the_user_can_cancel_an_interactive_sign_in() {
         .mount(&server)
         .await;
     // The user never enters the code.
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(oauth_error("authorization_pending"))
         .mount(&server)
         .await;
@@ -1181,8 +1104,7 @@ async fn requests_waiting_on_a_cancelled_sign_in_do_not_prompt_again() {
         .respond_with(device_code_response(900))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(oauth_error("authorization_pending"))
         .mount(&server)
         .await;
@@ -1267,8 +1189,7 @@ async fn a_retry_as_soon_as_a_sign_in_ends_signs_in_again() {
         .respond_with(device_code_response(900))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
+    token_endpoint()
         .respond_with(oauth_error("authorization_pending"))
         .mount(&server)
         .await;

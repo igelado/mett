@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, TimeDelta, Utc};
-use mett_core::{AccessToken, Authenticator, Result};
+use mett_core::{AccessToken, AccountId, Authenticator, Result};
 use tokio::sync::Mutex;
 
 use crate::oauth::{self, FlowError, Tokens};
 use crate::prompt::Prompter;
 use crate::settings::{AuthFlow, AuthSettings};
-use crate::token_store::TokenStore;
+use crate::token_store::{TokenStore, TokenStoreError};
 
 /// Access tokens this close to expiry are refreshed before use.
 const EXPIRY_MARGIN: TimeDelta = TimeDelta::minutes(5);
@@ -118,8 +118,7 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
     /// retried.
     pub async fn sign_out(&self) -> Result<()> {
         let mut state = self.state.lock().await;
-        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
-        blocking(move || store.clear(&account)).await?;
+        self.stored(S::clear).await?;
         *state = State {
             loaded: true,
             ..State::default()
@@ -267,21 +266,22 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         }
     }
 
-    /// Records that confirming an interactive sign-in failed again, as a
-    /// sign-in attempt of its own: requests that were waiting meanwhile
-    /// share its failure rather than trying once more each.
-    fn sign_in_failed(&self, state: &mut State, error: &mett_core::Error) {
+    /// Records how an interactive sign-in ended (or confirming one again,
+    /// as a sign-in attempt of its own: requests that were waiting meanwhile
+    /// share its failure rather than trying once more each), and tells the
+    /// prompter.
+    fn end_sign_in(&self, state: &mut State, outcome: Result<(), &mett_core::Error>) {
         let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
-        state.failed_sign_in = Some((number, error.clone()));
-        self.prompter.finished(Err(error));
+        state.failed_sign_in = outcome.err().map(|e| (number, e.clone()));
+        self.prompter.finished(outcome);
     }
 
     /// Removes `token` from the store if it is still the stored one, and
     /// returns the stored token otherwise.
     async fn clear_if_stored(&self, token: &str) -> Result<Option<String>> {
-        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
         let token = token.to_owned();
-        blocking(move || store.clear_if(&account, &token)).await
+        self.stored(move |store, account| store.clear_if(account, &token))
+            .await
     }
 
     /// Caches `tokens` and stores a new refresh token if one was issued.
@@ -309,8 +309,8 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         let Some(refresh) = state.refresh.clone().filter(|_| state.unsaved) else {
             return Ok(());
         };
-        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
-        blocking(move || store.save(&account, &refresh)).await?;
+        self.stored(move |store, account| store.save(account, &refresh))
+            .await?;
         state.unsaved = false;
         Ok(())
     }
@@ -390,7 +390,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                         state.unconfirmed = Some(Unconfirmed { tokens, stored });
                         let e = mett_core::Error::from(e);
                         if interactive {
-                            self.sign_in_failed(&mut state, &e);
+                            self.end_sign_in(&mut state, Err(&e));
                         }
                         return Err(e);
                     }
@@ -403,15 +403,13 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
                         return Ok(token);
                     }
                     if interactive {
-                        self.sign_in_failed(&mut state, &e);
+                        self.end_sign_in(&mut state, Err(&e));
                     }
                     return Err(e);
                 }
             };
             if interactive {
-                state.failed_sign_in = None;
-                self.sign_ins.fetch_add(1, Ordering::SeqCst);
-                self.prompter.finished(Ok(()));
+                self.end_sign_in(&mut state, Ok(()));
             }
             // The check may have taken a while; if the token is no longer
             // usable, continue with the confirmed refresh token below.
@@ -421,8 +419,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         }
 
         if !state.loaded {
-            let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
-            state.refresh = blocking(move || store.load(&account)).await?;
+            state.refresh = self.stored(S::load).await?;
             state.loaded = true;
         }
 
@@ -461,21 +458,24 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
         }
 
         let result = self.sign_in_and_confirm(&mut state).await;
-        let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
-        state.failed_sign_in = result.as_ref().err().map(|e| (number, e.clone()));
         // Only now tell the user: a retry they start from here on counts
         // as a new request, not one that was waiting for this sign-in.
-        self.prompter.finished(result.as_ref().map(|_| ()));
+        self.end_sign_in(&mut state, result.as_ref().map(|_| ()));
         result
     }
 }
 
-/// Runs a blocking token-store call off the async runtime.
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T, crate::TokenStoreError> + Send + 'static,
-) -> Result<T> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| mett_core::Error::Auth(format!("credential store task failed: {e}")))?
-        .map_err(Into::into)
+impl<S: TokenStore, P> GraphAuthenticator<S, P> {
+    /// Runs a blocking call on the token store, for this account, off the
+    /// async runtime.
+    async fn stored<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&S, &AccountId) -> Result<T, TokenStoreError> + Send + 'static,
+    ) -> Result<T> {
+        let (store, account) = (Arc::clone(&self.store), self.settings.account.clone());
+        tokio::task::spawn_blocking(move || f(&store, &account))
+            .await
+            .map_err(|e| mett_core::Error::Auth(format!("credential store task failed: {e}")))?
+            .map_err(Into::into)
+    }
 }

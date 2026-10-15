@@ -9,11 +9,11 @@ use mett_core::{
     FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page, PageCursor,
     WellKnownFolder,
 };
-use mett_msgraph::{AuthSettings, GraphMailStore};
+use mett_msgraph::{AuthSettings, Cloud, GraphMailStore};
 use serde_json::{Value, json};
 use url::Url;
 use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
 
 /// Hands out a fixed token.
 struct StaticAuth;
@@ -25,11 +25,75 @@ impl Authenticator for StaticAuth {
 }
 
 fn store(server: &MockServer) -> GraphMailStore<StaticAuth> {
+    store_with(server, Cloud::default(), Arc::new(StaticAuth))
+}
+
+/// A store in `cloud`, against `server`, with `auth` for tokens.
+fn store_with<A: Authenticator>(
+    server: &MockServer,
+    cloud: Cloud,
+    auth: Arc<A>,
+) -> GraphMailStore<A> {
     let settings = AuthSettings {
+        cloud,
         graph_url: Some(Url::parse(&server.uri()).unwrap()),
         ..AuthSettings::new("alice@contoso.com".into(), "client")
     };
-    GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth))
+    GraphMailStore::new(reqwest::Client::new(), &settings, auth)
+}
+
+/// Mocks for `verb` requests to `at`, below the Graph root, to add
+/// matchers to.
+fn route(verb: &str, at: &str) -> MockBuilder {
+    Mock::given(method(verb)).and(path(format!("/v1.0{at}")))
+}
+
+/// Shorthands for mounting a mock.
+trait On {
+    /// Answers `verb` requests to `at` (see [`route`]) with `response`.
+    async fn on(&self, verb: &str, at: &str, response: ResponseTemplate);
+    /// Like [`On::on`], only the first `n` times.
+    async fn on_n(&self, verb: &str, at: &str, n: u64, response: ResponseTemplate);
+}
+
+impl On for MockServer {
+    async fn on(&self, verb: &str, at: &str, response: ResponseTemplate) {
+        route(verb, at).respond_with(response).mount(self).await;
+    }
+
+    async fn on_n(&self, verb: &str, at: &str, n: u64, response: ResponseTemplate) {
+        route(verb, at)
+            .respond_with(response)
+            .up_to_n_times(n)
+            .mount(self)
+            .await;
+    }
+}
+
+/// Answers a reply to `orig` with the draft `draft`, which takes updates.
+async fn reply_draft(server: &MockServer, draft: &str) {
+    server
+        .on("POST", "/me/messages/orig/createReply", id(201, draft))
+        .await;
+    server
+        .on("PATCH", &format!("/me/messages/{draft}"), id(200, draft))
+        .await;
+}
+
+/// Mocks for `PUT` requests to the upload session, to add matchers to.
+fn session() -> MockBuilder {
+    Mock::given(method("PUT")).and(path("/upload/session"))
+}
+
+/// A `status` response with Graph's error `code` and `message`.
+fn graph_error(status: u16, code: &str, message: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status)
+        .set_body_json(json!({ "error": { "code": code, "message": message } }))
+}
+
+/// A `status` response with the ID of what was made or changed.
+fn id(status: u16, id: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status).set_body_json(json!({ "id": id }))
 }
 
 fn folder(id: &str, name: &str) -> Value {
@@ -75,10 +139,12 @@ async fn mount_roles_with(server: &MockServer, status: u16) {
             _ => json!({ "id": i.to_string(), "status": status, "body": { "error": { "code": "Error", "message": "" } } }),
         })
         .collect();
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "responses": responses })))
-        .mount(server)
+    server
+        .on(
+            "POST",
+            "/$batch",
+            ResponseTemplate::new(200).set_body_json(json!({ "responses": responses })),
+        )
         .await;
 }
 
@@ -101,14 +167,12 @@ fn message(id: &str, sent: &str) -> Value {
 async fn finds_well_known_folders_and_labels_them() {
     let server = MockServer::start().await;
     mount_roles(&server).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox"))
+    route("GET", "/me/mailFolders/inbox")
         .and(header("authorization", "Bearer tok"))
         .respond_with(ResponseTemplate::new(200).set_body_json(folder("inbox-id", "Inbox")))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders"))
+    route("GET", "/me/mailFolders")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [folder("inbox-id", "Inbox"), folder("other-id", "Projects")],
         })))
@@ -140,15 +204,15 @@ async fn finds_well_known_folders_and_labels_them() {
 #[tokio::test]
 async fn reads_a_folder_s_counts_by_id() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/msgfolderroot"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "root-id" })))
-        .mount(&server)
+    server
+        .on("GET", "/me/mailFolders/msgfolderroot", id(200, "root-id"))
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/other-id"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(folder("other-id", "Projects")))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/other-id",
+            ResponseTemplate::new(200).set_body_json(folder("other-id", "Projects")),
+        )
         .await;
     let folder = store(&server)
         .folder(&FolderId::new("other-id"))
@@ -162,8 +226,7 @@ async fn reads_a_folder_s_counts_by_id() {
 #[tokio::test]
 async fn lists_messages_changed_since_a_time() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .and(query_param(
             "$filter",
             "lastModifiedDateTime ge 2024-05-01T10:00:00Z",
@@ -188,8 +251,7 @@ async fn lists_messages_changed_since_a_time() {
 #[tokio::test]
 async fn finds_when_unread_mail_last_changed() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .and(query_param(
             "$filter",
             "lastModifiedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
@@ -201,10 +263,12 @@ async fn finds_when_unread_mail_last_changed() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/empty-id/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/empty-id/messages",
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [] })),
+        )
         .await;
     let store = store(&server);
     let recent = store
@@ -239,8 +303,7 @@ async fn reads_where_messages_are_in_their_conversations() {
     let mut odd = message("odd", "2024-05-01T12:00:00Z");
     odd["conversationId"] = json!("other");
     odd["conversationIndex"] = json!(encode(&[1, 2, 3]));
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [second, first, odd, message("lone", "2024-05-01T09:00:00Z")],
         })))
@@ -281,10 +344,12 @@ async fn does_not_cache_roles_after_a_failed_lookup() {
     // Nothing was cached: the next call looks the roles up again.
     server.reset().await;
     mount_roles(&server).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/mailFolders",
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [] })),
+        )
         .await;
     assert!(store.list_folders().await.is_ok());
 }
@@ -293,24 +358,21 @@ async fn does_not_cache_roles_after_a_failed_lookup() {
 async fn lists_nested_folders() {
     let server = MockServer::start().await;
     mount_roles(&server).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders"))
+    route("GET", "/me/mailFolders")
         .and(query_param("includeHiddenFolders", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [child("inbox-id", "Inbox", "root-id", 1)],
         })))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/childFolders"))
+    route("GET", "/me/mailFolders/inbox-id/childFolders")
         .and(query_param("includeHiddenFolders", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [child("projects-id", "Projects", "inbox-id", 1)],
         })))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/projects-id/childFolders"))
+    route("GET", "/me/mailFolders/projects-id/childFolders")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [child("mett-id", "mett", "projects-id", 0)],
         })))
@@ -335,8 +397,7 @@ async fn lists_nested_folders() {
 #[tokio::test]
 async fn later_pages_replay_graphs_link_unchanged() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .and(query_param("$skip", "10"))
         .and(query_param("$top", "10"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
@@ -361,8 +422,7 @@ async fn lists_messages_newest_first_with_paging() {
         "{}/v1.0/me/mailFolders/inbox-id/messages?$skiptoken=abc",
         server.uri()
     );
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .and(query_param("$top", "2"))
         .and(query_param(
             "$orderby",
@@ -374,8 +434,7 @@ async fn lists_messages_newest_first_with_paging() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .and(query_param("$skiptoken", "abc"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [message("m0", "2026-10-12T10:00:00Z")],
@@ -441,8 +500,7 @@ async fn fetches_a_message_as_text() {
     body["replyTo"] = json!([{ "emailAddress": { "address": "list@contoso.com" } }]);
     body["internetMessageId"] = json!("<abc@contoso.com>");
     body["body"] = json!({ "contentType": "text", "content": "Hello" });
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/m1"))
+    route("GET", "/me/messages/m1")
         .and(header("prefer", "outlook.body-content-type=\"text\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&server)
@@ -466,8 +524,7 @@ async fn fetches_a_message_as_text() {
 async fn escapes_ids_in_paths() {
     let server = MockServer::start().await;
     // Graph IDs are base64 and may contain '/' and '+'.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/AA%2Fbb+cc="))
+    route("GET", "/me/messages/AA%2Fbb+cc=")
         .respond_with(
             ResponseTemplate::new(200).set_body_json(message("AA/bb+cc=", "2026-10-13T10:00:00Z")),
         )
@@ -483,8 +540,7 @@ async fn escapes_ids_in_paths() {
 #[tokio::test]
 async fn updates_flags_with_a_patch() {
     let server = MockServer::start().await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/m1"))
+    route("PATCH", "/me/messages/m1")
         .and(body_json(
             json!({ "isRead": true, "flag": { "flagStatus": "notFlagged" } }),
         ))
@@ -514,23 +570,20 @@ async fn updates_flags_with_a_patch() {
 #[tokio::test]
 async fn moves_copies_and_permanently_deletes_messages() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/m1/move"))
+    route("POST", "/me/messages/m1/move")
         .and(body_json(json!({ "destinationId": "archive-id" })))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "m1-moved" })))
+        .respond_with(id(201, "m1-moved"))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/m1-moved/permanentDelete"))
+    route("POST", "/me/messages/m1-moved/permanentDelete")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
 
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/m1-moved/copy"))
+    route("POST", "/me/messages/m1-moved/copy")
         .and(body_json(json!({ "destinationId": "inbox-id" })))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "m1-copy" })))
+        .respond_with(id(201, "m1-copy"))
         .expect(1)
         .mount(&server)
         .await;
@@ -552,21 +605,18 @@ async fn moves_copies_and_permanently_deletes_messages() {
 #[tokio::test]
 async fn maps_graph_errors_to_port_errors() {
     let server = MockServer::start().await;
-    let error = |code: &str| json!({ "error": { "code": code, "message": "details" } });
     Mock::given(path("/v1.0/me/messages/missing"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(error("ErrorItemNotFound")))
+        .respond_with(graph_error(404, "ErrorItemNotFound", "details"))
         .mount(&server)
         .await;
     Mock::given(path("/v1.0/me/messages/busy"))
         .respond_with(
-            ResponseTemplate::new(429)
-                .insert_header("Retry-After", "7")
-                .set_body_json(error("TooManyRequests")),
+            graph_error(429, "TooManyRequests", "details").insert_header("Retry-After", "7"),
         )
         .mount(&server)
         .await;
     Mock::given(path("/v1.0/me/messages/denied"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(error("ErrorAccessDenied")))
+        .respond_with(graph_error(403, "ErrorAccessDenied", "details"))
         .mount(&server)
         .await;
     Mock::given(path("/v1.0/me/messages/down"))
@@ -599,10 +649,12 @@ async fn unsent_drafts_use_their_creation_time() {
     draft["sentDateTime"] = json!("0001-01-01T00:00:00Z");
     draft["isDraft"] = json!(true);
     draft["createdDateTime"] = json!("2026-10-10T08:00:00Z");
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/drafts-id/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [draft] })))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/drafts-id/messages",
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [draft] })),
+        )
         .await;
 
     let page = store(&server)
@@ -622,8 +674,7 @@ async fn mail_without_a_sent_date_is_listed_with_the_drafts() {
     let mut odd = message("m1", "2026-10-14T10:00:00Z");
     odd["sentDateTime"] = json!(null);
     odd["createdDateTime"] = json!("2026-10-10T08:00:00Z");
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/in/messages"))
+    route("GET", "/me/mailFolders/in/messages")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [odd, message("m2", "2026-10-14T09:00:00Z")],
         })))
@@ -641,8 +692,7 @@ async fn mail_without_a_sent_date_is_listed_with_the_drafts() {
 async fn batch_item_failures_keep_their_meaning() {
     let server = MockServer::start().await;
     let item = |status: u16, headers: Value| json!({ "responses": [{ "id": "0", "status": status, "headers": headers, "body": {} }] });
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
+    route("POST", "/$batch")
         .respond_with(
             ResponseTemplate::new(200).set_body_json(item(429, json!({ "Retry-After": "9" }))),
         )
@@ -650,8 +700,7 @@ async fn batch_item_failures_keep_their_meaning() {
         .with_priority(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
+    route("POST", "/$batch")
         .respond_with(ResponseTemplate::new(200).set_body_json(item(403, json!({}))))
         .with_priority(2)
         .mount(&server)
@@ -668,8 +717,7 @@ async fn batch_item_failures_keep_their_meaning() {
 #[tokio::test]
 async fn caps_page_sizes_at_graphs_limit() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .and(query_param("$top", "1000"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
         .expect(1)
@@ -703,8 +751,7 @@ async fn follows_canonical_graph_links_through_a_proxy() {
     let server = MockServer::start().await;
     // Behind a proxy, Graph still writes its own host into page links.
     let link = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox-id/messages?$skip=10";
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+    route("GET", "/me/mailFolders/inbox-id/messages")
         .and(query_param("$skip", "10"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
         .expect(1)
@@ -726,8 +773,7 @@ async fn messages_are_dated_and_sorted_by_when_they_were_sent() {
     // Received a day later; the index still shows the sent date, as mutt
     // does, so the date matches the sort order.
     message["receivedDateTime"] = json!("2026-10-14T09:00:00Z");
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/sent-id/messages"))
+    route("GET", "/me/mailFolders/sent-id/messages")
         .and(query_param(
             "$orderby",
             "sentDateTime desc,createdDateTime desc",
@@ -749,22 +795,22 @@ async fn messages_are_dated_and_sorted_by_when_they_were_sent() {
 async fn opening_the_inbox_needs_only_the_root() {
     let server = MockServer::start().await;
     // Any $batch would fail; opening the Inbox must not need it.
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
+    route("POST", "/$batch")
         .respond_with(ResponseTemplate::new(503))
         .expect(0)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/msgfolderroot"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "root-id" })))
+    route("GET", "/me/mailFolders/msgfolderroot")
+        .respond_with(id(200, "root-id"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders/inbox"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(folder("inbox-id", "Inbox")))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/inbox",
+            ResponseTemplate::new(200).set_body_json(folder("inbox-id", "Inbox")),
+        )
         .await;
 
     let store = store(&server);
@@ -802,15 +848,13 @@ impl Authenticator for RotatingAuth {
 #[tokio::test]
 async fn retries_once_with_a_new_token_after_a_401() {
     let server = MockServer::start().await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/m1"))
+    route("PATCH", "/me/messages/m1")
         .and(header("authorization", "Bearer old"))
         .respond_with(ResponseTemplate::new(401))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/m1"))
+    route("PATCH", "/me/messages/m1")
         .and(header("authorization", "Bearer new"))
         .and(body_json(json!({ "isRead": true })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
@@ -818,22 +862,12 @@ async fn retries_once_with_a_new_token_after_a_401() {
         .mount(&server)
         .await;
 
-    let settings = AuthSettings {
-        graph_url: Some(Url::parse(&server.uri()).unwrap()),
-        ..AuthSettings::new("alice@contoso.com".into(), "client")
-    };
     let auth = Arc::new(RotatingAuth {
         rejected: Default::default(),
     });
-    let store = GraphMailStore::new(reqwest::Client::new(), &settings, auth);
+    let store = store_with(&server, Cloud::default(), auth);
     store
-        .update_flags(
-            &MessageId::new("m1"),
-            FlagsUpdate {
-                read: Some(true),
-                flagged: None,
-            },
-        )
+        .update_flags(&MessageId::new("m1"), FlagsUpdate::read(true))
         .await
         .unwrap();
 }
@@ -841,12 +875,7 @@ async fn retries_once_with_a_new_token_after_a_401() {
 #[tokio::test]
 async fn permanent_delete_is_reported_unavailable_in_national_clouds() {
     let server = MockServer::start().await;
-    let settings = AuthSettings {
-        cloud: mett_msgraph::Cloud::UsGov,
-        graph_url: Some(Url::parse(&server.uri()).unwrap()),
-        ..AuthSettings::new("alice@contoso.com".into(), "client")
-    };
-    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth));
+    let store = store_with(&server, Cloud::UsGov, Arc::new(StaticAuth));
     let result = store.delete_message(&MessageId::new("m1")).await;
     assert!(matches!(result, Err(Error::Backend(msg)) if msg.contains("usgov")));
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -857,8 +886,7 @@ async fn recognises_well_known_folders_created_later() {
     let server = MockServer::start().await;
     // At first the mailbox has no Archive folder…
     mount_roles(&server).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders"))
+    route("GET", "/me/mailFolders")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [folder("archive-id", "Archive")],
         })))
@@ -874,8 +902,7 @@ async fn recognises_well_known_folders_created_later() {
         json!({ "id": "6", "status": 200, "body": { "id": "archive-id" } }),
     ]
     .into();
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
+    route("POST", "/$batch")
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({ "responses": with_archive })),
         )
@@ -907,15 +934,13 @@ impl Authenticator for CountingAuth {
 async fn a_401_inside_a_batch_is_retried_once_with_a_new_token() {
     let server = MockServer::start().await;
     let rejected = json!({ "responses": [{ "id": "0", "status": 401, "body": {} }] });
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
+    route("POST", "/$batch")
         .and(header("authorization", "Bearer old"))
         .respond_with(ResponseTemplate::new(200).set_body_json(rejected))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
+    route("POST", "/$batch")
         .and(header("authorization", "Bearer new"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "responses": [{ "id": "0", "status": 200, "body": { "id": "root-id" } }],
@@ -923,40 +948,33 @@ async fn a_401_inside_a_batch_is_retried_once_with_a_new_token() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/mailFolders"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/mailFolders",
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [] })),
+        )
         .await;
 
-    let settings = AuthSettings {
-        graph_url: Some(Url::parse(&server.uri()).unwrap()),
-        ..AuthSettings::new("alice@contoso.com".into(), "client")
-    };
     let auth = Arc::new(RotatingAuth {
         rejected: Default::default(),
     });
-    let store = GraphMailStore::new(reqwest::Client::new(), &settings, auth);
+    let store = store_with(&server, Cloud::default(), auth);
     store.list_folders().await.unwrap();
 }
 
 #[tokio::test]
 async fn a_repeated_401_inside_a_batch_is_an_auth_error() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/$batch"))
+    route("POST", "/$batch")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "responses": [{ "id": "0", "status": 401, "body": {} }],
         })))
         .expect(2)
         .mount(&server)
         .await;
-    let settings = AuthSettings {
-        graph_url: Some(Url::parse(&server.uri()).unwrap()),
-        ..AuthSettings::new("alice@contoso.com".into(), "client")
-    };
     let auth = Arc::new(CountingAuth::default());
-    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::clone(&auth));
+    let store = store_with(&server, Cloud::default(), Arc::clone(&auth));
     assert!(matches!(store.list_folders().await, Err(Error::Auth(_))));
     assert_eq!(auth.rejected.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
@@ -964,22 +982,16 @@ async fn a_repeated_401_inside_a_batch_is_an_auth_error() {
 #[tokio::test]
 async fn a_token_rejected_on_retry_is_reported_too() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/m1"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&server)
+    server
+        .on("GET", "/me/messages/m1", ResponseTemplate::new(401))
         .await;
-    let settings = AuthSettings {
-        graph_url: Some(Url::parse(&server.uri()).unwrap()),
-        ..AuthSettings::new("alice@contoso.com".into(), "client")
-    };
     let auth = Arc::new(RotatingAuth {
         rejected: Default::default(),
     });
     let rejections = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let store = GraphMailStore::new(
-        reqwest::Client::new(),
-        &settings,
+    let store = store_with(
+        &server,
+        Cloud::default(),
         Arc::new(Recording {
             inner: auth,
             rejections: Arc::clone(&rejections),
@@ -1040,8 +1052,7 @@ fn draft_json() -> Value {
 #[tokio::test]
 async fn sends_new_mail_with_send_mail() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/sendMail"))
+    route("POST", "/me/sendMail")
         .and(body_json(
             json!({ "message": draft_json(), "saveToSentItems": true }),
         ))
@@ -1055,21 +1066,18 @@ async fn sends_new_mail_with_send_mail() {
 #[tokio::test]
 async fn sends_replies_through_a_server_draft() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages/orig/createReply")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
+    route("PATCH", "/me/messages/d1")
         .and(body_json(draft_json()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .respond_with(id(200, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
@@ -1081,25 +1089,15 @@ async fn sends_replies_through_a_server_draft() {
 #[tokio::test]
 async fn discards_the_server_draft_when_sending_fails() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createForward"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    server
+        .on("POST", "/me/messages/orig/createForward", id(201, "d1"))
+        .await;
+    server.on("PATCH", "/me/messages/d1", id(200, "d1")).await;
+    route("POST", "/me/messages/d1/send")
+        .respond_with(graph_error(400, "ErrorInvalidRecipients", "bad recipient"))
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": { "code": "ErrorInvalidRecipients", "message": "bad recipient" }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+    route("POST", "/me/messages/d1/permanentDelete")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -1112,23 +1110,13 @@ async fn discards_the_server_draft_when_sending_fails() {
 #[tokio::test]
 async fn saves_drafts() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages"))
+    route("POST", "/me/messages")
         .and(body_json(draft_json()))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "new" })))
+        .respond_with(id(201, "new"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "reply" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/reply"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "reply" })))
-        .mount(&server)
-        .await;
+    reply_draft(&server, "reply").await;
     let store = store(&server);
     assert_eq!(
         store.save_draft(&draft(None)).await.unwrap(),
@@ -1144,23 +1132,11 @@ async fn saves_drafts() {
 #[tokio::test]
 async fn keeps_the_server_draft_when_the_send_outcome_is_unknown() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
+    reply_draft(&server, "d1").await;
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(503))
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+    route("POST", "/me/messages/d1/permanentDelete")
         .respond_with(ResponseTemplate::new(204))
         .expect(0)
         .mount(&server)
@@ -1173,22 +1149,18 @@ async fn keeps_the_server_draft_when_the_send_outcome_is_unknown() {
 #[tokio::test]
 async fn postponing_after_an_unknown_send_outcome_reuses_the_draft() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages/orig/createReply")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+    route("PATCH", "/me/messages/d1")
+        .respond_with(id(200, "d1"))
         .expect(2)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(503))
         .await;
     let store = store(&server);
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
@@ -1202,19 +1174,15 @@ async fn postponing_after_an_unknown_send_outcome_reuses_the_draft() {
 #[tokio::test]
 async fn keeps_the_server_draft_when_its_update_outcome_is_unknown() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createForward"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages/orig/createForward")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
+    server
+        .on("PATCH", "/me/messages/d1", ResponseTemplate::new(503))
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+    route("POST", "/me/messages/d1/permanentDelete")
         .respond_with(ResponseTemplate::new(204))
         .expect(0)
         .mount(&server)
@@ -1230,39 +1198,22 @@ async fn keeps_the_server_draft_when_its_update_outcome_is_unknown() {
 #[tokio::test]
 async fn a_kept_draft_that_is_gone_is_made_again() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
-        .up_to_n_times(1)
+    server
+        .on_n("POST", "/me/messages/orig/createReply", 1, id(201, "d1"))
+        .await;
+    server
+        .on("POST", "/me/messages/orig/createReply", id(201, "d2"))
+        .await;
+    server
+        .on_n("PATCH", "/me/messages/d1", 1, id(200, "d1"))
+        .await;
+    route("PATCH", "/me/messages/d1")
+        .respond_with(graph_error(404, "ErrorItemNotFound", "gone"))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d2" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "error": { "code": "ErrorItemNotFound", "message": "gone" }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d2"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d2" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
+    server.on("PATCH", "/me/messages/d2", id(200, "d2")).await;
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(503))
         .await;
     let store = store(&server);
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
@@ -1276,18 +1227,13 @@ async fn a_kept_draft_that_is_gone_is_made_again() {
 #[tokio::test]
 async fn a_failure_before_sending_is_not_sent() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/orig/createReply", id(201, "d1"))
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
+    server
+        .on("PATCH", "/me/messages/d1", ResponseTemplate::new(503))
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(0)
         .mount(&server)
@@ -1300,28 +1246,19 @@ async fn a_failure_before_sending_is_not_sent() {
 #[tokio::test]
 async fn another_reply_to_the_same_message_gets_its_own_draft() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n("POST", "/me/messages/orig/createReply", 1, id(201, "d1"))
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d2" })))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/orig/createReply", id(201, "d2"))
         .await;
-    for id in ["d1", "d2"] {
-        Mock::given(method("PATCH"))
-            .and(path(format!("/v1.0/me/messages/{id}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": id })))
-            .mount(&server)
+    for draft in ["d1", "d2"] {
+        server
+            .on("PATCH", &format!("/me/messages/{draft}"), id(200, draft))
             .await;
     }
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(503))
         .await;
     let store = store(&server);
     let first = Draft {
@@ -1347,27 +1284,19 @@ async fn another_reply_to_the_same_message_gets_its_own_draft() {
 #[tokio::test]
 async fn a_draft_that_cannot_be_deleted_is_kept_for_the_next_attempt() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages/orig/createReply")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    let denied = || {
-        ResponseTemplate::new(403).set_body_json(json!({
-            "error": { "code": "ErrorAccessDenied", "message": "denied" }
-        }))
-    };
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
+    let denied = || graph_error(403, "ErrorAccessDenied", "denied");
+    route("PATCH", "/me/messages/d1")
         .respond_with(denied())
         .expect(2)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/permanentDelete"))
-        .respond_with(denied())
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/permanentDelete", denied())
         .await;
     let store = store(&server);
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
@@ -1393,11 +1322,7 @@ async fn failing_to_get_a_token_leaves_mail_unsent() {
         .expect(0)
         .mount(&server)
         .await;
-    let settings = AuthSettings {
-        graph_url: Some(Url::parse(&server.uri()).unwrap()),
-        ..AuthSettings::new("alice@contoso.com".into(), "client")
-    };
-    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(OfflineAuth));
+    let store = store_with(&server, Cloud::default(), Arc::new(OfflineAuth));
     let err = store.send(&draft(None)).await.unwrap_err();
     assert!(matches!(err, Error::NotSent(_)), "{err:?}");
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
@@ -1411,10 +1336,12 @@ async fn failing_to_get_a_token_leaves_mail_unsent() {
 #[tokio::test]
 async fn a_lost_create_reply_response_may_leave_a_draft() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
+    server
+        .on(
+            "POST",
+            "/me/messages/orig/createReply",
+            ResponseTemplate::new(503),
+        )
         .await;
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
     let err = store(&server).send(&reply).await.unwrap_err();
@@ -1427,23 +1354,11 @@ async fn a_lost_create_reply_response_may_leave_a_draft() {
 #[tokio::test]
 async fn giving_up_deletes_the_kept_draft() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
+    reply_draft(&server, "d1").await;
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(503))
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+    route("POST", "/me/messages/d1/permanentDelete")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
@@ -1459,30 +1374,19 @@ async fn giving_up_deletes_the_kept_draft() {
 #[tokio::test]
 async fn national_clouds_delete_drafts_into_deleted_items() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    server
+        .on("POST", "/me/messages/orig/createReply", id(201, "d1"))
+        .await;
+    route("PATCH", "/me/messages/d1")
+        .respond_with(graph_error(400, "ErrorInvalidRecipients", "bad recipient"))
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": { "code": "ErrorInvalidRecipients", "message": "bad recipient" }
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1"))
+    route("DELETE", "/me/messages/d1")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
-    let settings = AuthSettings {
-        cloud: mett_msgraph::Cloud::UsGov,
-        graph_url: Some(Url::parse(&server.uri()).unwrap()),
-        ..AuthSettings::new("alice@contoso.com".into(), "client")
-    };
-    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth));
+    let store = store_with(&server, Cloud::UsGov, Arc::new(StaticAuth));
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
     store.send(&reply).await.unwrap_err();
 }
@@ -1490,8 +1394,7 @@ async fn national_clouds_delete_drafts_into_deleted_items() {
 #[tokio::test]
 async fn finds_the_users_own_addresses() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me"))
+    route("GET", "/me")
         .and(query_param(
             "$select",
             "mail,userPrincipalName,proxyAddresses",
@@ -1522,8 +1425,7 @@ async fn finds_the_users_own_addresses() {
 #[tokio::test]
 async fn lists_and_fetches_attachments() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/m1/attachments"))
+    route("GET", "/me/messages/m1/attachments")
         .and(query_param(
             "$expand",
             "microsoft.graph.itemAttachment/item($select=id)",
@@ -1552,10 +1454,12 @@ async fn lists_and_fetches_attachments() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/m1/attachments/a1/$value"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/messages/m1/attachments/a1/$value",
+            ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()),
+        )
         .await;
     let store = store(&server);
     let list = store.list_attachments(&MessageId::new("m1")).await.unwrap();
@@ -1597,8 +1501,7 @@ async fn sends_small_attachments_with_the_message() {
         "contentType": "application/octet-stream",
         "contentBytes": "BwcH",
     }]);
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/sendMail"))
+    route("POST", "/me/sendMail")
         .and(body_json(
             json!({ "message": message, "saveToSentItems": true }),
         ))
@@ -1614,14 +1517,12 @@ async fn sends_small_attachments_with_the_message() {
 #[tokio::test]
 async fn uploads_large_attachments_without_the_token() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
+    route("POST", "/me/messages/d1/attachments/createUploadSession")
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "uploadUrl": format!("{}/upload/session", server.uri()),
         })))
@@ -1629,21 +1530,18 @@ async fn uploads_large_attachments_without_the_token() {
         .mount(&server)
         .await;
     // The upload URL carries its own authorisation.
-    Mock::given(method("PUT"))
-        .and(path("/upload/session"))
+    session()
         .and(header_exists("authorization"))
         .respond_with(ResponseTemplate::new(418))
         .with_priority(1)
         .mount(&server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path("/upload/session"))
+    session()
         .respond_with(ResponseTemplate::new(200))
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path("/upload/session"))
+    session()
         .and(header("content-range", "bytes 3276800-3999999/4000000"))
         .and(header("content-type", "application/octet-stream"))
         .respond_with(ResponseTemplate::new(201).insert_header(
@@ -1654,8 +1552,7 @@ async fn uploads_large_attachments_without_the_token() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
@@ -1672,8 +1569,7 @@ async fn follows_every_page_of_attachments() {
         "{}/v1.0/me/messages/m1/attachments?$skiptoken=2",
         server.uri()
     );
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/m1/attachments"))
+    route("GET", "/me/messages/m1/attachments")
         .and(query_param("$skiptoken", "2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "a2", "name": "two", "size": 1 }],
@@ -1681,8 +1577,7 @@ async fn follows_every_page_of_attachments() {
         .with_priority(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/m1/attachments"))
+    route("GET", "/me/messages/m1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "a1", "name": "one", "size": 1 }],
             "@odata.nextLink": next,
@@ -1702,20 +1597,14 @@ async fn follows_every_page_of_attachments() {
 #[tokio::test]
 async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createForward"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages/orig/createForward")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
-        .await;
+    server.on("PATCH", "/me/messages/d1", id(200, "d1")).await;
     // The forward carries the original's attachment along.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "carried", "name": "original.pdf", "size": 1 }],
         })))
@@ -1723,11 +1612,13 @@ async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
         .mount(&server)
         .await;
     // The first upload's answer is lost: it was attached as "lost".
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "POST",
+            "/me/messages/d1/attachments",
+            1,
+            ResponseTemplate::new(503),
+        )
         .await;
     let mut forward = draft(Some(DraftOrigin::Forward(MessageId::new("orig"))));
     forward.attachments.push(attached("a.bin", 3));
@@ -1736,8 +1627,7 @@ async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
 
     // The retry finds it there, takes it off, and attaches the file again,
     // leaving the forwarded one.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 { "id": "carried", "name": "original.pdf", "size": 1 },
@@ -1746,20 +1636,17 @@ async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/lost"))
+    route("DELETE", "/me/messages/d1/attachments/lost")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "again" })))
+    route("POST", "/me/messages/d1/attachments")
+        .respond_with(id(201, "again"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
@@ -1770,35 +1657,33 @@ async fn a_retry_takes_off_what_an_earlier_attempt_attached() {
 #[tokio::test]
 async fn a_retry_without_files_takes_off_those_attached_before() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/orig/createReply"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages/orig/createReply")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
+    server.on("PATCH", "/me/messages/d1", id(200, "d1")).await;
+    server
+        .on_n(
+            "GET",
+            "/me/messages/d1/attachments",
+            1,
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [] })),
+        )
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "a1" })))
+    route("POST", "/me/messages/d1/attachments")
+        .respond_with(id(201, "a1"))
         .expect(1)
         .mount(&server)
         .await;
     // The send's answer is lost.
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "POST",
+            "/me/messages/d1/send",
+            1,
+            ResponseTemplate::new(503),
+        )
         .await;
     let mut reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
     reply.attachments.push(attached("a.bin", 3));
@@ -1807,21 +1692,18 @@ async fn a_retry_without_files_takes_off_those_attached_before() {
 
     // The file is taken off the message: the retry takes it off the draft.
     reply.attachments.clear();
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "a1", "name": "a.bin", "size": 3 }],
         })))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/a1"))
+    route("DELETE", "/me/messages/d1/attachments/a1")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
@@ -1832,17 +1714,18 @@ async fn a_retry_without_files_takes_off_those_attached_before() {
 #[tokio::test]
 async fn a_kept_draft_is_sent_once_its_large_files_are_taken_off() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+    route("POST", "/me/messages")
+        .respond_with(id(201, "d1"))
         .expect(1)
         .mount(&server)
         .await;
     // The upload's outcome is unknown: the draft is kept.
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
+    server
+        .on(
+            "POST",
+            "/me/messages/d1/attachments/createUploadSession",
+            ResponseTemplate::new(503),
+        )
         .await;
     let mut message = draft(None);
     message.attachments.push(attached("big.bin", 4_000_000));
@@ -1851,25 +1734,24 @@ async fn a_kept_draft_is_sent_once_its_large_files_are_taken_off() {
 
     // Small enough to go inline now, but the kept draft is what is sent.
     message.attachments.clear();
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+    route("PATCH", "/me/messages/d1")
+        .respond_with(id(200, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/messages/d1/attachments",
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [] })),
+        )
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/sendMail"))
+    route("POST", "/me/sendMail")
         .respond_with(ResponseTemplate::new(202))
         .expect(0)
         .mount(&server)
@@ -1897,8 +1779,7 @@ fn a_long_body_counts_towards_the_request_size() {
 #[tokio::test]
 async fn searches_people_and_the_directory() {
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/people"))
+    route("GET", "/me/people")
         .and(query_param("$search", "\"car\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{
@@ -1908,8 +1789,7 @@ async fn searches_people_and_the_directory() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/users"))
+    route("GET", "/users")
         .and(header("consistencylevel", "eventual"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
@@ -1934,16 +1814,14 @@ async fn searches_people_and_the_directory() {
 
     // Without the directory, the people the user works with.
     server.reset().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/people"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
-        .mount(&server)
+    server
+        .on(
+            "GET",
+            "/me/people",
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [] })),
+        )
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/users"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&server)
-        .await;
+    server.on("GET", "/users", ResponseTemplate::new(403)).await;
     assert!(
         store(&server)
             .search_people("car")
@@ -1954,13 +1832,10 @@ async fn searches_people_and_the_directory() {
 
     // Without the people the user works with, the directory.
     server.reset().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/people"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&server)
+    server
+        .on("GET", "/me/people", ResponseTemplate::new(403))
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/users"))
+    route("GET", "/users")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "displayName": "Carlos", "mail": "carlos@z.org" }],
         })))
@@ -1976,22 +1851,18 @@ async fn searches_people_and_the_directory() {
     assert_eq!(found, ["Carlos <carlos@z.org>"]);
 
     // A broken request is said, not taken for a refusal.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/people"))
+    route("GET", "/me/people")
         .respond_with(ResponseTemplate::new(400))
         .with_priority(1)
         .mount(&server)
         .await;
     assert!(store(&server).search_people("car").await.is_err());
     server.reset().await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/people"))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&server)
+    server
+        .on("GET", "/me/people", ResponseTemplate::new(403))
         .await;
     // Neither: why.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/users"))
+    route("GET", "/users")
         .respond_with(ResponseTemplate::new(403))
         .with_priority(1)
         .mount(&server)
@@ -2007,12 +1878,11 @@ fn recalled() -> Draft {
 /// Mocks that fail the test if a draft is made or deleted.
 async fn no_new_or_deleted_drafts(server: &MockServer) {
     for (verb, at) in [
-        ("POST", "/v1.0/me/messages"),
-        ("POST", "/v1.0/me/messages/d1/permanentDelete"),
-        ("DELETE", "/v1.0/me/messages/d1"),
+        ("POST", "/me/messages"),
+        ("POST", "/me/messages/d1/permanentDelete"),
+        ("DELETE", "/me/messages/d1"),
     ] {
-        Mock::given(method(verb))
-            .and(path(at))
+        route(verb, at)
             .respond_with(ResponseTemplate::new(500))
             .expect(0)
             .mount(server)
@@ -2024,15 +1894,13 @@ async fn no_new_or_deleted_drafts(server: &MockServer) {
 async fn sends_a_recalled_draft_as_itself() {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
+    route("PATCH", "/me/messages/d1")
         .and(body_json(draft_json()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .respond_with(id(200, "d1"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
@@ -2044,9 +1912,8 @@ async fn sends_a_recalled_draft_as_itself() {
 async fn postpones_a_recalled_draft_in_place() {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+    route("PATCH", "/me/messages/d1")
+        .respond_with(id(200, "d1"))
         .expect(1)
         .mount(&server)
         .await;
@@ -2058,18 +1925,14 @@ async fn postpones_a_recalled_draft_in_place() {
 async fn a_recalled_draft_is_never_deleted() {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+    route("PATCH", "/me/messages/d1")
+        .respond_with(id(200, "d1"))
         .expect(2)
         .mount(&server)
         .await;
     // Graph refuses to send it: it stays, for the next attempt.
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": { "code": "ErrorInvalidRecipients", "message": "bad recipient" },
-        })))
+    route("POST", "/me/messages/d1/send")
+        .respond_with(graph_error(400, "ErrorInvalidRecipients", "bad recipient"))
         .expect(2)
         .mount(&server)
         .await;
@@ -2085,11 +1948,8 @@ async fn a_recalled_draft_is_never_deleted() {
 async fn a_recalled_draft_gone_from_drafts_is_not_sent_anew() {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-            "error": { "code": "ErrorItemNotFound", "message": "not found" },
-        })))
+    route("PATCH", "/me/messages/d1")
+        .respond_with(graph_error(404, "ErrorItemNotFound", "not found"))
         .mount(&server)
         .await;
     let e = store(&server).send(&recalled()).await.unwrap_err();
@@ -2100,13 +1960,8 @@ async fn a_recalled_draft_gone_from_drafts_is_not_sent_anew() {
 async fn takes_attachments_off_a_recalled_draft() {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    server.on("PATCH", "/me/messages/d1", id(200, "d1")).await;
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 { "id": "a1", "name": "a.pdf", "size": 3 },
@@ -2120,15 +1975,13 @@ async fn takes_attachments_off_a_recalled_draft() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/a1"))
+    route("DELETE", "/me/messages/d1/attachments/a1")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
     for id in ["a2", "a3"] {
-        Mock::given(method("DELETE"))
-            .and(path(format!("/v1.0/me/messages/d1/attachments/{id}")))
+        route("DELETE", &format!("/me/messages/d1/attachments/{id}"))
             .respond_with(ResponseTemplate::new(204))
             .expect(0)
             .mount(&server)
@@ -2143,13 +1996,8 @@ async fn takes_attachments_off_a_recalled_draft() {
 async fn every_attachment_can_come_off_a_recalled_draft_even_on_retry() {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    server.on("PATCH", "/me/messages/d1", id(200, "d1")).await;
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 { "id": "a1", "name": "a.pdf", "size": 3 },
@@ -2159,41 +2007,36 @@ async fn every_attachment_can_come_off_a_recalled_draft_even_on_retry() {
         .mount(&server)
         .await;
     for id in ["a1", "a2"] {
-        Mock::given(method("DELETE"))
-            .and(path(format!("/v1.0/me/messages/d1/attachments/{id}")))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
+        server
+            .on(
+                "DELETE",
+                &format!("/me/messages/d1/attachments/{id}"),
+                ResponseTemplate::new(204),
+            )
             .await;
     }
     // The first attempt keeps a2, and its send's answer is lost.
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "POST",
+            "/me/messages/d1/send",
+            1,
+            ResponseTemplate::new(503),
+        )
         .await;
     let store = store(&server);
     let mut message = recalled();
     message.drop_attachments = vec![mett_core::AttachmentId::new("a1")];
     assert!(store.send(&message).await.is_err());
     // Then a2 comes off too.
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(202))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(202))
         .await;
     message
         .drop_attachments
         .push(mett_core::AttachmentId::new("a2"));
     store.send(&message).await.unwrap();
-    let deleted: Vec<String> = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|r| r.method.as_str() == "DELETE")
-        .map(|r| r.url.path().to_owned())
-        .collect();
+    let deleted = deleted(&server).await;
     assert!(
         deleted.contains(&"/v1.0/me/messages/d1/attachments/a2".to_owned()),
         "{deleted:?}"
@@ -2208,30 +2051,24 @@ async fn recalled_upload_lost_send(
 ) -> (MockServer, GraphMailStore<StaticAuth>, Draft) {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    server.on("PATCH", "/me/messages/d1", id(200, "d1")).await;
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "a1", "name": "a.pdf", "size": 3 }],
         })))
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(upload)
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n("POST", "/me/messages/d1/attachments", 1, upload)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "POST",
+            "/me/messages/d1/send",
+            1,
+            ResponseTemplate::new(503),
+        )
         .await;
     let store = store(&server);
     let mut message = recalled();
@@ -2243,13 +2080,26 @@ async fn recalled_upload_lost_send(
 /// What d1 has on a retry: a1, mett's upload n1, and o1, a file of the
 /// same name and type added in Outlook meanwhile.
 async fn listed_on_retry(server: &MockServer) {
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 { "id": "a1", "name": "a.pdf", "size": 3 },
                 { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
                 { "id": "o1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+            ],
+        })))
+        .mount(server)
+        .await;
+}
+
+/// What d1 has after an upload's answer was lost: a1, and n1, which may
+/// be the upload.
+async fn listed_a1_n1(server: &MockServer) {
+    route("GET", "/me/messages/d1/attachments")
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
             ],
         })))
         .mount(server)
@@ -2270,23 +2120,21 @@ async fn deleted(server: &MockServer) -> Vec<String> {
 
 #[tokio::test]
 async fn a_retry_takes_off_only_mett_s_upload_of_a_recalled_draft() {
-    let upload = ResponseTemplate::new(201).set_body_json(json!({ "id": "n1" }));
+    let upload = id(201, "n1");
     let (server, store, message) = recalled_upload_lost_send(upload).await;
     listed_on_retry(&server).await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/n1"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&server)
+    server
+        .on(
+            "DELETE",
+            "/me/messages/d1/attachments/n1",
+            ResponseTemplate::new(204),
+        )
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/attachments", id(201, "n2"))
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(202))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(202))
         .await;
     store.send(&message).await.unwrap();
     // By its ID: o1, with the same name, stays.
@@ -2298,28 +2146,30 @@ async fn a_retry_takes_off_only_mett_s_upload_of_a_recalled_draft() {
 
 #[tokio::test]
 async fn a_file_taken_off_stays_known_until_it_is_gone() {
-    let upload = ResponseTemplate::new(201).set_body_json(json!({ "id": "n1" }));
+    let upload = id(201, "n1");
     let (server, store, mut message) = recalled_upload_lost_send(upload).await;
     listed_on_retry(&server).await;
     // The user takes the file off; taking it off the draft fails once.
     message.attachments.clear();
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/n1"))
-        .respond_with(ResponseTemplate::new(500))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "DELETE",
+            "/me/messages/d1/attachments/n1",
+            1,
+            ResponseTemplate::new(500),
+        )
         .await;
     assert!(store.send(&message).await.is_err());
     // The next attempt takes it off still.
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/n1"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&server)
+    server
+        .on(
+            "DELETE",
+            "/me/messages/d1/attachments/n1",
+            ResponseTemplate::new(204),
+        )
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(202))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(202))
         .await;
     store.send(&message).await.unwrap();
     assert_eq!(
@@ -2332,24 +2182,13 @@ async fn a_file_taken_off_stays_known_until_it_is_gone() {
 async fn an_upload_whose_answer_was_lost_is_left_alone() {
     // The upload's answer is lost: the attempt fails there.
     let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "value": [
-                { "id": "a1", "name": "a.pdf", "size": 3 },
-                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
-            ],
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
+    listed_a1_n1(&server).await;
+    route("POST", "/me/messages/d1/attachments")
+        .respond_with(id(201, "n2"))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .with_priority(1)
         .mount(&server)
@@ -2362,18 +2201,8 @@ async fn an_upload_whose_answer_was_lost_is_left_alone() {
 #[tokio::test]
 async fn a_file_taken_off_after_a_lost_upload_is_not_sent_unsure() {
     let (server, store, mut message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "value": [
-                { "id": "a1", "name": "a.pdf", "size": 3 },
-                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
-            ],
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    listed_a1_n1(&server).await;
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .with_priority(1)
         .expect(0)
@@ -2388,18 +2217,8 @@ async fn a_file_taken_off_after_a_lost_upload_is_not_sent_unsure() {
 #[tokio::test]
 async fn a_file_replaced_after_a_lost_upload_is_not_sent_unsure() {
     let (server, store, mut message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "value": [
-                { "id": "a1", "name": "a.pdf", "size": 3 },
-                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
-            ],
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    listed_a1_n1(&server).await;
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .with_priority(1)
         .expect(0)
@@ -2416,24 +2235,24 @@ async fn a_file_replaced_after_a_lost_upload_is_not_sent_unsure() {
 async fn more_lost_uploads_than_copies_are_not_sent_unsure() {
     // Two attempts lose their upload's answer.
     let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "a1", "name": "a.pdf", "size": 3 }],
         })))
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "POST",
+            "/me/messages/d1/attachments",
+            1,
+            ResponseTemplate::new(503),
+        )
         .await;
     assert!(store.send(&message).await.is_err());
     listed_on_retry(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(0)
         .mount(&server)
@@ -2449,8 +2268,7 @@ async fn a_lost_upload_stays_unsure_over_later_attempts() {
     let (server, store, mut message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
     // The next attempt lists it (maybe), uploads the file again (n2), and
     // loses the send's answer.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 { "id": "a1", "name": "a.pdf", "size": 3 },
@@ -2460,22 +2278,20 @@ async fn a_lost_upload_stays_unsure_over_later_attempts() {
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n("POST", "/me/messages/d1/attachments", 1, id(201, "n2"))
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "POST",
+            "/me/messages/d1/send",
+            1,
+            ResponseTemplate::new(503),
+        )
         .await;
     assert!(store.send(&message).await.is_err());
     // The user takes the file off: n1 may still be the lost upload.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 { "id": "a1", "name": "a.pdf", "size": 3 },
@@ -2485,8 +2301,7 @@ async fn a_lost_upload_stays_unsure_over_later_attempts() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .expect(0)
         .mount(&server)
@@ -2501,13 +2316,10 @@ async fn an_upload_whose_answer_was_lost_is_not_guessed_among_look_alikes() {
     let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
     // n1 and o1 both look like it: neither is taken off.
     listed_on_retry(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/attachments", id(201, "n2"))
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .with_priority(1)
         .mount(&server)
@@ -2518,13 +2330,10 @@ async fn an_upload_whose_answer_was_lost_is_not_guessed_among_look_alikes() {
 
 #[tokio::test]
 async fn a_refused_upload_leaves_nothing_to_take_off() {
-    let refused = ResponseTemplate::new(400).set_body_json(json!({
-        "error": { "code": "ErrorInvalidRequest", "message": "bad file" },
-    }));
+    let refused = graph_error(400, "ErrorInvalidRequest", "bad file");
     let (server, store, message) = recalled_upload_lost_send(refused).await;
     // A file of that name and type added in Outlook since stays.
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [
                 { "id": "a1", "name": "a.pdf", "size": 3 },
@@ -2533,13 +2342,10 @@ async fn a_refused_upload_leaves_nothing_to_take_off() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/attachments", id(201, "n2"))
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
+    route("POST", "/me/messages/d1/send")
         .respond_with(ResponseTemplate::new(202))
         .with_priority(1)
         .mount(&server)
@@ -2552,31 +2358,26 @@ async fn a_refused_upload_leaves_nothing_to_take_off() {
 async fn a_large_upload_is_known_by_its_decoded_id() {
     let server = MockServer::start().await;
     no_new_or_deleted_drafts(&server).await;
-    Mock::given(method("PATCH"))
-        .and(path("/v1.0/me/messages/d1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
-        .mount(&server)
+    server.on("PATCH", "/me/messages/d1", id(200, "d1")).await;
+    server
+        .on_n(
+            "GET",
+            "/me/messages/d1/attachments",
+            1,
+            ResponseTemplate::new(200).set_body_json(json!({ "value": [] })),
+        )
         .await;
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
+    route("POST", "/me/messages/d1/attachments/createUploadSession")
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "uploadUrl": format!("{}/upload/session", server.uri()),
         })))
         .mount(&server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path("/upload/session"))
+    session()
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
-    Mock::given(method("PUT"))
-        .and(path("/upload/session"))
+    session()
         .and(header("content-range", "bytes 3276800-3999999/4000000"))
         .respond_with(ResponseTemplate::new(201).insert_header(
             "Location",
@@ -2586,11 +2387,13 @@ async fn a_large_upload_is_known_by_its_decoded_id() {
         .mount(&server)
         .await;
     // The send's answer is lost.
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&server)
+    server
+        .on_n(
+            "POST",
+            "/me/messages/d1/send",
+            1,
+            ResponseTemplate::new(503),
+        )
         .await;
     let store = store(&server);
     let mut message = recalled();
@@ -2598,23 +2401,19 @@ async fn a_large_upload_is_known_by_its_decoded_id() {
     assert!(store.send(&message).await.is_err());
     // The user takes it off: it comes off, by its ID as listed.
     message.attachments.clear();
-    Mock::given(method("GET"))
-        .and(path("/v1.0/me/messages/d1/attachments"))
+    route("GET", "/me/messages/d1/attachments")
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "big=1", "name": "big.bin", "size": 4_000_000 }],
         })))
         .mount(&server)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/big=1"))
+    route("DELETE", "/me/messages/d1/attachments/big=1")
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/v1.0/me/messages/d1/send"))
-        .respond_with(ResponseTemplate::new(202))
-        .mount(&server)
+    server
+        .on("POST", "/me/messages/d1/send", ResponseTemplate::new(202))
         .await;
     store.send(&message).await.unwrap();
 }
