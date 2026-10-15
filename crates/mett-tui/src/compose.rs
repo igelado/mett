@@ -273,7 +273,19 @@ pub fn reply_recipients(
     };
     let from_me = !to.is_empty() && to.iter().all(|a| settings.is_me(a));
     if from_me {
-        to = summary.to.clone();
+        // Leave the user out too (unless `metoo`), but not if they were
+        // the only recipient.
+        let others: Vec<Address> = summary
+            .to
+            .iter()
+            .filter(|a| settings.metoo || !settings.is_me(a))
+            .cloned()
+            .collect();
+        to = if others.is_empty() {
+            summary.to.clone()
+        } else {
+            others
+        };
     }
     let mut cc = Vec::new();
     if group {
@@ -456,9 +468,15 @@ mod tests {
     fn replying_to_my_own_message_goes_to_its_recipients() {
         let mut message = message();
         message.summary.from = Some(Address::new("Me@Contoso.com"));
-        let (to, _) = reply_recipients(&message, true, false, &settings());
+        let (to, cc) = reply_recipients(&message, true, true, &settings());
         let to: Vec<_> = to.iter().map(|a| a.email.as_str()).collect();
-        assert_eq!(to, ["me@contoso.com", "carol@x.org"]);
+        assert_eq!(to, ["carol@x.org"], "without me");
+        let cc: Vec<_> = cc.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(cc, ["dave@x.org", "BOB@x.org"]);
+        // A note to self goes back to self.
+        message.summary.to = vec![Address::new("me@contoso.com")];
+        let (to, _) = reply_recipients(&message, true, false, &settings());
+        assert_eq!(to, [Address::new("me@contoso.com")]);
     }
 
     #[test]
