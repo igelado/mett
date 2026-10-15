@@ -1995,8 +1995,12 @@ impl App {
             return Vec::new();
         };
         let loading = self.listing.is_some();
-        // The next thread needs the threads of what was listed.
+        // The next thread needs the threads of what was listed, once it
+        // all is (threading at every page would be slow).
         if matches!(target, Target::NextThread | Target::PreviousThread) {
+            if loading {
+                return Vec::new();
+            }
             self.thread_listed();
         }
         let last = self.messages.len().saturating_sub(1);

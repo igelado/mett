@@ -418,6 +418,7 @@ impl App {
         // The others may have changed elsewhere (read in Outlook, say).
         // When both have a message, it comes as it was last changed.
         let mut updates: HashMap<&MessageId, &MessageSummary> = HashMap::new();
+        let mut reorder = false;
         for message in fresh.iter().chain(&changes) {
             match updates.get(&message.id) {
                 Some(earlier) if earlier.modified >= message.modified => {}
@@ -433,14 +434,27 @@ impl App {
             .chain(&mut self.folded)
         {
             if let Some(update) = updates.get(&summary.id) {
+                // Read or flagged, it stays where it is; otherwise the
+                // index may change order.
+                reorder |= summary.received != update.received
+                    || summary.delivered != update.delivered
+                    || summary.subject != update.subject
+                    || summary.from != update.from
+                    || summary.to != update.to
+                    || summary.thread != update.thread
+                    || summary.draft != update.draft;
                 *summary = (*update).clone();
             }
         }
+        reorder |= !arrived.is_empty();
         for message in arrived {
             self.insert_arrived(message);
         }
-        // In order, and in their threads.
-        self.arrange();
+        // In order, and in their threads (only if anything changed: a
+        // large folder takes a while).
+        if reorder {
+            self.arrange();
+        }
         // Stay on the same message.
         if let Some(at) = selected.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
             self.selected = at;
