@@ -1300,3 +1300,35 @@ async fn a_retry_as_soon_as_a_sign_in_ends_signs_in_again() {
         "the retry asked again"
     );
 }
+
+#[tokio::test]
+async fn requests_waiting_on_an_unconfirmed_sign_in_share_its_failure() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, "a1").await;
+    // Graph can't confirm the user the first time only.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    me(&server, "a1", "alice@contoso.com").await;
+
+    let outcomes = Outcomes::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        outcomes.clone(),
+    );
+    // Both arrive together: the second shares the first one's failure
+    // instead of confirming the tokens behind the user's back.
+    let (first, second) = tokio::join!(auth.access_token(), auth.access_token());
+    assert!(matches!(first, Err(Error::Network(_))));
+    assert!(matches!(second, Err(Error::Network(_))));
+    assert_eq!(*outcomes.0.lock().unwrap(), [false]);
+    // A later request (the user retrying) confirms them.
+    assert_eq!(auth.access_token().await.unwrap().secret(), "a1");
+    assert_eq!(*outcomes.0.lock().unwrap(), [false, true]);
+}

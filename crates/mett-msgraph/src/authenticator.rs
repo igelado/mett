@@ -334,6 +334,17 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             return Ok(token);
         }
 
+        // Callers that were waiting while a sign-in failed or was cancelled
+        // share its outcome, rather than asking the user again straight
+        // away or retrying it behind the user's back (which would settle
+        // the sign-in while the request that started it stays failed).
+        // Only a later request, such as the user retrying, tries again.
+        if let Some((number, error)) = &state.failed_sign_in
+            && *number > arrived
+        {
+            return Err(error.clone());
+        }
+
         // Retry confirming a previous sign-in before asking for a new one.
         // Breaking out of this block continues with the normal refresh path.
         'unconfirmed: {
@@ -439,15 +450,6 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             }
         }
 
-        // Callers that were waiting while a sign-in failed or was cancelled
-        // share its outcome, rather than asking the user again straight
-        // away. Only a later request (such as the user retrying) starts a
-        // new sign-in.
-        if let Some((number, error)) = &state.failed_sign_in
-            && *number > arrived
-        {
-            return Err(error.clone());
-        }
         let result = self.sign_in_and_confirm(&mut state).await;
         let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
         state.failed_sign_in = result.as_ref().err().map(|e| (number, e.clone()));
