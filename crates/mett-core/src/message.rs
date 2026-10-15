@@ -164,6 +164,22 @@ pub struct FlagsUpdate {
 }
 
 impl FlagsUpdate {
+    /// Sets [`Flags::read`] only.
+    pub fn read(read: bool) -> Self {
+        Self {
+            read: Some(read),
+            flagged: None,
+        }
+    }
+
+    /// Sets [`Flags::flagged`] only.
+    pub fn flagged(flagged: bool) -> Self {
+        Self {
+            read: None,
+            flagged: Some(flagged),
+        }
+    }
+
     /// Applies the update to `flags`.
     pub fn apply(self, flags: &mut Flags) {
         if let Some(read) = self.read {
@@ -321,11 +337,7 @@ mod tests {
             read: false,
             flagged: true,
         };
-        FlagsUpdate {
-            read: Some(true),
-            flagged: None,
-        }
-        .apply(&mut flags);
+        FlagsUpdate::read(true).apply(&mut flags);
         assert_eq!(
             flags,
             Flags {
