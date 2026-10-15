@@ -326,7 +326,7 @@ mod tests {
             ..Draft::default()
         };
         store.send(&draft).await.unwrap();
-        assert_eq!(store.sent(), [draft.clone()]);
+        assert_eq!(store.sent(), std::slice::from_ref(&draft));
         let sent = store
             .list_messages(&FolderId::new("sent"), Page::first(10))
             .await

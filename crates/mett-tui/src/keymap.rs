@@ -16,6 +16,8 @@ pub enum Menu {
     Pager,
     /// The sign-in window (a mett addition).
     SignIn,
+    /// The compose menu.
+    Compose,
 }
 
 /// A key press, normalised so that bindings compare reliably: Shift is
@@ -119,6 +121,10 @@ impl Keymap {
             (Key::new(Left), PreviousPage),
             (Key::new(Enter), DisplayMessage),
             (Key::char(' '), DisplayMessage),
+            (Key::char('m'), Mail),
+            (Key::char('r'), Reply),
+            (Key::char('g'), GroupReply),
+            (Key::char('f'), Forward),
         ];
         for (key, action) in index {
             keymap.bind(Menu::Index, *key, *action);
@@ -137,6 +143,10 @@ impl Keymap {
             (Key::new(Down), NextLine),
             (Key::new(Backspace), PreviousLine),
             (Key::new(Up), PreviousLine),
+            (Key::char('m'), Mail),
+            (Key::char('r'), Reply),
+            (Key::char('g'), GroupReply),
+            (Key::char('f'), Forward),
         ];
         for (key, action) in pager {
             keymap.bind(Menu::Pager, *key, *action);
@@ -155,6 +165,20 @@ impl Keymap {
         ];
         for (key, action) in sign_in {
             keymap.bind(Menu::SignIn, *key, *action);
+        }
+
+        let compose: &[(Key, Action)] = &[
+            (Key::char('y'), SendMessage),
+            (Key::char('q'), Exit),
+            (Key::char('P'), PostponeMessage),
+            (Key::char('e'), EditMessage),
+            (Key::char('t'), EditTo),
+            (Key::char('c'), EditCc),
+            (Key::char('b'), EditBcc),
+            (Key::char('s'), EditSubject),
+        ];
+        for (key, action) in compose {
+            keymap.bind(Menu::Compose, *key, *action);
         }
 
         keymap

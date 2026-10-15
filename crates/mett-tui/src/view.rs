@@ -11,9 +11,10 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
-use crate::app::{App, Pager, Row, Screen, SignIn};
+use crate::app::{App, Compose, Input, Pager, Row, Screen, SignIn};
 use crate::keymap::{Keymap, Menu};
 use crate::text::{fit, truncate, wrap_all};
 
@@ -36,6 +37,18 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
             (Action::NextPage, "NextPg"),
             (Action::NextEntry, "Next"),
             (Action::PreviousEntry, "Prev"),
+        ],
+    ),
+    (
+        Menu::Compose,
+        &[
+            (Action::SendMessage, "Send"),
+            (Action::Exit, "Abort"),
+            (Action::EditTo, "To"),
+            (Action::EditCc, "CC"),
+            (Action::EditSubject, "Subj"),
+            (Action::EditMessage, "Edit"),
+            (Action::PostponeMessage, "Postpone"),
         ],
     ),
     (
@@ -84,9 +97,13 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
             index_status(app)
         }
         Screen::Pager(pager) => render_pager(app, pager, frame, body),
+        Screen::Compose(compose) => render_compose(compose, frame, body),
     };
     frame.render_widget(Paragraph::new(status_line).style(REVERSED), status);
-    frame.render_widget(Paragraph::new(app.status.as_str()), message);
+    match &app.input {
+        Some(input) => render_input(input, frame, message),
+        None => frame.render_widget(Paragraph::new(app.status.as_str()), message),
+    }
     // The window may cover everything but the help line, which lists its
     // keys: on a small terminal, the sign-in instructions matter more than
     // the index behind them.
@@ -96,6 +113,81 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
         return render_sign_in(window, keymap, frame, below_help);
     }
     None
+}
+
+/// Draws a question on the message line, with the cursor where the answer
+/// is typed.
+fn render_input(input: &Input, frame: &mut Frame, area: Rect) {
+    let width = usize::from(area.width);
+    let (line, cursor) = match input {
+        Input::Line { prompt, editor, .. } => {
+            let prompt = truncate(prompt, width.saturating_sub(1));
+            let (text, column) = editor.view(width.saturating_sub(prompt.width()));
+            let cursor = prompt.width() + column;
+            (format!("{prompt}{text}"), cursor)
+        }
+        Input::YesNo {
+            prompt, default, ..
+        } => {
+            let choices = if *default { "([yes]/no)" } else { "(yes/[no])" };
+            let line = truncate(&format!("{prompt} {choices}: "), width);
+            let cursor = line.width();
+            (line, cursor)
+        }
+    };
+    frame.render_widget(Paragraph::new(line), area);
+    let x = u16::try_from(cursor)
+        .unwrap_or(u16::MAX)
+        .min(area.width.saturating_sub(1));
+    frame.set_cursor_position((area.x + x, area.y));
+}
+
+/// Draws the compose menu and returns its status line: the headers, then
+/// the message's parts (for now, only its text).
+fn render_compose(compose: &Compose, frame: &mut Frame, area: Rect) -> String {
+    let draft = &compose.draft;
+    let list = |addresses: &[Address]| Address::format_list(addresses);
+    let from = draft
+        .from
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let headers = [
+        ("From", from),
+        ("To", list(&draft.to)),
+        ("Cc", list(&draft.cc)),
+        ("Bcc", list(&draft.bcc)),
+        ("Subject", draft.subject.clone()),
+    ];
+    let width = usize::from(area.width);
+    let size = format_size(draft.body.len());
+    let mut lines: Vec<Line> = headers
+        .into_iter()
+        .map(|(name, value)| Line::raw(truncate(&format!("{name:>8}: {value}"), width)))
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("-- Attachments"));
+    lines.push(
+        Line::raw(truncate(
+            &format!("- I     1 <message text>  [text/plain, utf-8, {size}]"),
+            width,
+        ))
+        .style(REVERSED),
+    );
+    frame.render_widget(Paragraph::new(lines), area);
+    format!("-- mett: Compose  [Approx. msg size: {size}   Atts: 1]---")
+}
+
+/// A size the way mutt shows it: `0.5K`, `12K`, `1.2M`.
+fn format_size(bytes: usize) -> String {
+    let kilobytes = bytes as f64 / 1024.0;
+    if kilobytes < 10.0 {
+        format!("{kilobytes:.1}K")
+    } else if kilobytes < 1024.0 {
+        format!("{kilobytes:.0}K")
+    } else {
+        format!("{:.1}M", kilobytes / 1024.0)
+    }
 }
 
 /// Draws the sign-in window across the middle of `area`. It spans the
@@ -559,5 +651,51 @@ mod tests {
             .draw(|frame| overlay = render(&app, &Keymap::mutt_defaults(), frame))
             .unwrap();
         assert!(overlay.is_none());
+    }
+
+    #[test]
+    fn draws_prompts_and_the_compose_menu() {
+        let mut app = app(1);
+        app.update(Msg::Action(Action::Mail));
+        for c in "bob@x.org".chars() {
+            app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Char(c),
+            )));
+        }
+        assert_eq!(screen(&app)[7], "To: bob@x.org");
+        let enter = || {
+            Msg::Key(ratatui::crossterm::event::KeyEvent::from(
+                ratatui::crossterm::event::KeyCode::Enter,
+            ))
+        };
+        app.update(enter());
+        app.update(enter());
+        assert_eq!(screen(&app)[7], "No subject, abort? ([yes]/no):");
+        app.update(Msg::Key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('n'),
+        )));
+        app.update(Msg::Edited(Ok("x".repeat(2048))));
+        let lines = sized_screen(&app, WIDTH, 12);
+        assert_eq!(
+            lines[0],
+            "y:Send  q:Abort  t:To  c:CC  s:Subj  e:Edit  P:Postpone"
+        );
+        assert_eq!(lines[2], "      To: bob@x.org");
+        assert_eq!(lines[5], " Subject:");
+        assert_eq!(
+            lines[8],
+            "- I     1 <message text>  [text/plain, utf-8, 2.0K]"
+        );
+        assert_eq!(
+            lines[10],
+            "-- mett: Compose  [Approx. msg size: 2.0K   Atts: 1]---"
+        );
+    }
+
+    #[test]
+    fn sizes_read_like_mutt() {
+        assert_eq!(format_size(100), "0.1K");
+        assert_eq!(format_size(20 * 1024), "20K");
+        assert_eq!(format_size(3 * 1024 * 1024 / 2), "1.5M");
     }
 }

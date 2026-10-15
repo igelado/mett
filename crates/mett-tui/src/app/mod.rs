@@ -5,12 +5,18 @@
 //! to a [`Msg`]; side effects come back as [`Effect`]s for the main loop to
 //! carry out. This keeps the UI logic testable without a terminal.
 
+mod composing;
+
 use std::collections::{HashMap, HashSet};
 
 use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 use mett_msgraph::SignInPrompt;
+use ratatui::crossterm::event::KeyEvent;
 
+use self::composing::Composing;
+pub use self::composing::{Compose, Input};
 use crate::action::Action;
+use crate::compose::Kind;
 use crate::config::mailbox::FolderPath;
 use crate::keymap::Menu;
 use crate::signin::SignInEvent;
@@ -32,6 +38,24 @@ enum Target {
 /// Rows used by the help line, the status bar and the message line.
 const CHROME_ROWS: usize = 3;
 
+/// What the app needs from the configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// How many messages to request per page.
+    pub page_size: u32,
+    /// How to write messages.
+    pub compose: crate::compose::Settings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            page_size: PAGE_SIZE,
+            compose: crate::compose::Settings::default(),
+        }
+    }
+}
+
 /// Input to [`App::update`].
 // Messages are handled one at a time, so their size doesn't matter.
 #[allow(clippy::large_enum_variant)]
@@ -43,6 +67,11 @@ pub enum Msg {
     Response(Response),
     /// The authenticator needs the user, or finished signing in.
     SignIn(SignInEvent),
+    /// A key press while a question is on the message line, which takes
+    /// keys as typed rather than through the key bindings.
+    Key(KeyEvent),
+    /// The editor finished: the edited text, or why it failed.
+    Edited(Result<String, String>),
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -63,6 +92,9 @@ pub enum Effect {
     CancelSignIn,
     /// Put the text on the clipboard, through the terminal.
     Copy(String),
+    /// Edit the text in the user's editor, then send back
+    /// [`Msg::Edited`].
+    Edit(String),
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -74,6 +106,8 @@ pub enum Screen {
     Index,
     /// The pager, showing one message.
     Pager(Pager),
+    /// The compose menu, for a message about to be sent.
+    Compose(Compose),
 }
 
 /// Pager state.
@@ -217,6 +251,14 @@ pub struct App {
     /// late, from requests that were waiting on the same sign-in, aren't
     /// shown either. Cleared by the next prompt or the user's next action.
     dismissed: bool,
+    /// The question on the message line, if any.
+    pub input: Option<Input>,
+    /// A message being set up for the compose menu.
+    composing: Option<Composing>,
+    /// The request fetching a message to reply to or forward.
+    compose_fetch: Option<(RequestId, Kind)>,
+    /// How to write messages.
+    settings: crate::compose::Settings,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -258,12 +300,17 @@ impl App {
     #[cfg(test)]
     pub fn new(width: u16, height: u16) -> (Self, Vec<Effect>) {
         let inbox = FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new());
-        Self::open(width, height, inbox, PAGE_SIZE)
+        Self::open(width, height, inbox, Settings::default())
     }
 
-    /// A new app that opens the folder at `path`, listing `page_size`
-    /// messages per request, and the effects that start loading it.
-    pub fn open(width: u16, height: u16, path: FolderPath, page_size: u32) -> (Self, Vec<Effect>) {
+    /// A new app that opens the folder at `path`, and the effects that
+    /// start loading it.
+    pub fn open(
+        width: u16,
+        height: u16,
+        path: FolderPath,
+        settings: Settings,
+    ) -> (Self, Vec<Effect>) {
         let mut app = Self {
             screens: vec![Screen::Index],
             folder: None,
@@ -274,6 +321,10 @@ impl App {
             sign_in: None,
             cancelled: false,
             dismissed: false,
+            input: None,
+            composing: None,
+            compose_fetch: None,
+            settings: settings.compose,
             path,
             opening: None,
             width: usize::from(width),
@@ -287,7 +338,7 @@ impl App {
             unfetched: None,
             retry_after: HashSet::new(),
             next_request: 0,
-            page_size,
+            page_size: settings.page_size,
         };
         let effects = app.open_folder();
         (app, effects)
@@ -309,6 +360,7 @@ impl App {
         match self.screen() {
             Screen::Index => Menu::Index,
             Screen::Pager(_) => Menu::Pager,
+            Screen::Compose(_) => Menu::Compose,
         }
     }
 
@@ -325,6 +377,8 @@ impl App {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
             Msg::SignIn(event) => self.on_sign_in(event),
+            Msg::Key(key) => self.on_key(key),
+            Msg::Edited(result) => self.on_edited(result),
             Msg::Resize { width, height } => {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);
@@ -353,6 +407,7 @@ impl App {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
+            Menu::Compose => self.on_compose_action(action),
         }
     }
 
@@ -593,21 +648,18 @@ impl App {
                 }
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
-            // Opening the folder failed: try again.
-            Action::DisplayMessage if self.folder.is_none() => {
-                // Opening the folder failed: try again. (While it is still
-                // opening, there is nothing to display yet.)
-                if self.opening.is_none() {
-                    return self.open_folder();
-                }
+            // Opening the folder failed: try again. (While it is still
+            // opening, there is nothing to display yet.)
+            Action::DisplayMessage if self.folder.is_none() && self.opening.is_none() => {
+                return self.open_folder();
             }
+            Action::DisplayMessage if self.folder.is_none() => {}
             Action::DisplayMessage => return self.open_selected(),
-            Action::Exit
-            | Action::NextLine
-            | Action::PreviousLine
-            | Action::OpenBrowser
-            | Action::CopyLink
-            | Action::Retry => {}
+            Action::Mail => return self.start_compose(Kind::New),
+            Action::Reply => return self.start_compose(Kind::Reply),
+            Action::GroupReply => return self.start_compose(Kind::GroupReply),
+            Action::Forward => return self.start_compose(Kind::Forward),
+            _ => {}
         }
         Vec::new()
     }
@@ -643,12 +695,11 @@ impl App {
             Action::PreviousLine => self.scroll_by(-1),
             Action::NextPage => self.scroll_by(page as isize),
             Action::PreviousPage => self.scroll_by(-(page as isize)),
-            Action::FirstEntry
-            | Action::LastEntry
-            | Action::DisplayMessage
-            | Action::OpenBrowser
-            | Action::CopyLink
-            | Action::Retry => {}
+            Action::Mail => return self.start_compose(Kind::New),
+            Action::Reply => return self.start_compose(Kind::Reply),
+            Action::GroupReply => return self.start_compose(Kind::GroupReply),
+            Action::Forward => return self.start_compose(Kind::Forward),
+            _ => {}
         }
         Vec::new()
     }
@@ -734,7 +785,15 @@ impl App {
                     self.report(e);
                 }
             },
+            Event::MessageFetched(result)
+                if self.compose_fetch.is_some_and(|(request, _)| request == id) =>
+            {
+                let (_, kind) = self.compose_fetch.take().expect("checked above");
+                return self.on_compose_fetched(kind, result);
+            }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
+            Event::Sent(result) => self.on_delivered(id, result),
+            Event::DraftSaved(result) => self.on_delivered(id, result.map(drop)),
             Event::FlagsUpdated(result) => {
                 let Some(message) = self.flag_updates.remove(&id) else {
                     return Vec::new();
@@ -877,7 +936,7 @@ impl App {
         self.selected = selected;
         // The screen, not the menu: the sign-in window may be over it.
         match self.screen() {
-            Screen::Index => Vec::new(),
+            Screen::Index | Screen::Compose(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()
@@ -907,7 +966,7 @@ impl App {
     /// Whether changes to the mailbox are still being saved. mett waits
     /// for them before exiting, so they aren't lost.
     pub fn saving(&self) -> bool {
-        !self.flag_updates.is_empty()
+        !self.flag_updates.is_empty() || self.delivering()
     }
 
     fn report(&mut self, error: Error) {

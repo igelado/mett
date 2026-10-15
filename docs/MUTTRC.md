@@ -104,8 +104,17 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `ssl_force_tls` | boolean | Require encrypted connections. |
 | Caching | `header_cache` | path | Header cache database. |
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
-| Behaviour | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then `vi`. |
-| | `mail_check` | number | Seconds between new-mail checks. |
+| Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then `vi`. |
+| | `include` | quadoption | Quote the message in replies. |
+| | `attribution`, `indent_string` | string | The line before quoted text (`On %d, %n wrote:`), and the prefix of quoted lines (`> `). |
+| | `forward_format` | string | Subject of forwarded messages (`[%a: %s]`). |
+| | `reply_to` | quadoption | Reply to the `Reply-To:` address rather than the sender. |
+| | `fast_reply`, `askcc`, `askbcc` | boolean | Skip the recipient and subject questions when replying; ask for `Cc:` and `Bcc:`. |
+| | `metoo` | boolean | Keep one's own address in group replies. |
+| | `sig_dashes` | boolean | Put `-- ` before the signature. |
+| | `abort_unmodified`, `abort_nosubject`, `postpone` | quadoption | Abort an unedited message or one without subject; postpone when leaving the compose menu. |
+| | `tmpdir` | path | Where the editor's temporary files go. |
+| Behaviour | `mail_check` | number | Seconds between new-mail checks. |
 | | `timeout` | number | Seconds to wait for input before checking mail. |
 | | `sort`, `sort_aux` | sort order | Index sorting. |
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |

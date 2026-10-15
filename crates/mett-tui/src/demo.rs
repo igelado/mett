@@ -24,7 +24,8 @@ const SUBJECTS: &[&str] = &[
 ];
 
 /// A sample mailbox: an Inbox with messages of various ages and flags, one
-/// of them HTML, and an empty Archive.
+/// of them HTML, an empty Archive, and Drafts and Sent Items for what is
+/// written in the demo.
 pub fn mailbox() -> MemoryStore {
     let now = Utc::now();
     let mut store = MemoryStore::new()
@@ -33,6 +34,17 @@ pub fn mailbox() -> MemoryStore {
             "archive",
             "Archive",
             Some(WellKnownFolder::Archive),
+        ))
+        // Where sent and postponed messages go.
+        .with_folder(mock::folder(
+            "drafts",
+            "Drafts",
+            Some(WellKnownFolder::Drafts),
+        ))
+        .with_folder(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
         ));
 
     for i in 0..40 {

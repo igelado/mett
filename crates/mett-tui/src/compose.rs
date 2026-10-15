@@ -1,0 +1,382 @@
+//! Writing messages: the text and recipients of new mail, replies and
+//! forwards, as mutt builds them. Everything here is pure, so the app's
+//! compose flow is tested without an editor or a mailbox.
+
+use chrono::Local;
+use mett_core::{Address, Message};
+
+use crate::config::Quad;
+use crate::text;
+
+/// The settings that shape new messages, from the configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// The `From:` address (`from` and `realname`), if set.
+    pub from: Option<Address>,
+    /// The user's own addresses, in lower case, left out of group replies
+    /// (unless `metoo`).
+    pub me: Vec<String>,
+    /// The signature's text, if there is one.
+    pub signature: Option<String>,
+    /// `sig_dashes`: put `-- ` before the signature.
+    pub sig_dashes: bool,
+    /// `attribution`: the line before quoted text.
+    pub attribution: String,
+    /// `indent_string`: the prefix of quoted lines.
+    pub indent_string: String,
+    /// `forward_format`: the subject of forwarded messages.
+    pub forward_format: String,
+    /// `include`: quote the message in replies.
+    pub include: Quad,
+    /// `reply_to`: reply to the `Reply-To:` address.
+    pub reply_to: Quad,
+    /// `postpone`: postpone a message when leaving the compose menu.
+    pub postpone: Quad,
+    /// `abort_unmodified`: abort if the message wasn't edited.
+    pub abort_unmodified: Quad,
+    /// `abort_nosubject`: abort if the subject is empty.
+    pub abort_nosubject: Quad,
+    /// `copy`: keep a copy of sent messages.
+    pub copy: Quad,
+    /// `askcc`: ask for `Cc:` recipients.
+    pub askcc: bool,
+    /// `askbcc`: ask for `Bcc:` recipients.
+    pub askbcc: bool,
+    /// `fast_reply`: don't ask for recipients and subject when replying.
+    pub fast_reply: bool,
+    /// `metoo`: keep the user's own addresses in group replies.
+    pub metoo: bool,
+}
+
+impl Default for Settings {
+    /// mutt's defaults.
+    fn default() -> Self {
+        Self {
+            from: None,
+            me: Vec::new(),
+            signature: None,
+            sig_dashes: true,
+            attribution: "On %d, %n wrote:".into(),
+            indent_string: "> ".into(),
+            forward_format: "[%a: %s]".into(),
+            include: Quad::AskYes,
+            reply_to: Quad::AskYes,
+            postpone: Quad::AskYes,
+            abort_unmodified: Quad::Yes,
+            abort_nosubject: Quad::AskYes,
+            copy: Quad::Yes,
+            askcc: false,
+            askbcc: false,
+            fast_reply: false,
+            metoo: false,
+        }
+    }
+}
+
+impl Settings {
+    fn is_me(&self, address: &Address) -> bool {
+        let email = address.email.to_lowercase();
+        self.me.contains(&email)
+    }
+}
+
+/// What is being written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// New mail (`m`).
+    New,
+    /// A reply to the sender (`r`).
+    Reply,
+    /// A reply to everyone (`g`).
+    GroupReply,
+    /// A forward (`f`).
+    Forward,
+}
+
+/// Expands mutt's `%` expandos for `message` in `format`: `%n` (the
+/// author's name, or address), `%a` (the author's address), `%s` (the
+/// subject), `%d` (the date) and `%%`. Unknown expandos are kept.
+pub fn expand(format: &str, message: &Message) -> String {
+    let summary = &message.summary;
+    let mut out = String::new();
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push_str(
+                summary
+                    .from
+                    .as_ref()
+                    .map_or("", |a| a.name.as_deref().unwrap_or(&a.email)),
+            ),
+            Some('a') => out.push_str(summary.from.as_ref().map_or("", |a| a.email.as_str())),
+            Some('s') => out.push_str(&summary.subject),
+            Some('d') => out.push_str(
+                &summary
+                    .received
+                    .with_timezone(&Local)
+                    // mutt's default `date_format`.
+                    .format("%a, %b %d, %Y at %I:%M:%S%p %Z")
+                    .to_string(),
+            ),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// The subject of a reply: `Re: ` before the original, unless it is
+/// already there.
+pub fn reply_subject(original: &str) -> String {
+    let has_prefix = original
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("re:"));
+    if has_prefix {
+        original.to_owned()
+    } else {
+        format!("Re: {original}")
+    }
+}
+
+/// The original message's text, quoted, after the attribution line.
+pub fn quoted(message: &Message, settings: &Settings) -> String {
+    let mut out = expand(&settings.attribution, message);
+    out.push('\n');
+    for line in text::body_lines(&message.body) {
+        // Quoting an empty line adds no trailing space, as mutt does.
+        let prefix = if line.is_empty() {
+            settings.indent_string.trim_end()
+        } else {
+            &settings.indent_string
+        };
+        out.push_str(prefix);
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The original message, inline, as mutt forwards it.
+pub fn forwarded(message: &Message) -> String {
+    let summary = &message.summary;
+    let from = summary.from.as_ref().map(ToString::to_string);
+    let mut out = format!(
+        "----- Forwarded message from {} -----\n\n",
+        from.as_deref().unwrap_or("unknown sender")
+    );
+    // The pager's headers, then the body.
+    for line in text::pager_lines(message) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("\n----- End forwarded message -----\n");
+    out
+}
+
+/// Appends the signature to `body`.
+pub fn signed(mut body: String, settings: &Settings) -> String {
+    if let Some(signature) = &settings.signature {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+        if settings.sig_dashes {
+            body.push_str("-- \n");
+        }
+        body.push_str(signature);
+        if !signature.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    body
+}
+
+/// The recipients of a reply to `message`: `(to, cc)`.
+///
+/// A reply goes to the `Reply-To:` addresses if `use_reply_to` (and there
+/// are any), otherwise to the sender; a reply to one's own message goes to
+/// its recipients instead. A group reply also copies the original
+/// recipients, except the user (unless `metoo`). Nobody appears twice.
+pub fn reply_recipients(
+    message: &Message,
+    use_reply_to: bool,
+    group: bool,
+    settings: &Settings,
+) -> (Vec<Address>, Vec<Address>) {
+    let summary = &message.summary;
+    let mut to: Vec<Address> = if use_reply_to && !message.reply_to.is_empty() {
+        message.reply_to.clone()
+    } else {
+        summary.from.iter().cloned().collect()
+    };
+    let from_me = !to.is_empty() && to.iter().all(|a| settings.is_me(a));
+    if from_me {
+        to = summary.to.clone();
+    }
+    let mut cc = Vec::new();
+    if group {
+        let others = summary.to.iter().chain(&message.cc);
+        cc.extend(
+            others
+                .filter(|a| settings.metoo || !settings.is_me(a))
+                .cloned(),
+        );
+    }
+    // Keep the first of any duplicates, To before Cc.
+    let mut seen = Vec::new();
+    let mut unique = |list: Vec<Address>| {
+        list.into_iter()
+            .filter(|a| {
+                let email = a.email.to_lowercase();
+                let new = !seen.contains(&email);
+                seen.push(email);
+                new
+            })
+            .collect::<Vec<_>>()
+    };
+    let to = unique(to);
+    let cc = unique(cc);
+    (to, cc)
+}
+
+/// Whether `message` asks for replies to go somewhere other than its
+/// sender, so that mutt's `reply_to` question applies.
+pub fn has_distinct_reply_to(message: &Message) -> bool {
+    let from = message
+        .summary
+        .from
+        .as_ref()
+        .map(|a| a.email.to_lowercase());
+    !message.reply_to.is_empty()
+        && message
+            .reply_to
+            .iter()
+            .any(|a| Some(a.email.to_lowercase()) != from)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::DateTime;
+    use mett_core::mock;
+
+    use super::*;
+
+    fn message() -> Message {
+        // Mid-year at noon, so the local date is the same in any zone.
+        let date = DateTime::parse_from_rfc3339("2020-06-15T12:00:00Z").unwrap();
+        let mut message = mock::message("m1", "in", "Lunch", date.to_utc());
+        message.summary.from = Some(Address::new("bob@x.org").with_name("Bob"));
+        message.summary.to = vec![Address::new("me@contoso.com"), Address::new("carol@x.org")];
+        message.cc = vec![Address::new("dave@x.org"), Address::new("BOB@x.org")];
+        message.body.content = "Shall we?\n\nNoon.".into();
+        message
+    }
+
+    fn settings() -> Settings {
+        Settings {
+            me: vec!["me@contoso.com".into()],
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn expands_attribution_expandos() {
+        let message = message();
+        assert_eq!(
+            expand("%n <%a> wrote about %s, 100%%:", &message),
+            "Bob <bob@x.org> wrote about Lunch, 100%:"
+        );
+        assert!(expand("%d", &message).contains("Jun 15, 2020"));
+        assert_eq!(expand("%q %", &message), "%q %");
+    }
+
+    #[test]
+    fn quotes_the_original() {
+        let settings = Settings {
+            attribution: "%n wrote:".into(),
+            ..settings()
+        };
+        assert_eq!(
+            quoted(&message(), &settings),
+            "Bob wrote:\n> Shall we?\n>\n> Noon.\n"
+        );
+    }
+
+    #[test]
+    fn prefixes_reply_subjects_once() {
+        assert_eq!(reply_subject("Lunch"), "Re: Lunch");
+        assert_eq!(reply_subject("RE: Lunch"), "RE: Lunch");
+        assert_eq!(reply_subject(""), "Re: ");
+    }
+
+    #[test]
+    fn appends_the_signature() {
+        let settings = Settings {
+            signature: Some("Alice".into()),
+            ..settings()
+        };
+        assert_eq!(signed(String::new(), &settings), "\n-- \nAlice\n");
+        assert_eq!(signed("Hi".into(), &settings), "Hi\n\n-- \nAlice\n");
+        let no_dashes = Settings {
+            sig_dashes: false,
+            ..settings
+        };
+        assert_eq!(signed("Hi\n".into(), &no_dashes), "Hi\n\nAlice\n");
+        assert_eq!(signed("Hi\n".into(), &self::settings()), "Hi\n");
+    }
+
+    #[test]
+    fn replies_go_to_the_sender_or_reply_to() {
+        let mut message = message();
+        let (to, cc) = reply_recipients(&message, true, false, &settings());
+        assert_eq!(to, [Address::new("bob@x.org").with_name("Bob")]);
+        assert!(cc.is_empty());
+
+        message.reply_to = vec![Address::new("list@x.org")];
+        assert!(has_distinct_reply_to(&message));
+        let (to, _) = reply_recipients(&message, true, false, &settings());
+        assert_eq!(to, [Address::new("list@x.org")]);
+        let (to, _) = reply_recipients(&message, false, false, &settings());
+        assert_eq!(to[0].email, "bob@x.org");
+    }
+
+    #[test]
+    fn group_replies_copy_everyone_but_me_once() {
+        let (to, cc) = reply_recipients(&message(), true, true, &settings());
+        assert_eq!(to[0].email, "bob@x.org");
+        let cc: Vec<_> = cc.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(cc, ["carol@x.org", "dave@x.org"]);
+
+        let metoo = Settings {
+            metoo: true,
+            ..settings()
+        };
+        let (_, cc) = reply_recipients(&message(), true, true, &metoo);
+        assert_eq!(cc[0].email, "me@contoso.com");
+    }
+
+    #[test]
+    fn replying_to_my_own_message_goes_to_its_recipients() {
+        let mut message = message();
+        message.summary.from = Some(Address::new("Me@Contoso.com"));
+        let (to, _) = reply_recipients(&message, true, false, &settings());
+        let to: Vec<_> = to.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(to, ["me@contoso.com", "carol@x.org"]);
+    }
+
+    #[test]
+    fn forwards_inline() {
+        let text = forwarded(&message());
+        assert!(text.starts_with("----- Forwarded message from Bob <bob@x.org> -----\n\n"));
+        assert!(text.contains("Subject: Lunch\n\nShall we?\n\nNoon.\n"));
+        assert!(text.ends_with("----- End forwarded message -----\n"));
+    }
+}

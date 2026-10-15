@@ -61,6 +61,17 @@ actions! {
     OpenBrowser => "open-browser", "Open the sign-in page in a browser";
     Retry => "retry", "Try signing in again";
     CopyLink => "copy-link", "Copy the sign-in link or code to the clipboard";
+    Mail => "mail", "Compose a new message";
+    Reply => "reply", "Reply to the message";
+    GroupReply => "group-reply", "Reply to all recipients";
+    Forward => "forward-message", "Forward the message";
+    SendMessage => "send-message", "Send the message";
+    PostponeMessage => "postpone-message", "Save the message to send later";
+    EditMessage => "edit-message", "Edit the message";
+    EditTo => "edit-to", "Edit the To: list";
+    EditCc => "edit-cc", "Edit the Cc: list";
+    EditBcc => "edit-bcc", "Edit the Bcc: list";
+    EditSubject => "edit-subject", "Edit the subject";
 }
 
 #[cfg(test)]
