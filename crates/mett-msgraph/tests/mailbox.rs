@@ -2413,6 +2413,37 @@ async fn a_file_replaced_after_a_lost_upload_is_not_sent_unsure() {
 }
 
 #[tokio::test]
+async fn more_lost_uploads_than_copies_are_not_sent_unsure() {
+    // Two attempts lose their upload's answer.
+    let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a1", "name": "a.pdf", "size": 3 }],
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    assert!(store.send(&message).await.is_err());
+    listed_on_retry(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // Either may be there, and one copy is wanted: which can't be told.
+    let e = store.send(&message).await.unwrap_err();
+    assert!(e.to_string().contains("check it in Drafts"), "{e}");
+}
+
+#[tokio::test]
 async fn an_upload_whose_answer_was_lost_is_not_guessed_among_look_alikes() {
     let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
     // n1 and o1 both look like it: neither is taken off.

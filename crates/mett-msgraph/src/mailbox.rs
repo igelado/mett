@@ -1323,13 +1323,26 @@ impl<A: Authenticator> GraphMailStore<A> {
                 .any(|u| u.id.as_deref() == Some(a.id.as_str()))
         };
         for upload in uploads.iter().filter(|u| u.id.is_none()) {
-            // Taken off, or put in its place by a file of other contents:
-            // the one uploaded isn't to go.
-            let still_wanted = draft.attachments.iter().any(|f| {
-                f.name == upload.name
-                    && f.content_type == upload.content_type
-                    && digest(&f.data) == upload.digest
-            });
+            // Taken off, or put in its place by a file of other contents
+            // (or fewer of the same than lost uploads): the one uploaded
+            // may not be to go.
+            let same = |name: &str, content_type: &str, digest: &[u8; 32]| {
+                name == upload.name
+                    && content_type == upload.content_type
+                    && *digest == upload.digest
+            };
+            let wanted = draft
+                .attachments
+                .iter()
+                .filter(|f| same(&f.name, &f.content_type, &digest(&f.data)))
+                .count();
+            // (A copy may then go twice, as with any lost upload; more of
+            // them lost than are wanted can't be told apart.)
+            let lost = uploads
+                .iter()
+                .filter(|u| u.id.is_none() && same(&u.name, &u.content_type, &u.digest))
+                .count();
+            let still_wanted = wanted >= lost;
             let unsure = present.iter().any(|a| !known(a) && upload.is(a, before));
             if !still_wanted && unsure {
                 return Err(Error::Backend(format!(
