@@ -699,6 +699,12 @@ impl App {
         // What is known of mailboxes still listed is kept.
         self.mailbox_state
             .retain(|path, _| mailboxes.iter().any(|m| m.path == *path));
+        // A check of the mailboxes as they were is left to answer to
+        // nothing: the next one checks the new ones.
+        let paths = |list: &[MailboxEntry]| list.iter().map(|m| m.path.clone()).collect::<Vec<_>>();
+        if paths(&self.mailboxes) != paths(&mailboxes) {
+            self.checking = None;
+        }
         self.mailboxes = mailboxes;
         // A timer set for another interval is replaced.
         if self.sync_interval != interval {
@@ -1957,6 +1963,23 @@ mod tests {
         let id = poll(&mut app);
         polled(&mut app, id, vec![summary("moved", -50), draft]);
         assert_eq!(ids(&app), ["moved", "d"]);
+    }
+
+    #[test]
+    fn a_check_of_mailboxes_since_changed_is_left_aside() {
+        let (mut app, check) = app();
+        let mut fewer = app.mailboxes.clone();
+        fewer.truncate(1);
+        app.apply_mailboxes(fewer, app.sync_interval);
+        check_work(&mut app, check, &[("m9", 9)]);
+        assert_eq!(app.mailboxes_with_new_mail(), 0);
+        // The next check is of the mailboxes as they are.
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        assert!(
+            requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::CheckMailboxes(m) if m.len() == 1))
+        );
     }
 
     #[test]

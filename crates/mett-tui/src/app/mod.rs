@@ -1405,9 +1405,9 @@ impl App {
                 if let Some((kind, message)) = self.awaiting_addresses.take() {
                     let effects = self.begin(kind, Some(message));
                     if let Some(e) = failed {
-                        self.status = format!(
+                        self.fail(format!(
                             "Couldn't learn your own addresses ({e}); a reply to your own mail may need its recipients checked."
-                        );
+                        ));
                     }
                     return effects;
                 }
