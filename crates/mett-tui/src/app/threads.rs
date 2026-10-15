@@ -173,6 +173,17 @@ impl App {
             self.fail("Threading is not enabled.");
             return Some(Vec::new());
         }
+        // In the pager, from the message it shows (the index may have been
+        // listed again meanwhile).
+        if let Some(Screen::Pager(pager)) = self.screens.last() {
+            match self.messages.iter().position(|m| m.id == pager.id) {
+                Some(at) => self.selected = at,
+                None => {
+                    self.fail("The folder is being listed again; wait a moment.");
+                    return Some(Vec::new());
+                }
+            }
+        }
         let selected = self.messages.get(self.selected).map(|m| m.id.clone());
         let Some(selected) = selected else {
             self.fail("No messages.");

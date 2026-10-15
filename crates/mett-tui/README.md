@@ -73,7 +73,7 @@ commands and unknown variables are ignored with a warning, so a mettrc can
 
 The index is ordered by `sort` (mett's default is `reverse-date`, newest
 first, where mutt's is `date`), with `sort_aux` breaking ties: `date`
-(also `date-sent` and `date-received`), `from`, `subject`, `to`,
+(also `date-sent`), `date-received` (when it reached the mailbox), `from`, `subject`, `to`,
 `unsorted` (as listed) or, for `sort`, `threads`, each with `reverse-`;
 with threads, `sort_aux` orders each thread's messages, and with `last-`,
 orders the threads by their latest message. Threads are drawn with line

@@ -26,7 +26,7 @@ use crate::settings::{AuthSettings, Cloud};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The message fields the index needs.
-const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments,lastModifiedDateTime,conversationId,conversationIndex";
+const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments,lastModifiedDateTime,receivedDateTime,conversationId,conversationIndex";
 
 /// A [`MailStore`] backed by Microsoft Graph.
 ///
@@ -1087,6 +1087,7 @@ struct GraphMessage {
     is_draft: bool,
     created_date_time: Option<String>,
     last_modified_date_time: Option<String>,
+    received_date_time: Option<String>,
     #[serde(default)]
     is_read: bool,
     flag: Option<FollowupFlag>,
@@ -1201,6 +1202,11 @@ impl GraphMessage {
             // Without a sent date, it is listed with the drafts, whatever
             // Graph calls it.
             draft: unsent,
+            delivered: self
+                .received_date_time
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&Utc)),
             modified: self
                 .last_modified_date_time
                 .as_deref()

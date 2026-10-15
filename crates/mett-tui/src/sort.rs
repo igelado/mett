@@ -15,8 +15,10 @@ use mett_core::{MessageId, MessageSummary};
 /// What messages are ordered by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
-    /// The date (`date`, `date-sent`, `date-received`).
+    /// When it was sent (`date`, `date-sent`).
     Date,
+    /// When it reached the mailbox (`date-received`).
+    Received,
     /// The sender (`from`).
     From,
     /// The subject, without `Re:` and the like (`subject`).
@@ -62,7 +64,8 @@ impl Sort {
             }
         }
         sort.method = match rest.as_str() {
-            "date" | "date-sent" | "date-received" => Method::Date,
+            "date" | "date-sent" => Method::Date,
+            "date-received" => Method::Received,
             "from" => Method::From,
             "subject" => Method::Subject,
             "to" => Method::To,
@@ -77,6 +80,7 @@ impl Sort {
     pub fn name(self) -> String {
         let method = match self.method {
             Method::Date => "date",
+            Method::Received => "date-received",
             Method::From => "from",
             Method::Subject => "subject",
             Method::To => "to",
@@ -105,6 +109,10 @@ impl Sort {
 fn primary(method: Method, a: &MessageSummary, b: &MessageSummary) -> Ordering {
     match method {
         Method::Date | Method::Threads => a.received.cmp(&b.received),
+        Method::Received => {
+            let at = |m: &MessageSummary| m.delivered.unwrap_or(m.received);
+            at(a).cmp(&at(b))
+        }
         Method::From => key(a.from.as_ref()).cmp(&key(b.from.as_ref())),
         Method::Subject => base_subject(&a.subject)
             .to_lowercase()
@@ -398,12 +406,16 @@ mod tests {
         let sort = Sort::parse("reverse-last-date-received", false).unwrap();
         assert_eq!(
             (sort.method, sort.reverse, sort.last),
-            (Method::Date, true, true)
+            (Method::Received, true, true)
         );
         assert!(Sort::parse("threads", false).is_err(), "not for sort_aux");
         assert!(Sort::parse("size", true).is_err());
+        assert_eq!(
+            Sort::parse("date-received", false).unwrap().method,
+            Method::Received
+        );
         assert_eq!(base_subject("Re: FW:  re:Lunch"), "Lunch");
-        assert_eq!(sort.name(), "reverse-last-date");
+        assert_eq!(sort.name(), "reverse-last-date-received");
     }
 
     #[test]
@@ -416,6 +428,13 @@ mod tests {
         assert_eq!(arranged(&messages, "date", "date"), ["b", "c", "a"]);
         assert_eq!(arranged(&messages, "reverse-date", "date"), ["a", "c", "b"]);
         assert_eq!(arranged(&messages, "unsorted", "date"), ["a", "b", "c"]);
+        // Sent in one order, received in another.
+        messages[1].delivered = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(9));
+        assert_eq!(
+            arranged(&messages, "date-received", "date"),
+            ["c", "a", "b"]
+        );
+        messages[1].delivered = None;
         messages[0].from = Some(Address::new("z@x.org").with_name("Same"));
         messages[1].from = Some(Address::new("y@x.org").with_name("Same"));
         // Same sender: by date.
