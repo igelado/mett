@@ -2385,3 +2385,35 @@ async fn an_upload_whose_answer_was_lost_is_not_guessed_among_look_alikes() {
     store.send(&message).await.unwrap();
     assert!(deleted(&server).await.is_empty());
 }
+
+#[tokio::test]
+async fn a_refused_upload_leaves_nothing_to_take_off() {
+    let refused = ResponseTemplate::new(400).set_body_json(json!({
+        "error": { "code": "ErrorInvalidRequest", "message": "bad file" },
+    }));
+    let (server, store, message) = recalled_upload_lost_send(refused).await;
+    // A file of that name and type added in Outlook since stays.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "o1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+    assert!(deleted(&server).await.is_empty());
+}

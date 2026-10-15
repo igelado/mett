@@ -1120,7 +1120,17 @@ impl<A: Authenticator> GraphMailStore<A> {
                         upload.id = uploaded;
                     }
                 }
-                Err(e) => return Err(self.give_up(draft, id, Some(base), e).await),
+                Err(e) => {
+                    // Refused: nothing was attached. Only a lost answer
+                    // leaves it unknown.
+                    if recalled
+                        && !matches!(e, Error::Network(_))
+                        && let Some(uploads) = self.uploads.lock().expect("lock").get_mut(&key)
+                    {
+                        uploads.pop();
+                    }
+                    return Err(self.give_up(draft, id, Some(base), e).await);
+                }
             }
         }
         Ok((id, Some(base)))
