@@ -562,7 +562,8 @@ fn decode(content_type: &str, data: &[u8]) -> Option<String> {
 /// The attachment as lines of text, if it is text (and not too large).
 fn shown_as_text(attachment: &Attachment, data: &[u8]) -> Option<Vec<String>> {
     let content_type = attachment.content_type.to_ascii_lowercase();
-    let textual = content_type.starts_with("text/") || content_type == "message/rfc822";
+    let textual =
+        content_type.starts_with("text/") || media_type(&content_type) == "message/rfc822";
     if !textual || data.len() > MAX_TEXT {
         return None;
     }
@@ -577,6 +578,17 @@ fn shown_as_text(attachment: &Attachment, data: &[u8]) -> Option<Vec<String>> {
 
 /// A safe file name for an attachment: its name without directories, or
 /// a name for one without.
+/// A content type without its parameters (`text/calendar; charset=...`),
+/// in lower case.
+fn media_type(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
 fn file_name(attachment: &Attachment) -> String {
     let name = attachment
         .name
@@ -585,7 +597,7 @@ fn file_name(attachment: &Attachment) -> String {
         .unwrap_or_default()
         .trim();
     // An attached item is named by its kind of content.
-    let extension = match attachment.content_type.as_str() {
+    let extension = match media_type(&attachment.content_type).as_str() {
         "message/rfc822" => Some("eml"),
         "text/calendar" => Some("ics"),
         "text/vcard" => Some("vcf"),
@@ -793,6 +805,7 @@ mod tests {
         assert_eq!(item("Budget v1.2", "message/rfc822"), "Budget v1.2.eml");
         assert_eq!(item("Lunch.ICS", "text/calendar"), "Lunch.ICS");
         assert_eq!(item("", "text/vcard"), "item.vcf");
+        assert_eq!(item("Lunch", "Text/Calendar; charset=utf-8"), "Lunch.ics");
     }
 
     #[test]
