@@ -383,6 +383,7 @@ impl App {
             .messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .filter(|m| !listed.contains(&m.id) && !covered(m))
             .filter(|m| (if m.draft { oldest_draft } else { oldest_sent }) == Some(m.received))
             .filter(|m| !self.transferring(&m.id))
