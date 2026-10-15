@@ -204,7 +204,7 @@ impl App {
         if self.checking.is_some() {
             return Vec::new();
         }
-        let mailboxes: Vec<(FolderPath, Option<mett_core::FolderId>)> = self
+        let mailboxes: Vec<_> = self
             .mailboxes
             .iter()
             .filter(|m| m.poll)
@@ -214,7 +214,12 @@ impl App {
                     .get(&m.path)
                     .and_then(|s| s.folder.as_ref())
                     .map(|f| f.id.clone());
-                (m.path.clone(), id)
+                // What changed since the user last saw it.
+                let since = id
+                    .as_ref()
+                    .and_then(|id| self.seen.get(id))
+                    .and_then(|seen| seen.until);
+                (m.path.clone(), id, since)
             })
             .collect();
         if mailboxes.is_empty() {
@@ -308,13 +313,18 @@ impl App {
             .chain(&self.hidden)
             .map(|m| m.id.clone())
             .collect();
-        let mut seen = HashSet::new();
-        let arrived: Vec<MessageSummary> = fresh
-            .iter()
-            .chain(&changes)
-            .filter(|m| !known.contains(&m.id) && seen.insert(m.id.clone()))
-            .cloned()
-            .collect();
+        // A message in both lists comes as it was last changed.
+        let mut arrived: Vec<MessageSummary> = Vec::new();
+        for message in fresh.iter().chain(&changes) {
+            if known.contains(&message.id) {
+                continue;
+            }
+            match arrived.iter_mut().find(|m| m.id == message.id) {
+                Some(earlier) if message.modified > earlier.modified => *earlier = message.clone(),
+                Some(_) => {}
+                None => arrived.push(message.clone()),
+            }
+        }
         let unread = arrived.iter().any(|m| !m.flags.read);
         // More arrived than a page holds, or more changed: list the whole
         // folder again.
@@ -502,6 +512,9 @@ impl App {
                         let was_new = state.new;
                         state.new = match &seen {
                             None => !state.recent.is_empty(),
+                            // So many changed that some may be left out:
+                            // new mail may be among them.
+                            Some(_) if state.recent.len() >= mett_core::RECENT_UNREAD => true,
                             Some(seen) => state.recent.iter().any(|(id, at)| seen.is_new(id, *at)),
                         };
                         // Said when newer mail arrives, or mail found
@@ -1224,8 +1237,12 @@ mod tests {
         assert_eq!(
             request,
             Request::CheckMailboxes(vec![
-                (inbox(), Some(FolderId::new("in"))),
-                (work(), Some(FolderId::new("work"))),
+                (
+                    inbox(),
+                    Some(FolderId::new("in")),
+                    Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(2))
+                ),
+                (work(), Some(FolderId::new("work")), None),
             ])
         );
         respond(
@@ -1669,6 +1686,44 @@ mod tests {
             ]),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 0);
+    }
+
+    #[test]
+    fn a_message_in_both_lists_comes_as_last_changed() {
+        let (mut app, _) = app();
+        let id = poll(&mut app);
+        let unread = summary("m3", 3);
+        let mut read = unread.clone();
+        read.flags.read = true;
+        read.modified = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(9));
+        let polled = Polled {
+            newest: page(vec![
+                unread,
+                summary("m2", 2),
+                summary("m1", 1),
+                summary("m0", 0),
+            ]),
+            changed: page(vec![read]),
+        };
+        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        assert!(app.messages[0].flags.read);
+        assert_ne!(app.status, NEW_MAIL);
+    }
+
+    #[test]
+    fn too_many_changes_to_tell_count_as_new_mail() {
+        let (mut app, check) = app();
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 3, Some(2))),
+                (work(), checked("work", "Work", 0, None)),
+            ]),
+        );
+        let recent: Vec<(&str, i64)> = vec![("m2", 30); mett_core::RECENT_UNREAD];
+        leave_and_check(&mut app, recent);
+        assert_eq!(app.mailboxes_with_new_mail(), 1);
     }
 
     #[test]

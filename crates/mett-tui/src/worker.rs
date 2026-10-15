@@ -78,10 +78,11 @@ pub enum Request {
     DiscardKept(Draft),
     /// Find the mailbox owner's own addresses.
     OwnAddresses,
-    /// Read the counts of the folders at these paths, to tell which have
+    /// Read the counts of the folders at these paths, and their unread
+    /// mail that changed since a time (if one is given), to tell which have
     /// new mail: by ID, where the folder was found before, or else by
     /// path.
-    CheckMailboxes(Vec<(FolderPath, Option<FolderId>)>),
+    CheckMailboxes(Vec<(FolderPath, Option<FolderId>, Option<DateTime<Utc>>)>),
 }
 
 /// The outcome of a [`Request`].
@@ -211,8 +212,8 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             let mut checked = Vec::new();
             // The folder tree, listed once for every path that needs it.
             let mut listed = None;
-            for (path, id) in mailboxes {
-                let found = match id {
+            for (path, id, since) in mailboxes {
+                let found = match id.clone() {
                     // A folder deleted (or moved away) since is looked for
                     // by its path again.
                     // So is one renamed or moved since (another may be at
@@ -231,10 +232,15 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
                     None => resolve_listed(store, &path, &mut listed).await,
                 };
                 let found = match found {
-                    Ok(folder) => store
-                        .recent_unread(&folder.id)
-                        .await
-                        .map(|recent| Checked { folder, recent }),
+                    Ok(folder) => {
+                        // Changes since what was seen of the folder asked
+                        // about, not of another now at its path.
+                        let since = since.filter(|_| id.as_ref() == Some(&folder.id));
+                        store
+                            .recent_unread(&folder.id, since)
+                            .await
+                            .map(|recent| Checked { folder, recent })
+                    }
                     Err(e) => Err(e),
                 };
                 checked.push((path, found));
@@ -475,10 +481,10 @@ mod tests {
         let Event::MailboxesChecked(checked) = serve(
             &store,
             Request::CheckMailboxes(vec![
-                (archive.clone(), Some(FolderId::new("arc"))),
+                (archive.clone(), Some(FolderId::new("arc")), None),
                 // A folder that is gone is looked for by path again.
-                (inbox.clone(), Some(FolderId::new("gone"))),
-                (missing.clone(), None),
+                (inbox.clone(), Some(FolderId::new("gone")), None),
+                (missing.clone(), None, None),
             ]),
         )
         .await
@@ -501,7 +507,7 @@ mod tests {
             .with_folder(mock::folder("arc", "Archive", None));
         let Event::MailboxesChecked(checked) = serve(
             &renamed,
-            Request::CheckMailboxes(vec![(archive, Some(FolderId::new("old")))]),
+            Request::CheckMailboxes(vec![(archive, Some(FolderId::new("old")), None)]),
         )
         .await
         else {
@@ -527,8 +533,8 @@ mod tests {
         let Event::MailboxesChecked(checked) = serve(
             &moved,
             Request::CheckMailboxes(vec![
-                (path.clone(), Some(FolderId::new("shared-old"))),
-                (path, Some(FolderId::new("shared-new"))),
+                (path.clone(), Some(FolderId::new("shared-old")), None),
+                (path, Some(FolderId::new("shared-new")), None),
             ]),
         )
         .await

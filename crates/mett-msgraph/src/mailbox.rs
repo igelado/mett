@@ -429,7 +429,11 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         Ok(roles.folder(folder))
     }
 
-    async fn recent_unread(&self, folder: &FolderId) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
+    async fn recent_unread(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
         // A message moved in keeps when it was received; when it was
         // last modified tells.
         #[derive(Deserialize)]
@@ -438,30 +442,43 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             id: String,
             last_modified_date_time: String,
         }
+        let after = since.map_or_else(
+            || "ge 1900-01-01T00:00:00Z".to_owned(),
+            |since| format!("gt {}", since.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        );
         let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
         url.query_pairs_mut()
-            .append_pair("$top", &RECENT_UNREAD.to_string())
+            .append_pair("$top", "50")
             .append_pair("$select", "id,lastModifiedDateTime")
             // Graph wants the sorted property filtered too, first.
             .append_pair(
                 "$filter",
-                "lastModifiedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
+                &format!("lastModifiedDateTime {after} and isRead eq false"),
             )
             .append_pair("$orderby", "lastModifiedDateTime desc");
-        let page: Collection<Modified> = self
-            .json(
-                self.request(Method::GET, url),
-                About::folder(folder.as_str()),
-            )
-            .await?;
-        page.value
-            .into_iter()
-            .map(|m| {
+        let mut recent = Vec::new();
+        loop {
+            let page: Collection<Modified> = self
+                .json(
+                    self.request(Method::GET, url),
+                    About::folder(folder.as_str()),
+                )
+                .await?;
+            for m in page.value {
                 let at = DateTime::parse_from_rfc3339(&m.last_modified_date_time)
                     .map_err(|e| Error::Backend(format!("invalid lastModifiedDateTime: {e}")))?;
-                Ok((MessageId::new(m.id), at.with_timezone(&Utc)))
-            })
-            .collect()
+                recent.push((MessageId::new(m.id), at.with_timezone(&Utc)));
+            }
+            // Without `since`, the last few tell; with it, all of them, up
+            // to a limit.
+            let wanted = if since.is_some() { RECENT_UNREAD } else { 10 };
+            match page.next_link {
+                Some(next) if recent.len() < wanted => url = self.next_page_url(&next)?,
+                _ => break,
+            }
+        }
+        recent.truncate(RECENT_UNREAD);
+        Ok(recent)
     }
 
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {

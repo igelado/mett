@@ -170,7 +170,11 @@ impl MailStore for MemoryStore {
         Ok(state.with_counts(folder))
     }
 
-    async fn recent_unread(&self, folder: &FolderId) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
+    async fn recent_unread(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
         let state = self.state();
         state.folder(folder)?;
         let mut recent: Vec<_> = state
@@ -178,6 +182,7 @@ impl MailStore for MemoryStore {
             .iter()
             .filter(|m| &m.summary.folder == folder && !m.summary.flags.read)
             .filter_map(|m| Some((m.summary.id.clone(), m.summary.modified?)))
+            .filter(|(_, modified)| since.is_none_or(|since| *modified > since))
             .collect();
         recent.sort_by_key(|(_, modified)| Reverse(*modified));
         recent.truncate(crate::ports::RECENT_UNREAD);

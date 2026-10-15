@@ -194,7 +194,7 @@ async fn finds_when_unread_mail_last_changed() {
             "lastModifiedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
         ))
         .and(query_param("$orderby", "lastModifiedDateTime desc"))
-        .and(query_param("$top", "10"))
+        .and(query_param("$top", "50"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "value": [{ "id": "m9", "lastModifiedDateTime": "2024-05-01T10:00:00Z" }],
         })))
@@ -207,14 +207,14 @@ async fn finds_when_unread_mail_last_changed() {
         .await;
     let store = store(&server);
     let recent = store
-        .recent_unread(&FolderId::new("inbox-id"))
+        .recent_unread(&FolderId::new("inbox-id"), None)
         .await
         .unwrap();
     assert_eq!(recent[0].0, MessageId::new("m9"));
     assert_eq!(recent[0].1.to_rfc3339(), "2024-05-01T10:00:00+00:00");
     assert!(
         store
-            .recent_unread(&FolderId::new("empty-id"))
+            .recent_unread(&FolderId::new("empty-id"), None)
             .await
             .unwrap()
             .is_empty()

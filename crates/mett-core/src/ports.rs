@@ -16,7 +16,7 @@ use crate::ids::{FolderId, MessageId, PageCursor};
 use crate::message::{FlagsUpdate, Message, MessageSummary};
 
 /// How many unread messages [`MailStore::recent_unread`] returns at most.
-pub const RECENT_UNREAD: usize = 10;
+pub const RECENT_UNREAD: usize = 250;
 
 /// Which page of a listing to fetch.
 ///
@@ -84,13 +84,15 @@ pub trait MailStore: Send + Sync {
     /// new mail reads these.
     fn folder(&self, id: &FolderId) -> impl Future<Output = Result<Folder>> + Send;
 
-    /// The unread messages of a folder that arrived or changed last (up
-    /// to [`RECENT_UNREAD`]), most recently first, with when: unread mail
-    /// that arrives (or is moved in, or marked unread) after the user last
-    /// saw the folder is new.
+    /// The unread messages of a folder that arrived or changed after
+    /// `since` (up to [`RECENT_UNREAD`]; without `since`, the last ones),
+    /// most recently first, with when: unread mail that arrives (or is
+    /// moved in, or marked unread) after the user last saw the folder is
+    /// new.
     fn recent_unread(
         &self,
         folder: &FolderId,
+        since: Option<DateTime<Utc>>,
     ) -> impl Future<Output = Result<Vec<(MessageId, DateTime<Utc>)>>> + Send;
 
     /// Returns the folder with a well-known role, such as the Inbox.
