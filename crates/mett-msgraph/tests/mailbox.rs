@@ -562,6 +562,28 @@ async fn unsent_drafts_use_their_creation_time() {
         page.messages[0].received,
         DateTime::parse_from_rfc3339("2026-10-10T08:00:00Z").unwrap()
     );
+    assert!(page.messages[0].draft);
+}
+
+#[tokio::test]
+async fn mail_without_a_sent_date_is_listed_with_the_drafts() {
+    let server = MockServer::start().await;
+    let mut odd = message("m1", "2026-10-14T10:00:00Z");
+    odd["sentDateTime"] = json!(null);
+    odd["createdDateTime"] = json!("2026-10-10T08:00:00Z");
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/in/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [odd, message("m2", "2026-10-14T09:00:00Z")],
+        })))
+        .mount(&server)
+        .await;
+    let page = store(&server)
+        .list_messages(&FolderId::new("in"), Page::first(10))
+        .await
+        .unwrap();
+    let drafts: Vec<bool> = page.messages.iter().map(|m| m.draft).collect();
+    assert_eq!(drafts, [true, false]);
 }
 
 #[tokio::test]

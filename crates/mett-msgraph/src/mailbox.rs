@@ -1171,6 +1171,7 @@ impl GraphMessage {
         // Graph may give drafts a placeholder sent date (such as year 1),
         // so drafts always use their creation date.
         let sent = self.sent_date_time.filter(|_| !self.is_draft);
+        let unsent = sent.is_none();
         let timestamp = sent
             .or(self.created_date_time)
             .ok_or_else(|| Error::Backend("message has no timestamp".into()))?;
@@ -1193,7 +1194,9 @@ impl GraphMessage {
                 flagged: self.flag.is_some_and(|f| f.flag_status == "flagged"),
             },
             has_attachments: self.has_attachments,
-            draft: self.is_draft,
+            // Without a sent date, it is listed with the drafts, whatever
+            // Graph calls it.
+            draft: unsent,
             modified: self
                 .last_modified_date_time
                 .as_deref()
