@@ -425,10 +425,15 @@ impl Config {
                         self.warn_once("color", &what, format!("{what}; ignored"));
                         Ok(())
                     } else {
-                        let words = args
-                            .iter()
-                            .map(|word| self.expand(word))
-                            .collect::<Result<Vec<_>, _>>();
+                        // The object is expanded once (its backticks run
+                        // once).
+                        let words = object.and_then(|object| {
+                            object
+                                .into_iter()
+                                .map(Ok)
+                                .chain(args.iter().skip(1).map(|word| self.expand(word)))
+                                .collect::<Result<Vec<_>, _>>()
+                        });
                         words.and_then(|words| {
                             let palette = &mut self.colors;
                             let result = match name.as_str() {

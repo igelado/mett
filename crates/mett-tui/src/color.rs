@@ -265,9 +265,14 @@ impl Colors {
             .take_while(|word| attribute(word).is_some())
             .count();
         let (attrs, rest) = rest.split_at(attributes);
+        // A pattern written as several words, unquoted, is one.
+        let joined;
         let (fg, bg, expression) = match (rest, object.matches()) {
             ([fg, bg], false) => (fg, bg, None),
-            ([fg, bg, expression], true) => (fg, bg, Some(expression.as_str())),
+            ([fg, bg, expression @ ..], true) if !expression.is_empty() => {
+                joined = expression.join(" ");
+                (fg, bg, Some(joined.as_str()))
+            }
             (_, false) => {
                 return Err("color: expected an object, then a foreground and a background".into());
             }
@@ -301,7 +306,9 @@ impl Colors {
         let style = with_attribute(Style::new(), attr);
         match (rest, object.matches()) {
             ([], false) => self.set(object, style, None),
-            ([expression], true) => self.set(object, style, Some(expression)),
+            (expression, true) if !expression.is_empty() => {
+                self.set(object, style, Some(&expression.join(" ")))
+            }
             _ => Err("mono: expected an object, an attribute and maybe an expression".into()),
         }
     }
@@ -549,6 +556,12 @@ mod tests {
         colors
             .color(&words("header yellow default ^subject:"))
             .unwrap();
+        // An unquoted pattern of several words.
+        colors
+            .color(&words("index red default ~f alice@x.org"))
+            .unwrap();
+        assert_eq!(colors.index.last().unwrap().text, "~f alice@x.org");
+        colors.index.pop();
         assert_eq!(colors.header_style("Subject: hi").fg, Some(Color::Yellow));
         assert_eq!(colors.header_style("From: a").fg, None);
         // `mono` is for terminals without colors: its own palette.
