@@ -185,5 +185,20 @@ pub(super) fn browser_prompt() -> SignInEvent {
 
 /// Alice's sign-in failed as it expired.
 pub(super) fn signed_out(app: &mut App) {
-    app.update(Msg::SignIn(finished(Err("expired".into()))));
+    signed_out_as(app, "expired");
+}
+
+/// Alice's sign-in failed with `error`.
+pub(super) fn signed_out_as(app: &mut App, error: &str) {
+    app.update(Msg::SignIn(finished(Err(error.into()))));
+}
+
+/// The network is down.
+pub(super) fn offline() -> Error {
+    Error::Network("offline".into())
+}
+
+/// The sign-in expired.
+pub(super) fn expired() -> Error {
+    Error::Auth("expired".into())
 }

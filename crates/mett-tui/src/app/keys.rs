@@ -577,12 +577,11 @@ mod tests {
         app.push_after_load(crate::keymap::parse_strokes("<last-entry>").unwrap());
         assert!(app.next_stroke().is_none(), "nothing to move through yet");
         let open = first_request(&effects);
-        let effects = respond(
+        let list = first_request(&respond(
             &mut app,
             open,
             Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        );
-        let list = first_request(&effects);
+        ));
         let messages = (0..3)
             .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
             .collect();
@@ -916,11 +915,7 @@ mod tests {
         let (mut app, effects) = App::open(80, 10, inbox, Settings::default());
         app.push_after_load(crate::keymap::parse_strokes("<last-entry>").unwrap());
         let open = first_request(&effects);
-        respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
         assert!(app.next_stroke().is_none(), "not before the folder is open");
         assert!(!app.after_load.is_empty(), "still waiting");
     }

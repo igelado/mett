@@ -691,11 +691,7 @@ mod tests {
     fn attachments_are_listed_and_fetched_again_after_a_sign_in() {
         let mut app = app();
         let (id, _) = sent(&act(&mut app, Action::ViewAttachments));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentsListed(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::AttachmentsListed(Err(expired())));
         assert!(matches!(app.screen(), Screen::Attachments(_)));
         let failed = |app: &mut App| {
             app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
@@ -717,11 +713,7 @@ mod tests {
             )])),
         );
         let (id, _) = sent(&act(&mut app, Action::DisplayMessage));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentFetched(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::AttachmentFetched(Err(expired())));
         failed(&mut app);
         let (_, request) = sent(&act(&mut app, Action::Retry));
         assert!(

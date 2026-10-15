@@ -458,16 +458,15 @@ impl App {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeDelta};
-    use mett_core::{Address, MessageSummary, WellKnownFolder, mock};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use mett_core::{Address, MessageSummary, mock};
+    use ratatui::crossterm::event::KeyCode;
 
     use super::*;
     use crate::app::composing::Input;
     use crate::app::testing::*;
     use crate::app::{Msg, Settings};
     use crate::lineedit::LineEditor;
-
-    use crate::worker::Event;
+    use crate::worker::{Event, Request, RequestId};
 
     /// Messages from alternating senders, newest first: m0 from Alice
     /// ("Lunch 0"), m1 from Bob ("Report 1"), and so on; m0 and m1 unread.
@@ -492,14 +491,26 @@ mod tests {
         app
     }
 
-    fn answer(app: &mut App, text: &str) {
+    /// Types `text` over what the question holds, and presses Enter.
+    fn answer(app: &mut App, text: &str) -> Vec<Effect> {
         if let Some(Input::Line { editor, .. }) = &mut app.input {
             *editor = LineEditor::new("");
         }
-        for c in text.chars() {
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
-        }
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        typed(app, text);
+        key(app, KeyCode::Enter)
+    }
+
+    /// Answers the fetch of m0 ("Lunch 0") with `body`.
+    fn fetched(app: &mut App, fetch: RequestId, body: String) {
+        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
+        message.body.content = body;
+        respond(app, fetch, Event::MessageFetched(Ok(message)));
+    }
+
+    /// Shows the selected message as m0 ("Lunch 0"), with `body`.
+    fn show(app: &mut App, body: String) {
+        let fetch = first_request(&act(app, Action::DisplayMessage));
+        fetched(app, fetch, body);
     }
 
     #[test]
@@ -562,49 +573,29 @@ mod tests {
     #[test]
     fn searches_the_text_in_the_pager() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(&mut app, (0..60).map(|i| format!("line {i}\n")).collect());
         act(&mut app, Action::Search);
         answer(&mut app, "line 1[0-9]");
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert_eq!(pager.rows[pager.scroll], "line 10");
+        let view = pager(&app);
+        assert_eq!(view.rows[view.scroll], "line 10");
         act(&mut app, Action::SearchNext);
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert_eq!(pager.rows[pager.scroll], "line 11");
+        let view = pager(&app);
+        assert_eq!(view.rows[view.scroll], "line 11");
     }
 
     #[test]
     fn pager_search_moves_on_from_a_match_near_the_end() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(&mut app, (0..60).map(|i| format!("line {i}\n")).collect());
         // Both matches are on the last screen.
         act(&mut app, Action::Search);
         answer(&mut app, "line 5[89]");
         act(&mut app, Action::SearchNext);
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert_eq!(pager.lines[pager.search_match.unwrap().0], "line 59");
+        let view = pager(&app);
+        assert_eq!(view.lines[view.search_match.unwrap().0], "line 59");
         act(&mut app, Action::SearchNext);
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert_eq!(pager.lines[pager.search_match.unwrap().0], "line 58");
+        let view = pager(&app);
+        assert_eq!(view.lines[view.search_match.unwrap().0], "line 58");
         assert_eq!(app.status, "Search wrapped to top.");
     }
 
@@ -618,11 +609,7 @@ mod tests {
         // Limit to Bob's messages: m0, being flagged, is hidden.
         act(&mut app, Action::Limit);
         answer(&mut app, "~f bob");
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(mett_core::Error::Network("offline".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         act(&mut app, Action::Limit);
         answer(&mut app, "all");
         assert!(!app.messages[0].flags.flagged, "back as in the mailbox");
@@ -650,20 +637,15 @@ mod tests {
             width: 20,
             height: 24,
         });
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = "first line\nsome words before the important phrase\n".into();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(
+            &mut app,
+            "first line\nsome words before the important phrase\n".into(),
+        );
         act(&mut app, Action::Search);
         answer(&mut app, "important phrase");
         assert_ne!(app.status, "Not found.");
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert!(pager.lines[pager.search_match.unwrap().0].contains("important phrase"));
+        let view = pager(&app);
+        assert!(view.lines[view.search_match.unwrap().0].contains("important phrase"));
     }
 
     #[test]
@@ -675,18 +657,14 @@ mod tests {
         };
         act(&mut app, Action::Limit);
         answer(&mut app, "~f bob");
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
         app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
             account: mett_core::AccountId::new("demo@example.com"),
             outcome: Err("expired".into()),
         }));
         let effects = act(&mut app, Action::Retry);
         assert!(
-            effects.iter().any(|e| matches!(e, Effect::Request(_, crate::worker::Request::UpdateFlags(id, _)) if id.as_str() == "m0")),
+            effects.iter().any(|e| matches!(e, Effect::Request(_, Request::UpdateFlags(id, _)) if id.as_str() == "m0")),
             "{effects:?}"
         );
     }
@@ -702,10 +680,7 @@ mod tests {
         assert_eq!(app.selected, 1);
         assert_eq!(app.status, "", "the earlier Not found. is gone");
 
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
         respond(
             &mut app,
             fetch,
@@ -727,21 +702,16 @@ mod tests {
             width: 20,
             height: 8,
         });
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
         // One line, many rows, with two matches far down it.
-        message.body.content = format!("{} needle one needle two\nend\n", "word ".repeat(60));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(
+            &mut app,
+            format!("{} needle one needle two\nend\n", "word ".repeat(60)),
+        );
         act(&mut app, Action::Search);
         answer(&mut app, "needle");
         let shown = |app: &App| {
-            let Screen::Pager(pager) = app.screen() else {
-                panic!("not in the pager");
-            };
-            pager.rows[pager.scroll..]
+            let view = pager(app);
+            view.rows[view.scroll..]
                 .iter()
                 .take(app.body_height)
                 .cloned()
@@ -751,11 +721,9 @@ mod tests {
         assert!(shown(&app).contains("needle"), "{}", shown(&app));
         // The second match in the same line, not the first again.
         act(&mut app, Action::SearchNext);
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        let (line, end) = pager.search_match.unwrap();
-        assert!(pager.lines[line][..end].ends_with("needle one needle"));
+        let view = pager(&app);
+        let (line, end) = view.search_match.unwrap();
+        assert!(view.lines[line][..end].ends_with("needle one needle"));
         assert!(shown(&app).contains("two"), "{}", shown(&app));
         assert_eq!(app.status, "");
         act(&mut app, Action::SearchNext);
@@ -775,7 +743,7 @@ mod tests {
 
     /// An app whose first page (m0 from Alice) is listed, with more to
     /// come; returns the app and the request for the next page.
-    fn loading() -> (App, crate::worker::RequestId) {
+    fn loading() -> (App, RequestId) {
         let (mut app, list) = opening(Settings::default(), 24);
         let mut first = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
         first.from = Some(Address::new("alice@contoso.com"));
@@ -814,20 +782,12 @@ mod tests {
     #[test]
     fn empty_matches_at_line_ends_move_on() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = "one\ntwo\n".into();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(&mut app, "one\ntwo\n".into());
         act(&mut app, Action::Search);
         answer(&mut app, "$");
         let line = |app: &App| {
-            let Screen::Pager(pager) = app.screen() else {
-                panic!("not in the pager");
-            };
-            pager.search_match.unwrap().0
+            let view = pager(app);
+            view.search_match.unwrap().0
         };
         let first = line(&app);
         act(&mut app, Action::SearchNext);
@@ -837,24 +797,16 @@ mod tests {
     #[test]
     fn a_new_pager_query_starts_on_screen() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = "apple banana apple banana\n".into();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(&mut app, "apple banana apple banana\n".into());
         act(&mut app, Action::Search);
         answer(&mut app, "banana");
         act(&mut app, Action::Search);
         answer(&mut app, "apple");
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        let (line, end) = pager.search_match.unwrap();
+        let view = pager(&app);
+        let (line, end) = view.search_match.unwrap();
         // The first apple on the line, not the one after the banana.
         assert!(
-            pager.lines[line][..end].ends_with("apple") && end < 20,
+            view.lines[line][..end].ends_with("apple") && end < 20,
             "{end}"
         );
     }
@@ -877,86 +829,62 @@ mod tests {
     #[test]
     fn a_pager_search_waits_for_the_message() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
         act(&mut app, Action::Search);
         answer(&mut app, "line 1[0-9]");
         assert_eq!(app.status, "Searching...");
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert_eq!(pager.rows[pager.scroll], "line 10");
+        fetched(
+            &mut app,
+            fetch,
+            (0..60).map(|i| format!("line {i}\n")).collect(),
+        );
+        let view = pager(&app);
+        assert_eq!(view.rows[view.scroll], "line 10");
         assert_eq!(app.status, "");
     }
 
     #[test]
     fn the_pager_highlights_what_it_found() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = "one two one\n".into();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(&mut app, "one two one\n".into());
         act(&mut app, Action::Search);
         answer(&mut app, "one");
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        let found = highlighted(pager);
+        let view = pager(&app);
+        let found = highlighted(view);
         assert_eq!(found.len(), 1);
         let (row, range) = &found[0];
-        assert_eq!(&pager.rows[*row][range.clone()], "one");
+        assert_eq!(&view.rows[*row][range.clone()], "one");
         let first = range.start;
         act(&mut app, Action::SearchNext);
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        let (_, range) = &highlighted(pager)[0];
+        let view = pager(&app);
+        let (_, range) = &highlighted(view)[0];
         assert!(range.start > first, "the second one");
     }
 
     #[test]
     fn a_resized_pager_is_searched_as_shown() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = format!("{} needle\n{}", "word ".repeat(80), "more\n".repeat(40));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(
+            &mut app,
+            format!("{} needle\n{}", "word ".repeat(80), "more\n".repeat(40)),
+        );
         // Resized while something else covered the pager.
         app.width = 40;
         act(&mut app, Action::Search);
         answer(&mut app, "needle");
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert_eq!(pager.rows_width, Some(40));
-        assert!(pager.rows[pager.scroll].contains("needle"));
+        let view = pager(&app);
+        assert_eq!(view.rows_width, Some(40));
+        assert!(view.rows[view.scroll].contains("needle"));
     }
 
     #[test]
     fn a_search_waits_for_the_folder_to_open() {
-        let inbox = crate::config::mailbox::FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
+        let (mut app, effects) = App::open(80, 24, inbox(), Settings::default());
         let open = first_request(&effects);
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         assert_eq!(app.status, "Searching...");
-        let effects = respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        );
-        let list = first_request(&effects);
+        let list = folder_opened(&mut app, open, mock::folder("in", "Inbox", None));
         let mut alice = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
         alice.from = Some(Address::new("alice@contoso.com"));
         listed(&mut app, list, vec![alice, bob()], None);
@@ -966,24 +894,10 @@ mod tests {
     #[test]
     fn a_search_loads_a_page_that_failed() {
         let (mut app, next) = loading();
-        respond(
-            &mut app,
-            next,
-            Event::MessagesListed(Err(mett_core::Error::Network("offline".into()))),
-        );
+        respond(&mut app, next, Event::MessagesListed(Err(offline())));
         act(&mut app, Action::Search);
-        let effects = {
-            if let Some(Input::Line { editor, .. }) = &mut app.input {
-                *editor = LineEditor::new("");
-            }
-            for c in "~f bob".chars() {
-                app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
-            }
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)))
-        };
-        let Some(Effect::Request(again, _)) = effects.first().cloned() else {
-            panic!("expected the page again, got {effects:?}");
-        };
+        let effects = answer(&mut app, "~f bob");
+        let again = first_request(&effects);
         assert_eq!(app.status, "Searching...");
         listed(&mut app, again, vec![bob()], None);
         assert_eq!(app.selected, 1);
@@ -993,18 +907,8 @@ mod tests {
     fn a_search_stays_with_its_folder() {
         let (mut app, _) = loading();
         act(&mut app, Action::ChangeFolder);
-        let effects = {
-            if let Some(Input::Line { editor, .. }) = &mut app.input {
-                *editor = LineEditor::new("");
-            }
-            for c in "=Archive".chars() {
-                app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
-            }
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)))
-        };
-        let Some(Effect::Request(open, _)) = effects.first().cloned() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let effects = answer(&mut app, "=Archive");
+        let open = first_request(&effects);
         // Searched while the other folder is being opened, and this one's
         // pages are still on their way.
         act(&mut app, Action::Search);
@@ -1015,9 +919,7 @@ mod tests {
             open,
             Event::FolderOpened(Ok(mock::folder("ar", "Archive", None))),
         );
-        let Some(Effect::Request(list, _)) = effects.first().cloned() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let list = first_request(&effects);
         let mut other = mock::message("m9", "ar", "Old", DateTime::UNIX_EPOCH).summary;
         other.from = Some(Address::new("carol@contoso.com"));
         listed(&mut app, list, vec![other, bob()], None);
@@ -1037,15 +939,12 @@ mod tests {
     #[test]
     fn a_widened_pager_is_searched_from_what_it_shows() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = (0..60)
-            .map(|i| format!("row {i:02} {}\n", "x".repeat(140)))
-            .collect();
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(
+            &mut app,
+            (0..60)
+                .map(|i| format!("row {i:02} {}\n", "x".repeat(140)))
+                .collect(),
+        );
         let Some(Screen::Pager(pager)) = app.screens.last_mut() else {
             panic!("not in the pager");
         };
@@ -1059,17 +958,11 @@ mod tests {
 
     #[test]
     fn a_search_before_any_message_includes_the_first() {
-        let inbox = crate::config::mailbox::FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
+        let (mut app, effects) = App::open(80, 24, inbox(), Settings::default());
         let open = first_request(&effects);
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
-        let effects = respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        );
-        let list = first_request(&effects);
+        let list = folder_opened(&mut app, open, mock::folder("in", "Inbox", None));
         let mut other = bob();
         other.id = "m2".into();
         listed(&mut app, list, vec![bob(), other], None);
@@ -1095,16 +988,12 @@ mod tests {
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         signed_out(&mut app);
-        respond(
-            &mut app,
-            next,
-            Event::MessagesListed(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, next, Event::MessagesListed(Err(expired())));
         let effects = app.retry();
         let again = effects
             .iter()
             .find_map(|e| match e {
-                Effect::Request(id, crate::worker::Request::ListMessages { .. }) => Some(*id),
+                Effect::Request(id, Request::ListMessages { .. }) => Some(*id),
                 _ => None,
             })
             .expect("the page again");
@@ -1115,33 +1004,26 @@ mod tests {
     #[test]
     fn a_pager_search_waits_for_its_message_through_a_sign_in() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
         act(&mut app, Action::Search);
         answer(&mut app, "line 1[0-9]");
         signed_out(&mut app);
-        respond(
-            &mut app,
-            fetch,
-            Event::MessageFetched(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, fetch, Event::MessageFetched(Err(expired())));
         let effects = app.retry();
         let again = effects
             .iter()
             .find_map(|e| match e {
-                Effect::Request(id, crate::worker::Request::FetchMessage(_)) => Some(*id),
+                Effect::Request(id, Request::FetchMessage(_)) => Some(*id),
                 _ => None,
             })
             .expect("fetched again");
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = (0..60).map(|i| format!("line {i}\n")).collect();
-        respond(&mut app, again, Event::MessageFetched(Ok(message)));
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        assert_eq!(pager.rows[pager.scroll], "line 10");
+        fetched(
+            &mut app,
+            again,
+            (0..60).map(|i| format!("line {i}\n")).collect(),
+        );
+        let view = pager(&app);
+        assert_eq!(view.rows[view.scroll], "line 10");
     }
 
     #[test]
@@ -1160,13 +1042,7 @@ mod tests {
     #[test]
     fn a_covered_pager_keeps_its_highlight_through_a_resize() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = format!("{} needle\n", "word ".repeat(30));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(&mut app, format!("{} needle\n", "word ".repeat(30)));
         act(&mut app, Action::Search);
         answer(&mut app, "needle");
         act(&mut app, Action::BrowseMailboxes);
@@ -1190,60 +1066,37 @@ mod tests {
     #[test]
     fn a_space_shown_after_a_wrap_is_highlighted_where_it_is() {
         let mut app = app();
-        let effects = act(&mut app, Action::DisplayMessage);
-        let Effect::Request(fetch, _) = effects[0].clone() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        let mut message = mock::message("m0", "in", "Lunch 0", DateTime::UNIX_EPOCH);
-        message.body.content = format!("{}  y\n", "x".repeat(80));
-        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        show(&mut app, format!("{}  y\n", "x".repeat(80)));
         act(&mut app, Action::Search);
         answer(&mut app, "x  y");
         act(&mut app, Action::Search);
         answer(&mut app, r"\s y");
-        let Screen::Pager(pager) = app.screen() else {
-            panic!("not in the pager");
-        };
-        let found = highlighted(pager);
+        let view = pager(&app);
+        let found = highlighted(view);
         assert_eq!(found.len(), 1, "{found:?}");
         let (row, range) = &found[0];
-        assert_eq!(&pager.rows[*row][range.clone()], " y");
+        assert_eq!(&view.rows[*row][range.clone()], " y");
     }
 
     #[test]
     fn a_search_waits_for_the_folder_through_a_sign_in() {
-        let inbox = crate::config::mailbox::FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
+        let (mut app, effects) = App::open(80, 24, inbox(), Settings::default());
         let open = first_request(&effects);
         act(&mut app, Action::Search);
         answer(&mut app, "~f bob");
         signed_out(&mut app);
-        respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Err(mett_core::Error::Auth("expired".into()))),
-        );
-        let (again, _) = request_of(&app.retry());
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
+        let (again, _) = requests(&app.retry())[0].clone();
         let effects = respond(
             &mut app,
             again,
             Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
         );
-        let (list, _) = request_of(&effects);
+        let (list, _) = requests(&effects)[0].clone();
         let mut alice = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
         alice.from = Some(Address::new("alice@contoso.com"));
         listed(&mut app, list, vec![alice, bob()], None);
         assert_eq!(app.selected, 1);
-    }
-
-    fn request_of(effects: &[Effect]) -> (crate::worker::RequestId, crate::worker::Request) {
-        effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request(id, request) => Some((*id, request.clone())),
-                _ => None,
-            })
-            .expect("a request")
     }
 
     #[test]
@@ -1257,9 +1110,7 @@ mod tests {
         alice.from = Some(Address::new("alice@contoso.com"));
         let effects = listed(&mut app, next, vec![alice], Some("d"));
         assert!(app.pending.is_some(), "still waiting");
-        let Some(Effect::Request(last, _)) = effects.first().cloned() else {
-            panic!("expected the next page, got {effects:?}");
-        };
+        let last = first_request(&effects);
         listed(&mut app, last, vec![bob()], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "m1");
         assert!(app.pending.is_none());
@@ -1277,9 +1128,7 @@ mod tests {
         assert_eq!(shown, ["m0", "m1"]);
         // m0 is read now; a relist (say, new mail) brings it back read.
         let effects = app.relist();
-        let Some(Effect::Request(list, _)) = effects.first().cloned() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let list = first_request(&effects);
         let messages = (0..6)
             .map(|i| {
                 let mut m =

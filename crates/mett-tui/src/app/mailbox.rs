@@ -1307,8 +1307,7 @@ mod tests {
         let (mut app, effects) = App::open(80, 24, inbox, settings);
         let open = first_request(&effects);
         let folder = mett_core::mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
-        let effects = respond(&mut app, open, Event::FolderOpened(Ok(folder)));
-        let list = first_request(&effects);
+        let list = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(folder))));
         let messages = (0..3)
             .map(|i| {
                 let date = DateTime::UNIX_EPOCH + TimeDelta::minutes(10 - i);
@@ -1390,10 +1389,7 @@ mod tests {
         respond(
             &mut app,
             id,
-            Event::Purged(Ok(vec![(
-                "m0".into(),
-                Err(Error::Network("offline".into())),
-            )])),
+            Event::Purged(Ok(vec![("m0".into(), Err(offline()))])),
         );
         assert!(!app.quit, "the purge failed: stay");
         assert_eq!(app.status, "1 of 1 message failed: network error: offline");
@@ -1420,11 +1416,7 @@ mod tests {
             )
         ));
         assert!(app.messages[0].flags.flagged);
-        respond(
-            &mut app,
-            id,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, id, Event::FlagsUpdated(Err(offline())));
         assert!(!app.messages[0].flags.flagged, "undone");
 
         let (_, request) = sent(&act(&mut app, Action::ToggleNew));
@@ -1632,11 +1624,7 @@ mod tests {
         // still has the flag from the first update, which is what the index
         // shows, so nothing more is sent.
         act(&mut app, Action::FlagMessage);
-        let effects = respond(
-            &mut app,
-            second,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, second, Event::FlagsUpdated(Err(offline())));
         assert!(effects.is_empty(), "{effects:?}");
         assert!(app.messages[0].flags.flagged);
         assert!(!app.saving());
@@ -1646,11 +1634,7 @@ mod tests {
         let (first, _) = sent(&act(&mut app, Action::ToggleNew));
         act(&mut app, Action::ToggleNew);
         act(&mut app, Action::ToggleNew);
-        let effects = respond(
-            &mut app,
-            first,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, first, Event::FlagsUpdated(Err(offline())));
         assert!(matches!(
             sent(&effects).1,
             Request::UpdateFlags(
@@ -1672,11 +1656,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            id,
-            Event::Transferred(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         let effects = act(&mut app, Action::Retry);
         assert_eq!(sent(&effects).1, request);
     }
@@ -1702,7 +1682,7 @@ mod tests {
             id,
             Event::Transferred(Ok((
                 FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
+                vec![("m0".into(), Err(offline()))],
             ))),
         );
         assert_eq!(app.save_failures(), ["network error: offline"]);
@@ -1713,11 +1693,7 @@ mod tests {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::ToggleNew);
-        let effects = respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         assert!(matches!(
             sent(&effects).1,
             Request::UpdateFlags(
@@ -1752,11 +1728,7 @@ mod tests {
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::SaveMessage);
         assert!(answer(&mut app, "=Archive").is_empty(), "waits its turn");
-        let effects = respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (moving, _) = sent(&effects);
         respond(
             &mut app,
@@ -1818,7 +1790,7 @@ mod tests {
             id,
             Event::Transferred(Ok((
                 FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
+                vec![("m0".into(), Err(offline()))],
             ))),
         );
         act(&mut app, Action::CopyMessage);
@@ -1845,11 +1817,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            id,
-            Event::Transferred(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         let effects = act(&mut app, Action::Retry);
         assert_eq!(sent(&effects).1, request);
     }
@@ -1890,11 +1858,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
         let effects = act(&mut app, Action::Retry);
         assert!(
             effects.iter().any(|e| matches!(e,
@@ -1916,7 +1880,7 @@ mod tests {
             &mut app,
             purge,
             Event::Purged(Ok(vec![
-                ("m0".into(), Err(Error::Network("offline".into()))),
+                ("m0".into(), Err(offline())),
                 ("m1".into(), Ok(())),
             ])),
         );
@@ -1941,13 +1905,13 @@ mod tests {
         let (moving, _) = sent(&respond(
             &mut app,
             flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
+            Event::FlagsUpdated(Err(offline())),
         ));
         // The move fails: m0 stays, marked, and is purged.
         let (purge, request) = sent(&respond(
             &mut app,
             moving,
-            Event::Transferred(Err(Error::Network("offline".into()))),
+            Event::Transferred(Err(offline())),
         ));
         assert!(
             matches!(request, Request::Purge { ref ids, .. } if ids == &[MessageId::new("m0")])
@@ -2050,11 +2014,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            id,
-            Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::FoldersListed(Err(expired())));
         assert_eq!(app.screen(), &Screen::Index);
         let (_, request) = sent(&act(&mut app, Action::Retry));
         assert_eq!(request, Request::ListFolders);
@@ -2088,11 +2048,7 @@ mod tests {
             "waits for the move"
         );
         // A move that fails keeps the mark, and the purge takes it.
-        let effects = respond(
-            &mut app,
-            moving,
-            Event::Transferred(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, moving, Event::Transferred(Err(offline())));
         assert!(app.is_deleted(&"m0".into()));
         assert!(matches!(sent(&effects).1, Request::Purge { .. }));
     }
@@ -2119,11 +2075,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&key(&mut app, KeyCode::Tab));
-        respond(
-            &mut app,
-            id,
-            Event::FoldersListed(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, id, Event::FoldersListed(Err(offline())));
         assert_eq!(
             prompt(&app),
             "network error: offline. Copy to mailbox ('?' for list): "
@@ -2173,11 +2125,7 @@ mod tests {
     fn an_unrelated_save_does_not_hide_a_failed_one() {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (read, _) = sent(&act(&mut app, Action::ToggleNew));
         respond(&mut app, read, Event::FlagsUpdated(Ok(())));
         assert_eq!(app.save_failures(), ["network error: offline"]);
@@ -2207,11 +2155,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
         let (_, request) = sent(&act(&mut app, Action::Retry));
         assert_eq!(
             request,
@@ -2228,11 +2172,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            list,
-            Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         act(&mut app, Action::Retry);
         assert_eq!(app.menu(), Menu::Browser);
         assert!(app.input.is_none(), "the question waits for the browser");
@@ -2256,11 +2196,7 @@ mod tests {
     fn a_failed_flag_change_follows_its_message_when_moved() {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
         act(&mut app, Action::SaveMessage);
         let (save, _) = sent(&answer(&mut app, "=Archive"));
         respond(
@@ -2306,11 +2242,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::ChangeFolder);
         let (a, _) = sent(&answer(&mut app, "=A"));
-        respond(
-            &mut app,
-            a,
-            Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, a, Event::FolderOpened(Err(expired())));
         act(&mut app, Action::ChangeFolder);
         let (b, _) = sent(&answer(&mut app, "=B"));
         respond(
@@ -2358,11 +2290,7 @@ mod tests {
         act(&mut app, Action::DeleteMessage);
         assert_eq!(app.status, "Leaving the folder; wait a moment.");
         // The move fails: m0 stays, still marked, and is purged.
-        let effects = respond(
-            &mut app,
-            save,
-            Event::Transferred(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, save, Event::Transferred(Err(offline())));
         let (purge, request) = sent(&effects);
         assert!(
             matches!(request, Request::Purge { ref ids, .. } if ids == &[MessageId::new("m0")])
@@ -2452,17 +2380,9 @@ mod tests {
     fn failed_flag_changes_are_kept_together() {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (read, _) = sent(&act(&mut app, Action::ToggleNew));
-        respond(
-            &mut app,
-            read,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, read, Event::FlagsUpdated(Err(offline())));
         let (_, failed) = &app.save_failures[&MessageId::new("m0")];
         assert_eq!(
             *failed,
@@ -2553,11 +2473,7 @@ mod tests {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         assert!(act(&mut app, Action::FlagMessage).is_empty(), "queued");
-        let effects = respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         assert!(effects.is_empty(), "nothing left to change");
         assert!(app.save_failures().is_empty());
         assert!(!app.saving());
@@ -2570,11 +2486,7 @@ mod tests {
             ..settings()
         });
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         app.selected = 0;
         act(&mut app, Action::DeleteMessage);
         let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
@@ -2595,11 +2507,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            id,
-            Event::Transferred(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         app.sign_in = None;
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
@@ -2637,11 +2545,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            id,
-            Event::Transferred(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         app.sign_in = None;
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Projects"));
@@ -2680,7 +2584,7 @@ mod tests {
             id,
             Event::Transferred(Ok((
                 FolderId::new("archive"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
+                vec![("m0".into(), Err(offline()))],
             ))),
         );
         assert!(!app.save_failures().is_empty());
@@ -2735,11 +2639,7 @@ mod tests {
             account: AccountId::new("alice@contoso.com"),
             outcome: Err("expired".into()),
         }));
-        respond(
-            &mut app,
-            purge,
-            Event::Purged(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, purge, Event::Purged(Err(expired())));
         assert!(!app.quit);
         let (purge, _) = sent(&act(&mut app, Action::Retry));
         respond(
@@ -2757,11 +2657,7 @@ mod tests {
         act(&mut app, Action::PreviousEntry);
         let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
         signed_out(&mut app);
-        respond(
-            &mut app,
-            purge,
-            Event::Purged(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, purge, Event::Purged(Err(expired())));
         app.sign_in = None;
         act(&mut app, Action::UndeleteMessage);
         assert!(!app.is_deleted(&"m0".into()));
@@ -2781,11 +2677,7 @@ mod tests {
         act(&mut app, Action::SaveMessage);
         let (list, _) = sent(&key(&mut app, KeyCode::Tab));
         signed_out(&mut app);
-        respond(
-            &mut app,
-            list,
-            Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         app.sign_in = None;
         assert!(app.input.is_some(), "the question is back");
         key(&mut app, KeyCode::Esc);
@@ -2801,11 +2693,7 @@ mod tests {
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::FlagMessage);
         act(&mut app, Action::ToggleNew);
-        let effects = respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (read, request) = sent(&effects);
         assert!(matches!(
             request,
@@ -2871,11 +2759,7 @@ mod tests {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         signed_out(&mut app);
-        respond(
-            &mut app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
         // Its folder isn't open any more.
         app.messages.clear();
         let first = app.retry();
@@ -2894,16 +2778,8 @@ mod tests {
         let (open, _) = sent(&effects);
         let (list, _) = sent(&act(&mut app, Action::BrowseMailboxes));
         signed_out(&mut app);
-        respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        );
-        respond(
-            &mut app,
-            list,
-            Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         let effects = app.retry();
         assert!(lists_folders(&effects), "{effects:?}");
         assert!(
@@ -2919,11 +2795,7 @@ mod tests {
         act(&mut app, Action::SaveMessage);
         let (list, _) = sent(&key(&mut app, KeyCode::Tab));
         signed_out(&mut app);
-        respond(
-            &mut app,
-            list,
-            Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         app.sign_in = None;
         sent(&answer(&mut app, "=Archive"));
         assert!(!lists_folders(&app.retry()));
@@ -2934,11 +2806,7 @@ mod tests {
         app.selected = 0;
         let (purge, _) = sent(&act(app, Action::SyncMailbox));
         signed_out(app);
-        respond(
-            app,
-            purge,
-            Event::Purged(Err(Error::Auth("expired".into()))),
-        );
+        respond(app, purge, Event::Purged(Err(expired())));
         app.sign_in = None;
     }
 
@@ -2998,11 +2866,7 @@ mod tests {
 
     fn flag_failed(app: &mut App) {
         let (flag, _) = sent(&act(app, Action::FlagMessage));
-        respond(
-            app,
-            flag,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        respond(app, flag, Event::FlagsUpdated(Err(offline())));
     }
 
     #[test]
@@ -3053,11 +2917,7 @@ mod tests {
         act(&mut app, Action::ToggleNew);
         let effects = respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
         let (read, _) = sent(&effects);
-        respond(
-            &mut app,
-            read,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, read, Event::FlagsUpdated(Err(offline())));
         // The listing taken before both changes arrives now, into an
         // index it fills afresh.
         app.messages.clear();
@@ -3170,7 +3030,7 @@ mod tests {
             id,
             Event::Transferred(Ok((
                 FolderId::new("archive"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
+                vec![("m0".into(), Err(offline()))],
             ))),
         );
         app.selected = 0;
@@ -3236,7 +3096,7 @@ mod tests {
             copy,
             Event::Transferred(Ok((
                 FolderId::new("in"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
+                vec![("m0".into(), Err(offline()))],
             ))),
         );
         assert!(effects.is_empty(), "{effects:?}");
@@ -3270,11 +3130,7 @@ mod tests {
         let mut app = app(settings());
         let (list, _) = sent(&act(&mut app, Action::BrowseMailboxes));
         signed_out(&mut app);
-        respond(
-            &mut app,
-            list,
-            Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         app.sign_in = None;
         let (list, _) = sent(&act(&mut app, Action::BrowseMailboxes));
         respond(
@@ -3340,7 +3196,7 @@ mod tests {
             id,
             Event::Transferred(Ok((
                 FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
+                vec![("m0".into(), Err(offline()))],
             ))),
         );
         assert!(!app.save_failures().is_empty());
@@ -3370,7 +3226,7 @@ mod tests {
             id,
             Event::Transferred(Ok((
                 FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Auth("expired".into())))],
+                vec![("m0".into(), Err(expired()))],
             ))),
         );
         app.sign_in = None;
@@ -3406,7 +3262,7 @@ mod tests {
                 id,
                 Event::Transferred(Ok((
                     FolderId::new("arc"),
-                    vec![("m0".into(), Err(Error::Auth("expired".into())))],
+                    vec![("m0".into(), Err(expired()))],
                 ))),
             );
         }

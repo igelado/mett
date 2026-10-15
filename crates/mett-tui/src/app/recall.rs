@@ -552,8 +552,7 @@ mod tests {
         let (mut app, effects) = App::open(80, 24, path, Settings::default());
         let open = first_request(&effects);
         let drafts = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
-        let effects = respond(&mut app, open, Event::FolderOpened(Ok(drafts)));
-        let list = first_request(&effects);
+        let list = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(drafts))));
         listed(&mut app, list, vec![postponed("d1", "Plans")], None);
         app.update(Msg::Action(Action::DisplayMessage));
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
@@ -591,8 +590,7 @@ mod tests {
         let (mut app, effects) = App::open(80, 24, path, Settings::default());
         let open = first_request(&effects);
         let drafts = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
-        let effects = respond(&mut app, open, Event::FolderOpened(Ok(drafts)));
-        let list = first_request(&effects);
+        let list = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(drafts))));
         listed(&mut app, list, vec![postponed("d1", "Plans")], None);
         if from_pager {
             app.update(Msg::Action(Action::DisplayMessage));
@@ -622,20 +620,12 @@ mod tests {
     fn a_recall_waiting_for_a_sign_in_starts_again() {
         let mut app = app();
         let (open, _) = sent(&app.update(Msg::Action(Action::RecallMessage)));
-        respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
         assert_eq!(app.recall, None);
         let (open, request) = sent(&app.retry_recall());
         assert!(matches!(request, Request::OpenFolder(_)));
         // Given up by a change of folder: not started again.
-        respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
         app.change_folder(FolderPath::WellKnown(WellKnownFolder::SentItems, vec![]));
         assert!(app.retry_recall().is_empty());
     }

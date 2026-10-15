@@ -2441,6 +2441,10 @@ mod tests {
         respond(app, *fetch, Event::MessageFetched(Ok(message)))
     }
 
+    fn denied() -> Error {
+        Error::Auth("denied".into())
+    }
+
     #[test]
     fn loads_the_inbox_on_start() {
         let app = loaded(3);
@@ -2454,8 +2458,7 @@ mod tests {
         let (mut app, effects) = App::new(80, 23);
         let open = first_request(&effects);
         let folder = mock::folder("in", "Inbox", None);
-        let effects = respond(&mut app, open, Event::FolderOpened(Ok(folder)));
-        let first = first_request(&effects);
+        let first = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(folder))));
         let effects = listed(&mut app, first, summaries(2), Some("c"));
         let [Effect::Request(_, Request::ListMessages { page, .. })] = effects.as_slice() else {
             panic!("expected another page request, got {effects:?}");
@@ -2532,13 +2535,8 @@ mod tests {
         let second = page(&mut app, first, summaries(1), "c");
 
         // An error is reported while the second page is loading…
-        let effects = open(&mut app, 1);
-        let update = first_request(&effects);
-        respond(
-            &mut app,
-            update,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let update = first_request(&open(&mut app, 1));
+        respond(&mut app, update, Event::FlagsUpdated(Err(offline())));
         // …and survives the end of the listing.
         listed(&mut app, second, Vec::new(), None);
         assert_eq!(app.status, "network error: offline");
@@ -2548,11 +2546,7 @@ mod tests {
     fn a_failed_page_leaves_the_index_incomplete_until_retried() {
         let (mut app, first) = opening(Settings::default(), 23);
         let second = page(&mut app, first, summaries(2), "c");
-        respond(
-            &mut app,
-            second,
-            Event::MessagesListed(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, second, Event::MessagesListed(Err(offline())));
         assert!(app.incomplete());
 
         // Reaching the end of the index retries the failed page.
@@ -2573,11 +2567,7 @@ mod tests {
     fn the_pager_also_retries_a_failed_page() {
         let (mut app, first) = opening(Settings::default(), 23);
         let second = page(&mut app, first, summaries(1), "c");
-        respond(
-            &mut app,
-            second,
-            Event::MessagesListed(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, second, Event::MessagesListed(Err(offline())));
 
         open(&mut app, 1);
         let effects = act(&mut app, Action::NextEntry);
@@ -2599,30 +2589,22 @@ mod tests {
         act(&mut app, Action::NextEntry);
         // One change at a time: the second waits for the first.
         assert!(open(&mut app, 1).is_empty());
-        let [Effect::Request(first, _)] = first.as_slice() else {
-            panic!("expected a flag update, got {first:?}");
-        };
-        let second = respond(
+        let (first, _) = sent(&first);
+        let (second, _) = sent(&respond(
             &mut app,
-            *first,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
-        let [Effect::Request(second, _)] = second.as_slice() else {
-            panic!("expected a flag update, got {second:?}");
-        };
+            first,
+            Event::FlagsUpdated(Err(offline())),
+        ));
         // A later success doesn't hide the earlier failure.
-        respond(&mut app, *second, Event::FlagsUpdated(Ok(())));
+        respond(&mut app, second, Event::FlagsUpdated(Ok(())));
         assert_eq!(app.save_failures(), ["network error: offline"]);
         assert!(!app.saving());
 
         // Saving the same message again successfully clears its failure.
         act(&mut app, Action::Exit);
         act(&mut app, Action::FirstEntry);
-        let retry = open(&mut app, 1);
-        let [Effect::Request(retry, _)] = retry.as_slice() else {
-            panic!("expected a retried flag update, got {retry:?}");
-        };
-        respond(&mut app, *retry, Event::FlagsUpdated(Ok(())));
+        let (retry, _) = sent(&open(&mut app, 1));
+        respond(&mut app, retry, Event::FlagsUpdated(Ok(())));
         assert!(app.save_failures().is_empty());
     }
 
@@ -2634,14 +2616,6 @@ mod tests {
         (app, second)
     }
 
-    fn deliver_last_page(
-        app: &mut App,
-        id: RequestId,
-        messages: Vec<MessageSummary>,
-    ) -> Vec<Effect> {
-        listed(app, id, messages, None)
-    }
-
     #[test]
     fn next_entry_waits_for_the_next_page_in_the_index() {
         let (mut app, second) = loading_more(1);
@@ -2650,7 +2624,7 @@ mod tests {
         assert_eq!(app.status, "Loading more messages...");
         let mut more = summaries(2);
         more.remove(0);
-        deliver_last_page(&mut app, second, more);
+        listed(&mut app, second, more, None);
         assert_eq!(app.selected, 1, "moved on once the page arrived");
     }
 
@@ -2661,7 +2635,7 @@ mod tests {
         act(&mut app, Action::NextEntry);
         let mut more = summaries(2);
         more.remove(0);
-        let effects = deliver_last_page(&mut app, second, more);
+        let effects = listed(&mut app, second, more, None);
         assert_eq!(app.selected, 1);
         assert!(
             matches!(
@@ -2677,7 +2651,7 @@ mod tests {
         let (mut app, second) = loading_more(2);
         act(&mut app, Action::LastEntry);
         assert_eq!(app.selected, 1);
-        deliver_last_page(&mut app, second, summaries(5));
+        listed(&mut app, second, summaries(5), None);
         assert_eq!(app.selected, 6, "the real last message");
     }
 
@@ -2687,7 +2661,7 @@ mod tests {
         // 20 rows per page: the target, entry 20, isn't loaded yet.
         act(&mut app, Action::NextPage);
         assert_eq!(app.selected, 4);
-        deliver_last_page(&mut app, second, summaries(30));
+        listed(&mut app, second, summaries(30), None);
         assert_eq!(app.selected, 20);
     }
 
@@ -2697,7 +2671,7 @@ mod tests {
         act(&mut app, Action::NextEntry);
         act(&mut app, Action::NextEntry);
         act(&mut app, Action::PreviousEntry);
-        deliver_last_page(&mut app, second, Vec::new());
+        listed(&mut app, second, Vec::new(), None);
         assert_eq!(app.selected, 0);
     }
 
@@ -2715,13 +2689,8 @@ mod tests {
     #[test]
     fn a_failed_flag_update_marks_the_message_unread_again() {
         let mut app = loaded(1);
-        let effects = open(&mut app, 1);
-        let update = first_request(&effects);
-        respond(
-            &mut app,
-            update,
-            Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        );
+        let update = first_request(&open(&mut app, 1));
+        respond(&mut app, update, Event::FlagsUpdated(Err(offline())));
         assert!(!app.messages[0].flags.read);
         assert_eq!(app.status, "network error: offline");
     }
@@ -2729,11 +2698,9 @@ mod tests {
     #[test]
     fn shows_the_fetched_message_and_ignores_stale_ones() {
         let mut app = loaded(2);
-        let effects = act(&mut app, Action::DisplayMessage);
-        let first = first_request(&effects);
+        let first = first_request(&act(&mut app, Action::DisplayMessage));
         // Move on to the next message before the first one arrives.
-        let effects = act(&mut app, Action::NextEntry);
-        let second = first_request(&effects);
+        let second = first_request(&act(&mut app, Action::NextEntry));
 
         respond(&mut app, first, Event::MessageFetched(Ok(message("m0", 1))));
         assert_eq!(pager(&app).message, None, "stale response ignored");
@@ -2752,13 +2719,8 @@ mod tests {
     #[test]
     fn a_failed_fetch_returns_to_the_index_and_leaves_it_unread() {
         let mut app = loaded(1);
-        let effects = act(&mut app, Action::DisplayMessage);
-        let fetch = first_request(&effects);
-        let effects = respond(
-            &mut app,
-            fetch,
-            Event::MessageFetched(Err(Error::Network("offline".into()))),
-        );
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
+        let effects = respond(&mut app, fetch, Event::MessageFetched(Err(offline())));
         assert!(effects.is_empty());
         assert_eq!(app.menu(), Menu::Index);
         assert_eq!(app.status, "network error: offline");
@@ -2801,8 +2763,7 @@ mod tests {
             width: 10,
             height: 8,
         });
-        let effects = act(&mut app, Action::DisplayMessage);
-        let fetch = first_request(&effects);
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
         let mut message = message("m0", 0);
         message.body.content = "x".repeat(100);
         respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
@@ -2916,11 +2877,7 @@ mod tests {
         // Pressing Enter while the folder is still opening does nothing.
         assert!(act(&mut app, Action::DisplayMessage).is_empty());
         assert_eq!(app.status, "Opening folder...");
-        respond(
-            &mut app,
-            open_inbox,
-            Event::FolderOpened(Err(Error::Network("offline".into()))),
-        );
+        respond(&mut app, open_inbox, Event::FolderOpened(Err(offline())));
         assert!(matches!(
             act(&mut app, Action::DisplayMessage).as_slice(),
             [Effect::Request(_, Request::OpenFolder(_))]
@@ -2935,11 +2892,7 @@ mod tests {
         let [Effect::Request(update, Request::UpdateFlags(..))] = effects.as_slice() else {
             panic!("expected a flag update, got {effects:?}");
         };
-        respond(
-            &mut app,
-            *update,
-            Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, *update, Event::FlagsUpdated(Err(expired())));
         // …and opening the second one fails too.
         act(&mut app, Action::Exit);
         act(&mut app, Action::NextEntry);
@@ -2947,13 +2900,9 @@ mod tests {
         let [Effect::Request(fetch, Request::FetchMessage(_))] = effects.as_slice() else {
             panic!("expected a fetch, got {effects:?}");
         };
-        respond(
-            &mut app,
-            *fetch,
-            Event::MessageFetched(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, *fetch, Event::MessageFetched(Err(expired())));
         assert_eq!(app.menu(), Menu::Index);
-        app.update(Msg::SignIn(finished(Err("expired".into()))));
+        signed_out(&mut app);
 
         let effects = act(&mut app, Action::Retry);
         assert!(
@@ -2977,13 +2926,9 @@ mod tests {
         };
         // The sign-in failure arrives before the request's own failure, and
         // the user retries straight away.
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        signed_out_as(&mut app, "denied");
         assert!(act(&mut app, Action::Retry).is_empty());
-        let effects = respond(
-            &mut app,
-            *first,
-            Event::FolderOpened(Err(Error::Auth("denied".into()))),
-        );
+        let effects = respond(&mut app, *first, Event::FolderOpened(Err(denied())));
         assert!(
             matches!(
                 effects.as_slice(),
@@ -3011,26 +2956,15 @@ mod tests {
     fn retry_waits_for_every_pending_request() {
         let (mut app, list) = loading_more(1);
         // Opening a message fails while the next page is still loading.
-        let effects = act(&mut app, Action::DisplayMessage);
-        let [Effect::Request(fetch, _)] = effects.as_slice() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
+        signed_out_as(&mut app, "denied");
         assert!(act(&mut app, Action::Retry).is_empty());
-        let effects = respond(
-            &mut app,
-            *fetch,
-            Event::MessageFetched(Err(Error::Auth("denied".into()))),
-        );
+        let effects = respond(&mut app, fetch, Event::MessageFetched(Err(denied())));
         assert!(
             effects.is_empty(),
             "still waiting for the page: {effects:?}"
         );
-        let effects = respond(
-            &mut app,
-            list,
-            Event::MessagesListed(Err(Error::Auth("denied".into()))),
-        );
+        let effects = respond(&mut app, list, Event::MessagesListed(Err(denied())));
         assert!(
             matches!(
                 effects.as_slice(),
@@ -3046,17 +2980,10 @@ mod tests {
     #[test]
     fn retry_resends_failures_at_once_and_waits_for_the_rest() {
         let (mut app, list) = loading_more(1);
-        let effects = act(&mut app, Action::DisplayMessage);
-        let [Effect::Request(fetch, _)] = effects.as_slice() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
+        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
         // The fetch has failed; the page hasn't reported back yet.
-        respond(
-            &mut app,
-            *fetch,
-            Event::MessageFetched(Err(Error::Auth("denied".into()))),
-        );
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        respond(&mut app, fetch, Event::MessageFetched(Err(denied())));
+        signed_out_as(&mut app, "denied");
         let effects = act(&mut app, Action::Retry);
         assert!(
             matches!(
@@ -3067,11 +2994,7 @@ mod tests {
         );
         // The retried fetch asks the user to sign in again meanwhile.
         app.update(Msg::SignIn(browser_prompt()));
-        let effects = respond(
-            &mut app,
-            list,
-            Event::MessagesListed(Err(Error::Auth("denied".into()))),
-        );
+        let effects = respond(&mut app, list, Event::MessagesListed(Err(denied())));
         assert!(
             matches!(
                 effects.as_slice(),
@@ -3090,14 +3013,14 @@ mod tests {
         app.update(Msg::SignIn(finished(Ok(()))));
         let mut more = summaries(2);
         more.remove(0);
-        deliver_last_page(&mut app, second, more);
+        listed(&mut app, second, more, None);
         assert_eq!(app.selected, 1, "moved on once the page arrived");
     }
 
     #[test]
     fn closing_a_failed_sign_in_drops_waiting_retries() {
         let (mut app, _) = App::new(80, 23);
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        signed_out_as(&mut app, "denied");
         app.retry_after.insert(RequestId(1));
         act(&mut app, Action::Exit);
         assert!(app.retry_after.is_empty());
@@ -3127,28 +3050,21 @@ mod tests {
         app.update(Msg::SignIn(finished(Err("sign-in cancelled".into()))));
         assert_eq!(app.sign_in, None);
         // A later failure is shown.
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        signed_out_as(&mut app, "denied");
         assert!(app.sign_in.is_some());
     }
 
     #[test]
     fn retrying_while_quitting_waits_only_for_saves() {
         let (mut app, list) = loading_more(1);
-        let effects = open(&mut app, 1);
-        let [Effect::Request(update, _)] = effects.as_slice() else {
-            panic!("expected a flag update, got {effects:?}");
-        };
+        let (update, _) = sent(&open(&mut app, 1));
         act(&mut app, Action::Exit);
         act(&mut app, Action::Quit);
         assert!(app.quit);
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        signed_out_as(&mut app, "denied");
         act(&mut app, Action::Retry);
         assert!(!app.retry_after.contains(&list), "listing isn't waited for");
-        let effects = respond(
-            &mut app,
-            *update,
-            Event::FlagsUpdated(Err(Error::Auth("denied".into()))),
-        );
+        let effects = respond(&mut app, update, Event::FlagsUpdated(Err(denied())));
         assert!(
             matches!(
                 effects.as_slice(),
@@ -3161,19 +3077,12 @@ mod tests {
     #[test]
     fn a_failed_fetch_is_retried_under_a_new_sign_in_window() {
         let mut app = loaded(1);
-        let effects = act(&mut app, Action::DisplayMessage);
-        let [Effect::Request(fetch, _)] = effects.as_slice() else {
-            panic!("expected a fetch, got {effects:?}");
-        };
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
+        signed_out_as(&mut app, "denied");
         act(&mut app, Action::Retry);
         // Another sign-in starts before the fetch reports its failure.
         app.update(Msg::SignIn(browser_prompt()));
-        let effects = respond(
-            &mut app,
-            *fetch,
-            Event::MessageFetched(Err(Error::Auth("denied".into()))),
-        );
+        let effects = respond(&mut app, fetch, Event::MessageFetched(Err(denied())));
         assert!(
             matches!(
                 effects.as_slice(),
@@ -3187,7 +3096,7 @@ mod tests {
     fn a_failed_sign_in_offers_no_stale_link() {
         let (mut app, _) = App::new(80, 23);
         app.update(Msg::SignIn(browser_prompt()));
-        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        signed_out_as(&mut app, "denied");
         assert!(act(&mut app, Action::OpenBrowser).is_empty());
         assert!(act(&mut app, Action::CopyLink).is_empty());
         let rows = app.sign_in.as_ref().unwrap().rows(80);
@@ -3204,8 +3113,8 @@ mod tests {
         assert_eq!(app.status, "");
     }
 
-    #[test]
-    fn the_sign_in_window_scroll_follows_resizes() {
+    /// A 40×6 app whose sign-in window, with a long link, is scrolled down.
+    fn scrolled_sign_in() -> App {
         let (mut app, _) = App::new(40, 6);
         let url = format!("https://login.example/authorize?{}", "x".repeat(400));
         app.update(Msg::SignIn(SignInEvent::Prompt {
@@ -3217,6 +3126,12 @@ mod tests {
         for _ in 0..30 {
             act(&mut app, Action::NextLine);
         }
+        app
+    }
+
+    #[test]
+    fn the_sign_in_window_scroll_follows_resizes() {
+        let mut app = scrolled_sign_in();
         let deep = app.sign_in.as_ref().unwrap().scroll;
         assert!(deep > 0);
         app.update(Msg::Resize {
@@ -3228,19 +3143,9 @@ mod tests {
 
     #[test]
     fn a_failure_shows_in_a_scrolled_sign_in_window() {
-        let (mut app, _) = App::new(40, 6);
-        let url = format!("https://login.example/authorize?{}", "x".repeat(400));
-        app.update(Msg::SignIn(SignInEvent::Prompt {
-            account: AccountId::new("alice@contoso.com"),
-            prompt: SignInPrompt::OpenBrowser {
-                url: url.parse().unwrap(),
-            },
-        }));
-        for _ in 0..30 {
-            act(&mut app, Action::NextLine);
-        }
+        let mut app = scrolled_sign_in();
         assert!(app.sign_in.as_ref().unwrap().scroll > 0);
-        app.update(Msg::SignIn(finished(Err("expired".into()))));
+        signed_out(&mut app);
         let window = app.sign_in.as_ref().unwrap();
         let room = (app.body_height + CHROME_ROWS).saturating_sub(3);
         assert!(window.scroll <= window.rows(app.width).len().saturating_sub(room));
@@ -3269,12 +3174,8 @@ mod tests {
         );
         assert!(app.settings.me.contains(&"alice@contoso.com".to_owned()));
         // Not asked again when the folder is listed again.
-        let effects = app.relist();
-        let (list, _) = match effects.as_slice() {
-            [Effect::Request(id, request)] => (*id, request.clone()),
-            _ => panic!("{effects:?}"),
-        };
-        let effects = deliver_last_page(&mut app, list, Vec::new());
+        let (list, _) = sent(&app.relist());
+        let effects = listed(&mut app, list, Vec::new(), None);
         assert!(effects.is_empty(), "{effects:?}");
     }
 }

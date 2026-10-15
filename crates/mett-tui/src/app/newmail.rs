@@ -1121,7 +1121,7 @@ mod tests {
         respond(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![(inbox(), Err(Error::Auth("expired".into())))]),
+            Event::MailboxesChecked(vec![(inbox(), Err(expired()))]),
         );
         poll(&mut app);
     }
@@ -1330,11 +1330,7 @@ mod tests {
     fn checks_wait_for_a_sign_in_after_one_failed() {
         let (mut app, _) = app();
         let id = poll(&mut app);
-        respond(
-            &mut app,
-            id,
-            Event::FolderPolled(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::FolderPolled(Err(expired())));
         let effects = app.update(Msg::Timer(Timer::Poll(0)));
         assert_eq!(effects, [Effect::Later(MINUTE, Timer::Poll(0))]);
         app.retry();
