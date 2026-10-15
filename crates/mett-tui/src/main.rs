@@ -1184,10 +1184,15 @@ fn dispatch(
                 });
             }
             Effect::AppendFile { path, text } => {
-                let appended = append_line(&path, &text)
-                    .map(|()| path.clone())
-                    .map_err(|e| format!("{}: {e}", path.display()));
-                deferred.msgs.push(app::Msg::Appended(appended));
+                let files = files.clone();
+                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let appended = append_line(&path, &text)
+                        .map(|()| path.clone())
+                        .map_err(|e| format!("{}: {e}", path.display()));
+                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = files.send(app::Msg::Appended(appended));
+                });
             }
             Effect::ReadFile(op, path) => {
                 let files = files.clone();
