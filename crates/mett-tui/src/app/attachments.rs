@@ -138,8 +138,12 @@ impl App {
             menu.listing = Some(effect_id(&request));
             effects.push(request);
         }
+        // While its menu is there (under the help, say).
         if let Some((message, attachment, to)) = self.unfetched_attachment.take()
-            && matches!(self.screens.last(), Some(Screen::Attachments(m)) if m.message == message)
+            && self
+                .screens
+                .iter()
+                .any(|s| matches!(s, Screen::Attachments(m) if m.message == message))
         {
             effects.extend(self.fetch_attachment(message, attachment, to));
         }

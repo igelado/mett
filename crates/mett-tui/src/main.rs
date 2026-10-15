@@ -772,10 +772,8 @@ static SAVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 
 /// Waits (a while) for the files being saved.
 fn wait_for_saves() {
-    let started = std::time::Instant::now();
-    while SAVING.load(std::sync::atomic::Ordering::SeqCst) > 0
-        && started.elapsed() < std::time::Duration::from_secs(30)
-    {
+    // However long it takes: cut short, a file would be left half written.
+    while SAVING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
@@ -898,11 +896,20 @@ fn remove_viewed() {
     }
 }
 
-/// Whether process `pid` may still be running (another mett, whose
-/// viewers still use their copies). Without `/proc` to tell, it may.
-fn running(pid: &str) -> bool {
+/// How long another mett may keep a viewer's copy, where mett can't tell
+/// whether it still runs.
+const VIEWED_KEPT: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Whether process `pid`, which made a copy `age` ago, may still be
+/// running (another mett, whose viewers still use their copies). Without
+/// `/proc` to tell, one made in the last week may be.
+fn running(pid: &str, age: std::time::Duration) -> bool {
     let proc = std::path::Path::new("/proc");
-    !proc.is_dir() || proc.join(pid).exists()
+    if proc.is_dir() {
+        proc.join(pid).exists()
+    } else {
+        age < VIEWED_KEPT
+    }
 }
 
 /// Removes the copies of attachments that earlier runs left for their
@@ -931,7 +938,12 @@ fn remove_viewed_before() {
         if numeric(pid)
             && numeric(count)
             && now.saturating_sub(started) > VIEWED_LEFT.as_nanos()
-            && !running(pid)
+            && !running(
+                pid,
+                std::time::Duration::from_nanos(
+                    u64::try_from(now.saturating_sub(started)).unwrap_or(u64::MAX),
+                ),
+            )
             && entry.file_type().is_ok_and(|t| t.is_dir())
         {
             let _ = std::fs::remove_dir_all(entry.path());
