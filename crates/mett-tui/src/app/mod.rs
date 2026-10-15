@@ -6,6 +6,7 @@
 //! carry out. This keeps the UI logic testable without a terminal.
 
 mod composing;
+mod keys;
 mod mailbox;
 mod search;
 
@@ -17,6 +18,7 @@ use ratatui::crossterm::event::KeyEvent;
 
 use self::composing::Composing;
 pub use self::composing::{Compose, Input};
+pub use self::keys::{Help, Reconfigured};
 pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
 pub use self::search::{Limit, highlighted};
@@ -24,7 +26,7 @@ use crate::action::Action;
 use crate::compose::Kind;
 use crate::config::Quad;
 use crate::config::mailbox::FolderPath;
-use crate::keymap::Menu;
+use crate::keymap::{Keymap, Menu, Stroke};
 use crate::signin::SignInEvent;
 use crate::text;
 use crate::worker::{Event, Request, RequestId, Response};
@@ -104,9 +106,11 @@ pub enum Msg {
     Response(Response),
     /// The authenticator needs the user, or finished signing in.
     SignIn(SignInEvent),
-    /// A key press while a question is on the message line, which takes
-    /// keys as typed rather than through the key bindings.
+    /// A key press: typed into the question on the message line, if
+    /// there is one, or looked up in the key bindings.
     Key(KeyEvent),
+    /// A `:` command ran.
+    Configured(Reconfigured),
     /// The editor finished: the edited text, or why it failed.
     Edited(Result<String, String>),
     /// A timer the app set went off.
@@ -136,6 +140,8 @@ pub enum Effect {
     /// Edit the text in the user's editor, then send back
     /// [`Msg::Edited`].
     Edit(String),
+    /// Run a mettrc command, then send back [`Msg::Configured`].
+    Command(String),
     /// Send back [`Msg::Timer`] after a while.
     Later(std::time::Duration, Timer),
 }
@@ -161,6 +167,8 @@ pub enum Screen {
     Compose(Compose),
     /// The folder browser.
     Browser(Browser),
+    /// The key bindings of a menu.
+    Help(Help),
 }
 
 /// Pager state.
@@ -322,6 +330,22 @@ pub struct App {
     pub quit: bool,
     /// The sign-in window, if it is open.
     pub sign_in: Option<SignIn>,
+    /// The key bindings, which `:bind` and `:macro` change.
+    pub keymap: Keymap,
+    /// Keys and functions a macro or `push` queued, played before new
+    /// input.
+    strokes: VecDeque<Stroke>,
+    /// Keys and functions of a macro run in the sign-in window, played
+    /// there while `strokes` wait for the sign-in.
+    sign_in_strokes: VecDeque<Stroke>,
+    /// `:` commands sent to the main loop and not yet answered.
+    configuring: usize,
+    /// How many queued keys have played in a row.
+    played: usize,
+    /// Whether the screen needs drawing again before waiting for input.
+    redraw: bool,
+    /// Keys to play once the folder is listed.
+    after_load: Vec<Stroke>,
     /// The user cancelled the sign-in in progress: the outcome it still
     /// reports isn't shown.
     cancelled: bool,
@@ -352,6 +376,9 @@ pub struct App {
     discarding: HashMap<RequestId, mett_core::Draft>,
     /// Whether the mailbox has been asked for the user's own addresses.
     asked_addresses: bool,
+    /// The user's own addresses as the mailbox told them, kept apart from
+    /// the configured ones so that reconfiguring keeps them.
+    mailbox_addresses: Vec<String>,
     /// That request, while it is on its way.
     addresses_request: Option<RequestId>,
     /// A reply whose message has arrived, waiting for the user's own
@@ -505,6 +532,13 @@ impl App {
             status: "Opening folder...".into(),
             quit: false,
             sign_in: None,
+            keymap: Keymap::mutt_defaults(),
+            strokes: VecDeque::new(),
+            sign_in_strokes: VecDeque::new(),
+            configuring: 0,
+            played: 0,
+            redraw: false,
+            after_load: Vec::new(),
             cancelled: false,
             dismissed: false,
             input: None,
@@ -516,6 +550,7 @@ impl App {
             reselect: None,
             discarding: HashMap::new(),
             asked_addresses: false,
+            mailbox_addresses: Vec::new(),
             addresses_request: None,
             awaiting_addresses: None,
             left_drafts: Vec::new(),
@@ -588,6 +623,7 @@ impl App {
             Screen::Pager(_) => Menu::Pager,
             Screen::Compose(_) => Menu::Compose,
             Screen::Browser(_) => Menu::Browser,
+            Screen::Help(_) => Menu::Help,
         }
     }
 
@@ -625,7 +661,8 @@ impl App {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
             Msg::SignIn(event) => self.on_sign_in(event),
-            Msg::Key(key) => self.on_key(key),
+            Msg::Key(key) => self.on_key_press(key),
+            Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
             Msg::Timer(Timer::RelistSentItems) => {
                 let open = self.folder.as_ref().and_then(|f| f.well_known);
@@ -653,11 +690,23 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Effect> {
+        // A new action replaces the previous message, as in mutt.
+        self.status.clear();
+        let menu = self.menu();
+        if action == Action::Noop {
+            return Vec::new();
+        }
+        // A question on the message line takes typed keys only: a macro's
+        // function can't open another screen or question over it.
+        if self.input.is_some() && menu != Menu::SignIn {
+            self.status = "Not available in a prompt.".into();
+            return Vec::new();
+        }
         // Any new action in a menu replaces a pending move, and a reply or
         // forward still waiting for its message: the user has moved on,
-        // perhaps to another message. The sign-in window's keys don't
-        // move anywhere, so leave them.
-        if self.menu() != Menu::SignIn {
+        // perhaps to another message, or to help. The sign-in window's
+        // keys don't move anywhere, so leave them.
+        if menu != Menu::SignIn {
             self.pending = None;
             // Moving through the index, or opening a message, replaces
             // going back to the message a background refresh left (other
@@ -685,12 +734,20 @@ impl App {
             // that.
             self.dismissed = false;
         }
+        match action {
+            // Help and commands work in every menu but the sign-in window.
+            Action::Help if menu != Menu::SignIn => return self.open_help(),
+            Action::EnterCommand if menu != Menu::SignIn => return self.ask_command(),
+            _ => {}
+        }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
             Menu::Compose => self.on_compose_action(action),
             Menu::Browser => self.on_browser_action(action),
+            Menu::Help => self.on_help_action(action),
+            Menu::Generic => Vec::new(),
         }
     }
 
@@ -1000,7 +1057,9 @@ impl App {
             Action::DisplayMessage if self.folder.is_none() && self.opening.is_none() => {
                 return self.open_folder();
             }
-            Action::DisplayMessage if self.folder.is_none() => {}
+            Action::DisplayMessage if self.folder.is_none() => {
+                self.status = "Opening folder...".into();
+            }
             Action::DisplayMessage => return self.open_selected(),
             Action::Mail => return self.start_compose(Kind::New),
             Action::Reply => return self.start_compose(Kind::Reply),
@@ -1075,6 +1134,13 @@ impl App {
             if let Screen::Pager(pager) = screen {
                 pager.layout(width);
                 pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+            }
+        }
+        // A taller help screen shows more lines, not empty space.
+        if let Some(Screen::Help(help)) = self.screens.last() {
+            let last = self.help_lines(help.menu).len().saturating_sub(height);
+            if let Some(Screen::Help(help)) = self.screens.last_mut() {
+                help.scroll = help.scroll.min(last);
             }
         }
     }
@@ -1158,6 +1224,7 @@ impl App {
                         self.saved_flags.clear();
                         self.removed_while_listing.clear();
                         self.forget_missing_marks();
+                        self.loaded();
                         // Clear the "Loading" message, but not an error that
                         // was reported while the folder was loading.
                         if self.status.starts_with("Loading ") {
@@ -1181,6 +1248,11 @@ impl App {
                     // lets it load.
                     if !matches!(e, Error::Auth(_)) {
                         self.pending_search = None;
+                    }
+                    // Keys waiting for the folder play anyway, unless a
+                    // sign-in is to load it after all.
+                    if !matches!(e, Error::Auth(_)) {
+                        self.loaded();
                     }
                     self.report(e);
                 }
@@ -1239,12 +1311,11 @@ impl App {
                 }
                 let failed = match result {
                     Ok(addresses) => {
-                        for address in addresses {
-                            let address = address.to_lowercase();
-                            if !self.settings.me.contains(&address) {
-                                self.settings.me.push(address);
-                            }
-                        }
+                        self.mailbox_addresses = addresses
+                            .into_iter()
+                            .map(|address| address.to_lowercase())
+                            .collect();
+                        self.add_mailbox_addresses();
                         None
                     }
                     // Asked again by the next reply.
@@ -1292,6 +1363,11 @@ impl App {
                 // lets it open.
                 if !matches!(e, Error::Auth(_)) {
                     self.pending_search = None;
+                }
+                // Keys waiting for the folder play anyway, unless a sign-in
+                // is to open it after all.
+                if !matches!(e, Error::Auth(_)) {
+                    self.loaded();
                 }
                 self.report(e);
             }
@@ -1612,6 +1688,29 @@ impl App {
         self.unlisted.is_some()
     }
 
+    /// Takes in the settings after a `:` command changed them. The account
+    /// stays the same.
+    /// Counts the addresses the mailbox reported as the user's own.
+    fn add_mailbox_addresses(&mut self) {
+        for address in &self.mailbox_addresses {
+            if !self.settings.me.contains(address) {
+                self.settings.me.push(address.clone());
+            }
+        }
+    }
+
+    pub(super) fn apply_settings(&mut self, settings: Settings) {
+        self.page_size = settings.page_size;
+        self.settings = settings.compose;
+        // The configuration doesn't know what the mailbox told.
+        self.add_mailbox_addresses();
+        self.mailbox_root = settings.folder;
+        self.trash = settings.trash;
+        self.delete = settings.delete;
+        self.resolve = settings.resolve;
+        self.shortcuts = settings.shortcuts;
+    }
+
     /// Lists the open folder again from the start, to show messages that
     /// arrived in it.
     fn relist(&mut self) -> Vec<Effect> {
@@ -1734,7 +1833,7 @@ impl App {
         self.selected = selected;
         // The screen, not the menu: the sign-in window may be over it.
         match self.screen() {
-            Screen::Index | Screen::Compose(_) | Screen::Browser(_) => Vec::new(),
+            Screen::Index | Screen::Compose(_) | Screen::Browser(_) | Screen::Help(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()

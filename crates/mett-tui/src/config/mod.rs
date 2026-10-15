@@ -32,14 +32,12 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "append-hook",
     "attachments",
     "auto_view",
-    "bind",
     "cd",
     "charset-hook",
     "close-hook",
     "color",
     "crypt-hook",
     "echo",
-    "exec",
     "fcc-hook",
     "fcc-save-hook",
     "folder-hook",
@@ -49,7 +47,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "ignore",
     "index-format-hook",
     "lists",
-    "macro",
     "mailboxes",
     "mailto_allow",
     "mbox-hook",
@@ -59,7 +56,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "my_hdr",
     "nospam",
     "open-hook",
-    "push",
     "reply-hook",
     "run",
     "save-hook",
@@ -91,8 +87,33 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "unsubscribe",
 ];
 
+/// A `bind` or `macro` command, for the key bindings to carry out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyCommand {
+    /// `bind MENUS KEY FUNCTION`.
+    Bind {
+        /// Comma-separated menu names.
+        menus: String,
+        /// The key, in mutt's notation.
+        key: String,
+        /// The function's name.
+        function: String,
+    },
+    /// `macro MENUS KEY SEQUENCE [DESCRIPTION]`.
+    Macro {
+        /// Comma-separated menu names.
+        menus: String,
+        /// The key, in mutt's notation.
+        key: String,
+        /// The keys and `<functions>` to play.
+        sequence: String,
+        /// What it does, for the help screen.
+        description: Option<String>,
+    },
+}
+
 /// The loaded configuration.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Config {
     values: HashMap<&'static str, Value>,
     /// User-defined `my_` variables.
@@ -102,6 +123,10 @@ pub struct Config {
     pub errors: Vec<String>,
     /// `alternates`: regular expressions for the user's other addresses.
     alternates: Vec<String>,
+    /// `bind` and `macro` commands not yet taken by the key bindings.
+    key_commands: Vec<KeyCommand>,
+    /// Keys to play, from `push` and `exec`, in mutt's notation.
+    pushed: Vec<String>,
     /// Things that were ignored, such as unsupported mutt commands.
     pub warnings: Vec<String>,
     /// Warnings from the command being run, waiting for its location.
@@ -112,6 +137,9 @@ pub struct Config {
     /// Variables given a value by `set`, `unset` or `toggle`, as opposed
     /// to their defaults.
     assigned: std::collections::HashSet<&'static str>,
+    /// What `set ?var` asked about, as `var=value`: shown at the `:`
+    /// prompt (a mettrc has no one to show it to).
+    answers: Vec<String>,
     home: Option<String>,
 }
 
@@ -130,10 +158,13 @@ impl Config {
             user: HashMap::new(),
             errors: Vec::new(),
             alternates: Vec::new(),
+            key_commands: Vec::new(),
+            pushed: Vec::new(),
             warnings: Vec::new(),
             pending: Vec::new(),
             warned: Default::default(),
             assigned: Default::default(),
+            answers: Vec::new(),
             home,
         };
         for var in VARS {
@@ -151,6 +182,18 @@ impl Config {
     /// rather than left at (or reset to) its default.
     pub fn was_set(&self, name: &str) -> bool {
         self.assigned.contains(name)
+    }
+
+    /// The variables whose values differ from `before`'s.
+    pub fn changed_since(&self, before: &Config) -> Vec<&'static str> {
+        let mut changed: Vec<&'static str> = self
+            .values
+            .iter()
+            .filter(|(name, value)| before.values.get(*name) != Some(*value))
+            .map(|(name, _)| *name)
+            .collect();
+        changed.sort_unstable();
+        changed
     }
 
     /// The value of a known string or path variable, or `""`.
@@ -177,6 +220,45 @@ impl Config {
     /// The user's other addresses, as regular expressions (`alternates`).
     pub fn alternates(&self) -> &[String] {
         &self.alternates
+    }
+
+    /// The `bind` and `macro` commands read since the last call.
+    pub fn take_key_commands(&mut self) -> Vec<KeyCommand> {
+        std::mem::take(&mut self.key_commands)
+    }
+
+    /// The keys `push` and `exec` asked to play since the last call.
+    pub fn take_pushed(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pushed)
+    }
+
+    /// Runs one command typed at mett's `:` prompt. Returns its warnings,
+    /// or its first error.
+    pub fn run_line(&mut self, line: &str) -> Result<Vec<String>, String> {
+        let (errors, warnings) = (self.errors.len(), self.warnings.len());
+        self.answers.clear();
+        // Each command typed is answered, even if it was ignored before.
+        let warned = std::mem::take(&mut self.warned);
+        self.run(
+            line,
+            &Origin {
+                file: Path::new(""),
+                depth: 0,
+            },
+        );
+        self.warned = warned;
+        let new_errors: Vec<String> = self.errors.drain(errors..).collect();
+        let new_warnings: Vec<String> = self.warnings.drain(warnings..).collect();
+        // The location is just the prompt: leave it out.
+        let strip = |m: String| m.strip_prefix(":1: ").map(str::to_owned).unwrap_or(m);
+        match new_errors.into_iter().map(strip).next() {
+            Some(error) => Err(error),
+            // What was asked about comes first.
+            None => Ok(std::mem::take(&mut self.answers)
+                .into_iter()
+                .chain(new_warnings.into_iter().map(strip))
+                .collect()),
+        }
     }
 
     /// Reads and runs the mettrc at `path`.
@@ -288,6 +370,28 @@ impl Config {
                         }
                     }
                 }),
+                "bind" => match args {
+                    [menus, key, function] => self.bind(menus, key, function),
+                    _ => Err("bind: expected a menu, a key and a function".to_owned()),
+                },
+                "macro" => match args {
+                    [menus, key, sequence, rest @ ..] if rest.len() <= 1 => {
+                        self.macro_(menus, key, sequence, rest.first())
+                    }
+                    _ => Err(
+                        "macro: expected a menu, a key, the keys to play and maybe a description"
+                            .to_owned(),
+                    ),
+                },
+                "push" => match args {
+                    [keys] => self.expand(keys).map(|keys| self.pushed.push(keys)),
+                    _ => Err("push: expected one string".to_owned()),
+                },
+                "exec" if !args.is_empty() => self.each(args, |c, function| {
+                    c.pushed.push(format!("<{function}>"));
+                    Ok(())
+                }),
+                "exec" => Err("exec: expected a function".to_owned()),
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
                         let path = self.resolve_source(&path, origin.file);
@@ -323,7 +427,6 @@ impl Config {
             .extend(pending.into_iter().map(|w| format!("{at}: {w}")));
     }
 
-    /// Expands a word now, with the values set so far.
     /// The expanded patterns of `alternates`-like commands, leaving out
     /// `-group NAME` (mett has no address groups yet).
     fn patterns(&self, args: &[Word]) -> Result<Vec<String>, String> {
@@ -340,6 +443,34 @@ impl Config {
         Ok(patterns)
     }
 
+    fn bind(&mut self, menus: &Word, key: &Word, function: &Word) -> Result<(), String> {
+        let command = KeyCommand::Bind {
+            menus: self.expand(menus)?,
+            key: self.expand(key)?,
+            function: self.expand(function)?,
+        };
+        self.key_commands.push(command);
+        Ok(())
+    }
+
+    fn macro_(
+        &mut self,
+        menus: &Word,
+        key: &Word,
+        sequence: &Word,
+        description: Option<&Word>,
+    ) -> Result<(), String> {
+        let command = KeyCommand::Macro {
+            menus: self.expand(menus)?,
+            key: self.expand(key)?,
+            sequence: self.expand(sequence)?,
+            description: description.map(|d| self.expand(d)).transpose()?,
+        };
+        self.key_commands.push(command);
+        Ok(())
+    }
+
+    /// Expands a word now, with the values set so far.
     fn expand(&self, word: &Word) -> Result<String, String> {
         word.expand(&Expand { config: self })
     }
@@ -399,9 +530,8 @@ impl Config {
     fn set_flag(&mut self, arg: &str) -> Result<(), String> {
         if let Some(name) = arg.strip_prefix('&') {
             self.reset_named(name)
-        } else if arg.starts_with('?') {
-            // A query, meaningful only interactively.
-            Ok(())
+        } else if let Some(name) = arg.strip_prefix('?') {
+            self.query(name)
         } else if let Some(name) = arg.strip_prefix("inv").filter(|n| is_bool(n)) {
             self.toggle(name)
         } else if let Some(name) = arg.strip_prefix("no").filter(|n| is_bool(n)) {
@@ -422,6 +552,26 @@ impl Config {
                 None => self.unknown_variable(arg),
             }
         }
+    }
+
+    /// `set ?var`: notes the variable's value, as mutt shows it.
+    fn query(&mut self, name: &str) -> Result<(), String> {
+        let value = if name.starts_with("my_") {
+            match self.user.get(name) {
+                Some(value) => Value::Str(value.clone()),
+                None => return Err(format!("{name}: unknown variable")),
+            }
+        } else {
+            let Some(var) = vars::find(name) else {
+                return self.unknown_variable(name);
+            };
+            match self.values.get(var.name) {
+                Some(value) => value.clone(),
+                None => return Ok(()),
+            }
+        };
+        self.answers.push(format!("{name}={value}"));
+        Ok(())
     }
 
     /// Assigns `value` to `name`. The value is expanded only for variables
@@ -716,7 +866,7 @@ mod tests {
     #[test]
     fn reports_bad_values_as_errors_and_unknowns_as_warnings() {
         let config = load(
-            "set timeout=soon\nset no_such_var=1\nbind index j next-entry\nfrobnicate\nset from\n",
+            "set timeout=soon\nset no_such_var=1\ncolor index red default ~N\nfrobnicate\nset from\n",
         );
         assert_eq!(config.errors.len(), 2, "{:?}", config.errors);
         assert!(config.errors[0].starts_with("/conf/mettrc:1: timeout"));
@@ -726,7 +876,7 @@ mod tests {
             config
                 .warnings
                 .iter()
-                .any(|w| w.contains("bind is not supported yet"))
+                .any(|w| w.contains("color is not supported yet"))
         );
         assert!(
             config
@@ -754,11 +904,77 @@ mod tests {
     }
 
     #[test]
+    fn reads_key_commands() {
+        let mut config = load(
+            "bind index,pager \\Cn next-entry\nmacro index A 's=Archive<enter>' 'archive it'\n\
+             push '<last-entry>'\nexec first-entry next-entry\n",
+        );
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(
+            config.take_key_commands(),
+            [
+                KeyCommand::Bind {
+                    menus: "index,pager".into(),
+                    // The lexer turns `\Cn` into Control-N, as mutt's does.
+                    key: "\u{e}".into(),
+                    function: "next-entry".into(),
+                },
+                KeyCommand::Macro {
+                    menus: "index".into(),
+                    key: "A".into(),
+                    sequence: "s=Archive<enter>".into(),
+                    description: Some("archive it".into()),
+                },
+            ]
+        );
+        assert!(config.take_key_commands().is_empty(), "taken");
+        assert_eq!(
+            config.take_pushed(),
+            ["<last-entry>", "<first-entry>", "<next-entry>"]
+        );
+        assert_eq!(load("bind index x\n").errors.len(), 1);
+        assert_eq!(load("macro index\n").errors.len(), 1);
+    }
+
+    #[test]
+    fn runs_commands_typed_at_the_prompt() {
+        let mut config = load("");
+        assert_eq!(config.run_line("set timeout=7"), Ok(vec![]));
+        assert_eq!(config.get("timeout"), Some(&Value::Number(7)));
+        assert_eq!(
+            config.run_line("set timeout=soon"),
+            Err("timeout: expected a number, got \"soon\"".into())
+        );
+        assert!(config.errors.is_empty(), "prompt errors aren't kept");
+        assert_eq!(
+            config.run_line("frobnicate"),
+            Ok(vec!["unknown command frobnicate; ignored".into()])
+        );
+        // `set ?var` shows the value.
+        assert_eq!(
+            config.run_line("set ?timeout"),
+            Ok(vec!["timeout=7".into()])
+        );
+        assert_eq!(
+            config.run_line("set ?resolve"),
+            Ok(vec!["resolve=yes".into()])
+        );
+        assert_eq!(
+            config.run_line("set my_x=hi; set ?my_x"),
+            Ok(vec!["my_x=\"hi\"".into()])
+        );
+        // Ignored commands are reported each time they are typed.
+        let first = config.run_line("color a b c").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(config.run_line("color a b c"), Ok(first));
+    }
+
+    #[test]
     fn warns_about_each_ignored_item_once() {
-        let config = load("bind a b c\nbind d e f\nset imap_user=x\nset imap_user=y\n");
+        let config = load("color a b c\ncolor d e f\nset imap_user=x\nset imap_user=y\n");
         assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
         // A variable and a command with the same name are different items.
-        let both = load("set bind=1\nbind a b c\n");
+        let both = load("set color=1\ncolor a b c\n");
         assert_eq!(both.warnings.len(), 2, "{:?}", both.warnings);
         assert!(config.warnings[0].starts_with("/conf/mettrc:1:"));
         assert!(config.warnings[1].starts_with("/conf/mettrc:3:"));
@@ -814,7 +1030,7 @@ mod tests {
         let marker = std::env::temp_dir().join(format!("mett-ran-{}", std::process::id()));
         let _ = fs::remove_file(&marker);
         let config = load(&format!(
-            "set imap_pass=`touch {0}; false`\nbind index x `touch {0}`\n",
+            "set imap_pass=`touch {0}; false`\ncolor index x `touch {0}`\n",
             marker.display()
         ));
         assert!(config.errors.is_empty(), "{:?}", config.errors);

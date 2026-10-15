@@ -25,12 +25,12 @@ use std::sync::Arc;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::app::{App, Effect, Msg, Settings};
 use crate::config::mailbox::FolderPath;
 use crate::editor::Editor;
-use crate::keymap::{Key, Keymap};
+use crate::keymap::Keymap;
 use crate::signin::{CancelHandle, SignInEvent, TuiPrompter};
 use crate::worker::{Request, RequestId};
 
@@ -118,48 +118,20 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let compose = match compose::Settings::from_config(&config, &spoolfile.account) {
-            Ok(compose) => compose,
+        let settings = match settings_from_config(&config, &spoolfile.account) {
+            Ok(settings) => settings,
             Err(e) => {
                 eprintln!("mett: {e}");
                 return ExitCode::FAILURE;
             }
         };
+        let (keymap, problems) = keymap_from_config(&mut config);
+        for problem in problems {
+            eprintln!("mett: warning: {problem}; ignored");
+        }
         let editor = Editor::new(config.string("editor"), config.string("tmpdir"), &|name| {
             std::env::var(name).ok()
         });
-        let trash = match config.string("trash") {
-            "" => None,
-            // mutt's shortcuts work here too (`^` and `-` name no folder
-            // before one is open, and are taken as written).
-            trash => match config::mailbox::configured_path(
-                trash,
-                config.string("folder"),
-                &spoolfile.account,
-                config.string("spoolfile"),
-                config.string("mbox"),
-                config.string("record"),
-            ) {
-                Ok(path) => Some(path),
-                Err(e) => {
-                    eprintln!("mett: trash: {e}");
-                    return ExitCode::FAILURE;
-                }
-            },
-        };
-        let page_size = match config.get("msgraph_page_size") {
-            Some(config::Value::Number(n)) if *n > 0 => match u32::try_from(*n) {
-                Ok(size) => size,
-                Err(_) => {
-                    eprintln!("mett: msgraph_page_size {n} is too large");
-                    return ExitCode::FAILURE;
-                }
-            },
-            _ => {
-                eprintln!("mett: msgraph_page_size must be a positive number");
-                return ExitCode::FAILURE;
-            }
-        };
         let Some(runtime) = runtime() else {
             return ExitCode::FAILURE;
         };
@@ -174,22 +146,20 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let mut pushed = Vec::new();
+        for keys in config.take_pushed() {
+            match keymap::parse_strokes(&keys) {
+                Ok(strokes) => pushed.extend(strokes),
+                Err(e) => eprintln!("mett: warning: push: {e}; ignored"),
+            }
+        }
         let session = Session {
             folder: spoolfile.folder,
-            settings: Settings {
-                page_size,
-                compose,
-                account: spoolfile.account.clone(),
-                folder: config.string("folder").to_owned(),
-                trash,
-                delete: config.quad("delete"),
-                resolve: config.flag("resolve"),
-                shortcuts: app::Shortcuts {
-                    spoolfile: config.string("spoolfile").to_owned(),
-                    mbox: config.string("mbox").to_owned(),
-                    record: config.string("record").to_owned(),
-                },
-            },
+            settings,
+            keymap,
+            pushed,
+            account: spoolfile.account,
+            config,
             editor,
             sign_in,
             cancel: Some(cancel),
@@ -202,14 +172,36 @@ fn main() -> ExitCode {
     };
     // The demo mailbox never signs in, so nothing is ever sent here.
     let (_, sign_in) = mpsc::unbounded_channel();
+    // The demo reads no mettrc, but `:` commands work on the defaults.
+    let (config, settings) = demo_config(std::env::var("HOME").ok().filter(|h| !h.is_empty()));
     let session = Session {
         folder: FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new()),
-        settings: demo::settings(),
+        account: settings.account.clone(),
+        settings,
+        keymap: Keymap::mutt_defaults(),
+        pushed: Vec::new(),
+        config,
         editor: Editor::new("", "", &|name| std::env::var(name).ok()),
         sign_in,
         cancel: None,
     };
     start(&runtime, Arc::new(demo::mailbox()), session)
+}
+
+/// The demo's configuration, and the settings it gives. Its folders are
+/// the demo mailbox's own (`=Archive`, not `~/Mail/Archive`), and stay so
+/// when `:` commands change the configuration.
+fn demo_config(home: Option<String>) -> (config::Config, Settings) {
+    let mut config = config::Config::new(home);
+    let defaults = demo::settings();
+    // The value is quoted; an empty one is always valid.
+    let _ = config.run_line(&format!("set folder=\"{}\"", defaults.folder));
+    // Sample mail goes out without the user's own signature.
+    let _ = config.run_line("set signature=\"\"");
+    // The demo user's own address, which group replies leave out.
+    let account = mett_core::AccountId::new(demo::YOU);
+    let settings = settings_from_config(&config, &account).unwrap_or(defaults);
+    (config, settings)
 }
 
 /// What the TUI works with, besides the mailbox.
@@ -218,12 +210,88 @@ struct Session {
     folder: FolderPath,
     /// The app's settings.
     settings: Settings,
+    /// The key bindings.
+    keymap: Keymap,
+    /// Keys to play first, from `push` and `exec`.
+    pushed: Vec<keymap::Stroke>,
+    /// The account, whose folders mailbox paths name.
+    account: mett_core::AccountId,
+    /// The configuration, which `:` commands change.
+    config: config::Config,
     /// The editor for writing messages.
     editor: Editor,
     /// Events from the mailbox's sign-in.
     sign_in: mpsc::UnboundedReceiver<SignInEvent>,
     /// Cancels the sign-in in progress, for mailboxes that sign in.
     cancel: Option<CancelHandle>,
+}
+
+/// The app's settings from the configuration, for `account`.
+fn settings_from_config(
+    config: &config::Config,
+    account: &mett_core::AccountId,
+) -> Result<Settings, String> {
+    settings_keeping(config, account, None)
+}
+
+/// Like [`settings_from_config`], with `signature`, if given, instead of
+/// reading the signature file again.
+fn settings_keeping(
+    config: &config::Config,
+    account: &mett_core::AccountId,
+    signature: Option<Option<String>>,
+) -> Result<Settings, String> {
+    let compose = compose::Settings::from_config_keeping(config, account, signature)?;
+    let trash = match config.string("trash") {
+        "" => None,
+        // mutt's shortcuts work here too (`^` and `-` name no folder before
+        // one is open, and are taken as written).
+        trash => Some(
+            config::mailbox::configured_path(
+                trash,
+                config.string("folder"),
+                account,
+                config.string("spoolfile"),
+                config.string("mbox"),
+                config.string("record"),
+            )
+            .map_err(|e| format!("trash: {e}"))?,
+        ),
+    };
+    let page_size = match config.get("msgraph_page_size") {
+        Some(config::Value::Number(n)) if *n > 0 => {
+            u32::try_from(*n).map_err(|_| format!("msgraph_page_size {n} is too large"))?
+        }
+        _ => return Err("msgraph_page_size must be a positive number".into()),
+    };
+    Ok(Settings {
+        page_size,
+        compose,
+        account: account.clone(),
+        folder: config.string("folder").to_owned(),
+        trash,
+        delete: config.quad("delete"),
+        resolve: config.flag("resolve"),
+        shortcuts: app::Shortcuts {
+            spoolfile: config.string("spoolfile").to_owned(),
+            mbox: config.string("mbox").to_owned(),
+            record: config.string("record").to_owned(),
+        },
+    })
+}
+
+/// mutt's default key bindings, changed by the configuration's `bind` and
+/// `macro` commands, and the bindings that couldn't be made. Those don't
+/// stop mett: a muttrc it sources may bind mutt menus and functions mett
+/// doesn't have.
+fn keymap_from_config(config: &mut config::Config) -> (Keymap, Vec<String>) {
+    let mut keymap = Keymap::mutt_defaults();
+    let problems = config
+        .take_key_commands()
+        .iter()
+        .filter_map(|command| keymap.apply(command).err())
+        .collect();
+    (keymap, problems)
 }
 
 fn runtime() -> Option<tokio::runtime::Runtime> {
@@ -263,11 +331,14 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     let Session {
         folder,
         settings,
-        editor,
+        keymap,
+        pushed,
+        account,
+        config,
+        mut editor,
         sign_in: mut sign_in_rx,
         cancel,
     } = session;
-    let keymap = Keymap::mutt_defaults();
 
     let (request_tx, request_rx) = mpsc::unbounded_channel::<(RequestId, Request)>();
     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
@@ -276,13 +347,26 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     let (input, mut input_rx) = Input::start();
     let (timer_tx, mut timer_rx) = mpsc::unbounded_channel();
 
+    // `:` commands run on their own thread, one at a time: `source` and
+    // backticks may take a while, and the UI doesn't wait for them.
+    let mut commands = Commands::new(Configuration {
+        // Kept for `:` commands that don't change it.
+        signature: settings.compose.signature.clone(),
+        config,
+    });
+    let mut running: Option<oneshot::Receiver<(Configuration, app::Reconfigured)>> = None;
     let size = terminal.size()?;
     let (mut app, effects) = App::open(size.width, size.height, folder, settings);
-    let mut edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+    app.keymap = keymap;
+    // Played once the folder is listed, so that `push <last-entry>` has
+    // somewhere to go.
+    app.push_after_load(pushed);
+    let mut deferred = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
 
     while !app.quit {
         // The editor runs between messages, with the terminal handed over.
-        while let Some(text) = edit.take() {
+        commands.queue.extend(deferred.commands.drain(..));
+        while let Some(text) = deferred.edit.take() {
             let result = input.suspended(&mut terminal, &mut input_rx, || editor.edit(&text))?;
             // The terminal may have been resized meanwhile.
             let size = terminal.size()?;
@@ -291,44 +375,84 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 height: size.height,
             });
             let effects = app.update(Msg::Edited(result));
-            edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+            deferred.absorb(dispatch(
+                &mut app,
+                &request_tx,
+                &timer_tx,
+                cancel.as_ref(),
+                effects,
+            ));
+            commands.queue.extend(deferred.commands.drain(..));
         }
-        draw(&mut terminal, &app, &keymap)?;
-        let msg = tokio::select! {
-            // Without input mett can't be used or quit, so a terminal read
-            // error ends it (and the terminal is restored).
-            event = input_rx.recv() => match event.transpose()? {
-                None => return Err(std::io::Error::other("terminal input closed")),
-                Some(event) => match event {
-                // Repeats too, so holding a key keeps moving.
-                // A question on the message line takes keys as typed.
-                TermEvent::Key(key) if key.kind != KeyEventKind::Release
-                    && app.input.is_some() && app.sign_in.is_none() => Msg::Key(key),
-                TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
-                    match keymap.lookup(app.menu(), Key::from(key)) {
-                        Some(action) => Msg::Action(action),
-                        None => {
-                            app.status = "Key is not bound.".into();
-                            // Restarts the loop, which redraws first.
-                            continue;
+        if running.is_none()
+            && let Some((command, mut configuration)) = commands.start()
+        {
+            let account = account.clone();
+            let (done, result) = oneshot::channel();
+            running = Some(result);
+            // A thread of its own, not the runtime's blocking pool: quitting
+            // doesn't wait for a command that takes its time.
+            std::thread::spawn(move || {
+                let reconfigured = run_command(
+                    &mut configuration.config,
+                    &account,
+                    &mut configuration.signature,
+                    &command,
+                );
+                let _ = done.send((configuration, reconfigured));
+            });
+        }
+        draw(&mut terminal, &app)?;
+        // Keys a macro or `push` queued come before new input, once the
+        // last action has what it was waiting for.
+        let stroke = app.next_stroke();
+        if stroke.is_none() && app.take_redraw() {
+            continue;
+        }
+        let msg = match stroke {
+            Some(msg) => msg,
+            None => tokio::select! {
+                // Without input mett can't be used or quit, so a terminal
+                // read error ends it (and the terminal is restored).
+                event = input_rx.recv() => match event.transpose()? {
+                    None => return Err(std::io::Error::other("terminal input closed")),
+                    Some(event) => match event {
+                        // Repeats too, so holding a key keeps moving.
+                        TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                            app.typed();
+                            Msg::Key(key)
                         }
-                    }
-                }
-                TermEvent::Resize(width, height) => Msg::Resize { width, height },
-                _ => continue,
+                        TermEvent::Resize(width, height) => Msg::Resize { width, height },
+                        _ => continue,
+                    },
                 },
+                Some(response) = response_rx.recv() => Msg::Response(response),
+                Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
+                Some(timer) = timer_rx.recv() => Msg::Timer(timer),
+                done = async { running.as_mut().expect("checked").await }, if running.is_some() => {
+                    running = None;
+                    let (configuration, reconfigured) =
+                        done.map_err(|_| std::io::Error::other("a : command stopped"))?;
+                    // `editor` and `tmpdir` may have changed.
+                    editor = Editor::new(
+                        configuration.config.string("editor"),
+                        configuration.config.string("tmpdir"),
+                        &|name| std::env::var(name).ok(),
+                    );
+                    commands.finish(configuration);
+                    Msg::Configured(reconfigured)
+                }
+                else => break,
             },
-            Some(response) = response_rx.recv() => Msg::Response(response),
-            Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
-            Some(timer) = timer_rx.recv() => Msg::Timer(timer),
-            else => break,
         };
-        if matches!(msg, Msg::Action(_)) {
-            // A new action replaces the previous message, as in mutt.
-            app.status.clear();
-        }
         let effects = app.update(msg);
-        edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+        deferred.absorb(dispatch(
+            &mut app,
+            &request_tx,
+            &timer_tx,
+            cancel.as_ref(),
+            effects,
+        ));
     }
 
     // Give pending changes (such as marking a message read) a moment to
@@ -361,6 +485,11 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 let effects = app.update(Msg::SignIn(event));
                 dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
             }
+            // A macro run in the sign-in window plays there.
+            while let Some(msg) = app.next_sign_in_stroke() {
+                let effects = app.update(msg);
+                dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+            }
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
             // sign-ins don't matter any more.
@@ -369,7 +498,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             if !waiting {
                 break;
             }
-            draw(&mut terminal, &app, &keymap)?;
+            draw(&mut terminal, &app)?;
             let msg = tokio::select! {
                 // Saving may need the user to sign in: the sign-in window
                 // still works, and only it takes keys.
@@ -378,10 +507,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     Some(TermEvent::Key(key))
                         if key.kind != KeyEventKind::Release && app.sign_in.is_some() =>
                     {
-                        match keymap.lookup(app.menu(), Key::from(key)) {
-                            Some(action) => Msg::Action(action),
-                            None => continue,
-                        }
+                        Msg::Key(key)
                     }
                     Some(TermEvent::Resize(width, height)) => Msg::Resize { width, height },
                     Some(_) => continue,
@@ -413,7 +539,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             };
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
-            // Nothing is edited any more.
+            // Nothing is edited, nor configured, any more.
             let _ = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
             // The wait starts again once the user is done signing in.
             if window_was_open || app.sign_in.is_some() {
@@ -438,13 +564,13 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
 
 /// Draws the screen, then prints the view's overlay, if any, as plain text
 /// that the terminal wraps by itself.
-fn draw(terminal: &mut DefaultTerminal, app: &App, keymap: &Keymap) -> std::io::Result<()> {
+fn draw(terminal: &mut DefaultTerminal, app: &App) -> std::io::Result<()> {
     use std::io::Write;
 
     use ratatui::crossterm::{cursor, queue, style};
 
     let mut overlay = None;
-    terminal.draw(|frame| overlay = view::render(app, keymap, frame))?;
+    terminal.draw(|frame| overlay = view::render(app, frame))?;
     if let Some(overlay) = overlay {
         // The cells already hold the same text, so ratatui's next draw,
         // which compares against what it drew, leaves this alone.
@@ -475,16 +601,136 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 /// How long to wait for pending changes when quitting.
 const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Carries out `effects`, except editing, which needs the terminal: the
-/// text to edit, if any, is returned.
+/// Effects that the main loop carries out itself, between messages.
+#[derive(Default)]
+struct Deferred {
+    /// Text to edit, which needs the terminal.
+    edit: Option<String>,
+    /// `:` commands, which need the configuration.
+    commands: Vec<String>,
+}
+
+impl Deferred {
+    fn absorb(&mut self, other: Deferred) {
+        if other.edit.is_some() {
+            self.edit = other.edit;
+        }
+        self.commands.extend(other.commands);
+    }
+}
+
+/// The configuration that `:` commands change.
+struct Configuration {
+    config: config::Config,
+    /// The signature in use: see [`run_command`].
+    signature: Option<String>,
+}
+
+/// `:` commands waiting to run, one at a time, in order, and the
+/// configuration while none is running.
+struct Commands<T = Configuration> {
+    /// The configuration; `None` while a command has it.
+    idle: Option<T>,
+    queue: std::collections::VecDeque<String>,
+}
+
+impl<T> Commands<T> {
+    fn new(configuration: T) -> Self {
+        Self {
+            idle: Some(configuration),
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// The next command to run, with the configuration it changes, unless
+    /// one is running.
+    fn start(&mut self) -> Option<(String, T)> {
+        self.idle.as_ref()?;
+        let command = self.queue.pop_front()?;
+        Some((command, self.idle.take()?))
+    }
+
+    /// Takes the configuration back from the command that ran.
+    fn finish(&mut self, configuration: T) {
+        self.idle = Some(configuration);
+    }
+}
+
+/// Runs a `:` command and reports what the configuration is now.
+///
+/// `signature` is the signature in use, kept unless the command changes
+/// the `signature` variable.
+fn run_command(
+    config: &mut config::Config,
+    account: &mett_core::AccountId,
+    signature: &mut Option<String>,
+    command: &str,
+) -> app::Reconfigured {
+    let before = config.clone();
+    let mut outcome = config.run_line(command);
+    // A command that fails changes nothing: what it did before failing is
+    // undone.
+    if outcome.is_err() {
+        *config = before;
+        let _ = config.take_key_commands();
+        let _ = config.take_pushed();
+        return app::Reconfigured {
+            outcome,
+            settings: settings_keeping(config, account, Some(signature.clone())),
+            key_commands: Vec::new(),
+            pushed: Vec::new(),
+        };
+    }
+    let changed = config.changed_since(&before);
+    // The mailbox and its sign-in were set up when mett started.
+    if let Ok(warnings) = &mut outcome {
+        warnings.extend(
+            changed
+                .iter()
+                .filter(|name| name.starts_with("msgraph_") && **name != "msgraph_page_size")
+                .map(|name| format!("{name}: takes effect when mett starts again")),
+        );
+    }
+    // The signature file is read again only if the command changed it: a
+    // command about something else doesn't fail because of it.
+    // Setting it to its default value counts: a missing default is fine,
+    // a missing file the user named isn't.
+    let signature_changed = changed.contains(&"signature")
+        || config.was_set("signature") != before.was_set("signature");
+    let keep = (!signature_changed).then(|| signature.clone());
+    match settings_keeping(config, account, keep) {
+        Ok(settings) => app::Reconfigured {
+            outcome,
+            settings: Ok({
+                signature.clone_from(&settings.compose.signature);
+                settings
+            }),
+            key_commands: config.take_key_commands(),
+            pushed: config.take_pushed(),
+        },
+        // A command that leaves the settings unusable is undone, so the
+        // next one starts from settings that work.
+        Err(error) => {
+            *config = before;
+            app::Reconfigured {
+                outcome,
+                settings: Err(error),
+                key_commands: Vec::new(),
+                pushed: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Carries out `effects`, except those the main loop does itself.
 fn dispatch(
     app: &mut App,
     requests: &mpsc::UnboundedSender<(RequestId, Request)>,
     timers: &mpsc::UnboundedSender<app::Timer>,
     cancel: Option<&CancelHandle>,
     effects: Vec<Effect>,
-) -> Option<String> {
-    let mut edit = None;
+) -> Deferred {
+    let mut deferred = Deferred::default();
     for effect in effects {
         match effect {
             Effect::Request(id, request) => {
@@ -508,7 +754,8 @@ fn dispatch(
                     app.status = format!("Could not copy: {e}");
                 }
             }
-            Effect::Edit(text) => edit = Some(text),
+            Effect::Edit(text) => deferred.edit = Some(text),
+            Effect::Command(command) => deferred.commands.push(command),
             Effect::Later(after, timer) => {
                 let timers = timers.clone();
                 tokio::spawn(async move {
@@ -519,7 +766,7 @@ fn dispatch(
             }
         }
     }
-    edit
+    deferred
 }
 
 /// The thread that reads terminal input. crossterm's reads block, so they
@@ -620,5 +867,152 @@ fn discard_pending_input() {
         if event::read().is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_command_that_breaks_the_settings_is_undone() {
+        let (mut config, settings) = demo_config(Some("/home/alice".into()));
+        let mut signature = None;
+        let broken = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set signature=/nonexistent/mett/signature",
+        );
+        assert!(broken.settings.is_err());
+        // The next command works on what was there before.
+        let next = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set resolve=no",
+        );
+        assert!(!next.settings.unwrap().resolve);
+    }
+
+    #[test]
+    fn commands_run_one_at_a_time_in_order() {
+        let mut commands = Commands::new(0);
+        commands.queue.extend(["a".to_owned(), "b".to_owned()]);
+        let (first, n) = commands.start().unwrap();
+        assert_eq!(first, "a");
+        assert!(commands.start().is_none(), "a is running");
+        commands.queue.push_back("c".into());
+        commands.finish(n + 1);
+        let (second, n) = commands.start().unwrap();
+        assert_eq!((second.as_str(), n), ("b", 1));
+        commands.finish(n + 1);
+        assert_eq!(commands.start().unwrap().0, "c");
+        commands.finish(3);
+        assert!(commands.start().is_none(), "nothing left");
+    }
+
+    #[test]
+    fn naming_the_default_signature_checks_it() {
+        let home = std::env::temp_dir().join(format!("mett-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (mut config, settings) = demo_config(Some(home.display().to_string()));
+        let mut signature = None;
+        // ~/.signature doesn't exist: fine as the default, not when named.
+        let named = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set signature=~/.signature",
+        );
+        assert!(named.settings.is_err());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn mailbox_settings_wait_for_a_restart() {
+        let (mut config, settings) = demo_config(Some("/home/alice".into()));
+        let mut signature = None;
+        let done = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set msgraph_client_id=abc msgraph_page_size=10",
+        );
+        assert_eq!(
+            done.outcome,
+            Ok(vec![
+                "msgraph_client_id: takes effect when mett starts again".to_owned()
+            ])
+        );
+        assert_eq!(config.string("msgraph_client_id"), "abc", "kept");
+    }
+
+    #[test]
+    fn an_unreadable_signature_only_fails_commands_that_set_it() {
+        let dir = std::env::temp_dir().join(format!("mett-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("signature");
+        std::fs::write(&path, "-- \nAlice\n").unwrap();
+        let (mut config, settings) = demo_config(Some("/home/alice".into()));
+        let mut signature = None;
+        let set = format!("set signature={}", path.display());
+        let first = run_command(&mut config, &settings.account, &mut signature, &set);
+        assert!(first.settings.is_ok());
+        assert_eq!(signature.as_deref(), Some("-- \nAlice\n"));
+        // The file goes away; commands about other things still work.
+        std::fs::remove_file(&path).unwrap();
+        let other = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set resolve=no",
+        );
+        let other = other.settings.unwrap();
+        assert!(!other.resolve);
+        assert_eq!(other.compose.signature.as_deref(), Some("-- \nAlice\n"));
+        // Setting it again reads it, and fails.
+        let again = run_command(&mut config, &settings.account, &mut signature, &set);
+        assert!(again.settings.is_ok(), "unchanged value: not read again");
+        let reset = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set signature=/nonexistent/mett/other",
+        );
+        assert!(reset.settings.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn demo_commands_keep_the_demo_folders() {
+        let (mut config, settings) = demo_config(Some("/home/alice".into()));
+        assert_eq!(settings.folder, "");
+        // An unrelated `:` command leaves `=Archive` meaning the demo's.
+        config.run_line("set resolve=no").unwrap();
+        let after = settings_from_config(&config, &settings.account).unwrap();
+        assert_eq!(after.folder, "");
+        assert!(!after.resolve);
+        assert!(
+            after.compose.me.iter().any(|me| me == demo::YOU),
+            "still the demo user"
+        );
+        assert_eq!(after.compose.signature, None, "not the user's signature");
+    }
+
+    #[test]
+    fn a_failing_command_changes_nothing() {
+        let (mut config, settings) = demo_config(Some("/home/alice".into()));
+        let mut signature = settings.compose.signature.clone();
+        let before = config.clone();
+        // The first command works, the second doesn't: neither stays.
+        let done = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set resolve=no; set timeout=soon",
+        );
+        assert!(done.outcome.is_err());
+        assert!(config.changed_since(&before).is_empty());
     }
 }

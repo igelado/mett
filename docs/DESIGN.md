@@ -164,6 +164,9 @@ A background `tokio` task, the worker, owns the `mett-msgraph` client, token
 refresh and the local cache. The UI sends `Request`s over an `mpsc`
 channel and receives `Event`s on another. Every request carries a
 `RequestId`, so that the UI can match responses and drop stale ones.
+Commands typed at the `:` prompt, which may `source` files or run
+backticks, likewise run on a thread of their own, one at a time, and
+report back to the main loop.
 
 - **Pros:**
   - The UI never blocks on I/O.

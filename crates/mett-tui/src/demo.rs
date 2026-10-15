@@ -13,7 +13,7 @@ const PEOPLE: &[(&str, &str)] = &[
 ];
 
 /// The demo user, to whom the sample mail is addressed.
-const YOU: &str = "you@contoso.com";
+pub const YOU: &str = "you@contoso.com";
 
 const SUBJECTS: &[&str] = &[
     "Welcome to mett",

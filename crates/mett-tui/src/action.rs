@@ -84,6 +84,9 @@ actions! {
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";
+    Help => "help", "Show the key bindings";
+    EnterCommand => "enter-command", "Run a mettrc command";
+    Noop => "noop", "Do nothing (unbinds a key)";
 }
 
 #[cfg(test)]

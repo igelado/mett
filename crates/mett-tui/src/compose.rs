@@ -81,7 +81,18 @@ impl Default for Settings {
 impl Settings {
     /// How to write messages, from the configuration. `account` is the
     /// signed-in user, whose address counts as the user's own.
+    #[cfg(test)]
     pub fn from_config(config: &Config, account: &AccountId) -> Result<Self, String> {
+        Self::from_config_keeping(config, account, None)
+    }
+
+    /// Like [`Settings::from_config`], with `signature`, if given, instead
+    /// of reading the signature file again.
+    pub fn from_config_keeping(
+        config: &Config,
+        account: &AccountId,
+        signature: Option<Option<String>>,
+    ) -> Result<Self, String> {
         let realname = config.string("realname");
         let from = match config.string("from") {
             // Without `from`, the signed-in account is the sender; it still
@@ -101,24 +112,9 @@ impl Settings {
         // Without `use_from`, the address still counts as the user's own, but
         // messages carry no explicit sender: Graph uses the signed-in user.
         let from = from.filter(|_| config.flag("use_from"));
-        let signature = match config.string("signature") {
-            "" => None,
-            path if path.ends_with('|') => {
-                return Err(format!(
-                    "signature: commands ({path}) are not supported yet; use a file"
-                ));
-            }
-            path => match std::fs::read_to_string(path) {
-                Ok(text) => Some(text),
-                // mutt's default, ~/.signature, often doesn't exist; a
-                // signature the user set should.
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound && !config.was_set("signature") =>
-                {
-                    None
-                }
-                Err(e) => return Err(format!("signature: cannot read {path}: {e}")),
-            },
+        let signature = match signature {
+            Some(signature) => signature,
+            None => read_signature(config)?,
         };
         Ok(Settings {
             from,
@@ -369,6 +365,28 @@ pub fn has_distinct_reply_to(message: &Message) -> bool {
             .reply_to
             .iter()
             .any(|a| Some(a.email.to_lowercase()) != from)
+}
+
+/// The signature file's text: none if `signature` is empty, or is mutt's
+/// default and missing.
+fn read_signature(config: &Config) -> Result<Option<String>, String> {
+    Ok(match config.string("signature") {
+        "" => None,
+        path if path.ends_with('|') => {
+            return Err(format!(
+                "signature: commands ({path}) are not supported yet; use a file"
+            ));
+        }
+        path => match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            // mutt's default, ~/.signature, often doesn't exist; a
+            // signature the user set should.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !config.was_set("signature") => {
+                None
+            }
+            Err(e) => return Err(format!("signature: cannot read {path}: {e}")),
+        },
+    })
 }
 
 #[cfg(test)]

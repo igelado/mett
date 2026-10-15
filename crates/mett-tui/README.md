@@ -53,9 +53,16 @@ set spoolfile = =@inbox
 set msgraph_client_id = <your app's client ID>
 ```
 
-So far `set`, `unset`, `toggle`, `reset`, `source` and `alternates` (the
-user's other addresses, for replies) are supported, with
-mutt's quoting, `$` expansion, backticks and `my_` variables. Other mutt
+So far `set`, `unset`, `toggle`, `reset`, `source`, `alternates` (the
+user's other addresses, for replies), `bind`, `macro`, `push` and `exec`
+are supported, with mutt's quoting, `$` expansion, backticks and `my_`
+variables. `bind` and `macro` take mutt's menus (`generic`, `index`,
+`pager`, `compose`, `browser`) plus mett's `signin` and `help`, and mutt's
+key notation (`\Cx`, `^x`, `\e`, `<PageDown>`, `<F1>`; `^M`, `^I` and
+`^[` are Enter, Tab and Esc; `^J` and `\n` are Control-J, which does what
+Enter does unless bound); a macro's
+`<function>` runs that function. Binding a sequence of several keys is not
+supported yet. Other mutt
 commands and unknown variables are ignored with a warning, so a mettrc can
 `source` an existing muttrc.
 
@@ -120,6 +127,7 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 |------|------|
 | Index | `j`/`k` or arrows: next or previous message. `z`/`Z`, PageDown/PageUp: next or previous page. `=`/`*`, Home/End: first or last message. `Enter`/`Space`: read the message. `q`: quit. |
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
+| Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size` take effect when mett starts again). |
 | Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `s`/`C`: move or copy to another folder. `c`: open another folder. `y`: the folder browser. |
 | Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
 | Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. |
