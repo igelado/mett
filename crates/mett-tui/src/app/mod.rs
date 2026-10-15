@@ -288,6 +288,11 @@ pub struct App {
     discarding: HashMap<RequestId, mett_core::Draft>,
     /// Whether the mailbox has been asked for the user's own addresses.
     asked_addresses: bool,
+    /// That request, while it is on its way.
+    addresses_request: Option<RequestId>,
+    /// A reply whose message has arrived, waiting for the user's own
+    /// addresses to choose its recipients.
+    awaiting_addresses: Option<(Kind, Message)>,
     /// Drafts of messages the user gave up on that couldn't be deleted,
     /// reported on exit like changes that couldn't be saved; with the
     /// message, if deleting it again after a sign-in may work.
@@ -365,6 +370,8 @@ impl App {
             reselect: None,
             discarding: HashMap::new(),
             asked_addresses: false,
+            addresses_request: None,
+            awaiting_addresses: None,
             left_drafts: Vec::new(),
             path,
             opening: None,
@@ -466,6 +473,7 @@ impl App {
             self.pending = None;
             self.reselect = None;
             self.compose_fetch = None;
+            self.awaiting_addresses = None;
             // What the user does next may need a sign-in that fails; show
             // that.
             self.dismissed = false;
@@ -843,7 +851,9 @@ impl App {
                 // sign-in name may not be one of them).
                 if !self.asked_addresses {
                     self.asked_addresses = true;
-                    effects.push(self.request(Request::OwnAddresses));
+                    let request = self.request(Request::OwnAddresses);
+                    self.addresses_request = Some(effect_id(&request));
+                    effects.push(request);
                 }
                 return effects;
             }
@@ -889,11 +899,18 @@ impl App {
             Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
             // Without them, the configured ones do.
             Event::OwnAddresses(result) => {
+                if self.addresses_request == Some(id) {
+                    self.addresses_request = None;
+                }
                 for address in result.unwrap_or_default() {
                     let address = address.to_lowercase();
                     if !self.settings.me.contains(&address) {
                         self.settings.me.push(address);
                     }
+                }
+                // A reply that waited for them can choose its recipients.
+                if let Some((kind, message)) = self.awaiting_addresses.take() {
+                    return self.begin(kind, Some(message));
                 }
             }
             Event::KeptDiscarded(result) => {
