@@ -163,6 +163,8 @@ pub struct App {
     /// The message that last failed to open, so that opening it can be
     /// retried.
     unfetched: Option<MessageId>,
+    /// The user asked to retry before the failed request reported back.
+    retry_when_reported: bool,
     next_request: u64,
     /// How many messages to request per page.
     page_size: u32,
@@ -200,6 +202,7 @@ impl App {
             pending: None,
             flag_updates: HashMap::new(),
             unfetched: None,
+            retry_when_reported: false,
             next_request: 0,
             page_size,
         };
@@ -267,6 +270,7 @@ impl App {
         match event {
             SignInEvent::Prompt { account, prompt } => {
                 self.sign_in_cancelled = false;
+                self.retry_when_reported = false;
                 let effects = match &prompt {
                     // The browser flow needs the browser: open it straight
                     // away. The device code flow is for when there is none.
@@ -283,9 +287,10 @@ impl App {
             SignInEvent::Finished {
                 outcome: Ok(()), ..
             } => {
-                if self.sign_in.take().is_some() {
-                    self.status = "Signed in.".into();
-                }
+                // Just close the window: the status line may already show
+                // how the request that needed the sign-in went.
+                self.sign_in = None;
+                self.sign_in_cancelled = false;
                 Vec::new()
             }
             SignInEvent::Finished {
@@ -336,11 +341,35 @@ impl App {
             }
             Action::Retry if failed => {
                 self.sign_in = None;
-                return self.retry();
+                let effects = self.retry();
+                // The request that failed may not have reported back yet:
+                // retry once it does.
+                self.retry_when_reported = effects.is_empty() && self.awaiting_responses();
+                return effects;
             }
             _ => {}
         }
         Vec::new()
+    }
+
+    /// Whether requests that [`Self::retry`] can repeat are still waiting
+    /// for their responses.
+    fn awaiting_responses(&self) -> bool {
+        let fetching = matches!(self.screen(), Screen::Pager(Pager { message: None, .. }));
+        self.opening.is_some()
+            || self.listing.is_some()
+            || fetching
+            || !self.flag_updates.is_empty()
+    }
+
+    /// Retries, if the user asked to before the failed request reported
+    /// back.
+    fn retry_if_requested(&mut self) -> Vec<Effect> {
+        if std::mem::take(&mut self.retry_when_reported) {
+            self.retry()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Retries what failed for want of a sign-in: opening the folder,
@@ -525,6 +554,7 @@ impl App {
                     self.listing = None;
                     self.unlisted = self.listing_page.take();
                     self.report(e);
+                    return self.retry_if_requested();
                 }
             },
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
@@ -544,12 +574,14 @@ impl App {
                         }
                         self.save_failures.insert(message, e.to_string());
                         self.report(e);
+                        return self.retry_if_requested();
                     }
                 }
             }
             Event::FolderOpened(Err(e)) => {
                 self.opening = None;
                 self.report(e);
+                return self.retry_if_requested();
             }
             Event::MessagesListed(_) => {}
         }
@@ -576,7 +608,7 @@ impl App {
                 self.screens.pop();
                 self.unfetched = Some(failed);
                 self.report(e);
-                return Vec::new();
+                return self.retry_if_requested();
             }
         };
         pager.lines = text::pager_lines(&message);
@@ -1330,7 +1362,6 @@ mod tests {
         app.update(Msg::SignIn(finished(Ok(()))));
         assert_eq!(app.sign_in, None);
         assert_eq!(app.menu(), Menu::Index);
-        assert_eq!(app.status, "Signed in.");
     }
 
     #[test]
@@ -1448,5 +1479,43 @@ mod tests {
             "{effects:?}"
         );
         assert_eq!(app.menu(), Menu::Pager);
+    }
+
+    #[test]
+    fn retry_waits_for_the_failed_request_to_report_back() {
+        let (mut app, effects) = App::new(80, 23);
+        let [Effect::Request(first, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
+        };
+        // The sign-in failure arrives before the request's own failure, and
+        // the user retries straight away.
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(act(&mut app, Action::Retry).is_empty());
+        let effects = app.update(Msg::Response(Response {
+            id: *first,
+            event: Event::FolderOpened(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::OpenFolder(_))]
+            ),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_successful_sign_in_keeps_an_error_already_reported() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open_inbox, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        app.update(Msg::SignIn(browser_prompt()));
+        app.update(Msg::Response(Response {
+            id: open_inbox,
+            event: Event::FolderOpened(Err(Error::not_found("folder", "x"))),
+        }));
+        app.update(Msg::SignIn(finished(Ok(()))));
+        assert_eq!(app.status, "folder not found: x");
     }
 }

@@ -170,7 +170,20 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
         tokens: Tokens,
         stored: Option<&str>,
     ) -> Result<AccessToken> {
-        match self.check_identity(&tokens).await {
+        let identity = self.check_identity(&tokens).await;
+        self.settle(state, tokens, stored, identity).await
+    }
+
+    /// Acts on the outcome of checking which user `tokens` belong to (see
+    /// [`Self::confirm`]).
+    async fn settle(
+        &self,
+        state: &mut State,
+        tokens: Tokens,
+        stored: Option<&str>,
+        identity: Identity,
+    ) -> Result<AccessToken> {
+        match identity {
             Identity::Confirmed => {
                 let token = self.keep(state, tokens).await?;
                 // The check may have outlasted a short-lived token. The
@@ -221,25 +234,25 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
     /// Signs in interactively, unless the user cancels, and tells the
     /// prompter how it ended.
     ///
-    /// Cancelling also interrupts confirming the user and storing the
-    /// tokens, so the sign-in can't go on to succeed after the user gave
-    /// up on it.
+    /// The user can cancel until the sign-in has been confirmed to be for
+    /// this account, which covers all the waiting. Neither step changes any
+    /// state, so cancelling leaves nothing behind. Keeping the confirmed
+    /// tokens is not interrupted, so that a cancellation can't leave them
+    /// half stored.
     async fn sign_in_and_confirm(&self, state: &mut State) -> Result<AccessToken> {
-        let signed_in = tokio::select! {
-            result = async {
+        let checked = tokio::select! {
+            checked = async {
                 let tokens = self.sign_in().await?;
-                self.confirm(state, tokens, None).await
-            } => Some(result),
+                let identity = self.check_identity(&tokens).await;
+                Ok::<_, mett_core::Error>((tokens, identity))
+            } => Some(checked),
             () = self.prompter.cancelled() => None,
         };
-        let result = signed_in.unwrap_or_else(|| {
-            // Interactive sign-in only starts without a usable token, so
-            // there is nothing to keep but what the interrupted sign-in
-            // may have left half done. Loading from the store again picks
-            // up a refresh token it had already stored.
-            *state = State::default();
-            Err(mett_core::Error::Auth("sign-in cancelled".into()))
-        });
+        let result = match checked {
+            None => Err(mett_core::Error::Auth("sign-in cancelled".into())),
+            Some(Err(e)) => Err(e),
+            Some(Ok((tokens, identity))) => self.settle(state, tokens, None, identity).await,
+        };
         self.prompter.finished(result.as_ref().map(|_| ()));
         result
     }
