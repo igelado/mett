@@ -1008,6 +1008,8 @@ impl<A: Authenticator> GraphMailStore<A> {
                 .put(upload.clone())
                 .timeout(REQUEST_TIMEOUT)
                 .header("Content-Range", format!("bytes {start}-{end}/{total}"))
+                // Graph requires it of every piece.
+                .header("Content-Type", "application/octet-stream")
                 .header("Content-Length", chunk.len())
                 .body(chunk.to_vec())
                 .send()

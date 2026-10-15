@@ -1635,6 +1635,7 @@ async fn uploads_large_attachments_without_the_token() {
     Mock::given(method("PUT"))
         .and(path("/upload/session"))
         .and(header("content-range", "bytes 3276800-3999999/4000000"))
+        .and(header("content-type", "application/octet-stream"))
         .respond_with(ResponseTemplate::new(201).insert_header(
             "Location",
             "https://x/api/v2.0/Users('u')/Messages('d1')/Attachments('att')",

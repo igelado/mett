@@ -801,13 +801,30 @@ fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::F
 /// Writes `data` to a new file at `path`, which is removed again if that
 /// fails partway.
 fn write_new_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    write_new(path, data, None)
+}
+
+/// [`write_new_file`], with `permissions` given to the file before
+/// anything is written to it (it is private until then).
+fn write_new(
+    path: &std::path::Path,
+    data: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(data).inspect_err(|_| {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if permissions.is_some() {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let written = permissions
+        .map_or(Ok(()), |permissions| file.set_permissions(permissions))
+        .and_then(|()| file.write_all(data));
+    written.inspect_err(|_| {
         let _ = std::fs::remove_file(path);
     })
 }
@@ -825,11 +842,10 @@ fn replace_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         name.to_string_lossy(),
         std::process::id()
     ));
-    write_new_file(&temporary, data)?;
-    // The file keeps its permissions.
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&temporary, metadata.permissions());
-    }
+    // The file keeps its permissions, from the start: a private one is
+    // never readable by others meanwhile.
+    let permissions = std::fs::metadata(path)?.permissions();
+    write_new(&temporary, data, Some(permissions))?;
     std::fs::rename(&temporary, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temporary);
     })
@@ -1265,6 +1281,14 @@ mod tests {
             app::FileOutcome::Done(_)
         ));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            save_file(path.clone(), b"newer".to_vec(), true);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         // Nothing left beside it.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
