@@ -161,8 +161,9 @@ pub enum Timer {
     /// List Sent Items again, if it is open: Graph files the copy of a
     /// sent message a moment after accepting it.
     RelistSentItems,
-    /// Check for new mail.
-    Poll,
+    /// Check for new mail, if this is still the timer for it (it counts
+    /// the changes of interval).
+    Poll(u64),
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -526,9 +527,12 @@ pub struct App {
     poll_armed: bool,
     /// Checks for new mail wait for the user to sign in again.
     poll_paused: bool,
-    /// The request listing the start of the open folder again, for new
-    /// mail, and the folder.
-    polling: Option<(RequestId, mett_core::FolderId)>,
+    /// The open folder's check for new mail, on its way.
+    polling: Option<newmail::Polling>,
+    /// Since when the next check asks for changes.
+    poll_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which timer for checks counts.
+    poll_timer: u64,
     /// The request reading the mailboxes' counts.
     checking: Option<RequestId>,
 }
@@ -632,6 +636,8 @@ impl App {
             poll_armed: false,
             poll_paused: false,
             polling: None,
+            poll_since: None,
+            poll_timer: 0,
             checking: None,
         };
         let effects = app.open_folder();
@@ -707,7 +713,7 @@ impl App {
                 }
                 Vec::new()
             }
-            Msg::Timer(Timer::Poll) => self.on_poll_timer(),
+            Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
             Msg::Resize { width, height } => {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);
@@ -1248,7 +1254,7 @@ impl App {
                 }
                 return effects;
             }
-            Event::MessagesListed(result) if self.is_poll(id) => return self.on_polled(result),
+            Event::FolderPolled(result) => return self.on_polled(id, result),
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
                     self.poll_paused = false;
@@ -1819,8 +1825,9 @@ impl App {
             folder: folder.id.clone(),
             page: page.clone(),
         });
-        // The listing shows what new mail a check would find.
-        self.polling = None;
+        if page.cursor().is_none() {
+            self.listing_started();
+        }
         self.listing = Some(effect_id(&list));
         self.listing_page = Some(page);
         vec![list]

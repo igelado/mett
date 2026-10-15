@@ -4,6 +4,7 @@
 //! can be tested against [`MemoryStore`] without a network connection.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -29,6 +30,9 @@ struct State {
     messages: Vec<Message>,
     moves: u64,
     sent: Vec<Draft>,
+    /// When each message last changed, for
+    /// [`MailStore::changed_messages`].
+    modified: HashMap<MessageId, DateTime<Utc>>,
 }
 
 impl MemoryStore {
@@ -43,10 +47,17 @@ impl MemoryStore {
         self
     }
 
-    /// Adds a message.
+    /// Adds a message, last changed when it is dated.
     pub fn with_message(self, message: Message) -> Self {
-        self.state().messages.push(message);
+        self.deliver(message.clone(), message.summary.received);
         self
+    }
+
+    /// Adds a message, as if it arrived (or last changed) at `modified`.
+    pub fn deliver(&self, message: Message, modified: DateTime<Utc>) {
+        let mut state = self.state();
+        state.modified.insert(message.summary.id.clone(), modified);
+        state.messages.push(message);
     }
 
     /// The drafts sent so far, oldest first.
@@ -107,6 +118,7 @@ impl State {
             .id
             .clone();
         let id = self.fresh_id(&MessageId::new(which.as_str()));
+        self.modified.insert(id.clone(), Utc::now());
         // A forward carries the original's attachments along, as Graph's
         // createForward does.
         let has_attachments = match &draft.origin {
@@ -206,12 +218,39 @@ impl MailStore for MemoryStore {
         Ok(MessagePage { messages, next })
     }
 
+    /// Every change matching is on the one page.
+    async fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        _page: Page,
+    ) -> Result<MessagePage> {
+        let state = self.state();
+        state.folder(folder)?;
+        let mut changed: Vec<_> = state
+            .messages
+            .iter()
+            .filter(|m| &m.summary.folder == folder)
+            .filter_map(|m| {
+                let modified = *state.modified.get(&m.summary.id)?;
+                (modified >= since).then(|| (modified, m.summary.clone()))
+            })
+            .collect();
+        changed.sort_by_key(|(modified, _)| Reverse(*modified));
+        Ok(MessagePage {
+            messages: changed.into_iter().map(|(_, m)| m).collect(),
+            next: None,
+        })
+    }
+
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
         self.state().message_mut(id).map(|m| m.clone())
     }
 
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
-        update.apply(&mut self.state().message_mut(id)?.summary.flags);
+        let mut state = self.state();
+        update.apply(&mut state.message_mut(id)?.summary.flags);
+        state.modified.insert(id.clone(), Utc::now());
         Ok(())
     }
 
@@ -223,6 +262,8 @@ impl MailStore for MemoryStore {
         let message = state.message_mut(id)?;
         message.summary.id = new_id.clone();
         message.summary.folder = to.clone();
+        state.modified.remove(id);
+        state.modified.insert(new_id.clone(), Utc::now());
         Ok(new_id)
     }
 
@@ -234,6 +275,7 @@ impl MailStore for MemoryStore {
         copy.summary.folder = to.clone();
         let new_id = copy.summary.id.clone();
         state.messages.push(copy);
+        state.modified.insert(new_id.clone(), Utc::now());
         Ok(new_id)
     }
 
@@ -568,6 +610,38 @@ mod tests {
         assert_ne!(new_id, MessageId::new("m1~1"));
         let decoy = store.fetch_message(&MessageId::new("m1~1")).await.unwrap();
         assert_eq!(decoy.summary.subject, "decoy");
+    }
+
+    #[tokio::test]
+    async fn lists_changes_since_a_time() {
+        let store = store();
+        let inbox = FolderId::new("in");
+        let late = mock_message_at("late", at(-60));
+        store.deliver(late, at(50));
+        let changed = store
+            .changed_messages(&inbox, at(40), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&changed), ["late"]);
+        store
+            .update_flags(
+                &MessageId::new("m1"),
+                FlagsUpdate {
+                    read: Some(true),
+                    flagged: None,
+                },
+            )
+            .await
+            .unwrap();
+        let changed = store
+            .changed_messages(&inbox, at(40), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(changed.messages[0].id, MessageId::new("m1"));
+    }
+
+    fn mock_message_at(subject: &str, received: DateTime<Utc>) -> Message {
+        message(subject, "in", subject, received)
     }
 
     #[tokio::test]

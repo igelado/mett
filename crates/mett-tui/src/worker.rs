@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use mett_core::{
     Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId,
     MessagePage, Page, Result,
@@ -31,6 +32,16 @@ pub enum Request {
         folder: FolderId,
         /// Which page.
         page: Page,
+    },
+    /// Check a folder for new mail: list its newest messages, and those
+    /// that changed or arrived since a time.
+    PollFolder {
+        /// The folder.
+        folder: FolderId,
+        /// How many of each to list.
+        page: Page,
+        /// Changes since when.
+        since: DateTime<Utc>,
     },
     /// Fetch a full message.
     FetchMessage(MessageId),
@@ -80,6 +91,8 @@ pub enum Event {
     FolderOpened(Result<Folder>),
     /// Outcome of [`Request::ListMessages`].
     MessagesListed(Result<MessagePage>),
+    /// Outcome of [`Request::PollFolder`].
+    FolderPolled(Result<Polled>),
     /// Outcome of [`Request::FetchMessage`].
     MessageFetched(Result<Message>),
     /// Outcome of [`Request::UpdateFlags`].
@@ -104,6 +117,15 @@ pub enum Event {
     /// Outcome of [`Request::CheckMailboxes`]: each folder, or why it
     /// couldn't be read.
     MailboxesChecked(Vec<(FolderPath, Result<Folder>)>),
+}
+
+/// What a check of a folder for new mail found.
+#[derive(Debug)]
+pub struct Polled {
+    /// The newest messages.
+    pub newest: MessagePage,
+    /// The messages that changed or arrived, most recently first.
+    pub changed: MessagePage,
 }
 
 /// How each message of a move or copy fared: its new ID (or the copy's),
@@ -142,6 +164,22 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::OpenFolder(path) => Event::FolderOpened(resolve(store, &path).await),
         Request::ListMessages { folder, page } => {
             Event::MessagesListed(store.list_messages(&folder, page).await)
+        }
+        Request::PollFolder {
+            folder,
+            page,
+            since,
+        } => {
+            let (newest, changed) = tokio::join!(
+                store.list_messages(&folder, page.clone()),
+                store.changed_messages(&folder, since, page),
+            );
+            Event::FolderPolled(newest.and_then(|newest| {
+                Ok(Polled {
+                    newest,
+                    changed: changed?,
+                })
+            }))
         }
         Request::FetchMessage(id) => Event::MessageFetched(store.fetch_message(&id).await),
         Request::UpdateFlags(id, update) => {

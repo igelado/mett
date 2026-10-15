@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags,
     FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId, MessagePage,
@@ -450,53 +450,25 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
-        let url = match page.cursor() {
-            // The cursor is Graph's `@odata.nextLink`, which already holds
-            // the query; only the page size may change.
-            Some(cursor) => {
-                let link = cursor
-                    .as_str()
-                    .strip_prefix(folder.as_str())
-                    .and_then(|rest| rest.strip_prefix(' '))
-                    .ok_or_else(|| {
-                        Error::Backend(format!("page cursor is not for folder {folder}"))
-                    })?;
-                // Graph's continuation links must be replayed unchanged, so
-                // the page keeps the size the listing started with.
-                self.next_page_url(link)?
-            }
-            None => {
-                let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
-                url.query_pairs_mut()
-                    .append_pair("$top", &top_for(&page))
-                    .append_pair("$select", SUMMARY_FIELDS)
-                    // Sort by the date the summaries show (see `split`).
-                    // Graph can't sort by "this field, else that one", so
-                    // the date is the sent date, which received and sent
-                    // mail both have; only unsent drafts fall back to
-                    // their creation date.
-                    .append_pair("$orderby", "sentDateTime desc,createdDateTime desc");
-                url
-            }
-        };
-        let page: Collection<GraphMessage> = self
-            .json(
-                self.request(Method::GET, url),
-                About::folder(folder.as_str()),
-            )
-            .await?;
-        Ok(MessagePage {
-            messages: page
-                .value
-                .into_iter()
-                .map(GraphMessage::into_summary)
-                .collect::<Result<_>>()?,
-            // The cursor records its folder, so it can't be used for
-            // another one by mistake.
-            next: page
-                .next_link
-                .map(|link| PageCursor::new(format!("{folder} {link}"))),
-        })
+        // Sort by the date the summaries show (see `split`). Graph can't
+        // sort by "this field, else that one", so the date is the sent
+        // date, which received and sent mail both have; only unsent drafts
+        // fall back to their creation date.
+        self.messages_page(folder, page, None, "sentDateTime desc,createdDateTime desc")
+            .await
+    }
+
+    async fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        page: Page,
+    ) -> Result<MessagePage> {
+        // Graph wants the sorted property filtered too, first.
+        let since = since.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let filter = format!("lastModifiedDateTime ge {since}");
+        self.messages_page(folder, page, Some(&filter), "lastModifiedDateTime desc")
+            .await
     }
 
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
@@ -593,6 +565,67 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             }
             Some(origin) => self.answer(origin, draft).await,
         }
+    }
+}
+
+impl<A: Authenticator> GraphMailStore<A> {
+    /// A page of a folder's message summaries, sorted by `order` and, on
+    /// the first page, filtered by `filter`.
+    async fn messages_page(
+        &self,
+        folder: &FolderId,
+        page: Page,
+        filter: Option<&str>,
+        order: &str,
+    ) -> Result<MessagePage> {
+        let url = match page.cursor() {
+            // The cursor is Graph's `@odata.nextLink`, which already holds
+            // the query; only the page size may change.
+            Some(cursor) => {
+                let link = cursor
+                    .as_str()
+                    .strip_prefix(folder.as_str())
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .ok_or_else(|| {
+                        Error::Backend(format!("page cursor is not for folder {folder}"))
+                    })?;
+                // Graph's continuation links must be replayed unchanged, so
+                // the page keeps the size the listing started with.
+                self.next_page_url(link)?
+            }
+            None => {
+                let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
+                {
+                    let mut query = url.query_pairs_mut();
+                    query
+                        .append_pair("$top", &top_for(&page))
+                        .append_pair("$select", SUMMARY_FIELDS);
+                    if let Some(filter) = filter {
+                        query.append_pair("$filter", filter);
+                    }
+                    query.append_pair("$orderby", order);
+                }
+                url
+            }
+        };
+        let page: Collection<GraphMessage> = self
+            .json(
+                self.request(Method::GET, url),
+                About::folder(folder.as_str()),
+            )
+            .await?;
+        Ok(MessagePage {
+            messages: page
+                .value
+                .into_iter()
+                .map(GraphMessage::into_summary)
+                .collect::<Result<_>>()?,
+            // The cursor records its folder, so it can't be used for
+            // another one by mistake.
+            next: page
+                .next_link
+                .map(|link| PageCursor::new(format!("{folder} {link}"))),
+        })
     }
 }
 

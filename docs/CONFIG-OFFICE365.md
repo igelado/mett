@@ -175,7 +175,7 @@ instructions and troubleshooting.
 | `msgraph_focused_inbox` | boolean | `no` | When set, `=@inbox` opens the Focused view, and a status-line indicator lets the user switch to Other. |
 | `msgraph_query_directory` | boolean | `yes` | When `query_command` is unset, `<query>` searches the people the user works with (People API, `People.Read`) and the whole organisation directory (`User.ReadBasic.All`). |
 | `msgraph_page_size` | number | `50` | Number of messages fetched per Graph request. |
-| `msgraph_sync_interval` | number | `60` | Seconds between checks for new mail; `0` turns them off. This plays the role of `mail_check`, which mett uses only for local mailboxes. *Implemented so far:* each check lists the newest page of the open folder again (adding new mail, and taking in what changed or went among those messages) and reads the counts of the `mailboxes`; a mailbox has new mail when its unread count grew since it was last open (at first, when it has unread mail). |
+| `msgraph_sync_interval` | number | `60` | Seconds between checks for new mail; `0` turns them off. This plays the role of `mail_check`, which mett uses only for local mailboxes. *Implemented so far:* each check lists the newest page of the open folder again (taking in what arrived, changed or went among those messages) and the messages changed since the last check (`lastModifiedDateTime`, which also finds mail delivered late or moved in with an old date), and reads the counts of the `mailboxes`; a mailbox has new mail when its unread count grew since it was last open (at first, when it has unread mail). |
 
 ## 5. Accounts and sending
 

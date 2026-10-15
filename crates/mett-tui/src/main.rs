@@ -278,11 +278,17 @@ fn settings_keeping(
         .map(|mailbox| {
             let path = config::mailbox::folder_path(&mailbox.path, folder, account)
                 .map_err(|e| format!("mailboxes: {e}"))?;
-            // As mutt shows it: relative to `folder`, with `=`.
-            let text = match mailbox.path.strip_prefix(folder) {
-                Some(rest) if !folder.is_empty() && !rest.is_empty() => {
-                    format!("={}", rest.trim_start_matches('/'))
+            // As mutt shows it: relative to `folder`, with `=`, if it is
+            // below it.
+            let below = mailbox.path.strip_prefix(folder).and_then(|rest| {
+                if folder.ends_with('/') {
+                    Some(rest)
+                } else {
+                    rest.strip_prefix('/')
                 }
+            });
+            let text = match below {
+                Some(rest) if !folder.is_empty() && !rest.is_empty() => format!("={rest}"),
                 _ => mailbox.path.clone(),
             };
             Ok(app::MailboxEntry {
@@ -1017,6 +1023,37 @@ mod tests {
         );
         assert!(reset.settings.is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mailboxes_are_shown_relative_to_the_folder() {
+        let mut config = config::Config::new(None);
+        for line in [
+            "set folder=msgraph://a@b.c/Work signature=\"\"",
+            "mailboxes =Old msgraph://a@b.c/Workshops -label Mine msgraph://a@b.c/@inbox",
+            "set msgraph_sync_interval=0",
+        ] {
+            config.run_line(line).unwrap();
+        }
+        let account = mett_core::AccountId::new("a@b.c");
+        let settings = settings_from_config(&config, &account).unwrap();
+        let shown: Vec<_> = settings
+            .mailboxes
+            .iter()
+            .map(|m| (m.name.as_str(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("=Old", "=Old"),
+                // Not below Work.
+                ("msgraph://a@b.c/Workshops", "msgraph://a@b.c/Workshops"),
+                ("Mine", "msgraph://a@b.c/@inbox"),
+            ]
+        );
+        assert_eq!(settings.sync_interval, None);
+        config.run_line("mailboxes msgraph://z@y.x/@inbox").unwrap();
+        assert!(settings_from_config(&config, &account).is_err());
     }
 
     #[test]

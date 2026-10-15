@@ -159,6 +159,32 @@ async fn reads_a_folder_s_counts_by_id() {
 }
 
 #[tokio::test]
+async fn lists_messages_changed_since_a_time() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .and(query_param(
+            "$filter",
+            "lastModifiedDateTime ge 2024-05-01T10:00:00Z",
+        ))
+        .and(query_param("$orderby", "lastModifiedDateTime desc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [message("late", "2024-04-01T08:00:00Z")],
+        })))
+        .mount(&server)
+        .await;
+    let since = DateTime::parse_from_rfc3339("2024-05-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let page = store(&server)
+        .changed_messages(&FolderId::new("inbox-id"), since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(page.messages[0].id, MessageId::new("late"));
+    assert_eq!(page.next, None);
+}
+
+#[tokio::test]
 async fn does_not_cache_roles_after_a_failed_lookup() {
     let server = MockServer::start().await;
     mount_roles_with(&server, 503).await;

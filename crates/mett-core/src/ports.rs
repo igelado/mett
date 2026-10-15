@@ -94,6 +94,18 @@ pub trait MailStore: Send + Sync {
         page: Page,
     ) -> impl Future<Output = Result<MessagePage>> + Send;
 
+    /// Lists the messages in a folder that changed or arrived at or after
+    /// `since` (by the backend's clock), most recently changed first. New
+    /// mail can arrive with an old date (delivered late, or moved in from
+    /// another folder), so checking for it takes this as well as the
+    /// newest messages.
+    fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        page: Page,
+    ) -> impl Future<Output = Result<MessagePage>> + Send;
+
     /// Fetches a full message, including its body.
     fn fetch_message(&self, id: &MessageId) -> impl Future<Output = Result<Message>> + Send;
 

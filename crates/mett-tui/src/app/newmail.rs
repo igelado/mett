@@ -6,11 +6,27 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use mett_core::{Error, Folder, MessageId, MessagePage, MessageSummary, Page};
+use chrono::{DateTime, TimeDelta, Utc};
+use mett_core::{Error, Folder, MessageId, MessageSummary, Page};
 
 use super::{App, Effect, Screen, Timer, effect_id};
 use crate::config::mailbox::FolderPath;
-use crate::worker::{Request, RequestId};
+use crate::worker::{Polled, Request, RequestId};
+
+/// How far back each check asks for changes, before the last one began:
+/// enough for the clocks of mett's computer and the server to differ.
+const OVERLAP: TimeDelta = TimeDelta::minutes(15);
+
+/// The open folder's check for new mail, on its way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Polling {
+    /// The request.
+    pub(super) request: RequestId,
+    /// The folder checked.
+    pub(super) folder: mett_core::FolderId,
+    /// When the check began.
+    pub(super) started: DateTime<Utc>,
+}
 
 /// A folder from the `mailboxes` command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,14 +62,18 @@ impl App {
         match self.sync_interval {
             Some(interval) if !self.poll_armed => {
                 self.poll_armed = true;
-                vec![Effect::Later(interval, Timer::Poll)]
+                vec![Effect::Later(interval, Timer::Poll(self.poll_timer))]
             }
             _ => Vec::new(),
         }
     }
 
-    /// The timer went off: check for new mail, and set it again.
-    pub(super) fn on_poll_timer(&mut self) -> Vec<Effect> {
+    /// The timer went off: check for new mail, and set it again. A timer
+    /// set before the interval changed is ignored: another was set.
+    pub(super) fn on_poll_timer(&mut self, timer: u64) -> Vec<Effect> {
+        if timer != self.poll_timer {
+            return Vec::new();
+        }
         self.poll_armed = false;
         let mut effects = Vec::new();
         // After a failed sign-in, background checks would only ask the
@@ -67,8 +87,8 @@ impl App {
         effects
     }
 
-    /// Lists the start of the open folder again, to add what arrived,
-    /// unless the folder is being listed (which shows that anyway).
+    /// Checks the open folder for new mail, unless it is being listed
+    /// (which shows that anyway).
     fn poll_folder(&mut self) -> Vec<Effect> {
         let Some(folder) = &self.folder else {
             return Vec::new();
@@ -81,12 +101,27 @@ impl App {
             return Vec::new();
         }
         let folder = folder.id.clone();
-        let request = self.request(Request::ListMessages {
+        let started = Utc::now();
+        let since = self.poll_since.unwrap_or(started) - OVERLAP;
+        let request = self.request(Request::PollFolder {
             folder: folder.clone(),
             page: Page::first(self.page_size),
+            since,
         });
-        self.polling = Some((effect_id(&request), folder));
+        self.polling = Some(Polling {
+            request: effect_id(&request),
+            folder,
+            started,
+        });
         vec![request]
+    }
+
+    /// The folder is being listed from the start: later checks look for
+    /// changes from now on.
+    pub(super) fn listing_started(&mut self) {
+        // The listing shows what a check on its way would find.
+        self.polling = None;
+        self.poll_since = Some(Utc::now());
     }
 
     /// Reads the counts of the mailboxes to check, unless that is on its
@@ -123,18 +158,17 @@ impl App {
         self.listing.is_some() || self.polling.is_some()
     }
 
-    /// Whether `id` is the request listing the start of the folder again.
-    pub(super) fn is_poll(&self, id: RequestId) -> bool {
-        self.polling
-            .as_ref()
-            .is_some_and(|(request, _)| *request == id)
-    }
-
-    /// Takes in the start of the open folder, listed again: adds the
-    /// messages that arrived, takes out those that went, and updates the
-    /// rest.
-    pub(super) fn on_polled(&mut self, result: mett_core::Result<MessagePage>) -> Vec<Effect> {
-        let Some((_, folder)) = self.polling.take() else {
+    /// Takes in what a check of the open folder found: adds the messages
+    /// that arrived, takes out those that went, and updates the rest.
+    pub(super) fn on_polled(
+        &mut self,
+        id: RequestId,
+        result: mett_core::Result<Polled>,
+    ) -> Vec<Effect> {
+        let Some(Polling {
+            folder, started, ..
+        }) = self.polling.take_if(|p| p.request == id)
+        else {
             return Vec::new();
         };
         let still_open = self.folder.as_ref().is_some_and(|f| f.id == folder);
@@ -151,6 +185,8 @@ impl App {
                 return Vec::new();
             }
         };
+        // The next check asks for what changed after this one began.
+        self.poll_since = Some(started);
         let effects = self.merge_polled(page);
         self.forget_index_changes();
         effects
@@ -176,26 +212,34 @@ impl App {
         }
     }
 
-    fn merge_polled(&mut self, page: MessagePage) -> Vec<Effect> {
-        let mut fresh = page.messages;
+    fn merge_polled(&mut self, polled: Polled) -> Vec<Effect> {
+        let Polled { newest, changed } = polled;
+        let mut fresh = newest.messages;
+        let mut changes = changed.messages;
         // Moved or purged away since it was asked for.
         fresh.retain(|m| !self.removed_while_listing.contains(&m.id));
+        changes.retain(|m| !self.removed_while_listing.contains(&m.id));
         self.overlay_wanted_flags(&mut fresh);
-        let complete = page.next.is_none();
+        self.overlay_wanted_flags(&mut changes);
+        let complete = newest.next.is_none();
         let known: HashSet<MessageId> = self
             .messages
             .iter()
             .chain(&self.hidden)
             .map(|m| m.id.clone())
             .collect();
+        let mut seen = HashSet::new();
         let arrived: Vec<MessageSummary> = fresh
             .iter()
-            .filter(|m| !known.contains(&m.id))
+            .chain(&changes)
+            .filter(|m| !known.contains(&m.id) && seen.insert(m.id.clone()))
             .cloned()
             .collect();
         let unread = arrived.iter().any(|m| !m.flags.read);
-        // More arrived than a page holds: list the whole folder again.
-        if !complete && !fresh.is_empty() && arrived.len() == fresh.len() {
+        // More arrived than a page holds, or more changed: list the whole
+        // folder again.
+        let all_new = !fresh.is_empty() && fresh.iter().all(|m| !known.contains(&m.id));
+        if (!complete && all_new) || changed.next.is_some() {
             if unread {
                 self.status = NEW_MAIL.into();
             }
@@ -219,8 +263,9 @@ impl App {
         // The selected message, or the one that took its place.
         let selected = self.messages.get(self.selected).map(|m| m.id.clone());
         // The others may have changed elsewhere (read in Outlook, say).
+        // The changes are newer than the newest page when they disagree.
         let updates: HashMap<&MessageId, &MessageSummary> =
-            fresh.iter().map(|m| (&m.id, m)).collect();
+            fresh.iter().chain(&changes).map(|m| (&m.id, m)).collect();
         for summary in self.messages.iter_mut().chain(&mut self.hidden) {
             if let Some(update) = updates.get(&summary.id) {
                 *summary = (*update).clone();
@@ -301,6 +346,11 @@ impl App {
                         failure = Some((path, e.clone()));
                     }
                     state.error = Some(e.to_string());
+                    // Gone: nothing to offer, nor counts to show.
+                    if matches!(e, Error::NotFound { .. }) {
+                        state.folder = None;
+                        state.new = false;
+                    }
                     if matches!(e, Error::Auth(_)) {
                         self.poll_paused = true;
                     }
@@ -422,7 +472,12 @@ impl App {
         self.mailbox_state
             .retain(|path, _| mailboxes.iter().any(|m| m.path == *path));
         self.mailboxes = mailboxes;
-        self.sync_interval = interval;
+        // A timer set for another interval is replaced.
+        if self.sync_interval != interval {
+            self.sync_interval = interval;
+            self.poll_timer += 1;
+            self.poll_armed = false;
+        }
         self.refresh_mailbox_browser();
     }
 }
@@ -440,6 +495,7 @@ mod tests {
     use crate::action::Action;
     use crate::app::{Input, Msg, Settings};
     use crate::worker::{Event, Response};
+    use mett_core::MessagePage;
 
     const MINUTE: Duration = Duration::from_secs(60);
 
@@ -507,7 +563,7 @@ mod tests {
         let sent = requests(&effects);
         assert!(matches!(sent[0].1, Request::ListMessages { .. }));
         assert!(matches!(&sent[1].1, Request::CheckMailboxes(m) if m.len() == 2));
-        assert!(effects.contains(&Effect::Later(MINUTE, Timer::Poll)));
+        assert!(effects.contains(&Effect::Later(MINUTE, Timer::Poll(0))));
         let page = MessagePage {
             messages: vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)],
             next: None,
@@ -522,21 +578,28 @@ mod tests {
 
     /// Fires the poll timer and returns the folder's listing request.
     fn poll(app: &mut App) -> RequestId {
-        let effects = app.update(Msg::Timer(Timer::Poll));
-        assert!(effects.contains(&Effect::Later(MINUTE, Timer::Poll)));
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        assert!(effects.contains(&Effect::Later(MINUTE, Timer::Poll(0))));
         requests(&effects)
             .into_iter()
-            .find(|(_, r)| matches!(r, Request::ListMessages { .. }))
-            .expect("the folder is listed again")
+            .find(|(_, r)| matches!(r, Request::PollFolder { .. }))
+            .expect("the folder is checked")
             .0
     }
 
-    fn polled(app: &mut App, id: RequestId, messages: Vec<MessageSummary>) -> Vec<Effect> {
-        let page = MessagePage {
+    fn page(messages: Vec<MessageSummary>) -> MessagePage {
+        MessagePage {
             messages,
             next: None,
+        }
+    }
+
+    fn polled(app: &mut App, id: RequestId, messages: Vec<MessageSummary>) -> Vec<Effect> {
+        let polled = Polled {
+            newest: page(messages),
+            changed: page(Vec::new()),
         };
-        respond(app, id, Event::MessagesListed(Ok(page)))
+        respond(app, id, Event::FolderPolled(Ok(polled)))
     }
 
     #[test]
@@ -559,15 +622,57 @@ mod tests {
     }
 
     #[test]
+    fn mail_that_arrives_with_an_old_date_joins_the_index() {
+        let (mut app, _) = app();
+        let id = poll(&mut app);
+        let Some(Polling { started, .. }) = app.polling.clone() else {
+            panic!("expected a check");
+        };
+        let polled = Polled {
+            newest: page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
+            changed: page(vec![summary("late", -5)]),
+        };
+        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        assert_eq!(ids(&app), ["m2", "m1", "m0", "late"]);
+        assert_eq!(app.status, NEW_MAIL);
+        // The next check asks for changes since this one began.
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let since = requests(&effects).into_iter().find_map(|(_, r)| match r {
+            Request::PollFolder { since, .. } => Some(since),
+            _ => None,
+        });
+        assert_eq!(since, Some(started - OVERLAP));
+    }
+
+    #[test]
+    fn a_new_interval_replaces_the_timer() {
+        let (mut app, _) = app();
+        let mut settings = settings();
+        settings.sync_interval = Some(Duration::from_secs(10));
+        app.apply_settings(settings);
+        let effects = app.arm_poll();
+        assert_eq!(
+            effects,
+            [Effect::Later(Duration::from_secs(10), Timer::Poll(1))]
+        );
+        // The old timer does nothing.
+        assert_eq!(app.update(Msg::Timer(Timer::Poll(0))), []);
+    }
+
+    #[test]
     fn mail_gone_elsewhere_leaves_the_index() {
         let (mut app, _) = app();
         let id = poll(&mut app);
         // A full page that ends at m1: m0 may be on the next.
-        let page = MessagePage {
+        let newest = MessagePage {
             messages: vec![summary("m1", 1)],
             next: Some(mett_core::PageCursor::new("in next")),
         };
-        respond(&mut app, id, Event::MessagesListed(Ok(page)));
+        let polled = Polled {
+            newest,
+            changed: page(Vec::new()),
+        };
+        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
         assert_eq!(ids(&app), ["m1", "m0"]);
         assert!(app.status.is_empty());
     }
@@ -576,11 +681,15 @@ mod tests {
     fn a_full_page_of_new_mail_lists_the_folder_again() {
         let (mut app, _) = app();
         let id = poll(&mut app);
-        let page = MessagePage {
+        let newest = MessagePage {
             messages: vec![summary("m4", 4), summary("m3", 3)],
             next: Some(mett_core::PageCursor::new("in next")),
         };
-        let effects = respond(&mut app, id, Event::MessagesListed(Ok(page)));
+        let polled = Polled {
+            newest,
+            changed: page(Vec::new()),
+        };
+        let effects = respond(&mut app, id, Event::FolderPolled(Ok(polled)));
         assert!(matches!(
             requests(&effects)[..],
             [(_, Request::ListMessages { .. })]
@@ -639,10 +748,10 @@ mod tests {
         respond(
             &mut app,
             id,
-            Event::MessagesListed(Err(Error::Auth("expired".into()))),
+            Event::FolderPolled(Err(Error::Auth("expired".into()))),
         );
-        let effects = app.update(Msg::Timer(Timer::Poll));
-        assert_eq!(effects, [Effect::Later(MINUTE, Timer::Poll)]);
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        assert_eq!(effects, [Effect::Later(MINUTE, Timer::Poll(0))]);
         app.retry();
         poll(&mut app);
     }
@@ -676,7 +785,7 @@ mod tests {
         );
         // The open folder doesn't count.
         assert_eq!(app.mailboxes_with_new_mail(), 0);
-        let effects = app.update(Msg::Timer(Timer::Poll));
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
         let (check, request) = requests(&effects)
             .into_iter()
             .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
@@ -728,6 +837,7 @@ mod tests {
             ]),
         );
         assert!(app.status.starts_with("Couldn't check =Work"));
+        assert!(!app.has_new_mail(&work()));
         let effects = app.update(Msg::Action(Action::BrowseMailboxes));
         // With fresh counts.
         assert!(matches!(
