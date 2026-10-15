@@ -237,9 +237,9 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   tell which draft it made, and says one may be left in Drafts.)
 
 *Implemented so far:* mail is sent through the account of `spoolfile`, and
-a copy is kept in its Sent Items when `copy` allows. `record` and
-`postponed` are not used yet: postponed messages always go to the
-account's Drafts folder.
+a copy is kept in its Sent Items when `copy` allows. `record` is not used
+yet, and `postponed` only as described above: messages are postponed to,
+and recalled from, the account's Drafts folder.
 
 ## 6. New meanings for existing mutt concepts
 

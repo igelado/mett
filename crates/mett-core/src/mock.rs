@@ -128,12 +128,18 @@ impl State {
     /// Fails if `draft` recalls a draft that is gone (sent or deleted), as
     /// Office365 does.
     fn check_recalled(&self, draft: &Draft) -> Result<()> {
+        // Still in Drafts: one moved elsewhere isn't recalled any more.
+        let drafts = self
+            .folders
+            .iter()
+            .find(|f| f.well_known == Some(WellKnownFolder::Drafts))
+            .map(|f| &f.id);
         match &draft.origin {
             Some(DraftOrigin::Recalled(id))
                 if !self
                     .messages
                     .iter()
-                    .any(|m| &m.summary.id == id && m.summary.draft) =>
+                    .any(|m| &m.summary.id == id && Some(&m.summary.folder) == drafts) =>
             {
                 Err(Error::Backend(
                     "the postponed message is no longer in Drafts".into(),

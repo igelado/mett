@@ -1096,10 +1096,14 @@ impl<A: Authenticator> GraphMailStore<A> {
             if let Err(e) = self.remove_attachment(&id, attachment.id.as_str()).await {
                 return Err(self.give_up(draft, id, Some(base), e).await);
             }
-            // Gone: no more an upload of mett's to take off.
+            // Gone: no more an upload of mett's to take off (one known by
+            // its ID: an upload whose answer was lost is never matched by
+            // name here, so it still stops a send it may be part of).
             if recalled
                 && let Some(uploads) = self.uploads.lock().expect("lock").get_mut(&key)
-                && let Some(at) = uploads.iter().position(|u| u.is(attachment, &base))
+                && let Some(at) = uploads
+                    .iter()
+                    .position(|u| u.id.as_deref() == Some(attachment.id.as_str()))
             {
                 uploads.remove(at);
             }
