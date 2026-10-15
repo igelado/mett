@@ -2436,3 +2436,74 @@ async fn a_refused_upload_leaves_nothing_to_take_off() {
     store.send(&message).await.unwrap();
     assert!(deleted(&server).await.is_empty());
 }
+
+#[tokio::test]
+async fn a_large_upload_is_known_by_its_decoded_id() {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments/createUploadSession"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "uploadUrl": format!("{}/upload/session", server.uri()),
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/upload/session"))
+        .and(header("content-range", "bytes 3276800-3999999/4000000"))
+        .respond_with(ResponseTemplate::new(201).insert_header(
+            "Location",
+            "https://x/api/v2.0/Users('u')/Messages('d1')/Attachments('big%3D1')",
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // The send's answer is lost.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let mut message = recalled();
+    message.attachments.push(attached("big.bin", 4_000_000));
+    assert!(store.send(&message).await.is_err());
+    // The user takes it off: it comes off, by its ID as listed.
+    message.attachments.clear();
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "big=1", "name": "big.bin", "size": 4_000_000 }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/big=1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+}

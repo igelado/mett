@@ -1255,7 +1255,7 @@ impl<A: Authenticator> GraphMailStore<A> {
                 .and_then(|location| location.to_str().ok())
                 .and_then(|location| location.rsplit_once("Attachments('"))
                 .and_then(|(_, rest)| rest.split_once("')"))
-                .map(|(id, _)| id.to_owned());
+                .map(|(id, _)| percent_decoded(id));
         }
         Ok(id)
     }
@@ -1415,6 +1415,32 @@ impl<A: Authenticator> GraphMailStore<A> {
             Err(e) => Err(e),
         }
     }
+}
+
+/// `text` with its `%XX` escapes decoded (as a `Location` header may have
+/// them in an ID).
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(high), Some(low)) => {
+                out.push(u8::try_from(high * 16 + low).expect("two hex digits"));
+                i += 3;
+            }
+            (b, ..) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether `id` is the postponed message `draft` recalls.
