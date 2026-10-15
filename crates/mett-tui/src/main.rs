@@ -564,11 +564,25 @@ impl Input {
             while events.try_recv().is_ok() {}
             ratatui::restore();
             let result = f();
+            // Take the terminal back while still paused, and drop what was
+            // typed as the editor exited: a key read after the compose
+            // menu is up would act on it (a stray `y` could send the
+            // message).
+            *terminal = ratatui::init();
+            discard_pending_input();
             drop(resume);
             result
         });
-        *terminal = ratatui::init();
         terminal.clear()?;
         Ok(result)
+    }
+}
+
+/// Reads and drops the terminal input that is already waiting.
+fn discard_pending_input() {
+    while matches!(event::poll(std::time::Duration::ZERO), Ok(true)) {
+        if event::read().is_err() {
+            break;
+        }
     }
 }

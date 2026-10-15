@@ -59,6 +59,9 @@ pub enum Question {
     /// Whether to give up on a message without a subject
     /// (`abort_nosubject`).
     AbortNoSubject,
+    /// Whether to go back to the compose menu rather than send a message
+    /// without a subject (`abort_nosubject`, asked again when sending).
+    AbortSendNoSubject,
     /// Whether to give up on a message that wasn't edited
     /// (`abort_unmodified`).
     AbortUnmodified,
@@ -401,7 +404,6 @@ impl App {
                 let list = match Address::parse_list(&text) {
                     Ok(list) => list,
                     Err(e) => {
-                        // Ask again, keeping what was typed.
                         // Ask again, keeping what was typed, and say why on
                         // the line itself, where the question hides the
                         // status.
@@ -439,6 +441,11 @@ impl App {
             Question::ReplyTo => self.composing_mut().use_reply_to = answer,
             Question::Include => self.composing_mut().include = answer,
             Question::AbortNoSubject if answer => return self.abort("No subject, aborting."),
+            Question::AbortSendNoSubject if answer => {
+                self.status = "No subject specified.".into();
+                return Vec::new();
+            }
+            Question::AbortSendNoSubject => return self.send_or_ask_copy(),
             Question::AbortUnmodified if answer => {
                 return self.abort("Aborted unmodified message.");
             }
@@ -462,6 +469,23 @@ impl App {
             | Question::Subject => {}
         }
         self.advance()
+    }
+
+    /// Sends the compose menu's message, asking first whether to keep a
+    /// copy (`copy`). Graph always keeps a copy of replies and forwards, so
+    /// `copy` only applies to new mail.
+    fn send_or_ask_copy(&mut self) -> Vec<Effect> {
+        let Some(Screen::Compose(compose)) = self.screens.last() else {
+            return Vec::new();
+        };
+        if compose.draft.origin.is_some() {
+            return self.answer(Question::Copy, true);
+        }
+        let prompt = "Save a copy of this message?".to_owned();
+        match self.decide(self.settings.copy, prompt, Question::Copy) {
+            Some(copy) => self.answer(Question::Copy, copy),
+            None => Vec::new(),
+        }
     }
 
     /// Gives up on the message being set up.
@@ -546,16 +570,17 @@ impl App {
                     self.status = "No recipients are specified!".into();
                     return Vec::new();
                 }
-                // Graph always keeps a copy of replies and forwards, so
-                // `copy` only applies to new mail.
-                if draft.origin.is_some() {
-                    return self.answer(Question::Copy, true);
+                // As in mutt, a subject left out is checked again when
+                // sending (it may have been cleared in the menu).
+                if draft.subject.is_empty() {
+                    let prompt = "No subject, abort sending?".to_owned();
+                    let quad = self.settings.abort_nosubject;
+                    return match self.decide(quad, prompt, Question::AbortSendNoSubject) {
+                        Some(answer) => self.answer(Question::AbortSendNoSubject, answer),
+                        None => Vec::new(),
+                    };
                 }
-                let prompt = "Save a copy of this message?".to_owned();
-                match self.decide(self.settings.copy, prompt, Question::Copy) {
-                    Some(copy) => return self.answer(Question::Copy, copy),
-                    None => return Vec::new(),
-                }
+                return self.send_or_ask_copy();
             }
             Action::Exit => {
                 let prompt = "Postpone this message?".to_owned();
@@ -1030,6 +1055,30 @@ mod tests {
         assert_eq!(prompt(&app), "No subject, abort?");
         key(&mut app, KeyCode::Char('n'));
         assert!(app.input.is_none());
+    }
+
+    #[test]
+    fn sending_without_a_subject_asks_again() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        // Cleared in the compose menu.
+        act(&mut app, Action::EditSubject);
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Backspace);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(compose(&app).draft.subject, "");
+        assert!(act(&mut app, Action::SendMessage).is_empty());
+        assert_eq!(prompt(&app), "No subject, abort sending?");
+        key(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.status, "No subject specified.");
+        assert!(compose(&app).delivery.is_none(), "still in the menu");
+        // Or it is sent anyway.
+        act(&mut app, Action::SendMessage);
+        let effects = key(&mut app, KeyCode::Char('n'));
+        assert!(matches!(request(&effects).1, Request::Send(d) if d.subject.is_empty()));
     }
 
     #[test]

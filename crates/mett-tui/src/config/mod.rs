@@ -143,6 +143,16 @@ impl Config {
         self.values.get(name)
     }
 
+    /// Whether a known variable has its default value.
+    pub fn is_default(&self, name: &str) -> bool {
+        vars::find(name).is_some_and(|var| {
+            vars::parse(var, var.default, self.home.as_deref())
+                .ok()
+                .as_ref()
+                == self.get(name)
+        })
+    }
+
     /// The value of a known string or path variable, or `""`.
     pub fn string(&self, name: &str) -> &str {
         match self.get(name) {

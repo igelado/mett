@@ -110,8 +110,14 @@ impl Settings {
             }
             path => match std::fs::read_to_string(path) {
                 Ok(text) => Some(text),
-                // mutt's default, ~/.signature, often doesn't exist.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                // mutt's default, ~/.signature, often doesn't exist; a
+                // signature the user set should.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && config.is_default("signature") =>
+                {
+                    None
+                }
                 Err(e) => return Err(format!("signature: cannot read {path}: {e}")),
             },
         };
@@ -296,18 +302,21 @@ pub fn reply_recipients(
     let from_me = summary.from.as_ref().is_some_and(|a| settings.is_me(a));
     if from_me && to.iter().all(|a| settings.is_me(a)) {
         // Leave the user out too (unless `metoo`): to the other To:
-        // recipients, else the Cc: ones, else the Bcc: ones (a sent copy
-        // has them), else back to the user.
+        // recipients, else the Cc: ones, else the one Bcc: recipient (a
+        // sent copy has them), else back to the user. Several blind
+        // recipients stay blind: a reply to them all would show each the
+        // others.
         let others = |list: &[Address]| -> Vec<Address> {
             list.iter()
                 .filter(|a| settings.metoo || !settings.is_me(a))
                 .cloned()
                 .collect()
         };
+        let blind = Some(others(&message.bcc)).filter(|bcc| bcc.len() == 1);
         to = [
             others(&summary.to),
             others(&message.cc),
-            others(&message.bcc),
+            blind.unwrap_or_default(),
         ]
         .into_iter()
         .find(|list| !list.is_empty())
@@ -423,6 +432,15 @@ mod tests {
 
         assert!(Settings::from_config(&config("set from=nobody\n"), &account).is_err());
         assert!(Settings::from_config(&config("set signature='sig.sh|'\n"), &account).is_err());
+        // The default signature may be missing; one the user set may not.
+        assert_eq!(
+            Settings::from_config(&config(""), &account)
+                .unwrap()
+                .signature,
+            None
+        );
+        let missing = Settings::from_config(&config("set signature=/nonexistent/sig\n"), &account);
+        assert!(missing.unwrap_err().contains("/nonexistent/sig"));
     }
 
     #[test]
@@ -539,6 +557,11 @@ mod tests {
         message.bcc = vec![Address::new("eve@x.org")];
         let (to, _) = reply_recipients(&message, true, false, &settings());
         assert_eq!(to, [Address::new("eve@x.org")]);
+        // Several Bcc recipients aren't shown to each other.
+        message.bcc = vec![Address::new("eve@x.org"), Address::new("mallory@x.org")];
+        let (to, cc) = reply_recipients(&message, true, true, &settings());
+        assert_eq!(to, [Address::new("me@contoso.com")]);
+        assert!(cc.is_empty());
         // A note to self goes back to self.
         message.bcc.clear();
         let (to, _) = reply_recipients(&message, true, false, &settings());

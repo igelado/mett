@@ -85,7 +85,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `realname` | string | Display name for outgoing mail. |
 | | `use_from` | boolean | Generate the `From:` header. |
 | | `hostname` | string | Fully qualified host name, used for Message-IDs. |
-| | `signature` | path | Signature file. |
+| | `signature` | path | Signature file. Only the default, `~/.signature`, may be missing; a missing file that was set is an error. |
 | Mailboxes | `folder` | path | Base of the mailbox tree, often an `imaps://` URL. Default `~/Mail`. |
 | | `spoolfile` | path | Incoming mailbox, opened at startup. |
 | | `record` | path | Where copies of sent mail are saved. |
@@ -110,9 +110,9 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `forward_format` | string | Subject of forwarded messages (`[%a: %s]`). |
 | | `reply_to` | quadoption | Reply to the `Reply-To:` address rather than the sender. |
 | | `fast_reply`, `askcc`, `askbcc` | boolean | Skip the recipient and subject questions when replying; ask for `Cc:` and `Bcc:`. |
-| | `metoo` | boolean | Keep one's own address in group replies. |
+| | `metoo` | boolean | Keep one's own address in group replies. (A reply to one's own message goes to its other recipients, or to its one `Bcc:` recipient; several `Bcc:` recipients are never shown to each other.) |
 | | `sig_dashes` | boolean | Put `-- ` before the signature. |
-| | `abort_unmodified`, `abort_nosubject`, `postpone` | quadoption | Abort an unedited message or one without subject; postpone when leaving the compose menu. |
+| | `abort_unmodified`, `abort_nosubject`, `postpone` | quadoption | Abort an unedited message or one without subject (asked again when sending without one, as in mutt); postpone when leaving the compose menu. |
 | | `tmpdir` | path | Where the editor's temporary files go. |
 | Behaviour | `mail_check` | number | Seconds between new-mail checks. |
 | | `timeout` | number | Seconds to wait for input before checking mail. |
