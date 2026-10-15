@@ -471,7 +471,20 @@ impl App {
         // move anywhere, so leave them.
         if self.menu() != Menu::SignIn {
             self.pending = None;
-            self.reselect = None;
+            // Moving through the index replaces going back to the message
+            // a background refresh left (other actions leave it be).
+            let moving = matches!(
+                action,
+                Action::NextEntry
+                    | Action::PreviousEntry
+                    | Action::FirstEntry
+                    | Action::LastEntry
+                    | Action::NextPage
+                    | Action::PreviousPage
+            );
+            if moving && matches!(self.menu(), Menu::Index | Menu::Pager) {
+                self.reselect = None;
+            }
             self.compose_fetch = None;
             self.awaiting_addresses = None;
             // What the user does next may need a sign-in that fails; show
@@ -555,6 +568,9 @@ impl App {
             Action::Exit if failed => {
                 self.sign_in = None;
                 self.dismissed = true;
+                // Nor restart, on a later Retry, a reply or forward whose
+                // message couldn't be fetched.
+                self.compose_unfetched = None;
                 // The user gave up: don't let a retry that was waiting
                 // start another sign-in.
                 self.retry_after.clear();

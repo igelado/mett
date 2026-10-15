@@ -1822,4 +1822,61 @@ mod tests {
         };
         assert_eq!(editor.text(), "bob@x.org");
     }
+
+    #[test]
+    fn a_reply_given_up_with_its_sign_in_is_not_restarted_later() {
+        let mut app = app(settings());
+        let (fetch, _) = request(&act(&mut app, Action::Reply));
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Err(Error::Auth("expired".into()))),
+        }));
+        // The user closes the failure window.
+        act(&mut app, Action::Exit);
+        // Another sign-in fails later, and the user retries that one.
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
+            account: mett_core::AccountId::new("me@contoso.com"),
+            outcome: Err("expired".into()),
+        }));
+        let effects = act(&mut app, Action::Retry);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Request(_, Request::FetchMessage(_)))),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn writing_during_a_sent_items_refresh_keeps_the_selection() {
+        let mut app = app(settings());
+        app.folder = Some(mock::folder(
+            "sent",
+            "Sent Items",
+            Some(WellKnownFolder::SentItems),
+        ));
+        let listed = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| mock::message(id, "sent", "s", DateTime::UNIX_EPOCH).summary)
+                .collect::<Vec<_>>()
+        };
+        app.messages = listed(&["a", "b", "c"]);
+        app.selected = 1;
+        let effects = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
+        let (list, _) = request(&effects);
+        // The user starts a new message before the listing is back.
+        act(&mut app, Action::Mail);
+        app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: listed(&["new", "a", "b", "c"]),
+                next: None,
+            })),
+        }));
+        assert_eq!(app.messages[app.selected].id.as_str(), "b");
+    }
 }
