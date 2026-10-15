@@ -505,8 +505,8 @@ impl App {
                     self.folder_ids.insert(path.clone(), folder.id.clone());
                     let first = !state.sampled;
                     state.sampled = true;
-                    let before = state.recent.iter().map(|(_, at)| *at).max();
-                    let newest = recent.iter().map(|(_, at)| *at).max();
+                    let before: HashSet<MessageId> =
+                        state.recent.iter().map(|(id, _)| id.clone()).collect();
                     state.recent = recent;
                     if open {
                         // Not new while open; what was seen is what reaches
@@ -524,12 +524,14 @@ impl App {
                             Some(_) if state.recent.len() >= mett_core::RECENT_UNREAD => true,
                             Some(seen) => state.recent.iter().any(|(id, at)| seen.is_new(id, *at)),
                         };
-                        // Said when newer mail arrives, or mail found
-                        // while the folder was open turns out unseen; not at
+                        // Said when unseen mail arrives (not when mail that
+                        // was there already changes), or mail found while
+                        // the folder was open turns out unseen; not at
                         // first.
-                        let newer = newest
-                            .is_some_and(|newest| before.is_none_or(|before| newest > before));
-                        if state.new && (newer || !was_new) && !first {
+                        let arriving = state.recent.iter().any(|(id, at)| {
+                            !before.contains(id) && seen.as_ref().is_none_or(|s| s.is_new(id, *at))
+                        });
+                        if state.new && (arriving || !was_new) && !first {
                             arrived.push(path);
                         }
                     }
@@ -1747,6 +1749,46 @@ mod tests {
         let recent: Vec<(&str, i64)> = vec![("m2", 30); mett_core::RECENT_UNREAD];
         leave_and_check(&mut app, recent);
         assert_eq!(app.mailboxes_with_new_mail(), 1);
+    }
+
+    #[test]
+    fn a_change_to_unread_mail_already_there_is_not_announced() {
+        let (mut app, check) = app();
+        // Work had unread m5 before the user ever opened it.
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 1, Some(1))),
+                (work(), checked("work", "Work", 1, Some(5))),
+            ]),
+        );
+        assert_eq!(app.mailboxes_with_new_mail(), 1);
+        app.status.clear();
+        // m5 is flagged in Outlook: it changed, but didn't arrive.
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let (check, _) = requests(&effects)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+            .unwrap();
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 1, Some(1))),
+                (
+                    work(),
+                    Ok(Checked {
+                        folder: folder("work", "Work", 1),
+                        recent: vec![(
+                            MessageId::new("work-unread-5"),
+                            DateTime::UNIX_EPOCH + TimeDelta::minutes(30),
+                        )],
+                    }),
+                ),
+            ]),
+        );
+        assert!(app.status.is_empty(), "{}", app.status);
     }
 
     #[test]
