@@ -281,12 +281,13 @@ impl App {
             .unwrap_or(self.selected);
         match action {
             Action::NextThread => {
+                // While pages come, a thread's start (and with it, where
+                // the thread goes) may still be on its way: wait for them.
+                if self.more_to_list() {
+                    return Some(self.wait_for(super::Target::NextThread));
+                }
                 match self.next_thread_root() {
                     Some(next) => self.selected = next,
-                    // The next thread may be on a page still to come.
-                    None if self.more_to_list() => {
-                        return Some(self.wait_for(super::Target::NextThread));
-                    }
                     None => {
                         self.fail("You are on the last thread.");
                         return Some(Vec::new());

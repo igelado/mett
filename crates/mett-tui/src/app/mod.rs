@@ -1958,30 +1958,6 @@ impl App {
         vec![list]
     }
 
-    /// Whether the folder lists drafts: the Drafts folder, or one with a
-    /// draft listed so far.
-    fn drafts_about(&self) -> bool {
-        self.folder
-            .as_ref()
-            .is_some_and(|f| f.well_known == Some(mett_core::WellKnownFolder::Drafts))
-            || self
-                .messages
-                .iter()
-                .chain(&self.hidden)
-                .chain(&self.folded)
-                .any(|m| m.draft)
-    }
-
-    /// The date of the oldest message listed so far.
-    fn oldest_listed(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
-            .map(|m| m.received)
-            .min()
-    }
-
     /// Whether more messages are loading or could be loaded.
     fn more_to_list(&self) -> bool {
         self.listing.is_some() || self.unlisted.is_some()
@@ -2034,28 +2010,15 @@ impl App {
                 let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
                 let from = shown(&message)
                     .or_else(|| self.thread_of(&message).and_then(|t| shown(&t.root)));
-                // What comes after it is settled while the folder loads
-                // only if the index is in the order pages come in (by
-                // date), and none of the way there is as old as the oldest
-                // listed: later pages bring older mail, and mail from the
-                // same time may go anywhere among it (by `sort_aux`).
-                // Drafts come in a group of their own, by another date:
-                // with any about, nothing is.
-                let settled = |from: usize, entry: usize| {
-                    !loading
-                        || self.ordering.sort.method == crate::sort::Method::Date
-                            && !self.drafts_about()
-                            && self.oldest_listed().is_some_and(|oldest| {
-                                self.messages[from..=entry]
-                                    .iter()
-                                    .all(|m| m.received != oldest)
-                            })
-                };
-                match from.map(|from| (from, from + steps)) {
-                    Some((from, entry)) if entry < self.messages.len() && settled(from, entry) => {
-                        entry
-                    }
-                    _ if loading => return Vec::new(),
+                // While the folder loads, a later page may put a message
+                // in between (mail from the same time, a draft by its own
+                // date, a reply's start): wait for all of it, as mutt
+                // reads every message before showing any.
+                if loading {
+                    return Vec::new();
+                }
+                match from.map(|from| from + steps) {
+                    Some(entry) if entry < self.messages.len() => entry,
                     _ => last,
                 }
             }
