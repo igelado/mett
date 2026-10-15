@@ -30,6 +30,8 @@ pub enum Menu {
     Attach,
     /// Addresses to choose from (mutt's query and alias menus).
     Query,
+    /// Postponed messages to choose from.
+    Postpone,
 }
 
 impl Menu {
@@ -45,6 +47,7 @@ impl Menu {
             Menu::Help => "help",
             Menu::Attach => "attach",
             Menu::Query => "query",
+            Menu::Postpone => "postpone",
         }
     }
 
@@ -60,6 +63,7 @@ impl Menu {
             Menu::Help,
             Menu::Attach,
             Menu::Query,
+            Menu::Postpone,
         ]
         .into_iter()
         .find(|m| m.name() == name)
@@ -351,6 +355,7 @@ impl Keymap {
             (Key::char('v'), ViewAttachments),
             (Key::char('Q'), Query),
             (Key::char('a'), CreateAlias),
+            (Key::char('R'), RecallMessage),
             (Key::ctrl('n'), NextThread),
             (Key::ctrl('p'), PreviousThread),
         ];
@@ -535,6 +540,28 @@ impl Keymap {
         ];
         for (key, action) in query {
             keymap.bind_action(Menu::Query, *key, *action);
+        }
+
+        let postpone: &[(Key, Action)] = &[
+            (Key::char('q'), Exit),
+            (Key::new(Esc), Exit),
+            (Key::char('j'), NextEntry),
+            (Key::new(Down), NextEntry),
+            (Key::char('k'), PreviousEntry),
+            (Key::new(Up), PreviousEntry),
+            (Key::char('='), FirstEntry),
+            (Key::new(Home), FirstEntry),
+            (Key::char('*'), LastEntry),
+            (Key::new(End), LastEntry),
+            (Key::char('z'), NextPage),
+            (Key::new(PageDown), NextPage),
+            (Key::char('Z'), PreviousPage),
+            (Key::new(PageUp), PreviousPage),
+            (Key::new(Enter), DisplayMessage),
+            (Key::char(' '), DisplayMessage),
+        ];
+        for (key, action) in postpone {
+            keymap.bind_action(Menu::Postpone, *key, *action);
         }
 
         keymap

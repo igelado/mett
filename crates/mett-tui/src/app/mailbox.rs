@@ -629,6 +629,8 @@ impl App {
     /// The open folder stays until the new one is found, so that a bad
     /// name or a failure leaves the user where they were.
     pub(super) fn change_folder(&mut self, path: FolderPath) -> Vec<Effect> {
+        // A recall on its way gives way to the folder the user wants.
+        self.recall = None;
         if self.folder.is_none() {
             self.reset_folder();
             self.path = path;

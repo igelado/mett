@@ -125,6 +125,24 @@ impl State {
         }
     }
 
+    /// Fails if `draft` recalls a draft that is gone (sent or deleted), as
+    /// Office365 does.
+    fn check_recalled(&self, draft: &Draft) -> Result<()> {
+        match &draft.origin {
+            Some(DraftOrigin::Recalled(id))
+                if !self
+                    .messages
+                    .iter()
+                    .any(|m| &m.summary.id == id && m.summary.draft) =>
+            {
+                Err(Error::Backend(
+                    "the postponed message is no longer in Drafts".into(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Returns an ID derived from `id` that no stored message uses.
     fn fresh_id(&mut self, id: &MessageId) -> MessageId {
         loop {
@@ -148,9 +166,15 @@ impl State {
         let id = self.fresh_id(&MessageId::new(which.as_str()));
         // A forward carries the original's attachments along, as Graph's
         // createForward does.
+        // So does a recalled draft its own.
         let mut attachments: Vec<(Attachment, Vec<u8>)> = match &draft.origin {
             Some(DraftOrigin::Forward(original)) => {
                 self.attachments.get(original).cloned().unwrap_or_default()
+            }
+            Some(DraftOrigin::Recalled(original)) => {
+                let mut kept = self.attachments.get(original).cloned().unwrap_or_default();
+                kept.retain(|(a, _)| !draft.drop_attachments.contains(&a.id));
+                kept
             }
             _ => Vec::new(),
         };
@@ -419,7 +443,27 @@ impl MailStore for MemoryStore {
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
-        self.state().store_draft(draft, WellKnownFolder::Drafts)
+        let mut state = self.state();
+        state.check_recalled(draft)?;
+        let id = state.store_draft(draft, WellKnownFolder::Drafts)?;
+        // A recalled draft is postponed again as itself.
+        match &draft.origin {
+            Some(DraftOrigin::Recalled(old))
+                if state.messages.iter().any(|m| &m.summary.id == old) =>
+            {
+                let old = old.clone();
+                state.messages.retain(|m| m.summary.id != old);
+                state.attachments.remove(&old);
+                for message in state.messages.iter_mut().filter(|m| m.summary.id == id) {
+                    message.summary.id = old.clone();
+                }
+                if let Some(attachments) = state.attachments.remove(&id) {
+                    state.attachments.insert(old.clone(), attachments);
+                }
+                Ok(old)
+            }
+            _ => Ok(id),
+        }
     }
 }
 
@@ -429,8 +473,19 @@ impl MailSender for MemoryStore {
             return Err(Error::Backend("the message has no recipients".into()));
         }
         let mut state = self.state();
-        if draft.save_copy {
+        state.check_recalled(draft)?;
+        // A recalled draft is what is sent: it leaves Drafts, and a copy
+        // is always kept, as Office365 does with drafts it sends.
+        let recalled = match &draft.origin {
+            Some(DraftOrigin::Recalled(id)) => Some(id.clone()),
+            _ => None,
+        };
+        if draft.save_copy || recalled.is_some() {
             state.store_draft(draft, WellKnownFolder::SentItems)?;
+        }
+        if let Some(id) = recalled {
+            state.messages.retain(|m| m.summary.id != id);
+            state.attachments.remove(&id);
         }
         state.sent.push(draft.clone());
         Ok(())
@@ -562,6 +617,67 @@ mod tests {
             FolderId::new("drafts")
         );
         assert!(store.send(&Draft::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_recalled_draft_is_postponed_and_sent_as_itself() {
+        let store = store()
+            .with_folder(folder("drafts", "Drafts", Some(WellKnownFolder::Drafts)))
+            .with_folder(folder("sent", "Sent", Some(WellKnownFolder::SentItems)));
+        let draft = Draft {
+            to: vec![crate::Address::new("bob@x.org")],
+            subject: "hi".into(),
+            attachments: vec![crate::OutgoingAttachment {
+                name: "a.txt".into(),
+                content_type: "text/plain".into(),
+                data: b"a".to_vec(),
+            }],
+            ..Draft::default()
+        };
+        let id = store.save_draft(&draft).await.unwrap();
+        assert!(
+            store
+                .fetch_message(&id)
+                .await
+                .unwrap()
+                .summary
+                .has_attachments
+        );
+        let recalled = Draft {
+            attachments: Vec::new(),
+            subject: "hi again".into(),
+            origin: Some(DraftOrigin::Recalled(id.clone())),
+            ..draft
+        };
+        assert_eq!(store.save_draft(&recalled).await.unwrap(), id);
+        let drafts = FolderId::new("drafts");
+        let listed = store.list_messages(&drafts, Page::first(10)).await.unwrap();
+        assert_eq!(subjects(&listed), ["hi again"]);
+        // Without the attachments it had.
+        let bare = Draft {
+            drop_attachments: vec![crate::AttachmentId::new(format!("{id}-a0"))],
+            ..recalled.clone()
+        };
+        assert_eq!(store.save_draft(&bare).await.unwrap(), id);
+        assert!(
+            !store
+                .fetch_message(&id)
+                .await
+                .unwrap()
+                .summary
+                .has_attachments
+        );
+        store.send(&recalled).await.unwrap();
+        let listed = store.list_messages(&drafts, Page::first(10)).await.unwrap();
+        assert!(listed.messages.is_empty());
+        let sent = store
+            .list_messages(&FolderId::new("sent"), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&sent), ["hi again"]);
+        // Gone: not sent again, nor made again.
+        assert!(store.send(&recalled).await.is_err());
+        assert!(store.save_draft(&recalled).await.is_err());
     }
 
     #[tokio::test]

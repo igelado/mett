@@ -213,7 +213,12 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   (`saveToSentItems=true`) instead of uploading a second one. Any other
   `record` value is honoured with an explicit save.
 - **Postponing:** `postponed` pointing at `@drafts` stores drafts as server
-  drafts, so they are visible in Outlook.
+  drafts, so they are visible in Outlook. Recalling one (`R`) lists the
+  drafts there (drafts only); the one chosen is updated in place when it
+  is postponed again, and sent as itself (its attachments go with it
+  unless taken off with `D`, and Graph keeps a copy in Sent Items). It is
+  never deleted after a failed attempt: it is the user's. One deleted or
+  sent elsewhere meanwhile isn't sent again.
 - **Attachments** go with a new message in the request that sends it when
   that request (attachments in base64, and the text) stays under 3.5 MB,
   as Graph takes requests of up to 4 MB. Larger ones, and those of replies and forwards, go

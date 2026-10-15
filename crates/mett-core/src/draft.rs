@@ -1,7 +1,7 @@
 //! Messages being written: what mett sends or saves as a draft.
 
 use crate::attachment::OutgoingAttachment;
-use crate::ids::MessageId;
+use crate::ids::{AttachmentId, MessageId};
 use crate::message::Address;
 
 /// What a draft answers or passes on, if anything. Backends use it to
@@ -13,6 +13,9 @@ pub enum DraftOrigin {
     Reply(MessageId),
     /// A forward of this message.
     Forward(MessageId),
+    /// This postponed message (a draft), recalled: it is sent, or
+    /// postponed again, as itself, with the attachments it has.
+    Recalled(MessageId),
 }
 
 /// A message to send, or to save as a draft.
@@ -32,6 +35,8 @@ pub struct Draft {
     pub body: String,
     /// Files attached to it.
     pub attachments: Vec<OutgoingAttachment>,
+    /// For a recalled draft, the attachments of its own the user took off.
+    pub drop_attachments: Vec<AttachmentId>,
     /// The message this one replies to or forwards.
     pub origin: Option<DraftOrigin>,
     /// Whether to keep a copy in the sent-items folder (mutt's `copy`).

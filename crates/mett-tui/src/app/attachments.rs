@@ -517,14 +517,21 @@ impl App {
             return;
         };
         let first_file = compose.parts() - compose.draft.attachments.len();
-        if compose.selected < first_file {
+        let first_kept = first_file - compose.kept.len();
+        if compose.selected < first_kept {
             self.fail("Only attached files can be detached.");
             return;
         }
-        compose
-            .draft
-            .attachments
-            .remove(compose.selected - first_file);
+        if compose.selected < first_file {
+            // A recalled message's: it comes off the draft when it goes.
+            let dropped = compose.kept.remove(compose.selected - first_kept);
+            compose.draft.drop_attachments.push(dropped.id);
+        } else {
+            compose
+                .draft
+                .attachments
+                .remove(compose.selected - first_file);
+        }
         compose.selected = compose.selected.min(compose.parts() - 1);
     }
 }

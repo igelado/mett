@@ -54,6 +54,46 @@ pub struct GraphMailStore<A> {
     /// message they hold ([`Draft::attempt`]): sending or postponing that
     /// message again updates the draft rather than making another.
     kept: Mutex<HashMap<(Option<DraftOrigin>, u64), Kept>>,
+    /// The files mett uploaded to recalled drafts, by the same key, until
+    /// they are known to be gone or the message is done with: a retry
+    /// takes them off (to put on again what is still to go), and leaves
+    /// alone what was added elsewhere.
+    uploads: Mutex<HashMap<DraftKey, Vec<Upload>>>,
+}
+
+/// A composed message, as backends tell its attempts apart: what it answers
+/// or recalls, and its [`Draft::attempt`].
+type DraftKey = (Option<DraftOrigin>, u64);
+
+/// A file mett uploaded (or may have: the answer can be lost).
+#[derive(Clone, Debug)]
+struct Upload {
+    /// Its attachment's ID, once Graph said.
+    id: Option<String>,
+    /// Without an ID, it is known by its name and type.
+    name: String,
+    content_type: String,
+}
+
+impl Upload {
+    /// Whether `attachment` is this upload. One whose answer was lost is
+    /// matched by name and type, among attachments not in `base` (what
+    /// the draft had of its own): Graph's `size` counts more than the
+    /// file's bytes, so it can't be compared. (A file of the same name and
+    /// type added in Outlook meanwhile would be taken for it.)
+    fn is(&self, attachment: &Attachment, base: &[String]) -> bool {
+        let id = attachment.id.to_string();
+        match &self.id {
+            Some(uploaded) => *uploaded == id,
+            None => {
+                !base.contains(&id)
+                    && self.name == attachment.name
+                    && self
+                        .content_type
+                        .eq_ignore_ascii_case(&attachment.content_type)
+            }
+        }
+    }
 }
 
 /// A server draft kept after an attempt whose outcome is unknown.
@@ -128,6 +168,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             roles: Mutex::new(None),
             root: Mutex::new(None),
             kept: Mutex::new(HashMap::new()),
+            uploads: Mutex::new(HashMap::new()),
         }
     }
 
@@ -720,7 +761,12 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         if needs_server_draft(draft) || self.has_kept(draft) {
-            return self.server_draft(draft).await;
+            // Postponed: what mett attached is the draft's own now.
+            let saved = self.server_draft(draft).await;
+            if saved.is_ok() {
+                self.forget_uploads(draft);
+            }
+            return saved;
         }
         // A plain draft is created with its content in one request.
         let url = self.url(&["me", "messages"]);
@@ -892,11 +938,11 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
             // Graph refused it: it wasn't sent. A draft that can't be
             // deleted either is kept, for the next attempt.
             Err(_) => {
-                if !self.discard(&id).await {
+                if !self.discard(draft, &id).await {
                     self.keep(draft, id, base);
                 }
             }
-            Ok(_) => {}
+            Ok(_) => self.forget_uploads(draft),
         }
         sent.map(drop)
     }
@@ -919,6 +965,17 @@ impl<A: Authenticator> GraphMailStore<A> {
         let kept = self.kept.lock().expect("lock").remove(&key);
         if let Some(Kept { id, base }) = kept {
             match self.update_draft(&id, draft).await {
+                // A recalled draft's own attachments the user took off since
+                // come off too; any added elsewhere stay.
+                Ok(()) if is_recalled(draft, &id) => {
+                    return match self.recalled_base(draft, &id, base.clone()).await {
+                        Ok(base) => self.attach_all(draft, id, base, false).await,
+                        Err(e) => {
+                            self.keep(draft, id, base);
+                            Err(e)
+                        }
+                    };
+                }
                 Ok(()) => return self.attach_all(draft, id, base, false).await,
                 Err(Error::NotFound { .. }) => {}
                 Err(e) => {
@@ -926,6 +983,25 @@ impl<A: Authenticator> GraphMailStore<A> {
                     return Err(e);
                 }
             }
+        }
+        // A recalled postponed message is the draft: it gets the new
+        // content, and keeps its attachments (they are the base). One
+        // gone from Drafts was sent or deleted elsewhere; sending it again
+        // from a new draft could send it twice.
+        if let Some(DraftOrigin::Recalled(id)) = &draft.origin {
+            return match self.update_draft(id, draft).await {
+                // Those the user took off come off.
+                Ok(()) => {
+                    let base = self.recalled_base(draft, id, None).await?;
+                    self.attach_all(draft, id.clone(), base, false).await
+                }
+                Err(Error::NotFound { .. }) => Err(Error::Backend(
+                    "the postponed message is no longer in Drafts (it was sent or deleted \
+                     elsewhere)"
+                        .into(),
+                )),
+                Err(e) => Err(e),
+            };
         }
         // A lost response may still have made a draft, which mett can't
         // tell apart from others: say so. Failing before the request is
@@ -935,6 +1011,7 @@ impl<A: Authenticator> GraphMailStore<A> {
                 let (original, action) = match origin {
                     DraftOrigin::Reply(id) => (id, "createReply"),
                     DraftOrigin::Forward(id) => (id, "createForward"),
+                    DraftOrigin::Recalled(_) => unreachable!("updated above"),
                 };
                 let url = self.url(&["me", "messages", original.as_str(), action]);
                 (
@@ -998,14 +1075,48 @@ impl<A: Authenticator> GraphMailStore<A> {
             },
         };
         let base = base.unwrap_or_else(|| present.iter().map(|a| a.id.to_string()).collect());
+        let recalled = is_recalled(draft, &id);
+        let key = (draft.origin.clone(), draft.attempt);
         for attachment in present.iter().filter(|a| !base.contains(&a.id.to_string())) {
             if let Err(e) = self.remove_attachment(&id, attachment.id.as_str()).await {
                 return Err(self.give_up(draft, id, Some(base), e).await);
             }
+            // Gone: no more an upload of mett's to take off.
+            if recalled
+                && let Some(uploads) = self.uploads.lock().expect("lock").get_mut(&key)
+                && let Some(at) = uploads.iter().position(|u| u.is(attachment, &base))
+            {
+                uploads.remove(at);
+            }
         }
         for file in &draft.attachments {
-            if let Err(e) = self.attach(&id, file).await {
-                return Err(self.give_up(draft, id, Some(base), e).await);
+            // Remembered before it is sent: the answer may be lost.
+            if recalled {
+                self.uploads
+                    .lock()
+                    .expect("lock")
+                    .entry(key.clone())
+                    .or_default()
+                    .push(Upload {
+                        id: None,
+                        name: file.name.clone(),
+                        content_type: file.content_type.clone(),
+                    });
+            }
+            match self.attach(&id, file).await {
+                Ok(uploaded) => {
+                    if recalled
+                        && let Some(upload) = self
+                            .uploads
+                            .lock()
+                            .expect("lock")
+                            .get_mut(&key)
+                            .and_then(|uploads| uploads.last_mut())
+                    {
+                        upload.id = uploaded;
+                    }
+                }
+                Err(e) => return Err(self.give_up(draft, id, Some(base), e).await),
             }
         }
         Ok((id, Some(base)))
@@ -1028,7 +1139,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             // One that can't be deleted (access was denied, say) is kept
             // for the next attempt, rather than left behind.
             _ => {
-                if !self.discard(&id).await {
+                if !self.discard(draft, &id).await {
                     self.keep(draft, id, base);
                 }
             }
@@ -1037,7 +1148,12 @@ impl<A: Authenticator> GraphMailStore<A> {
     }
 
     /// Attaches `file` to the server draft `message`.
-    async fn attach(&self, message: &MessageId, file: &OutgoingAttachment) -> Result<()> {
+    /// Returns the attachment's ID, if Graph said.
+    async fn attach(
+        &self,
+        message: &MessageId,
+        file: &OutgoingAttachment,
+    ) -> Result<Option<String>> {
         use base64::Engine;
 
         if file.data.len() < SMALL_ATTACHMENT {
@@ -1048,13 +1164,17 @@ impl<A: Authenticator> GraphMailStore<A> {
                 "contentType": file.content_type,
                 "contentBytes": base64::engine::general_purpose::STANDARD.encode(&file.data),
             });
-            return self
+            let response = self
                 .send(
                     self.request(Method::POST, url).json(&body),
                     About::message(message.as_str()),
                 )
+                .await?;
+            return Ok(response
+                .json::<IdOnly>()
                 .await
-                .map(drop);
+                .ok()
+                .map(|created| created.id));
         }
         let url = self.url(&[
             "me",
@@ -1093,6 +1213,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             ));
         }
         let total = file.data.len();
+        let mut id = None;
         for (i, chunk) in file.data.chunks(UPLOAD_CHUNK).enumerate() {
             let start = i * UPLOAD_CHUNK;
             let end = start + chunk.len() - 1;
@@ -1108,9 +1229,18 @@ impl<A: Authenticator> GraphMailStore<A> {
                 .send()
                 .await
                 .map_err(|e| Error::Network(e.to_string()))?;
-            Self::checked(response, About::message(message.as_str())).await?;
+            let response = Self::checked(response, About::message(message.as_str())).await?;
+            // The last answer says where the attachment is:
+            // `.../Attachments('ID')`.
+            id = response
+                .headers()
+                .get("Location")
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| location.rsplit_once("Attachments('"))
+                .and_then(|(_, rest)| rest.split_once("')"))
+                .map(|(id, _)| id.to_owned());
         }
-        Ok(())
+        Ok(id)
     }
 
     /// Takes an attachment off a server draft. One already gone is as good
@@ -1135,6 +1265,51 @@ impl<A: Authenticator> GraphMailStore<A> {
         }
     }
 
+    /// The base for [`Self::attach_all`] of the recalled `draft`, `id`
+    /// (whose base was `base`, before an earlier attempt): what it has now,
+    /// but the attachments of its own the user took off and mett's uploads
+    /// of earlier attempts, which come off. Others, even ones added
+    /// elsewhere since, stay.
+    async fn recalled_base(
+        &self,
+        draft: &Draft,
+        id: &MessageId,
+        base: Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>> {
+        let key = (draft.origin.clone(), draft.attempt);
+        let uploads = self
+            .uploads
+            .lock()
+            .expect("lock")
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        // Nothing to take off: all it has is the base.
+        if uploads.is_empty() && draft.drop_attachments.is_empty() {
+            return Ok(None);
+        }
+        let before = base.unwrap_or_default();
+        let base = self
+            .list_attachments(id)
+            .await?
+            .into_iter()
+            .filter(|a| {
+                !draft.drop_attachments.contains(&a.id) && !uploads.iter().any(|u| u.is(a, &before))
+            })
+            .map(|a| a.id.to_string())
+            .collect();
+        Ok(Some(base))
+    }
+
+    /// Forgets the uploads of `draft`, which is done with: sent, postponed,
+    /// or given up.
+    fn forget_uploads(&self, draft: &Draft) {
+        self.uploads
+            .lock()
+            .expect("lock")
+            .remove(&(draft.origin.clone(), draft.attempt));
+    }
+
     /// Gives a server draft `draft`'s content.
     async fn update_draft(&self, id: &MessageId, draft: &Draft) -> Result<()> {
         let url = self.url(&["me", "messages", id.as_str()]);
@@ -1154,6 +1329,12 @@ impl<A: Authenticator> GraphMailStore<A> {
         let Some(Kept { id, base }) = self.kept.lock().expect("lock").remove(&key) else {
             return Ok(());
         };
+        // A recalled postponed message stays in Drafts (with what the
+        // attempts put on it).
+        if is_recalled(draft, &id) {
+            self.forget_uploads(draft);
+            return Ok(());
+        }
         let deleted = self.delete_draft(&id).await;
         if deleted.is_err() {
             self.keep(draft, id, base);
@@ -1178,11 +1359,12 @@ impl<A: Authenticator> GraphMailStore<A> {
             .insert((draft.origin.clone(), draft.attempt), Kept { id, base });
     }
 
-    /// Deletes a server draft that could not be completed, so it doesn't
-    /// linger in Drafts, and returns whether it is gone. Failing to is not
-    /// worth reporting over the error that caused it.
-    async fn discard(&self, id: &MessageId) -> bool {
-        self.delete_draft(id).await.is_ok()
+    /// Deletes a server draft of `draft` that could not be completed, so
+    /// it doesn't linger in Drafts, and returns whether it is gone. Failing
+    /// to is not worth reporting over the error that caused it. A recalled
+    /// postponed message is never deleted: it is the user's.
+    async fn discard(&self, draft: &Draft, id: &MessageId) -> bool {
+        !is_recalled(draft, id) && self.delete_draft(id).await.is_ok()
     }
 
     /// Deletes a server draft for good where Graph can (DELETE would only
@@ -1200,6 +1382,11 @@ impl<A: Authenticator> GraphMailStore<A> {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Whether `id` is the postponed message `draft` recalls.
+fn is_recalled(draft: &Draft, id: &MessageId) -> bool {
+    matches!(&draft.origin, Some(DraftOrigin::Recalled(recalled)) if recalled == id)
 }
 
 /// A network failure before a message was handed over: it wasn't sent.

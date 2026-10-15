@@ -1998,3 +1998,367 @@ async fn searches_people_and_the_directory() {
         .await;
     assert!(store(&server).search_people("car").await.is_err());
 }
+
+/// A recalled postponed message, `d1`.
+fn recalled() -> Draft {
+    draft(Some(DraftOrigin::Recalled(MessageId::new("d1"))))
+}
+
+/// Mocks that fail the test if a draft is made or deleted.
+async fn no_new_or_deleted_drafts(server: &MockServer) {
+    for (verb, at) in [
+        ("POST", "/v1.0/me/messages"),
+        ("POST", "/v1.0/me/messages/d1/permanentDelete"),
+        ("DELETE", "/v1.0/me/messages/d1"),
+    ] {
+        Mock::given(method(verb))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn sends_a_recalled_draft_as_itself() {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .and(body_json(draft_json()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server).send(&recalled()).await.unwrap();
+}
+
+#[tokio::test]
+async fn postpones_a_recalled_draft_in_place() {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let id = store(&server).save_draft(&recalled()).await.unwrap();
+    assert_eq!(id, MessageId::new("d1"));
+}
+
+#[tokio::test]
+async fn a_recalled_draft_is_never_deleted() {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    // Graph refuses to send it: it stays, for the next attempt.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": { "code": "ErrorInvalidRecipients", "message": "bad recipient" },
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let message = recalled();
+    assert!(store.send(&message).await.is_err());
+    assert!(store.send(&message).await.is_err());
+    // Nor when the user gives up on it.
+    store.discard_kept(&message).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_recalled_draft_gone_from_drafts_is_not_sent_anew() {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "ErrorItemNotFound", "message": "not found" },
+        })))
+        .mount(&server)
+        .await;
+    let e = store(&server).send(&recalled()).await.unwrap_err();
+    assert!(e.to_string().contains("no longer in Drafts"), "{e}");
+}
+
+#[tokio::test]
+async fn takes_attachments_off_a_recalled_draft() {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "a2", "name": "b.pdf", "size": 3 },
+                // Added in Outlook since it was recalled.
+                { "id": "a3", "name": "c.pdf", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/a1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for id in ["a2", "a3"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1.0/me/messages/d1/attachments/{id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
+    let mut message = recalled();
+    message.drop_attachments = vec![mett_core::AttachmentId::new("a1")];
+    store(&server).save_draft(&message).await.unwrap();
+}
+
+#[tokio::test]
+async fn every_attachment_can_come_off_a_recalled_draft_even_on_retry() {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "a2", "name": "b.pdf", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    for id in ["a1", "a2"] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/v1.0/me/messages/d1/attachments/{id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+    }
+    // The first attempt keeps a2, and its send's answer is lost.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let mut message = recalled();
+    message.drop_attachments = vec![mett_core::AttachmentId::new("a1")];
+    assert!(store.send(&message).await.is_err());
+    // Then a2 comes off too.
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    message
+        .drop_attachments
+        .push(mett_core::AttachmentId::new("a2"));
+    store.send(&message).await.unwrap();
+    let deleted: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "DELETE")
+        .map(|r| r.url.path().to_owned())
+        .collect();
+    assert!(
+        deleted.contains(&"/v1.0/me/messages/d1/attachments/a2".to_owned()),
+        "{deleted:?}"
+    );
+}
+
+/// d1, a recalled draft with a1, to which mett attaches new.bin: the
+/// upload's answer is `upload` (Graph's status and body), and the send's
+/// answer is lost. Returns the store, the message, and the server.
+async fn recalled_upload_lost_send(
+    upload: ResponseTemplate,
+) -> (MockServer, GraphMailStore<StaticAuth>, Draft) {
+    let server = MockServer::start().await;
+    no_new_or_deleted_drafts(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "a1", "name": "a.pdf", "size": 3 }],
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(upload)
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let mut message = recalled();
+    message.attachments.push(attached("new.bin", 3));
+    assert!(store.send(&message).await.is_err());
+    (server, store, message)
+}
+
+/// What d1 has on a retry: a1, mett's upload n1, and o1, a file of the
+/// same name and type added in Outlook meanwhile.
+async fn listed_on_retry(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+                { "id": "o1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+            ],
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The paths of the DELETE requests `server` received.
+async fn deleted(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "DELETE")
+        .map(|r| r.url.path().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_retry_takes_off_only_mett_s_upload_of_a_recalled_draft() {
+    let upload = ResponseTemplate::new(201).set_body_json(json!({ "id": "n1" }));
+    let (server, store, message) = recalled_upload_lost_send(upload).await;
+    listed_on_retry(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/n1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+    // By its ID: o1, with the same name, stays.
+    assert_eq!(
+        deleted(&server).await,
+        ["/v1.0/me/messages/d1/attachments/n1"]
+    );
+}
+
+#[tokio::test]
+async fn a_file_taken_off_stays_known_until_it_is_gone() {
+    let upload = ResponseTemplate::new(201).set_body_json(json!({ "id": "n1" }));
+    let (server, store, mut message) = recalled_upload_lost_send(upload).await;
+    listed_on_retry(&server).await;
+    // The user takes the file off; taking it off the draft fails once.
+    message.attachments.clear();
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/n1"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    assert!(store.send(&message).await.is_err());
+    // The next attempt takes it off still.
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/n1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+    assert_eq!(
+        deleted(&server).await,
+        ["/v1.0/me/messages/d1/attachments/n1"; 2]
+    );
+}
+
+#[tokio::test]
+async fn an_upload_whose_answer_was_lost_is_known_by_name_and_type() {
+    // The upload's answer is lost: the attempt fails there.
+    let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+                { "id": "x1", "name": "other.pdf", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1/attachments/n1"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+    assert_eq!(
+        deleted(&server).await,
+        ["/v1.0/me/messages/d1/attachments/n1"]
+    );
+}
