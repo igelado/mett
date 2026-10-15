@@ -408,6 +408,9 @@ impl App {
                     scroll: 0,
                 });
                 window.failure = Some(e);
+                // The failure replaces the prompt, which may have been
+                // scrolled further than the window is long now.
+                self.clamp_sign_in_scroll();
                 Vec::new()
             }
         }
@@ -1921,5 +1924,25 @@ mod tests {
             height: 60,
         });
         assert_eq!(app.sign_in.as_ref().unwrap().scroll, 0, "it all fits now");
+    }
+
+    #[test]
+    fn a_failure_shows_in_a_scrolled_sign_in_window() {
+        let (mut app, _) = App::new(40, 6);
+        let url = format!("https://login.example/authorize?{}", "x".repeat(400));
+        app.update(Msg::SignIn(SignInEvent::Prompt {
+            account: AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::OpenBrowser {
+                url: url.parse().unwrap(),
+            },
+        }));
+        for _ in 0..30 {
+            act(&mut app, Action::NextLine);
+        }
+        assert!(app.sign_in.as_ref().unwrap().scroll > 0);
+        app.update(Msg::SignIn(finished(Err("expired".into()))));
+        let window = app.sign_in.as_ref().unwrap();
+        let room = (app.body_height + CHROME_ROWS).saturating_sub(3);
+        assert!(window.scroll <= window.rows(app.width).len().saturating_sub(room));
     }
 }
