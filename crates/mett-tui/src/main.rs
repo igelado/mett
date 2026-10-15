@@ -132,27 +132,21 @@ fn main() -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
-        let spoolfile = match config.spoolfile() {
-            Ok(url) => url,
-            Err(e) => {
-                eprintln!("mett: {e}");
-                return ExitCode::FAILURE;
-            }
+        fn report(e: &impl std::fmt::Display) {
+            eprintln!("mett: {e}");
+        }
+        let Ok(spoolfile) = config.spoolfile().inspect_err(report) else {
+            return ExitCode::FAILURE;
         };
-        let settings = match settings_from_config(&config, &spoolfile.account) {
-            Ok(settings) => settings,
-            Err(e) => {
-                eprintln!("mett: {e}");
-                return ExitCode::FAILURE;
-            }
+        let Ok(settings) = settings_from_config(&config, &spoolfile.account).inspect_err(report)
+        else {
+            return ExitCode::FAILURE;
         };
         let (keymap, problems) = keymap_from_config(&mut config);
         for problem in problems {
             eprintln!("mett: warning: {problem}; ignored");
         }
-        let editor = Editor::new(config.string("editor"), config.string("tmpdir"), &|name| {
-            std::env::var(name).ok()
-        });
+        let editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
         let Some(runtime) = runtime() else {
             return ExitCode::FAILURE;
         };
@@ -160,12 +154,9 @@ fn main() -> ExitCode {
         // folder is first opened.
         let (events, sign_in) = mpsc::unbounded_channel();
         let (prompter, cancel) = TuiPrompter::new(spoolfile.account.clone(), events);
-        let mailbox = match account::mailbox(&config, &spoolfile, prompter) {
-            Ok(mailbox) => mailbox,
-            Err(e) => {
-                eprintln!("mett: {e}");
-                return ExitCode::FAILURE;
-            }
+        let Ok(mailbox) = account::mailbox(&config, &spoolfile, prompter).inspect_err(report)
+        else {
+            return ExitCode::FAILURE;
         };
         let mut pushed = Vec::new();
         for keys in config.take_pushed() {
@@ -202,7 +193,7 @@ fn main() -> ExitCode {
         keymap: Keymap::mutt_defaults(),
         pushed: Vec::new(),
         config,
-        editor: Editor::new("", "", &|name| std::env::var(name).ok()),
+        editor: Editor::from_env("", ""),
         sign_in,
         cancel: None,
     };
@@ -386,13 +377,9 @@ fn keymap_from_config(config: &mut config::Config) -> (Keymap, Vec<String>) {
 }
 
 fn runtime() -> Option<tokio::runtime::Runtime> {
-    match tokio::runtime::Runtime::new() {
-        Ok(runtime) => Some(runtime),
-        Err(e) => {
-            eprintln!("mett: cannot start: {e}");
-            None
-        }
-    }
+    tokio::runtime::Runtime::new()
+        .inspect_err(|e| eprintln!("mett: cannot start: {e}"))
+        .ok()
 }
 
 /// Runs the TUI on `store`.
@@ -451,34 +438,30 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         config,
     });
     let mut running: Option<oneshot::Receiver<(Configuration, app::Reconfigured)>> = None;
+    let carry_out = |app: &mut App, effects| {
+        dispatch(
+            app,
+            &request_tx,
+            &timer_tx,
+            &file_tx,
+            cancel.as_ref(),
+            effects,
+        )
+    };
     let size = terminal.size()?;
     let (mut app, effects) = App::open(size.width, size.height, folder, settings);
     app.keymap = keymap;
     // Played once the folder is listed, so that `push <last-entry>` has
     // somewhere to go.
     app.push_after_load(pushed);
-    let mut deferred = dispatch(
-        &mut app,
-        &request_tx,
-        &timer_tx,
-        &file_tx,
-        cancel.as_ref(),
-        effects,
-    );
+    let mut deferred = carry_out(&mut app, effects);
 
     while !app.quit {
         // What effects done at once answered goes to the app first.
         while !deferred.msgs.is_empty() {
             for msg in std::mem::take(&mut deferred.msgs) {
                 let effects = app.update(msg);
-                deferred.absorb(dispatch(
-                    &mut app,
-                    &request_tx,
-                    &timer_tx,
-                    &file_tx,
-                    cancel.as_ref(),
-                    effects,
-                ));
+                deferred.absorb(carry_out(&mut app, effects));
             }
         }
         // The editor runs between messages, with the terminal handed over.
@@ -492,14 +475,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 height: size.height,
             });
             let effects = app.update(Msg::Edited(result));
-            deferred.absorb(dispatch(
-                &mut app,
-                &request_tx,
-                &timer_tx,
-                &file_tx,
-                cancel.as_ref(),
-                effects,
-            ));
+            deferred.absorb(carry_out(&mut app, effects));
             commands.queue.extend(deferred.commands.drain(..));
         }
         if running.is_none()
@@ -553,11 +529,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     let (configuration, reconfigured) =
                         done.map_err(|_| std::io::Error::other("a : command stopped"))?;
                     // `editor` and `tmpdir` may have changed.
-                    editor = Editor::new(
-                        configuration.config.string("editor"),
-                        configuration.config.string("tmpdir"),
-                        &|name| std::env::var(name).ok(),
-                    );
+                    let config = &configuration.config;
+                    editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
                     commands.finish(configuration);
                     Msg::Configured(reconfigured)
                 }
@@ -565,14 +538,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             },
         };
         let effects = app.update(msg);
-        deferred.absorb(dispatch(
-            &mut app,
-            &request_tx,
-            &timer_tx,
-            &file_tx,
-            cancel.as_ref(),
-            effects,
-        ));
+        deferred.absorb(carry_out(&mut app, effects));
     }
 
     // Give pending changes (such as marking a message read) a moment to
@@ -591,14 +557,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             continue;
         }
         let effects = app.update(Msg::SignIn(event));
-        dispatch(
-            &mut app,
-            &request_tx,
-            &timer_tx,
-            &file_tx,
-            cancel.as_ref(),
-            effects,
-        );
+        carry_out(&mut app, effects);
     }
     let unsaved = !app.save_failures().is_empty();
     if app.saving() || (unsaved && app.sign_in.is_some()) {
@@ -610,26 +569,12 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             // save can be retried even after nothing is left pending.
             while let Ok(event) = sign_in_rx.try_recv() {
                 let effects = app.update(Msg::SignIn(event));
-                dispatch(
-                    &mut app,
-                    &request_tx,
-                    &timer_tx,
-                    &file_tx,
-                    cancel.as_ref(),
-                    effects,
-                );
+                carry_out(&mut app, effects);
             }
             // A macro run in the sign-in window plays there.
             while let Some(msg) = app.next_sign_in_stroke() {
                 let effects = app.update(msg);
-                dispatch(
-                    &mut app,
-                    &request_tx,
-                    &timer_tx,
-                    &file_tx,
-                    cancel.as_ref(),
-                    effects,
-                );
+                carry_out(&mut app, effects);
             }
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
@@ -681,14 +626,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
             // Nothing is edited, nor configured, any more.
-            let _ = dispatch(
-                &mut app,
-                &request_tx,
-                &timer_tx,
-                &file_tx,
-                cancel.as_ref(),
-                effects,
-            );
+            let _ = carry_out(&mut app, effects);
             // The wait starts again once the user is done signing in.
             if window_was_open || app.sign_in.is_some() {
                 deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
@@ -846,7 +784,7 @@ fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::F
     let written = if overwrite {
         replace_file(&path, &data)
     } else {
-        write_new_file(&path, &data)
+        write_new(&path, &data, None)
     };
     match written {
         Ok(()) => app::FileOutcome::Done(path),
@@ -861,12 +799,7 @@ fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::F
 }
 
 /// Writes `data` to a new file at `path`, which is removed again if that
-/// fails partway.
-fn write_new_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    write_new(path, data, None)
-}
-
-/// [`write_new_file`], with `permissions` given to the file before
+/// fails partway; with `permissions`, if given, given to the file before
 /// anything is written to it (it is private until then).
 fn write_new(
     path: &std::path::Path,
@@ -928,10 +861,7 @@ fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
     }
     // A name no earlier run left behind: the process, the time, and a
     // count, tried again if taken all the same.
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let started = now_nanos();
     let dir = loop {
         let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("mett-{}-{started}-{n}", std::process::id()));
@@ -950,6 +880,14 @@ fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_dir_all(&dir);
     }
     opened
+}
+
+/// The time, in nanoseconds since the epoch.
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 /// How old a copy of an attachment given to a viewer has to be to be
@@ -978,10 +916,7 @@ fn remove_viewed_before() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let now = now_nanos();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("mett-")) else {
@@ -1163,44 +1098,25 @@ fn dispatch(
                 path,
                 data,
                 overwrite,
-            } => {
-                let files = files.clone();
-                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::thread::spawn(move || {
-                    let saved = save_file(path, data, overwrite);
-                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = files.send(app::Msg::FileSaved(op, saved));
-                });
-            }
-            Effect::OpenFile { name, data } => {
-                let files = files.clone();
-                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::thread::spawn(move || {
-                    let opened = open_file(&name, &data);
-                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    if let Err(e) = opened {
-                        let _ = files.send(app::Msg::Failed(format!("Could not open {name}: {e}")));
-                    }
-                });
-            }
-            Effect::AppendFile { path, text } => {
-                let files = files.clone();
-                SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::thread::spawn(move || {
-                    let appended = append_line(&path, &text)
-                        .map(|()| path.clone())
-                        .map_err(|e| format!("{}: {e}", path.display()));
-                    SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = files.send(app::Msg::Appended(appended));
-                });
-            }
-            Effect::ReadFile(op, path) => {
-                let files = files.clone();
-                std::thread::spawn(move || {
-                    let read = read_attachment(&path);
-                    let _ = files.send(app::Msg::FileRead(op, path, read));
-                });
-            }
+            } => spawn_file(files, true, move || {
+                Some(app::Msg::FileSaved(op, save_file(path, data, overwrite)))
+            }),
+            Effect::OpenFile { name, data } => spawn_file(files, true, move || {
+                let opened = open_file(&name, &data);
+                opened
+                    .err()
+                    .map(|e| app::Msg::Failed(format!("Could not open {name}: {e}")))
+            }),
+            Effect::AppendFile { path, text } => spawn_file(files, true, move || {
+                let appended = append_line(&path, &text)
+                    .map(|()| path.clone())
+                    .map_err(|e| format!("{}: {e}", path.display()));
+                Some(app::Msg::Appended(appended))
+            }),
+            Effect::ReadFile(op, path) => spawn_file(files, false, move || {
+                let read = read_attachment(&path);
+                Some(app::Msg::FileRead(op, path, read))
+            }),
             Effect::Command(command) => deferred.commands.push(command),
             Effect::Later(after, timer) => {
                 let timers = timers.clone();
@@ -1213,6 +1129,29 @@ fn dispatch(
         }
     }
     deferred
+}
+
+/// Runs `work` on a thread of its own, and sends the app what it has to
+/// say, if anything. One `counted` among [`SAVING`] is waited for before
+/// exiting, until it is done.
+fn spawn_file(
+    files: &mpsc::UnboundedSender<Msg>,
+    counted: bool,
+    work: impl FnOnce() -> Option<Msg> + Send + 'static,
+) {
+    let files = files.clone();
+    if counted {
+        SAVING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    std::thread::spawn(move || {
+        let msg = work();
+        if counted {
+            SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(msg) = msg {
+            let _ = files.send(msg);
+        }
+    });
 }
 
 /// The thread that reads terminal input. crossterm's reads block, so they
