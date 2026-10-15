@@ -195,6 +195,12 @@ pub struct MessageSummary {
     pub flags: Flags,
     /// Whether the message has attachments.
     pub has_attachments: bool,
+    /// Whether it has no sent date, as an unsent draft: it is dated when
+    /// it was created, and comes apart from the rest when listed by date.
+    pub draft: bool,
+    /// When it last changed (arrived, was moved, read, flagged), if the
+    /// backend says.
+    pub modified: Option<DateTime<Utc>>,
 }
 
 /// The format of a message body.

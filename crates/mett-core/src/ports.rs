@@ -15,6 +15,9 @@ use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{FolderId, MessageId, PageCursor};
 use crate::message::{FlagsUpdate, Message, MessageSummary};
 
+/// How many unread messages [`MailStore::recent_unread`] returns at most.
+pub const RECENT_UNREAD: usize = 250;
+
 /// Which page of a listing to fetch.
 ///
 /// A page always holds at least one item, so that following
@@ -77,6 +80,21 @@ pub trait MailStore: Send + Sync {
     /// Lists all folders in the mailbox.
     fn list_folders(&self) -> impl Future<Output = Result<Vec<Folder>>> + Send;
 
+    /// Returns a folder by its identifier, with fresh counts: polling for
+    /// new mail reads these.
+    fn folder(&self, id: &FolderId) -> impl Future<Output = Result<Folder>> + Send;
+
+    /// The unread messages of a folder that arrived or changed at or after
+    /// `since` (up to [`RECENT_UNREAD`]; without `since`, the last ones),
+    /// most recently first, with when: unread mail that arrives (or is
+    /// moved in, or marked unread) after the user last saw the folder is
+    /// new.
+    fn recent_unread(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> impl Future<Output = Result<Vec<(MessageId, DateTime<Utc>)>>> + Send;
+
     /// Returns the folder with a well-known role, such as the Inbox.
     fn well_known_folder(
         &self,
@@ -87,6 +105,18 @@ pub trait MailStore: Send + Sync {
     fn list_messages(
         &self,
         folder: &FolderId,
+        page: Page,
+    ) -> impl Future<Output = Result<MessagePage>> + Send;
+
+    /// Lists the messages in a folder that changed or arrived at or after
+    /// `since` (by the backend's clock), most recently changed first. New
+    /// mail can arrive with an old date (delivered late, or moved in from
+    /// another folder), so checking for it takes this as well as the
+    /// newest messages.
+    fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
         page: Page,
     ) -> impl Future<Output = Result<MessagePage>> + Send;
 

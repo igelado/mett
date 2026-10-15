@@ -7,7 +7,9 @@ in `spoolfile` (§3, without the Focused Inbox views), signing in with the
 through the spoolfile's account and postpones it to that account's Drafts
 (§5.2, without `record` and `postponed`). Folders of that account can be
 opened, browsed, and used to save or copy messages, and purged messages go
-to `trash` (§6). Everything else is still a proposal.
+to `trash` (§6). The open folder and the `mailboxes` of that account are
+checked for new mail every `msgraph_sync_interval` seconds (§4.4).
+Everything else is still a proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc
 format described in [MUTTRC.md](MUTTRC.md) and adds the minimum extensions
@@ -173,7 +175,7 @@ instructions and troubleshooting.
 | `msgraph_focused_inbox` | boolean | `no` | When set, `=@inbox` opens the Focused view, and a status-line indicator lets the user switch to Other. |
 | `msgraph_query_directory` | boolean | `yes` | When `query_command` is unset, `<query>` searches the people the user works with (People API, `People.Read`) and the whole organisation directory (`User.ReadBasic.All`). |
 | `msgraph_page_size` | number | `50` | Number of messages fetched per Graph request. |
-| `msgraph_sync_interval` | number | `60` | Seconds between delta syncs. This plays the role of `mail_check`, which mett uses only for local mailboxes. |
+| `msgraph_sync_interval` | number | `60` | Seconds between checks for new mail; `0` turns them off. This plays the role of `mail_check`, which mett uses only for local mailboxes. *Implemented so far:* each check lists the newest page of the open folder again (taking in what arrived, changed or went among those messages) and the messages changed since the last check (`lastModifiedDateTime`, which also finds mail delivered late or moved in with an old date), and reads the counts of the `mailboxes` and their unread messages that arrived or changed since the user last saw them (by `lastModifiedDateTime`, which a message moved in also gets); a mailbox has new mail when one of those is unread mail the user didn't see when they last had it open, newer than what they saw (before that, when it has unread mail). |
 
 ## 5. Accounts and sending
 

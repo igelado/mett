@@ -8,6 +8,7 @@
 mod composing;
 mod keys;
 mod mailbox;
+mod newmail;
 mod search;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -21,6 +22,7 @@ pub use self::composing::{Compose, Input};
 pub use self::keys::{Help, Reconfigured};
 pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
+pub use self::newmail::MailboxEntry;
 pub use self::search::{Limit, highlighted};
 use crate::action::Action;
 use crate::compose::Kind;
@@ -66,6 +68,11 @@ pub struct Settings {
     pub resolve: bool,
     /// What the `!`, `>` and `<` mailbox shortcuts stand for.
     pub shortcuts: Shortcuts,
+    /// The folders to check for new mail (`mailboxes`).
+    pub mailboxes: Vec<MailboxEntry>,
+    /// How often to check for new mail (`msgraph_sync_interval`), or
+    /// `None` not to.
+    pub sync_interval: Option<std::time::Duration>,
 }
 
 /// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
@@ -91,6 +98,8 @@ impl Default for Settings {
             delete: Quad::AskYes,
             resolve: true,
             shortcuts: Shortcuts::default(),
+            mailboxes: Vec::new(),
+            sync_interval: None,
         }
     }
 }
@@ -152,6 +161,9 @@ pub enum Timer {
     /// List Sent Items again, if it is open: Graph files the copy of a
     /// sent message a moment after accepting it.
     RelistSentItems,
+    /// Check for new mail, if this is still the timer for it (it counts
+    /// the changes of interval).
+    Poll(u64),
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -332,6 +344,9 @@ pub struct App {
     pub sign_in: Option<SignIn>,
     /// The key bindings, which `:bind` and `:macro` change.
     pub keymap: Keymap,
+    /// The last error reported on the message line, so that the view can
+    /// tell it from other messages.
+    pub error: Option<String>,
     /// Keys and functions a macro or `push` queued, played before new
     /// input.
     strokes: VecDeque<Stroke>,
@@ -505,6 +520,37 @@ pub struct App {
     last_draft: u64,
     /// How many messages to request per page.
     page_size: u32,
+    /// See [`Settings::mailboxes`].
+    mailboxes: Vec<MailboxEntry>,
+    /// What is known of each mailbox's new mail.
+    mailbox_state: HashMap<FolderPath, newmail::MailboxState>,
+    /// See [`Settings::sync_interval`].
+    sync_interval: Option<std::time::Duration>,
+    /// Whether the timer for the next check for new mail is set.
+    poll_armed: bool,
+    /// Checks for new mail wait for the user to sign in again.
+    poll_paused: bool,
+    /// The open folder's check for new mail, on its way.
+    polling: Option<newmail::Polling>,
+    /// Since when the next check asks for changes.
+    poll_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Which timer for checks counts.
+    poll_timer: u64,
+    /// The messages in the index before a check had it listed again, to
+    /// tell what arrived.
+    known_before_refresh: Option<HashSet<MessageId>>,
+    /// The request asking whether messages missing from a check's page,
+    /// as old as its last, are still in the folder (on the next page).
+    tie_check: Option<(RequestId, mett_core::FolderId)>,
+    /// The request reading the mailboxes' counts.
+    checking: Option<RequestId>,
+    /// The unread mail the user has seen, by folder.
+    seen: newmail::SeenByFolder,
+    /// How many times the user retried after a failed sign-in: background
+    /// checks made before the last retry don't hold off checking.
+    poll_epoch: u64,
+    /// When the folder was last listed from the start.
+    listed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl App {
@@ -533,6 +579,7 @@ impl App {
             quit: false,
             sign_in: None,
             keymap: Keymap::mutt_defaults(),
+            error: None,
             strokes: VecDeque::new(),
             sign_in_strokes: VecDeque::new(),
             configuring: 0,
@@ -600,6 +647,20 @@ impl App {
             next_request: 0,
             last_draft: 0,
             page_size: settings.page_size,
+            mailboxes: settings.mailboxes,
+            mailbox_state: HashMap::new(),
+            sync_interval: settings.sync_interval,
+            poll_armed: false,
+            poll_paused: false,
+            polling: None,
+            poll_since: None,
+            poll_timer: 0,
+            known_before_refresh: None,
+            tie_check: None,
+            checking: None,
+            seen: HashMap::new(),
+            poll_epoch: 0,
+            listed_at: None,
         };
         let effects = app.open_folder();
         (app, effects)
@@ -674,6 +735,7 @@ impl App {
                 }
                 Vec::new()
             }
+            Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
             Msg::Resize { width, height } => {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);
@@ -939,6 +1001,9 @@ impl App {
     /// listing the rest of it, opening the selected message and saving
     /// changes.
     fn retry(&mut self) -> Vec<Effect> {
+        // Signed in again: checking for new mail can go on.
+        self.poll_paused = false;
+        self.poll_epoch += 1;
         if self.quit {
             let mut effects = self.retry_saves();
             effects.extend(self.retry_discards());
@@ -1193,9 +1258,17 @@ impl App {
             Event::FolderOpened(_) if self.opening != Some(id) => {}
             Event::FolderOpened(Ok(folder)) => {
                 self.opening = None;
+                self.poll_paused = false;
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
+                self.visited();
                 let mut effects = self.list(Page::first(self.page_size));
+                // Then the mailboxes' new mail, and checking for more,
+                // unless checking is off.
+                if self.sync_interval.is_some() {
+                    effects.extend(self.check_mailboxes());
+                }
+                effects.extend(self.arm_poll());
                 // Before the user can reply: their own addresses, so that a
                 // reply to their own mail goes to its recipients (the
                 // sign-in name may not be one of them).
@@ -1207,12 +1280,15 @@ impl App {
                 }
                 return effects;
             }
+            Event::FolderPolled(result) => return self.on_polled(id, result),
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
+                    self.poll_paused = false;
                     let mut messages = page.messages;
                     messages.retain(|m| !self.removed_while_listing.contains(&m.id));
                     self.overlay_wanted_flags(&mut messages);
                     self.add_listed(messages);
+                    self.see_index();
                     self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
@@ -1225,6 +1301,7 @@ impl App {
                         self.removed_while_listing.clear();
                         self.forget_missing_marks();
                         self.loaded();
+                        self.relisted();
                         // Clear the "Loading" message, but not an error that
                         // was reported while the folder was loading.
                         if self.status.starts_with("Loading ") {
@@ -1240,6 +1317,7 @@ impl App {
                     self.pending = None;
                     self.reselect = None;
                     self.listing = None;
+                    self.known_before_refresh = None;
                     self.unlisted = self.listing_page.take();
                     // Pages asked for again come after the saves.
                     self.saved_flags.clear();
@@ -1268,6 +1346,8 @@ impl App {
             }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::FoldersListed(result) => return self.on_folders_listed(id, result),
+            Event::MailboxesChecked(checked) => return self.on_mailboxes_checked(id, checked),
+            Event::StillThere(result) => return self.on_still_there(id, result),
             Event::Transferred(result) => {
                 // The messages leave the index, or it is listed again; the
                 // new IDs matter to changes still to make, or that failed.
@@ -1330,9 +1410,9 @@ impl App {
                 if let Some((kind, message)) = self.awaiting_addresses.take() {
                     let effects = self.begin(kind, Some(message));
                     if let Some(e) = failed {
-                        self.status = format!(
+                        self.fail(format!(
                             "Couldn't learn your own addresses ({e}); a reply to your own mail may need its recipients checked."
-                        );
+                        ));
                     }
                     return effects;
                 }
@@ -1532,7 +1612,7 @@ impl App {
                     update.apply(&mut summary.flags);
                 }
                 // Pages of a listing on their way may predate it.
-                if self.listing.is_some() {
+                if self.fetching_index() {
                     let saved = self.saved_flags.get(&message).copied().unwrap_or_default();
                     self.saved_flags
                         .insert(message.clone(), merged(saved, update));
@@ -1568,6 +1648,9 @@ impl App {
         update: FlagsUpdate,
         result: mett_core::Result<()>,
     ) -> Vec<Effect> {
+        if result.is_ok() {
+            self.changed_here(&message);
+        }
         // Sent for a message mett has no flags for (its folder wasn't
         // open): only the fields it changed are known.
         let Some(mut mailbox) = self.mailbox_flags.get(&message).copied() else {
@@ -1620,7 +1703,7 @@ impl App {
             // The next change sends whatever still differs, which
             // includes what just failed. Pages of the listing on its way
             // may predate what was saved.
-            if saved && self.listing.is_some() {
+            if saved && self.fetching_index() {
                 self.saved_flags.insert(message.clone(), whole(mailbox));
             }
             self.mailbox_flags.insert(message, mailbox);
@@ -1647,7 +1730,7 @@ impl App {
         }
         // Pages of the listing on its way may predate the save (or an
         // earlier one, which a failure since doesn't undo).
-        if self.listing.is_some() && (saved || self.saved_flags.contains_key(message)) {
+        if self.fetching_index() && (saved || self.saved_flags.contains_key(message)) {
             self.saved_flags.insert(message.clone(), whole(mailbox));
         }
     }
@@ -1709,6 +1792,7 @@ impl App {
         self.delete = settings.delete;
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
+        self.apply_mailboxes(settings.mailboxes, settings.sync_interval);
     }
 
     /// Lists the open folder again from the start, to show messages that
@@ -1774,6 +1858,9 @@ impl App {
             folder: folder.id.clone(),
             page: page.clone(),
         });
+        if page.cursor().is_none() {
+            self.listing_started();
+        }
         self.listing = Some(effect_id(&list));
         self.listing_page = Some(page);
         vec![list]
@@ -1895,7 +1982,13 @@ impl App {
             self.status = "Sign-in cancelled.".into();
             return;
         }
-        self.status = error.to_string();
+        self.fail(error.to_string());
+    }
+
+    /// Shows an error on the message line, in the `error` color.
+    pub(super) fn fail(&mut self, text: impl Into<String>) {
+        self.status = text.into();
+        self.error = Some(self.status.clone());
     }
 }
 

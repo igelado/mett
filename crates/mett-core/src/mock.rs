@@ -43,10 +43,16 @@ impl MemoryStore {
         self
     }
 
-    /// Adds a message.
+    /// Adds a message, last changed when it is dated.
     pub fn with_message(self, message: Message) -> Self {
-        self.state().messages.push(message);
+        self.deliver(message.clone(), message.summary.received);
         self
+    }
+
+    /// Adds a message, as if it arrived (or last changed) at `modified`.
+    pub fn deliver(&self, mut message: Message, modified: DateTime<Utc>) {
+        message.summary.modified = Some(modified);
+        self.state().messages.push(message);
     }
 
     /// The drafts sent so far, oldest first.
@@ -129,6 +135,8 @@ impl State {
                     flagged: false,
                 },
                 has_attachments,
+                draft: which == WellKnownFolder::Drafts,
+                modified: Some(Utc::now()),
             },
             cc: draft.cc.clone(),
             bcc: draft.bcc.clone(),
@@ -154,6 +162,31 @@ impl MailStore for MemoryStore {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let state = self.state();
         Ok(state.folders.iter().map(|f| state.with_counts(f)).collect())
+    }
+
+    async fn folder(&self, id: &FolderId) -> Result<Folder> {
+        let state = self.state();
+        let folder = state.folder(id)?;
+        Ok(state.with_counts(folder))
+    }
+
+    async fn recent_unread(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
+        let state = self.state();
+        state.folder(folder)?;
+        let mut recent: Vec<_> = state
+            .messages
+            .iter()
+            .filter(|m| &m.summary.folder == folder && !m.summary.flags.read)
+            .filter_map(|m| Some((m.summary.id.clone(), m.summary.modified?)))
+            .filter(|(_, modified)| since.is_none_or(|since| *modified >= since))
+            .collect();
+        recent.sort_by_key(|(_, modified)| Reverse(*modified));
+        recent.truncate(crate::ports::RECENT_UNREAD);
+        Ok(recent)
     }
 
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
@@ -200,12 +233,40 @@ impl MailStore for MemoryStore {
         Ok(MessagePage { messages, next })
     }
 
+    /// Every change matching is on the one page.
+    async fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        _page: Page,
+    ) -> Result<MessagePage> {
+        let state = self.state();
+        state.folder(folder)?;
+        let mut changed: Vec<_> = state
+            .messages
+            .iter()
+            .filter(|m| &m.summary.folder == folder)
+            .filter_map(|m| {
+                let modified = m.summary.modified?;
+                (modified >= since).then(|| (modified, m.summary.clone()))
+            })
+            .collect();
+        changed.sort_by_key(|(modified, _)| Reverse(*modified));
+        Ok(MessagePage {
+            messages: changed.into_iter().map(|(_, m)| m).collect(),
+            next: None,
+        })
+    }
+
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
         self.state().message_mut(id).map(|m| m.clone())
     }
 
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
-        update.apply(&mut self.state().message_mut(id)?.summary.flags);
+        let mut state = self.state();
+        let summary = &mut state.message_mut(id)?.summary;
+        update.apply(&mut summary.flags);
+        summary.modified = Some(Utc::now());
         Ok(())
     }
 
@@ -217,6 +278,7 @@ impl MailStore for MemoryStore {
         let message = state.message_mut(id)?;
         message.summary.id = new_id.clone();
         message.summary.folder = to.clone();
+        message.summary.modified = Some(Utc::now());
         Ok(new_id)
     }
 
@@ -226,6 +288,7 @@ impl MailStore for MemoryStore {
         let mut copy = state.message_mut(id)?.clone();
         copy.summary.id = state.fresh_id(id);
         copy.summary.folder = to.clone();
+        copy.summary.modified = Some(Utc::now());
         let new_id = copy.summary.id.clone();
         state.messages.push(copy);
         Ok(new_id)
@@ -301,6 +364,8 @@ pub fn message(id: &str, folder: &str, subject: &str, received: DateTime<Utc>) -
             received,
             flags: Flags::default(),
             has_attachments: false,
+            draft: false,
+            modified: None,
         },
         cc: Vec::new(),
         bcc: Vec::new(),
@@ -562,6 +627,38 @@ mod tests {
         assert_ne!(new_id, MessageId::new("m1~1"));
         let decoy = store.fetch_message(&MessageId::new("m1~1")).await.unwrap();
         assert_eq!(decoy.summary.subject, "decoy");
+    }
+
+    #[tokio::test]
+    async fn lists_changes_since_a_time() {
+        let store = store();
+        let inbox = FolderId::new("in");
+        let late = mock_message_at("late", at(-60));
+        store.deliver(late, at(50));
+        let changed = store
+            .changed_messages(&inbox, at(40), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&changed), ["late"]);
+        store
+            .update_flags(
+                &MessageId::new("m1"),
+                FlagsUpdate {
+                    read: Some(true),
+                    flagged: None,
+                },
+            )
+            .await
+            .unwrap();
+        let changed = store
+            .changed_messages(&inbox, at(40), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(changed.messages[0].id, MessageId::new("m1"));
+    }
+
+    fn mock_message_at(subject: &str, received: DateTime<Utc>) -> Message {
+        message(subject, "in", subject, received)
     }
 
     #[tokio::test]

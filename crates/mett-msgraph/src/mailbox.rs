@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags,
     FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, Result, WellKnownFolder,
+    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, WellKnownFolder,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -26,7 +26,7 @@ use crate::settings::{AuthSettings, Cloud};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The message fields the index needs.
-const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments";
+const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments,lastModifiedDateTime";
 
 /// A [`MailStore`] backed by Microsoft Graph.
 ///
@@ -410,6 +410,79 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         Ok(folders)
     }
 
+    async fn folder(&self, id: &FolderId) -> Result<Folder> {
+        // The roles, if a folder listing looked them up, tell a well-known
+        // folder; only the root is needed otherwise, to tell a top-level
+        // folder.
+        let cached = self.roles.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let roles = match cached {
+            Some(roles) => roles,
+            None => Arc::new(Roles {
+                root: self.root().await?,
+                well_known: HashMap::new(),
+            }),
+        };
+        let url = self.url(&["me", "mailFolders", id.as_str()]);
+        let folder: GraphFolder = self
+            .json(self.request(Method::GET, url), About::folder(id.as_str()))
+            .await?;
+        Ok(roles.folder(folder))
+    }
+
+    async fn recent_unread(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
+        // A message moved in keeps when it was received; when it was
+        // last modified tells.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Modified {
+            id: String,
+            last_modified_date_time: String,
+        }
+        let after = since.map_or_else(
+            || "ge 1900-01-01T00:00:00Z".to_owned(),
+            // Mail that changed when `since` did may not have been seen:
+            // which was is told by its ID.
+            |since| format!("ge {}", since.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        );
+        let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
+        url.query_pairs_mut()
+            .append_pair("$top", "50")
+            .append_pair("$select", "id,lastModifiedDateTime")
+            // Graph wants the sorted property filtered too, first.
+            .append_pair(
+                "$filter",
+                &format!("lastModifiedDateTime {after} and isRead eq false"),
+            )
+            .append_pair("$orderby", "lastModifiedDateTime desc");
+        let mut recent = Vec::new();
+        loop {
+            let page: Collection<Modified> = self
+                .json(
+                    self.request(Method::GET, url),
+                    About::folder(folder.as_str()),
+                )
+                .await?;
+            for m in page.value {
+                let at = DateTime::parse_from_rfc3339(&m.last_modified_date_time)
+                    .map_err(|e| Error::Backend(format!("invalid lastModifiedDateTime: {e}")))?;
+                recent.push((MessageId::new(m.id), at.with_timezone(&Utc)));
+            }
+            // Without `since`, the last few tell; with it, all of them, up
+            // to a limit.
+            let wanted = if since.is_some() { RECENT_UNREAD } else { 10 };
+            match page.next_link {
+                Some(next) if recent.len() < wanted => url = self.next_page_url(&next)?,
+                _ => break,
+            }
+        }
+        recent.truncate(RECENT_UNREAD);
+        Ok(recent)
+    }
+
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
         // Only the root is needed here, so other well-known folders failing
         // to resolve can't get in the way.
@@ -431,53 +504,25 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
-        let url = match page.cursor() {
-            // The cursor is Graph's `@odata.nextLink`, which already holds
-            // the query; only the page size may change.
-            Some(cursor) => {
-                let link = cursor
-                    .as_str()
-                    .strip_prefix(folder.as_str())
-                    .and_then(|rest| rest.strip_prefix(' '))
-                    .ok_or_else(|| {
-                        Error::Backend(format!("page cursor is not for folder {folder}"))
-                    })?;
-                // Graph's continuation links must be replayed unchanged, so
-                // the page keeps the size the listing started with.
-                self.next_page_url(link)?
-            }
-            None => {
-                let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
-                url.query_pairs_mut()
-                    .append_pair("$top", &top_for(&page))
-                    .append_pair("$select", SUMMARY_FIELDS)
-                    // Sort by the date the summaries show (see `split`).
-                    // Graph can't sort by "this field, else that one", so
-                    // the date is the sent date, which received and sent
-                    // mail both have; only unsent drafts fall back to
-                    // their creation date.
-                    .append_pair("$orderby", "sentDateTime desc,createdDateTime desc");
-                url
-            }
-        };
-        let page: Collection<GraphMessage> = self
-            .json(
-                self.request(Method::GET, url),
-                About::folder(folder.as_str()),
-            )
-            .await?;
-        Ok(MessagePage {
-            messages: page
-                .value
-                .into_iter()
-                .map(GraphMessage::into_summary)
-                .collect::<Result<_>>()?,
-            // The cursor records its folder, so it can't be used for
-            // another one by mistake.
-            next: page
-                .next_link
-                .map(|link| PageCursor::new(format!("{folder} {link}"))),
-        })
+        // Sort by the date the summaries show (see `split`). Graph can't
+        // sort by "this field, else that one", so the date is the sent
+        // date, which received and sent mail both have; only unsent drafts
+        // fall back to their creation date.
+        self.messages_page(folder, page, None, "sentDateTime desc,createdDateTime desc")
+            .await
+    }
+
+    async fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        page: Page,
+    ) -> Result<MessagePage> {
+        // Graph wants the sorted property filtered too, first.
+        let since = since.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let filter = format!("lastModifiedDateTime ge {since}");
+        self.messages_page(folder, page, Some(&filter), "lastModifiedDateTime desc")
+            .await
     }
 
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
@@ -574,6 +619,67 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             }
             Some(origin) => self.answer(origin, draft).await,
         }
+    }
+}
+
+impl<A: Authenticator> GraphMailStore<A> {
+    /// A page of a folder's message summaries, sorted by `order` and, on
+    /// the first page, filtered by `filter`.
+    async fn messages_page(
+        &self,
+        folder: &FolderId,
+        page: Page,
+        filter: Option<&str>,
+        order: &str,
+    ) -> Result<MessagePage> {
+        let url = match page.cursor() {
+            // The cursor is Graph's `@odata.nextLink`, which already holds
+            // the query; only the page size may change.
+            Some(cursor) => {
+                let link = cursor
+                    .as_str()
+                    .strip_prefix(folder.as_str())
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .ok_or_else(|| {
+                        Error::Backend(format!("page cursor is not for folder {folder}"))
+                    })?;
+                // Graph's continuation links must be replayed unchanged, so
+                // the page keeps the size the listing started with.
+                self.next_page_url(link)?
+            }
+            None => {
+                let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
+                {
+                    let mut query = url.query_pairs_mut();
+                    query
+                        .append_pair("$top", &top_for(&page))
+                        .append_pair("$select", SUMMARY_FIELDS);
+                    if let Some(filter) = filter {
+                        query.append_pair("$filter", filter);
+                    }
+                    query.append_pair("$orderby", order);
+                }
+                url
+            }
+        };
+        let page: Collection<GraphMessage> = self
+            .json(
+                self.request(Method::GET, url),
+                About::folder(folder.as_str()),
+            )
+            .await?;
+        Ok(MessagePage {
+            messages: page
+                .value
+                .into_iter()
+                .map(GraphMessage::into_summary)
+                .collect::<Result<_>>()?,
+            // The cursor records its folder, so it can't be used for
+            // another one by mistake.
+            next: page
+                .next_link
+                .map(|link| PageCursor::new(format!("{folder} {link}"))),
+        })
     }
 }
 
@@ -980,6 +1086,7 @@ struct GraphMessage {
     #[serde(default)]
     is_draft: bool,
     created_date_time: Option<String>,
+    last_modified_date_time: Option<String>,
     #[serde(default)]
     is_read: bool,
     flag: Option<FollowupFlag>,
@@ -1064,6 +1171,7 @@ impl GraphMessage {
         // Graph may give drafts a placeholder sent date (such as year 1),
         // so drafts always use their creation date.
         let sent = self.sent_date_time.filter(|_| !self.is_draft);
+        let unsent = sent.is_none();
         let timestamp = sent
             .or(self.created_date_time)
             .ok_or_else(|| Error::Backend("message has no timestamp".into()))?;
@@ -1086,6 +1194,14 @@ impl GraphMessage {
                 flagged: self.flag.is_some_and(|f| f.flag_status == "flagged"),
             },
             has_attachments: self.has_attachments,
+            // Without a sent date, it is listed with the drafts, whatever
+            // Graph calls it.
+            draft: unsent,
+            modified: self
+                .last_modified_date_time
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&Utc)),
         };
         let rest = Rest {
             cc: self.cc_recipients,

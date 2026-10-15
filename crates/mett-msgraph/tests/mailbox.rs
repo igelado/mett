@@ -137,6 +137,91 @@ async fn finds_well_known_folders_and_labels_them() {
 }
 
 #[tokio::test]
+async fn reads_a_folder_s_counts_by_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/msgfolderroot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "root-id" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/other-id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(folder("other-id", "Projects")))
+        .mount(&server)
+        .await;
+    let folder = store(&server)
+        .folder(&FolderId::new("other-id"))
+        .await
+        .unwrap();
+    assert_eq!(folder.name, "Projects");
+    assert_eq!(folder.parent, None, "top-level folders have no parent");
+    assert_eq!((folder.unread_count, folder.total_count), (2, 5));
+}
+
+#[tokio::test]
+async fn lists_messages_changed_since_a_time() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .and(query_param(
+            "$filter",
+            "lastModifiedDateTime ge 2024-05-01T10:00:00Z",
+        ))
+        .and(query_param("$orderby", "lastModifiedDateTime desc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [message("late", "2024-04-01T08:00:00Z")],
+        })))
+        .mount(&server)
+        .await;
+    let since = DateTime::parse_from_rfc3339("2024-05-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let page = store(&server)
+        .changed_messages(&FolderId::new("inbox-id"), since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(page.messages[0].id, MessageId::new("late"));
+    assert_eq!(page.next, None);
+}
+
+#[tokio::test]
+async fn finds_when_unread_mail_last_changed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/inbox-id/messages"))
+        .and(query_param(
+            "$filter",
+            "lastModifiedDateTime ge 1900-01-01T00:00:00Z and isRead eq false",
+        ))
+        .and(query_param("$orderby", "lastModifiedDateTime desc"))
+        .and(query_param("$top", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [{ "id": "m9", "lastModifiedDateTime": "2024-05-01T10:00:00Z" }],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/empty-id/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let recent = store
+        .recent_unread(&FolderId::new("inbox-id"), None)
+        .await
+        .unwrap();
+    assert_eq!(recent[0].0, MessageId::new("m9"));
+    assert_eq!(recent[0].1.to_rfc3339(), "2024-05-01T10:00:00+00:00");
+    assert!(
+        store
+            .recent_unread(&FolderId::new("empty-id"), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn does_not_cache_roles_after_a_failed_lookup() {
     let server = MockServer::start().await;
     mount_roles_with(&server, 503).await;
@@ -477,6 +562,28 @@ async fn unsent_drafts_use_their_creation_time() {
         page.messages[0].received,
         DateTime::parse_from_rfc3339("2026-10-10T08:00:00Z").unwrap()
     );
+    assert!(page.messages[0].draft);
+}
+
+#[tokio::test]
+async fn mail_without_a_sent_date_is_listed_with_the_drafts() {
+    let server = MockServer::start().await;
+    let mut odd = message("m1", "2026-10-14T10:00:00Z");
+    odd["sentDateTime"] = json!(null);
+    odd["createdDateTime"] = json!("2026-10-10T08:00:00Z");
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/mailFolders/in/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [odd, message("m2", "2026-10-14T09:00:00Z")],
+        })))
+        .mount(&server)
+        .await;
+    let page = store(&server)
+        .list_messages(&FolderId::new("in"), Page::first(10))
+        .await
+        .unwrap();
+    let drafts: Vec<bool> = page.messages.iter().map(|m| m.draft).collect();
+    assert_eq!(drafts, [true, false]);
 }
 
 #[tokio::test]

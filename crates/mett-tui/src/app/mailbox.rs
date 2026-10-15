@@ -57,6 +57,9 @@ pub struct Browser {
     pub(super) listing: Option<RequestId>,
     /// What choosing a folder does.
     pub(super) purpose: Choose,
+    /// Whether it lists the mailboxes (`mailboxes`), rather than every
+    /// folder.
+    pub mailboxes: bool,
 }
 
 impl Browser {
@@ -71,10 +74,17 @@ impl Browser {
 pub struct BrowserEntry {
     /// How deep it is in the tree; top-level folders are 0.
     pub depth: usize,
-    /// The folder.
-    pub folder: Folder,
-    /// Its path from the top of the mailbox (`Inbox/Projects`), which
-    /// mailbox questions take whatever `folder` is.
+    /// What it is called.
+    pub name: String,
+    /// The folder, if it has been found.
+    pub id: Option<FolderId>,
+    /// Its unread and total counts, if known.
+    pub counts: Option<(u32, u32)>,
+    /// Whether it has new mail.
+    pub new: bool,
+    /// Its path from the top of the mailbox (`Inbox/Projects`), or for a
+    /// mailbox, as configured (`=Inbox/Projects`), which mailbox questions
+    /// take whatever `folder` is.
     pub path: String,
     /// The same path, by folder names: unlike the text, it can't be
     /// mistaken for a well-known folder (a folder named `@archive`).
@@ -235,7 +245,12 @@ impl App {
                 Vec::new()
             }
             Action::ChangeFolder => {
-                self.ask_mailbox(Question::OpenMailbox, "");
+                // As in mutt, a mailbox with new mail is offered.
+                let offered = self
+                    .next_new_mailbox(None)
+                    .map(|m| m.text.clone())
+                    .unwrap_or_default();
+                self.ask_mailbox(Question::OpenMailbox, &offered);
                 Vec::new()
             }
             Action::BrowseMailboxes => self.open_browser(Choose::Open),
@@ -529,7 +544,7 @@ impl App {
     }
 
     /// Whether the message is being moved, copied or purged.
-    fn transferring(&self, id: &MessageId) -> bool {
+    pub(super) fn transferring(&self, id: &MessageId) -> bool {
         self.transfers_of(id).next().is_some()
     }
 
@@ -611,7 +626,7 @@ impl App {
     ///
     /// The open folder stays until the new one is found, so that a bad
     /// name or a failure leaves the user where they were.
-    fn change_folder(&mut self, path: FolderPath) -> Vec<Effect> {
+    pub(super) fn change_folder(&mut self, path: FolderPath) -> Vec<Effect> {
         if self.folder.is_none() {
             self.reset_folder();
             self.path = path;
@@ -633,10 +648,12 @@ impl App {
             Ok(folder) => {
                 // An earlier folder change waiting for a sign-in is moot.
                 self.unswitched = None;
+                self.see_index();
                 self.reset_folder();
                 self.previous = Some(std::mem::replace(&mut self.path, path));
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
+                self.visited();
                 self.list(Page::first(self.page_size))
             }
             Err(e) => {
@@ -662,6 +679,9 @@ impl App {
     /// on their way or failed are kept: they don't depend on it.
     fn reset_folder(&mut self) {
         self.screens.truncate(1);
+        self.polling = None;
+        self.known_before_refresh = None;
+        self.tie_check = None;
         self.reselect = None;
         self.folder = None;
         self.messages.clear();
@@ -955,12 +975,12 @@ impl App {
     /// Takes messages that are no longer in the folder out of the index,
     /// closing the pager if it shows one of them, even under another
     /// screen.
-    fn remove_messages(&mut self, gone: &HashSet<MessageId>) {
+    pub(super) fn remove_messages(&mut self, gone: &HashSet<MessageId>) {
         if gone.is_empty() {
             return;
         }
         let selected = self.selected_id();
-        if self.listing.is_some() {
+        if self.fetching_index() {
             self.removed_while_listing.extend(gone.iter().cloned());
         }
         self.screens
@@ -987,14 +1007,59 @@ impl App {
         // This one takes the place of a browser to open again after a
         // sign-in.
         self.unbrowsed = None;
+        // As in mutt, the mailboxes come first, if there are any; the
+        // browser can switch to every folder.
+        if !self.mailboxes.is_empty() {
+            let entries = self.mailbox_entries();
+            let open = self.mailboxes.iter().position(|m| m.path == self.path);
+            self.screens.push(Screen::Browser(Browser {
+                entries,
+                selected: open.unwrap_or(0),
+                listing: None,
+                purpose,
+                mailboxes: true,
+            }));
+            // With fresh counts.
+            return self.check_mailboxes();
+        }
+        self.list_folders_in_browser(purpose)
+    }
+
+    /// Opens the browser on every folder.
+    fn list_folders_in_browser(&mut self, purpose: Choose) -> Vec<Effect> {
         let request = self.request(Request::ListFolders);
         self.screens.push(Screen::Browser(Browser {
             entries: Vec::new(),
             selected: 0,
             listing: Some(effect_id(&request)),
             purpose,
+            mailboxes: false,
         }));
         vec![request]
+    }
+
+    /// Switches the browser between the mailboxes and every folder.
+    fn toggle_mailboxes(&mut self) -> Vec<Effect> {
+        let Some(Screen::Browser(browser)) = self.screens.last() else {
+            return Vec::new();
+        };
+        if browser.mailboxes {
+            let purpose = browser.purpose.clone();
+            self.screens.pop();
+            return self.list_folders_in_browser(purpose);
+        }
+        if self.mailboxes.is_empty() {
+            self.status = "No mailboxes are defined.".into();
+            return Vec::new();
+        }
+        let entries = self.mailbox_entries();
+        if let Some(Screen::Browser(browser)) = self.screens.last_mut() {
+            browser.entries = entries;
+            browser.selected = 0;
+            browser.listing = None;
+            browser.mailboxes = true;
+        }
+        self.check_mailboxes()
     }
 
     /// Opens again the browser whose folders couldn't be listed for want of
@@ -1041,7 +1106,7 @@ impl App {
                     browser.selected = browser
                         .entries
                         .iter()
-                        .position(|e| Some(&e.folder.id) == open)
+                        .position(|e| e.id.as_ref() == open)
                         .unwrap_or(0);
                 }
             }
@@ -1086,6 +1151,7 @@ impl App {
                 return self.leave_browser(Some(chosen));
             }
             Action::Exit | Action::Quit => return self.leave_browser(None),
+            Action::ToggleMailboxes => return self.toggle_mailboxes(),
             _ => {}
         }
         Vec::new()
@@ -1200,7 +1266,10 @@ fn tree(folders: Vec<Folder>) -> Vec<BrowserEntry> {
         }
         entries.push(BrowserEntry {
             depth: names.len() - 1,
-            folder,
+            name: folder.name,
+            id: Some(folder.id),
+            counts: Some((folder.unread_count, folder.total_count)),
+            new: folder.unread_count > 0,
             path: names.join("/"),
             target: FolderPath::Named(names),
         });

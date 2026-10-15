@@ -434,6 +434,7 @@ impl Keymap {
             (Key::new(PageUp), PreviousPage),
             (Key::new(Enter), DisplayMessage),
             (Key::char(' '), DisplayMessage),
+            (Key::new(KeyCode::Tab), ToggleMailboxes),
         ];
         for (key, action) in browser {
             keymap.bind_action(Menu::Browser, *key, *action);
