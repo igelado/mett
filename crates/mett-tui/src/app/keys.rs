@@ -44,6 +44,8 @@ impl App {
         // Ctrl-J is a newline: it does what Enter does, unless bound.
         let ctrl_j = Key::from(event) == Key::ctrl('j');
         if self.input.is_some() && self.sign_in.is_none() {
+            // A question took over: an Escape before it is forgotten.
+            self.escape = None;
             let event = if ctrl_j {
                 KeyEvent::from(KeyCode::Enter)
             } else {
@@ -56,10 +58,12 @@ impl App {
         // Escape where it is bound to nothing starts Meta and the next key,
         // for terminals that send them apart.
         if key == Key::new(KeyCode::Esc) && self.keymap.lookup(menu, key).is_none() {
-            self.escape = true;
+            self.escape = Some(menu);
             return Vec::new();
         }
-        if std::mem::take(&mut self.escape)
+        // Only in the menu it was typed in: another may have taken over
+        // since (the sign-in window, say).
+        if self.escape.take() == Some(menu)
             && let KeyCode::Char(c) = event.code
         {
             key = Key::alt(c);

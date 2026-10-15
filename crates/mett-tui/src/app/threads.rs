@@ -504,6 +504,72 @@ mod tests {
     }
 
     #[test]
+    fn an_escape_is_forgotten_when_another_menu_takes_over() {
+        let mut app = app();
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        // The help screen opens before the next key (as the sign-in window
+        // may): its `q` still leaves it.
+        act(&mut app, Action::Help);
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('q'))));
+        assert_eq!(app.screen(), &Screen::Index);
+    }
+
+    #[test]
+    fn a_pending_move_waits_for_mail_from_the_same_time() {
+        let settings = Settings {
+            ordering: Ordering {
+                sort: Sort::parse("reverse-date", true).unwrap(),
+                aux: Sort::parse("from", false).unwrap(),
+                ..Ordering::default()
+            },
+            ..Settings::default()
+        };
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let (mut app, effects) = App::open(80, 24, inbox, settings);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let from = |id: &str, minutes: i64| {
+            let mut m = mock::message(
+                id,
+                "in",
+                id,
+                DateTime::UNIX_EPOCH + TimeDelta::minutes(minutes),
+            )
+            .summary;
+            m.from = Some(mett_core::Address::new(format!("{id}@x.org")));
+            m
+        };
+        let listed = |app: &mut App, id, messages, more: bool| {
+            let effects = app.update(Msg::Response(Response {
+                id,
+                event: Event::MessagesListed(Ok(MessagePage {
+                    messages,
+                    next: more.then(|| mett_core::PageCursor::new("in next")),
+                })),
+            }));
+            match effects.first() {
+                Some(Effect::Request(next, _)) => Some(*next),
+                _ => None,
+            }
+        };
+        let next = listed(&mut app, list, vec![from("c", 5)], true).unwrap();
+        act(&mut app, Action::NextEntry);
+        // e may not come right after c: d, from the same time, may follow.
+        let next = listed(&mut app, next, vec![from("e", 3)], true).unwrap();
+        assert_eq!(app.messages[app.selected].id.as_str(), "c");
+        listed(&mut app, next, vec![from("d", 3)], false);
+        assert_eq!(app.messages[app.selected].id.as_str(), "d");
+    }
+
+    #[test]
     fn a_collapsed_thread_tells_of_its_unread_mail() {
         let mut app = app();
         for m in &mut app.messages {

@@ -382,9 +382,10 @@ pub struct App {
     redraw: bool,
     /// Keys to play once the folder is listed.
     after_load: Vec<Stroke>,
-    /// Escape was typed where it does nothing by itself: with the next
-    /// key, it is Meta and that key (`Esc v`), as in mutt.
-    escape: bool,
+    /// Escape was typed where it does nothing by itself, in this menu:
+    /// with the next key there, it is Meta and that key (`Esc v`), as in
+    /// mutt.
+    escape: Option<Menu>,
     /// The user cancelled the sign-in in progress: the outcome it still
     /// reports isn't shown.
     cancelled: bool,
@@ -623,7 +624,7 @@ impl App {
             played: 0,
             redraw: false,
             after_load: Vec::new(),
-            escape: false,
+            escape: None,
             cancelled: false,
             dismissed: false,
             input: None,
@@ -1954,6 +1955,16 @@ impl App {
         vec![list]
     }
 
+    /// The date of the oldest message listed so far.
+    fn oldest_listed(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.messages
+            .iter()
+            .chain(&self.hidden)
+            .chain(&self.folded)
+            .map(|m| m.received)
+            .min()
+    }
+
     /// Whether more messages are loading or could be loaded.
     fn more_to_list(&self) -> bool {
         self.listing.is_some() || self.unlisted.is_some()
@@ -1991,9 +2002,10 @@ impl App {
         }
         let last = self.messages.len().saturating_sub(1);
         let selected = match target {
+            // A later page may bring a thread that goes in between.
+            Target::NextThread if loading => return Vec::new(),
             Target::NextThread => match self.next_thread_root() {
                 Some(next) => next,
-                None if loading => return Vec::new(),
                 None => {
                     self.pending = None;
                     self.fail("You are on the last thread.");
@@ -2006,11 +2018,23 @@ impl App {
                 let from = shown(&message)
                     .or_else(|| self.thread_of(&message).and_then(|t| shown(&t.root)));
                 // What comes after it is settled while the folder loads
-                // only if the index is in the order pages come in (by date):
-                // otherwise a later page may put a message in between.
-                let settled = !loading || self.ordering.sort.method == crate::sort::Method::Date;
-                match from.map(|from| from + steps) {
-                    Some(entry) if entry < self.messages.len() && settled => entry,
+                // only if the index is in the order pages come in (by
+                // date), and none of the way there is as old as the oldest
+                // listed: later pages bring older mail, and mail from the
+                // same time may go anywhere among it (by `sort_aux`).
+                let settled = |from: usize, entry: usize| {
+                    !loading
+                        || self.ordering.sort.method == crate::sort::Method::Date
+                            && self.oldest_listed().is_some_and(|oldest| {
+                                self.messages[from..=entry]
+                                    .iter()
+                                    .all(|m| m.received != oldest)
+                            })
+                };
+                match from.map(|from| (from, from + steps)) {
+                    Some((from, entry)) if entry < self.messages.len() && settled(from, entry) => {
+                        entry
+                    }
                     _ if loading => return Vec::new(),
                     _ => last,
                 }
