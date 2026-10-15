@@ -762,7 +762,7 @@ impl App {
         let into_open = to.is_some()
             && to.as_ref() == self.folder.as_ref().map(|f| &f.id)
             && results.iter().any(|(_, result)| result.is_ok());
-        let mut effects = self.finish_transfer(transfer, request, results);
+        let mut effects = self.finish_transfer(transfer, request, results, to.clone());
         if into_open {
             // Not under the pager, whose message and position would no
             // longer match the index: once back in the index.
@@ -780,6 +780,7 @@ impl App {
         transfer: Transfer,
         request: Request,
         results: Vec<(MessageId, mett_core::Result<()>)>,
+        resolved: Option<FolderId>,
     ) -> Vec<Effect> {
         let total = results.len();
         let to = destination(&request);
@@ -836,11 +837,21 @@ impl App {
         }
         // Only the same operation to the same place succeeding clears a
         // failure: a copy doesn't make up for a failed move, nor a copy to
-        // one folder for a copy to another.
-        for id in &done {
-            self.transfer_failures
-                .remove(&(id.clone(), transfer, to.clone()));
+        // one folder for a copy to another. The same folder may go by
+        // another name (`=Archive`, `=@archive`, the browser's).
+        if let (Some(path), Some(folder)) = (&to, &resolved) {
+            self.folder_ids.insert(path.clone(), folder.clone());
         }
+        let same_place = |place: &Option<FolderPath>| {
+            *place == to
+                || place
+                    .as_ref()
+                    .zip(resolved.as_ref())
+                    .is_some_and(|(path, folder)| self.folder_ids.get(path) == Some(folder))
+        };
+        self.transfer_failures.retain(|(id, failed, place), _| {
+            !(done.contains(id) && *failed == transfer && same_place(place))
+        });
         if let Some(e) = failure {
             // Whatever failed stays where it was, still marked; don't go
             // on as if the purge had worked (unless all of it is to retry
@@ -3229,5 +3240,31 @@ mod tests {
             event: Event::FlagsUpdated(Ok(())),
         }));
         assert!(!app.messages[0].flags.read);
+    }
+
+    #[test]
+    fn a_copy_to_the_same_folder_by_another_name_makes_up_for_a_failed_one() {
+        let mut app = app(settings());
+        act(&mut app, Action::CopyMessage);
+        let (id, _) = sent(&answer(&mut app, "=Archive"));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Transferred(Ok((
+                FolderId::new("arc"),
+                vec![("m0".into(), Err(Error::Network("offline".into())))],
+            ))),
+        }));
+        assert!(!app.save_failures().is_empty());
+        app.selected = 0;
+        act(&mut app, Action::CopyMessage);
+        let (id, _) = sent(&answer(&mut app, "=@archive"));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Transferred(Ok((
+                FolderId::new("arc"),
+                vec![("m0".into(), Ok("c0".into()))],
+            ))),
+        }));
+        assert!(app.save_failures().is_empty(), "{:?}", app.save_failures());
     }
 }

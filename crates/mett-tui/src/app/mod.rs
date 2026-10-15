@@ -419,6 +419,9 @@ pub struct App {
     /// Keyed by where the message was to go (none for a purge): a copy
     /// elsewhere doesn't make up for one that failed.
     transfer_failures: HashMap<(MessageId, Transfer, Option<FolderPath>), String>,
+    /// The folders that mailbox paths moved or copied to turned out to be,
+    /// to tell when two paths name the same folder.
+    folder_ids: HashMap<FolderPath, mett_core::FolderId>,
     /// The message that last failed to open, so that opening it can be
     /// retried.
     unfetched: Option<MessageId>,
@@ -502,6 +505,7 @@ impl App {
             saved_flags: HashMap::new(),
             removed_while_listing: HashSet::new(),
             transfer_failures: HashMap::new(),
+            folder_ids: HashMap::new(),
             unfetched: None,
             retry_after: HashSet::new(),
             next_request: 0,
