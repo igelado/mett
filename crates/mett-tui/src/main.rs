@@ -744,6 +744,27 @@ impl Deferred {
     }
 }
 
+/// The largest file Office365 takes as an attachment.
+const MAX_ATTACHMENT: u64 = 150 * 1024 * 1024;
+
+/// Reads a file to attach, stopping past [`MAX_ATTACHMENT`]: one larger
+/// (or without end, such as `/dev/zero`) can't be sent.
+fn read_attachment(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut data = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_ATTACHMENT + 1).read_to_end(&mut data))
+        .map_err(|e| e.to_string())?;
+    if data.len() as u64 > MAX_ATTACHMENT {
+        return Err(format!(
+            "larger than {} MB, which Office365 doesn't take",
+            MAX_ATTACHMENT / 1024 / 1024
+        ));
+    }
+    Ok(data)
+}
+
 /// How many files are being saved: mett waits for them before exiting, so
 /// none is left half written.
 static SAVING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1084,7 +1105,7 @@ fn dispatch(
             Effect::ReadFile(op, path) => {
                 let files = files.clone();
                 std::thread::spawn(move || {
-                    let read = std::fs::read(&path).map_err(|e| e.to_string());
+                    let read = read_attachment(&path);
                     let _ = files.send(app::Msg::FileRead(op, path, read));
                 });
             }
@@ -1205,6 +1226,13 @@ fn discard_pending_input() {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn attachments_stop_at_what_office365_takes() {
+        let read = read_attachment(std::path::Path::new("/dev/zero"));
+        assert!(read.is_err_and(|e| e.contains("150 MB")));
+    }
 
     #[test]
     fn replacing_a_file_keeps_it_until_the_new_one_is_written() {
