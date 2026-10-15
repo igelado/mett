@@ -1,6 +1,7 @@
 //! [`GraphAuthenticator`]: the [`Authenticator`] port for Microsoft Graph.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{AccessToken, Authenticator, Result};
@@ -26,6 +27,10 @@ pub struct GraphAuthenticator<S, P> {
     store: Arc<S>,
     prompter: P,
     state: Mutex<State>,
+    /// How many interactive sign-ins have ended. Read before waiting for
+    /// `state`, it tells whether a caller was already waiting when a
+    /// sign-in ended.
+    sign_ins: AtomicU64,
 }
 
 #[derive(Default)]
@@ -40,6 +45,9 @@ struct State {
     /// check succeeds, but keeping them avoids asking the user to sign in
     /// again.
     unconfirmed: Option<Unconfirmed>,
+    /// The last interactive sign-in, by its number (see
+    /// [`GraphAuthenticator::sign_ins`]), if it failed or was cancelled.
+    failed_sign_in: Option<(u64, mett_core::Error)>,
 }
 
 struct Unconfirmed {
@@ -93,6 +101,7 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
             store,
             prompter,
             state: Mutex::new(State::default()),
+            sign_ins: AtomicU64::new(0),
         }
     }
 
@@ -308,6 +317,7 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
     }
 
     async fn access_token(&self) -> Result<AccessToken> {
+        let arrived = self.sign_ins.load(Ordering::SeqCst);
         let mut state = self.state.lock().await;
 
         let now = Utc::now();
@@ -408,7 +418,19 @@ impl<S: TokenStore, P: Prompter> Authenticator for GraphAuthenticator<S, P> {
             }
         }
 
-        self.sign_in_and_confirm(&mut state).await
+        // Callers that were waiting while a sign-in failed or was cancelled
+        // share its outcome, rather than asking the user again straight
+        // away. Only a later request (such as the user retrying) starts a
+        // new sign-in.
+        if let Some((number, error)) = &state.failed_sign_in
+            && *number > arrived
+        {
+            return Err(error.clone());
+        }
+        let result = self.sign_in_and_confirm(&mut state).await;
+        let number = self.sign_ins.fetch_add(1, Ordering::SeqCst) + 1;
+        state.failed_sign_in = result.as_ref().err().map(|e| (number, e.clone()));
+        result
     }
 }
 

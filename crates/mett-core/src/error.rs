@@ -10,7 +10,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Adapters map their own failures onto these variants so that the UI can
 /// react to them (for example, re-authenticate on [`Error::Auth`]) without
 /// knowing which backend produced them.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The requested object does not exist.

@@ -1172,3 +1172,36 @@ async fn cancelling_while_confirming_the_user_keeps_nothing() {
     assert!(matches!(result, Err(Error::Auth(m)) if m.contains("cancelled")));
     assert_eq!(stored(&store), None);
 }
+
+#[tokio::test]
+async fn requests_waiting_on_a_cancelled_sign_in_do_not_prompt_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DEVICE_PATH))
+        .respond_with(device_code_response(900))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(oauth_error("authorization_pending"))
+        .mount(&server)
+        .await;
+
+    let recorder = Recorder::default();
+    let auth = GraphAuthenticator::new(
+        settings(&server, AuthFlow::DeviceCode),
+        reqwest::Client::new(),
+        Arc::new(MemoryStore::default()),
+        recorder.clone(),
+    );
+    // Two requests need a token at once; the user cancels the sign-in.
+    let (first, second) = tokio::join!(auth.access_token(), auth.access_token());
+    for result in [first, second] {
+        assert!(matches!(result, Err(Error::Auth(m)) if m.contains("cancelled")));
+    }
+    assert_eq!(recorder.0.prompts.lock().unwrap().len(), 1);
+
+    // A later request, such as the user retrying, signs in again.
+    assert!(auth.access_token().await.is_err());
+    assert_eq!(recorder.0.prompts.lock().unwrap().len(), 2);
+}

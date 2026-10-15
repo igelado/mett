@@ -362,10 +362,11 @@ impl App {
             || !self.flag_updates.is_empty()
     }
 
-    /// Retries, if the user asked to before the failed request reported
-    /// back.
+    /// Retries, if the user asked to before the failed requests reported
+    /// back and they all have now.
     fn retry_if_requested(&mut self) -> Vec<Effect> {
-        if std::mem::take(&mut self.retry_when_reported) {
+        if self.retry_when_reported && !self.awaiting_responses() {
+            self.retry_when_reported = false;
             self.retry()
         } else {
             Vec::new()
@@ -521,7 +522,13 @@ impl App {
         vec![fetch]
     }
 
-    fn on_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
+    fn on_response(&mut self, response: Response) -> Vec<Effect> {
+        let mut effects = self.handle_response(response);
+        effects.extend(self.retry_if_requested());
+        effects
+    }
+
+    fn handle_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
             Event::FolderOpened(_) if self.opening != Some(id) => {}
             Event::FolderOpened(Ok(folder)) => {
@@ -554,7 +561,6 @@ impl App {
                     self.listing = None;
                     self.unlisted = self.listing_page.take();
                     self.report(e);
-                    return self.retry_if_requested();
                 }
             },
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
@@ -574,14 +580,12 @@ impl App {
                         }
                         self.save_failures.insert(message, e.to_string());
                         self.report(e);
-                        return self.retry_if_requested();
                     }
                 }
             }
             Event::FolderOpened(Err(e)) => {
                 self.opening = None;
                 self.report(e);
-                return self.retry_if_requested();
             }
             Event::MessagesListed(_) => {}
         }
@@ -608,7 +612,7 @@ impl App {
                 self.screens.pop();
                 self.unfetched = Some(failed);
                 self.report(e);
-                return self.retry_if_requested();
+                return Vec::new();
             }
         };
         pager.lines = text::pager_lines(&message);
@@ -1517,5 +1521,39 @@ mod tests {
         }));
         app.update(Msg::SignIn(finished(Ok(()))));
         assert_eq!(app.status, "folder not found: x");
+    }
+
+    #[test]
+    fn retry_waits_for_every_pending_request() {
+        let (mut app, list) = loading_more(1);
+        // Opening a message fails while the next page is still loading.
+        let effects = act(&mut app, Action::DisplayMessage);
+        let [Effect::Request(fetch, _)] = effects.as_slice() else {
+            panic!("expected a fetch, got {effects:?}");
+        };
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(act(&mut app, Action::Retry).is_empty());
+        let effects = app.update(Msg::Response(Response {
+            id: *fetch,
+            event: Event::MessageFetched(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            effects.is_empty(),
+            "still waiting for the page: {effects:?}"
+        );
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Err(Error::Auth("denied".into()))),
+        }));
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::Request(_, Request::ListMessages { .. }),
+                    Effect::Request(_, Request::FetchMessage(_)),
+                ]
+            ),
+            "{effects:?}"
+        );
     }
 }
