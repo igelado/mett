@@ -271,8 +271,10 @@ pub fn reply_recipients(
     } else {
         summary.from.iter().cloned().collect()
     };
-    let from_me = !to.is_empty() && to.iter().all(|a| settings.is_me(a));
-    if from_me {
+    // A reply to one's own message (by its sender, not its Reply-To,
+    // which may point at the user) goes to its recipients instead.
+    let from_me = summary.from.as_ref().is_some_and(|a| settings.is_me(a));
+    if from_me && to.iter().all(|a| settings.is_me(a)) {
         // Leave the user out too (unless `metoo`), but not if they were
         // the only recipient.
         let others: Vec<Address> = summary
@@ -447,6 +449,14 @@ mod tests {
         assert_eq!(to, [Address::new("list@x.org")]);
         let (to, _) = reply_recipients(&message, false, false, &settings());
         assert_eq!(to[0].email, "bob@x.org");
+    }
+
+    #[test]
+    fn a_reply_to_address_of_mine_is_kept() {
+        let mut message = message();
+        message.reply_to = vec![Address::new("me@contoso.com")];
+        let (to, _) = reply_recipients(&message, true, false, &settings());
+        assert_eq!(to, [Address::new("me@contoso.com")]);
     }
 
     #[test]

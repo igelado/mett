@@ -115,11 +115,15 @@ impl LineEditor {
     /// column within it. The view scrolls so that the cursor stays visible.
     pub fn view(&self, width: usize) -> (String, usize) {
         let width = width.max(1);
-        let cells = |range: &[String]| range.iter().map(|g| g.width()).sum::<usize>();
         // Start as far right as possible while keeping the cursor visible,
         // leaving a cell for it at the end of the line.
+        let mut before_cursor: usize = self.graphemes[..self.cursor]
+            .iter()
+            .map(|g| g.width())
+            .sum();
         let mut start = 0;
-        while cells(&self.graphemes[start..self.cursor]) + 1 > width && start < self.cursor {
+        while before_cursor + 1 > width && start < self.cursor {
+            before_cursor -= self.graphemes[start].width();
             start += 1;
         }
         let mut shown = String::new();
@@ -131,7 +135,7 @@ impl LineEditor {
             used += g.width();
             shown.push_str(g);
         }
-        (shown, cells(&self.graphemes[start..self.cursor]))
+        (shown, before_cursor)
     }
 }
 
