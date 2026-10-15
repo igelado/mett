@@ -142,7 +142,10 @@ impl App {
         let Some(folder) = &self.folder else {
             return Vec::new();
         };
+        // Nor while part of it is still to be listed again: what a check
+        // adds, that listing would add again.
         if self.listing.is_some()
+            || self.unlisted.is_some()
             || self.polling.is_some()
             || self.opening.is_some()
             || self.switching.is_some()
@@ -199,7 +202,7 @@ impl App {
             return Vec::new();
         }
         let request = self.request(Request::CheckMailboxes(mailboxes));
-        self.checking = Some((effect_id(&request), self.poll_epoch));
+        self.checking = Some(effect_id(&request));
         vec![request]
     }
 
@@ -447,13 +450,25 @@ impl App {
         id: RequestId,
         checked: Vec<(FolderPath, mett_core::Result<Checked>)>,
     ) -> Vec<Effect> {
-        let Some((_, epoch)) = self.checking.take_if(|(request, _)| *request == id) else {
+        if self.checking.take_if(|request| *request == id).is_none() {
             return Vec::new();
-        };
+        }
         let mut arrived = Vec::new();
         let mut failure = None;
         for (path, result) in checked {
-            let open = self.is_open(&path, result.as_ref().ok().map(|c| &c.folder));
+            let found = result.as_ref().ok().map(|c| &c.folder);
+            let open = self.is_open(&path, found);
+            // Another mailbox path for the same folder: what was seen there
+            // was seen here.
+            let alias_seen = found.and_then(|found| {
+                self.mailbox_state
+                    .iter()
+                    .filter(|(other, s)| {
+                        **other != path && s.folder.as_ref().is_some_and(|f| f.id == found.id)
+                    })
+                    .filter_map(|(_, s)| s.seen)
+                    .max()
+            });
             let state = self.mailbox_state.entry(path.clone()).or_default();
             match result {
                 Ok(Checked {
@@ -465,6 +480,9 @@ impl App {
                         *state = MailboxState::default();
                     }
                     self.folder_ids.insert(path.clone(), folder.id.clone());
+                    if let Some(seen) = alias_seen {
+                        state.see(seen);
+                    }
                     let first = !state.sampled;
                     state.sampled = true;
                     let before = state.newest_unread;
@@ -477,15 +495,18 @@ impl App {
                         // Unread mail that arrived (or changed) after the
                         // user last had it open (or at all, before they
                         // did) is new.
+                        let was_new = state.new;
                         state.new = match (newest_unread, state.seen) {
                             (None, _) => false,
                             (Some(_), None) => true,
                             (Some(newest), Some(seen)) => seen.is_none_or(|seen| newest > seen),
                         };
-                        // Said when newer mail arrives, not at first.
+                        // Said when newer mail arrives, or mail found
+                        // while the folder was open turns out unseen; not at
+                        // first.
                         let newer = newest_unread
                             .is_some_and(|newest| before.is_none_or(|before| newest > before));
-                        if state.new && newer && !first {
+                        if state.new && (newer || !was_new) && !first {
                             arrived.push(path);
                         }
                     }
@@ -505,9 +526,9 @@ impl App {
                         state.new = false;
                         state.newest_unread = None;
                     }
-                    if matches!(e, Error::Auth(_)) && epoch == self.poll_epoch {
-                        self.poll_paused = true;
-                    }
+                    // A mailbox mett is refused (access denied) doesn't
+                    // stop checking the others: a failed sign-in shows in
+                    // its window, and stops the open folder's checks.
                 }
             }
         }
@@ -527,7 +548,7 @@ impl App {
                 .map_or(String::new(), |m| m.name.clone());
             // Said once the message line is free; until then, the next
             // check tries again.
-            if self.status.is_empty() && !matches!(e, Error::Auth(_)) {
+            if self.status.is_empty() {
                 self.status = format!("Couldn't check {name}: {e}");
                 if let Some(state) = self.mailbox_state.get_mut(&path) {
                     state.reported = true;
@@ -1461,6 +1482,72 @@ mod tests {
         settings.mailboxes[1].poll = false;
         app.apply_settings(settings);
         assert_eq!(app.mailboxes_with_new_mail(), 0);
+    }
+
+    #[test]
+    fn mail_found_while_open_but_unseen_is_announced_after_leaving() {
+        let (mut app, check) = app();
+        // Found while the Inbox is open, before its index shows it.
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 4, Some(9))),
+                (work(), checked("work", "Work", 0, None)),
+            ]),
+        );
+        app.change_folder(work());
+        let (switch, _) = app.switching.clone().unwrap();
+        respond(
+            &mut app,
+            switch,
+            Event::FolderOpened(Ok(folder("work", "Work", 0))),
+        );
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let (check, _) = requests(&effects)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+            .unwrap();
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 4, Some(9))),
+                (work(), checked("work", "Work", 0, None)),
+            ]),
+        );
+        assert_eq!(app.status, "New mail in =@inbox.");
+    }
+
+    #[test]
+    fn a_refused_mailbox_is_said_and_checks_go_on() {
+        let (mut app, check) = app();
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 1, Some(1))),
+                (work(), Err(Error::Auth("access denied".into()))),
+            ]),
+        );
+        assert!(
+            app.status.starts_with("Couldn't check =Work"),
+            "{}",
+            app.status
+        );
+        poll(&mut app);
+    }
+
+    #[test]
+    fn no_check_while_part_of_the_folder_is_to_be_listed_again() {
+        let (mut app, _) = app();
+        app.unlisted = Some(Page::first(10));
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        assert!(
+            !requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. }))
+        );
     }
 
     #[test]

@@ -536,9 +536,8 @@ pub struct App {
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
-    /// The request reading the mailboxes' counts, and the retries before
-    /// it was made.
-    checking: Option<(RequestId, u64)>,
+    /// The request reading the mailboxes' counts.
+    checking: Option<RequestId>,
     /// How many times the user retried after a failed sign-in: background
     /// checks made before the last retry don't hold off checking.
     poll_epoch: u64,
