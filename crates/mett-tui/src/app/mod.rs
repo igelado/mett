@@ -1703,7 +1703,9 @@ impl App {
         let last = self.messages.len().saturating_sub(1);
         let loading = self.listing.is_some();
         let selected = match target {
-            Target::Entry(entry) if entry <= last => entry,
+            // Loaded (the index may still be empty, with a limit hiding
+            // all the messages loaded so far).
+            Target::Entry(entry) if entry < self.messages.len() => entry,
             Target::Entry(_) | Target::Last if !loading => last,
             Target::Last => {
                 self.selected = last;

@@ -1335,4 +1335,35 @@ mod tests {
             })
             .expect("a request")
     }
+
+    #[test]
+    fn next_in_an_empty_limited_index_keeps_waiting_through_empty_pages() {
+        let (mut app, next) = loading();
+        act(&mut app, Action::Limit);
+        answer(&mut app, "~f bob");
+        act(&mut app, Action::NextEntry);
+        // A page without a match: still nothing to move to.
+        let mut alice = mock::message("m5", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
+        alice.from = Some(Address::new("alice@contoso.com"));
+        let effects = app.update(Msg::Response(Response {
+            id: next,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![alice],
+                next: Some(mett_core::PageCursor::new("d")),
+            })),
+        }));
+        assert!(app.pending.is_some(), "still waiting");
+        let Some(Effect::Request(last, _)) = effects.first().cloned() else {
+            panic!("expected the next page, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: last,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![bob()],
+                next: None,
+            })),
+        }));
+        assert_eq!(app.messages[app.selected].id.as_str(), "m1");
+        assert!(app.pending.is_none());
+    }
 }
