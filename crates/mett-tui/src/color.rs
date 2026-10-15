@@ -379,7 +379,10 @@ impl Colors {
             return Err(format!("uncolor: {}: expected * or an expression", args[0]).into());
         }
         let all = expressions.iter().any(|e| e == "*");
-        let keep = |text: &String| !all && !expressions.contains(text);
+        // Each expression, or all of them as one, as `color` joins one
+        // written unquoted.
+        let joined = expressions.join(" ");
+        let keep = |text: &String| !all && !expressions.contains(text) && *text != joined;
         match object {
             Object::Index => self.index.retain(|rule| keep(&rule.text)),
             Object::Header => self.header.retain(|rule| keep(&rule.text)),
@@ -620,6 +623,12 @@ mod tests {
         colors.color(&words("index red default ~N")).unwrap();
         colors.color(&words("index red default ~F")).unwrap();
         colors.uncolor(&words("index ~N")).unwrap();
+        assert_eq!(colors.index.len(), 1);
+        // Written unquoted, as it was given.
+        colors
+            .color(&words("index red default ~f alice@x.org"))
+            .unwrap();
+        colors.uncolor(&words("index ~f alice@x.org")).unwrap();
         assert_eq!(colors.index.len(), 1);
         colors.uncolor(&words("index *")).unwrap();
         colors.uncolor(&words("status")).unwrap();
