@@ -43,6 +43,7 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
         &[
             (Action::Exit, "Close"),
             (Action::OpenBrowser, "Browser"),
+            (Action::CopyLink, "Copy"),
             (Action::Retry, "Retry"),
         ],
     ),
@@ -486,7 +487,7 @@ mod tests {
             },
         }));
         let lines = sized_screen(&app, 60, 12);
-        assert_eq!(lines[0], "q:Close  o:Browser");
+        assert_eq!(lines[0], "q:Close  o:Browser  c:Copy");
         let window = lines.join("\n");
         assert!(
             window.contains("Sign in to alice@contoso.com"),
@@ -503,7 +504,7 @@ mod tests {
             outcome: Err("denied".into()),
         }));
         let lines = sized_screen(&app, 60, 12);
-        assert_eq!(lines[0], "q:Close  o:Browser  <Enter>:Retry");
+        assert_eq!(lines[0], "q:Close  o:Browser  c:Copy  <Enter>:Retry");
         let window = lines.join("\n");
         assert!(window.contains("Sign-in failed: denied"), "{window}");
     }
