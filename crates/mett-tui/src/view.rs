@@ -428,7 +428,7 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
             // unread.
             let thread = app.thread_of(&message.id);
             let folded_unread;
-            let message = if thread.is_some_and(|t| t.folded_unread) && message.flags.read {
+            let message = if message.flags.read && app.folded_unread(&message.id) {
                 let mut shown = message.clone();
                 shown.flags.read = false;
                 folded_unread = shown;
@@ -476,7 +476,7 @@ fn index_status(app: &App, height: usize, width: usize) -> String {
     let status = Status {
         folder: app.folder.as_ref().map_or("", |f| f.name.as_str()),
         total: app.total_messages(),
-        shown: app.limit.as_ref().map(|_| app.messages.len()),
+        shown: app.limit.as_ref().map(|_| app.shown_count()),
         // The whole folder, as in mutt, whatever the limit shows.
         new: app.folder_messages().filter(|m| !m.flags.read).count(),
         deleted: app.deleted_count(),

@@ -1990,7 +1990,10 @@ impl App {
                 }
             },
             Target::After(message, steps) => {
-                let from = self.messages.iter().position(|m| m.id == message);
+                // Folded into a collapsed thread since: from the thread.
+                let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+                let from = shown(&message)
+                    .or_else(|| self.thread_of(&message).and_then(|t| shown(&t.root)));
                 match from.map(|from| from + steps) {
                     Some(entry) if entry < self.messages.len() => entry,
                     _ if loading => return Vec::new(),

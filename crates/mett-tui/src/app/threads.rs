@@ -57,15 +57,27 @@ pub struct Threaded {
     /// For a collapsed thread's first message, how many messages are
     /// folded under it.
     pub folded: usize,
-    /// For a collapsed thread's first message, whether unread mail is
-    /// folded under it.
-    pub folded_unread: bool,
 }
 
 impl App {
     /// Whether the index shows threads.
     pub fn threaded(&self) -> bool {
         self.ordering.sort.method == Method::Threads
+    }
+
+    /// Whether unread mail is folded under `root` (into its collapsed
+    /// thread), as its flags are now.
+    pub fn folded_unread(&self, root: &MessageId) -> bool {
+        self.thread_of(root).is_some_and(|t| t.folded > 0)
+            && self
+                .folded
+                .iter()
+                .any(|m| !m.flags.read && self.thread_of(&m.id).is_some_and(|t| &t.root == root))
+    }
+
+    /// How many messages the index shows, folded ones too.
+    pub fn shown_count(&self) -> usize {
+        self.messages.len() + self.folded.len()
     }
 
     /// Where a message is in its thread, if the index shows threads.
@@ -93,7 +105,7 @@ impl App {
         let threaded = self.threaded();
         let ids: Vec<MessageId> = all.iter().map(|m| m.id.clone()).collect();
         let mut slots: Vec<Option<MessageSummary>> = all.into_iter().map(Some).collect();
-        let mut folded_under: HashMap<MessageId, (usize, bool)> = HashMap::new();
+        let mut folded_under: HashMap<MessageId, usize> = HashMap::new();
         self.threads.clear();
         for node in nodes {
             let message = slots[node.index].take().expect("each message once");
@@ -109,23 +121,19 @@ impl App {
                         root: root.clone(),
                         key,
                         folded: 0,
-                        folded_unread: false,
                     },
                 );
             }
             if fold {
-                let (count, unread) = folded_under.entry(root).or_default();
-                *count += 1;
-                *unread |= !message.flags.read;
+                *folded_under.entry(root).or_default() += 1;
                 self.folded.push(message);
             } else {
                 self.messages.push(message);
             }
         }
-        for (root, (count, unread)) in folded_under {
+        for (root, count) in folded_under {
             if let Some(threaded) = self.threads.get_mut(&root) {
                 threaded.folded = count;
-                threaded.folded_unread = unread;
             }
         }
         // (Collapsed threads hidden by a limit stay collapsed; the folder's
@@ -449,8 +457,16 @@ mod tests {
             m.flags.read = m.id.as_str() != "a2";
         }
         act(&mut app, Action::CollapseThread);
-        assert!(app.thread_of(&MessageId::new("a0")).unwrap().folded_unread);
-        assert!(!app.thread_of(&MessageId::new("b0")).unwrap().folded_unread);
+        assert!(app.folded_unread(&MessageId::new("a0")));
+        assert!(!app.folded_unread(&MessageId::new("b0")));
+        // As the flags are now.
+        let a2 = app
+            .folded
+            .iter_mut()
+            .find(|m| m.id.as_str() == "a2")
+            .unwrap();
+        a2.flags.read = true;
+        assert!(!app.folded_unread(&MessageId::new("a0")));
     }
 
     #[test]
@@ -459,6 +475,8 @@ mod tests {
         act(&mut app, Action::CollapseAll);
         app.set_limit("~s b");
         assert_eq!(shown(&app), ["b0 (1)"]);
+        // The limit shows both, one folded.
+        assert_eq!(app.shown_count(), 2);
         app.set_limit("all");
         assert_eq!(shown(&app), ["a0 (2)", "b0 (1)"]);
     }
@@ -568,6 +586,15 @@ mod tests {
         act(&mut app, Action::NextEntry);
         page(&mut app, next, vec![named("a"), named("c")]);
         assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    }
+
+    #[test]
+    fn a_pending_move_from_a_folded_message_goes_after_its_thread() {
+        let mut app = app();
+        act(&mut app, Action::CollapseAll);
+        app.pending = Some(super::super::Target::After(MessageId::new("a1"), 1));
+        app.apply_pending();
+        assert_eq!(app.messages[app.selected].id.as_str(), "b0");
     }
 
     #[test]
