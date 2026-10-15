@@ -990,12 +990,7 @@ mod tests {
         signed_out(&mut app);
         respond(&mut app, next, Event::MessagesListed(Err(expired())));
         let effects = app.retry();
-        let again = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request(id, Request::ListMessages { .. }) => Some(*id),
-                _ => None,
-            })
+        let again = request_for(&effects, |r| matches!(r, Request::ListMessages { .. }))
             .expect("the page again");
         listed(&mut app, again, vec![bob()], None);
         assert_eq!(app.selected, 1);
@@ -1010,12 +1005,7 @@ mod tests {
         signed_out(&mut app);
         respond(&mut app, fetch, Event::MessageFetched(Err(expired())));
         let effects = app.retry();
-        let again = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request(id, Request::FetchMessage(_)) => Some(*id),
-                _ => None,
-            })
+        let again = request_for(&effects, |r| matches!(r, Request::FetchMessage(_)))
             .expect("fetched again");
         fetched(
             &mut app,

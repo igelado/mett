@@ -202,3 +202,14 @@ pub(super) fn offline() -> Error {
 pub(super) fn expired() -> Error {
     Error::Auth("expired".into())
 }
+
+/// The first request among `effects` that `wanted` picks.
+pub(super) fn request_for(
+    effects: &[Effect],
+    wanted: impl Fn(&Request) -> bool,
+) -> Option<RequestId> {
+    effects.iter().find_map(|e| match e {
+        Effect::Request(id, request) if wanted(request) => Some(*id),
+        _ => None,
+    })
+}

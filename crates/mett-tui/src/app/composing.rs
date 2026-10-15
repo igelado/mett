@@ -1461,12 +1461,7 @@ mod tests {
         written(&mut app, "text");
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = respond(&mut app, id, Event::Sent(Ok(()), false));
-        let list = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request(id, Request::ListMessages { .. }) => Some(*id),
-                _ => None,
-            })
+        let list = request_for(&effects, |r| matches!(r, Request::ListMessages { .. }))
             .expect("listed again");
         listed(&mut app, list, sent_items(&["new", "a", "b", "c"]), None);
         assert_eq!(app.messages[app.selected].id.as_str(), "b");
