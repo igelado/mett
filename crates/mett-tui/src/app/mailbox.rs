@@ -97,6 +97,16 @@ impl App {
         self.messages.get(self.selected).map(|s| s.id.clone())
     }
 
+    /// The message mailbox actions act on: the one the pager shows, or the
+    /// one selected in the index. (A background listing may move the
+    /// index's selection while the pager is open.)
+    fn acted_on(&self) -> Option<MessageId> {
+        match self.screens.last() {
+            Some(Screen::Pager(pager)) => Some(pager.id.clone()),
+            _ => self.selected_id(),
+        }
+    }
+
     /// Whether the message is marked for deletion.
     pub fn is_deleted(&self, id: &MessageId) -> bool {
         self.deleted.contains(id)
@@ -114,7 +124,7 @@ impl App {
         // nothing else may happen to it meanwhile. While it is moved or
         // copied, the message can't be moved, copied or marked again: one
         // of them would find it gone.
-        let selected = self.selected_id();
+        let selected = self.acted_on();
         // A purge on its way can't be called off.
         let purging = selected
             .as_ref()
@@ -161,7 +171,7 @@ impl App {
         }
         let effects = match action {
             Action::DeleteMessage | Action::UndeleteMessage => {
-                let Some(id) = self.selected_id() else {
+                let Some(id) = self.acted_on() else {
                     self.status = "No messages.".into();
                     return Some(Vec::new());
                 };
@@ -178,11 +188,14 @@ impl App {
                 }
             }
             Action::FlagMessage | Action::ToggleNew => {
-                let Some(id) = self.selected_id() else {
+                let Some(flags) = self
+                    .acted_on()
+                    .and_then(|id| self.summary(&id).map(|summary| (id, summary.flags)))
+                else {
                     self.status = "No messages.".into();
                     return Some(Vec::new());
                 };
-                let flags = self.messages[self.selected].flags;
+                let (id, flags) = flags;
                 let update = if action == Action::FlagMessage {
                     FlagsUpdate {
                         flagged: Some(!flags.flagged),
@@ -217,7 +230,7 @@ impl App {
                 };
                 // The answer is for this message, whatever the index shows
                 // by then.
-                self.question_message = self.selected_id();
+                self.question_message = self.acted_on();
                 self.ask_mailbox(question, "");
                 Vec::new()
             }
@@ -3367,5 +3380,23 @@ mod tests {
         assert_eq!(kept, [MessageId::new("m0")]);
         app.retry();
         assert_eq!(app.writes.len() + usize::from(app.writing.is_some()), 1);
+    }
+
+    #[test]
+    fn the_pager_s_message_is_the_one_acted_on() {
+        let mut app = app(Settings {
+            resolve: false,
+            ..settings()
+        });
+        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
+        }));
+        // A background listing moves the index's selection meanwhile.
+        app.selected = 1;
+        act(&mut app, Action::DeleteMessage);
+        assert!(app.is_deleted(&"m0".into()));
+        assert!(!app.is_deleted(&"m1".into()));
     }
 }
