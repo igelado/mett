@@ -615,6 +615,14 @@ fn file_name(attachment: &Attachment) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::DateTime;
+    use mett_core::{AttachmentId, mock};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+    use crate::app::testing::*;
+    use crate::app::{Msg, Settings};
+    use crate::worker::Event;
 
     #[test]
     fn text_is_decoded_in_its_charset() {
@@ -632,26 +640,15 @@ mod tests {
         );
         assert_eq!(decode("text/plain; charset=x-unknown", b"x"), None);
     }
-    use chrono::DateTime;
-    use mett_core::{AttachmentId, mock};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    use super::*;
-    use crate::app::testing::*;
-    use crate::app::{Msg, Settings};
-
-    use crate::worker::Event;
 
     fn app() -> App {
         let settings = Settings {
             home: Some("/home/alice".into()),
             ..Settings::default()
         };
-        let (mut app, list) = opening(settings, 24);
         let mut message = mock::message("m0", "in", "Files", DateTime::UNIX_EPOCH).summary;
         message.has_attachments = true;
-        listed(&mut app, list, vec![message], None);
-        app
+        opened(settings, 24, vec![message], None).0
     }
 
     fn attachment(id: &str, name: &str, content_type: &str, kind: AttachmentKind) -> Attachment {
@@ -665,6 +662,10 @@ mod tests {
         }
     }
 
+    fn notes() -> Attachment {
+        attachment("a0", "notes.txt", "text/plain", AttachmentKind::File)
+    }
+
     /// The attachment menu of m0, with a text file, a PDF and a link.
     fn menu() -> App {
         let mut app = app();
@@ -674,7 +675,7 @@ mod tests {
             &mut app,
             id,
             Event::AttachmentsListed(Ok(vec![
-                attachment("a0", "notes.txt", "text/plain", AttachmentKind::File),
+                notes(),
                 attachment("a1", "report.pdf", "application/pdf", AttachmentKind::File),
                 attachment(
                     "a2",
@@ -702,16 +703,7 @@ mod tests {
         failed(&mut app);
         let (id, request) = sent(&act(&mut app, Action::Retry));
         assert_eq!(request, Request::ListAttachments(MessageId::new("m0")));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentsListed(Ok(vec![attachment(
-                "a0",
-                "notes.txt",
-                "text/plain",
-                AttachmentKind::File,
-            )])),
-        );
+        respond(&mut app, id, Event::AttachmentsListed(Ok(vec![notes()])));
         let (id, _) = sent(&act(&mut app, Action::DisplayMessage));
         respond(&mut app, id, Event::AttachmentFetched(Err(expired())));
         failed(&mut app);
@@ -844,7 +836,7 @@ mod tests {
             FileOp(1),
             FileOutcome::Exists(path.clone(), b"hello".to_vec()),
         ));
-        let effects = app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
+        let effects = key(&mut app, KeyCode::Char('y'));
         assert_eq!(
             effects,
             [Effect::SaveFile {
@@ -868,16 +860,7 @@ mod tests {
             menu: crate::keymap::Menu::Attach,
             scroll: 0,
         }));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentsListed(Ok(vec![attachment(
-                "a0",
-                "notes.txt",
-                "text/plain",
-                AttachmentKind::File,
-            )])),
-        );
+        respond(&mut app, id, Event::AttachmentsListed(Ok(vec![notes()])));
         assert!(!app.waiting());
         app.screens.pop();
         let Screen::Attachments(menu) = app.screen() else {
@@ -908,10 +891,7 @@ mod tests {
         let path = PathBuf::from("/home/alice/report.pdf");
         assert_eq!(effects, [Effect::ReadFile(FileOp(1), path.clone())]);
         // Keys wait for it.
-        assert!(
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Char('q'))))
-                .is_empty()
-        );
+        assert!(key(&mut app, KeyCode::Char('q')).is_empty());
         assert!(matches!(app.screen(), Screen::Compose(_)));
         assert!(app.status.starts_with("Waiting for /home/alice/report.pdf"));
         app.update(Msg::FileRead(FileOp(1), path, Ok(b"%PDF".to_vec())));

@@ -504,21 +504,21 @@ mod tests {
     #[test]
     fn escape_then_v_collapses_too() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('v'))));
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('v'));
         assert_eq!(shown(&app)[0], "a0 (2)");
     }
 
     #[test]
     fn an_escape_long_ago_leaves_the_next_key_alone() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        key(&mut app, KeyCode::Esc);
         if let Some((_, when)) = &mut app.escape
             && let Some(earlier) = when.checked_sub(std::time::Duration::from_secs(5))
         {
             *when = earlier;
         }
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('v'))));
+        key(&mut app, KeyCode::Char('v'));
         // `v`, not `Esc v`: the thread isn't collapsed.
         assert_eq!(shown(&app)[0], "a0");
     }
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn escape_then_control_n_is_control_n() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        key(&mut app, KeyCode::Esc);
         app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('n'),
             KeyModifiers::CONTROL,
@@ -538,11 +538,11 @@ mod tests {
     #[test]
     fn an_escape_is_forgotten_when_another_menu_takes_over() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        key(&mut app, KeyCode::Esc);
         // The help screen opens before the next key (as the sign-in window
         // may): its `q` still leaves it.
         act(&mut app, Action::Help);
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('q'))));
+        key(&mut app, KeyCode::Char('q'));
         assert_eq!(app.screen(), &Screen::Index);
     }
 

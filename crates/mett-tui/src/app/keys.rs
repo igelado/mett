@@ -413,23 +413,24 @@ fn macro_text(strokes: &[Stroke]) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
-    use mett_core::{WellKnownFolder, mock};
+    use mett_core::{MessageSummary, mock};
     use ratatui::crossterm::event::KeyCode;
 
     use super::*;
     use crate::app::composing::Input;
     use crate::app::testing::*;
-    use crate::config::mailbox::FolderPath;
     use crate::worker::Event;
+
+    /// Messages m0, m1 and m2.
+    fn three() -> Vec<MessageSummary> {
+        (0..3)
+            .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
+            .collect()
+    }
 
     /// An app with three messages in its index.
     fn app() -> App {
-        let (mut app, list) = opening(Settings::default(), 10);
-        let messages = (0..3)
-            .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
-            .collect();
-        listed(&mut app, list, messages, None);
-        app
+        opened(Settings::default(), 10, three(), None).0
     }
 
     fn press(app: &mut App, key: Key) -> Vec<Effect> {
@@ -572,20 +573,12 @@ mod tests {
 
     #[test]
     fn startup_keys_wait_for_the_folder() {
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 10, inbox, Settings::default());
+        let (mut app, effects) = App::open(80, 10, inbox(), Settings::default());
         app.push_after_load(crate::keymap::parse_strokes("<last-entry>").unwrap());
         assert!(app.next_stroke().is_none(), "nothing to move through yet");
         let open = first_request(&effects);
-        let list = first_request(&respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        ));
-        let messages = (0..3)
-            .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
-            .collect();
-        listed(&mut app, list, messages, None);
+        let list = folder_opened(&mut app, open, mock::folder("in", "Inbox", None));
+        listed(&mut app, list, three(), None);
         play(&mut app);
         assert_eq!(app.selected, 2);
     }
@@ -641,9 +634,9 @@ mod tests {
     #[test]
     fn help_waits_for_the_folder_list() {
         let mut app = app();
-        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
+        let effects = act(&mut app, Action::BrowseMailboxes);
         assert!(matches!(effects[..], [Effect::Request(..)]));
-        app.update(Msg::Action(Action::Help));
+        act(&mut app, Action::Help);
         assert!(matches!(app.screen(), Screen::Browser(_)));
         assert_eq!(app.status, "Listing folders; wait a moment.");
     }
@@ -701,12 +694,7 @@ mod tests {
             })
             .unwrap();
         app.push_keys("<last-entry>").unwrap();
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            prompt: mett_msgraph::SignInPrompt::OpenBrowser {
-                url: "https://login.example/authorize".parse().unwrap(),
-            },
-        }));
+        app.update(Msg::SignIn(browser_prompt()));
         press(&mut app, Key::char('x'));
         let Some(msg) = app.next_stroke() else {
             panic!("the macro waits");
@@ -765,13 +753,13 @@ mod tests {
     #[test]
     fn help_waits_for_another_folder_to_open() {
         let mut app = app();
-        app.update(Msg::Action(Action::ChangeFolder));
+        act(&mut app, Action::ChangeFolder);
         for c in "=Archive".chars() {
             press(&mut app, Key::char(c));
         }
         press(&mut app, Key::new(KeyCode::Enter));
         assert!(app.switching.is_some());
-        app.update(Msg::Action(Action::Help));
+        act(&mut app, Action::Help);
         assert_eq!(app.screen(), &Screen::Index);
         assert_eq!(app.status, "Opening folder; wait a moment.");
     }
@@ -779,8 +767,8 @@ mod tests {
     #[test]
     fn help_waits_for_the_message() {
         let mut app = app();
-        app.update(Msg::Action(Action::DisplayMessage));
-        app.update(Msg::Action(Action::Help));
+        act(&mut app, Action::DisplayMessage);
+        act(&mut app, Action::Help);
         assert!(matches!(app.screen(), Screen::Pager(_)));
         assert_eq!(app.status, "Loading message; wait a moment.");
     }
@@ -788,8 +776,8 @@ mod tests {
     #[test]
     fn a_taller_help_screen_scrolls_back() {
         let mut app = app();
-        app.update(Msg::Action(Action::Help));
-        app.update(Msg::Action(Action::LastEntry));
+        act(&mut app, Action::Help);
+        act(&mut app, Action::LastEntry);
         let Screen::Help(help) = app.screen() else {
             panic!("not in help");
         };
@@ -843,7 +831,7 @@ mod tests {
             kept_draft: false,
             kept: Vec::new(),
         }));
-        app.update(Msg::Action(Action::Help));
+        act(&mut app, Action::Help);
         assert!(matches!(app.screen(), Screen::Compose(_)));
         assert_eq!(app.status, "Sending message; wait a moment.");
     }
@@ -851,17 +839,12 @@ mod tests {
     #[test]
     fn commands_change_the_mailbox_shortcuts() {
         let mut app = app();
-        app.update(Msg::Configured(Reconfigured {
-            outcome: Ok(vec![]),
-            settings: Ok(Settings {
-                shortcuts: crate::app::Shortcuts {
-                    mbox: "=@archive".into(),
-                    ..Default::default()
-                },
-                ..Settings::default()
-            }),
-            key_commands: vec![],
-            pushed: vec![],
+        app.update(configured(Settings {
+            shortcuts: crate::app::Shortcuts {
+                mbox: "=@archive".into(),
+                ..Default::default()
+            },
+            ..Settings::default()
         }));
         assert_eq!(app.shortcuts.mbox, "=@archive");
     }
@@ -870,12 +853,7 @@ mod tests {
     fn signing_in_keeps_a_waiting_macro() {
         let mut app = app();
         app.push_keys("<last-entry>").unwrap();
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
-            account: mett_core::AccountId::new("alice@contoso.com"),
-            prompt: mett_msgraph::SignInPrompt::OpenBrowser {
-                url: "https://login.example/authorize".parse().unwrap(),
-            },
-        }));
+        app.update(Msg::SignIn(browser_prompt()));
         assert!(app.waiting());
         app.typed();
         assert!(!app.strokes.is_empty(), "the macro waits for the sign-in");
@@ -911,8 +889,7 @@ mod tests {
 
     #[test]
     fn startup_keys_wait_for_a_sign_in_to_open_the_folder() {
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 10, inbox, Settings::default());
+        let (mut app, effects) = App::open(80, 10, inbox(), Settings::default());
         app.push_after_load(crate::keymap::parse_strokes("<last-entry>").unwrap());
         let open = first_request(&effects);
         respond(&mut app, open, Event::FolderOpened(Err(expired())));
@@ -929,12 +906,7 @@ mod tests {
             Event::OwnAddresses(Ok(vec!["Alias@Contoso.com".into()])),
         );
         assert!(app.settings.me.contains(&"alias@contoso.com".to_owned()));
-        app.update(Msg::Configured(Reconfigured {
-            outcome: Ok(vec![]),
-            settings: Ok(Settings::default()),
-            key_commands: vec![],
-            pushed: vec![],
-        }));
+        app.update(configured(Settings::default()));
         assert!(app.settings.me.contains(&"alias@contoso.com".to_owned()));
     }
 }

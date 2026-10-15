@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn new_mail_joins_the_index_where_its_date_puts_it() {
         let (mut app, _) = app();
-        app.update(Msg::Action(Action::NextEntry));
+        act(&mut app, Action::NextEntry);
         let id = poll(&mut app);
         let mut read = summary("m1", 1);
         read.flags.read = true;
@@ -1233,11 +1233,11 @@ mod tests {
         draft.draft = true;
         app.messages.push(draft.clone());
         app.positions.insert(draft.id.clone(), 3);
-        app.update(Msg::Action(Action::Limit));
+        act(&mut app, Action::Limit);
         for c in "~s m2".chars() {
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+            key(&mut app, KeyCode::Char(c));
         }
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        key(&mut app, KeyCode::Enter);
         assert_eq!(ids(&app), ["m2"]);
         let id = poll(&mut app);
         let newest = MessagePage {
@@ -1249,16 +1249,16 @@ mod tests {
             changed: page(Vec::new()),
         };
         respond(&mut app, id, Event::FolderPolled(Ok(polled)));
-        app.update(Msg::Action(Action::Limit));
+        act(&mut app, Action::Limit);
         // The question starts with the limit in force.
         app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('u'),
             ratatui::crossterm::event::KeyModifiers::CONTROL,
         )));
         for c in "all".chars() {
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
+            key(&mut app, KeyCode::Char(c));
         }
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        key(&mut app, KeyCode::Enter);
         assert_eq!(ids(&app), ["m3", "m2", "m1", "m0", "d"]);
     }
 
@@ -1401,12 +1401,12 @@ mod tests {
         assert_eq!(app.mailboxes_with_new_mail(), 1);
 
         // `c` offers it.
-        app.update(Msg::Action(Action::ChangeFolder));
+        act(&mut app, Action::ChangeFolder);
         let Some(Input::Line { editor, .. }) = &app.input else {
             panic!("expected a question");
         };
         assert_eq!(editor.text(), "=Work");
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        key(&mut app, KeyCode::Enter);
         let (switch, _) = app.switching.clone().expect("the folder is being opened");
         respond(
             &mut app,
@@ -2112,7 +2112,7 @@ mod tests {
         // New mail elsewhere leaves the failure on the message line.
         app.announce("New mail in =Elsewhere.");
         assert!(app.status.starts_with("Couldn't check =Work"));
-        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
+        let effects = act(&mut app, Action::BrowseMailboxes);
         // With fresh counts.
         assert!(matches!(
             requests(&effects)[..],
@@ -2127,7 +2127,7 @@ mod tests {
             .map(|e| (e.name.as_str(), e.counts))
             .collect();
         assert_eq!(names, [("=@inbox", Some((1, 0))), ("=Work", None)]);
-        let effects = app.update(Msg::Action(Action::ToggleMailboxes));
+        let effects = act(&mut app, Action::ToggleMailboxes);
         assert!(matches!(
             requests(&effects)[..],
             [(_, Request::ListFolders)]
@@ -2164,15 +2164,15 @@ mod tests {
                 ),
             ]),
         );
-        app.update(Msg::Action(Action::ChangeFolder));
+        act(&mut app, Action::ChangeFolder);
         let text = |app: &App| match &app.input {
             Some(Input::Line { editor, .. }) => editor.text(),
             _ => panic!("expected a question"),
         };
         assert_eq!(text(&app), "=Work");
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(' '))));
+        key(&mut app, KeyCode::Char(' '));
         assert_eq!(text(&app), "=Lists");
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(' '))));
+        key(&mut app, KeyCode::Char(' '));
         assert_eq!(text(&app), "=Work");
     }
 }

@@ -292,20 +292,26 @@ mod tests {
     use mett_core::{Address, Body, MessageId, WellKnownFolder, mock};
 
     use super::*;
+    use crate::app::Settings;
     use crate::app::testing::*;
-    use crate::app::{Msg, Settings};
     use crate::worker::Event;
 
+    /// An app that has opened its Inbox, not listed yet.
     fn app() -> App {
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, Settings::default());
-        let open = first_request(&effects);
-        respond(
-            &mut app,
-            open,
-            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        );
+        opening(Settings::default(), 24).0
+    }
+
+    /// An app that has opened Drafts, with d1 in it.
+    fn drafts_app() -> App {
+        let path = FolderPath::WellKnown(WellKnownFolder::Drafts, vec![]);
+        let (mut app, effects) = App::open(80, 24, path, Settings::default());
+        let list = folder_opened(&mut app, first_request(&effects), drafts_folder());
+        listed(&mut app, list, vec![postponed("d1", "Plans")], None);
         app
+    }
+
+    fn drafts_folder() -> Folder {
+        mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts))
     }
 
     fn postponed(id: &str, subject: &str) -> MessageSummary {
@@ -317,14 +323,17 @@ mod tests {
 
     /// Presses `R` and answers until Drafts is listed with `drafts`.
     fn recall(app: &mut App, drafts: Vec<MessageSummary>) -> Vec<Effect> {
-        let (open, request) = sent(&app.update(Msg::Action(Action::RecallMessage)));
+        let (open, request) = sent(&act(app, Action::RecallMessage));
         assert_eq!(
             request,
             Request::OpenFolder(FolderPath::WellKnown(WellKnownFolder::Drafts, vec![]))
         );
         assert!(app.waiting());
-        let drafts_folder = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
-        let (list, _) = sent(&respond(app, open, Event::FolderOpened(Ok(drafts_folder))));
+        let (list, _) = sent(&respond(
+            app,
+            open,
+            Event::FolderOpened(Ok(drafts_folder())),
+        ));
         listed(app, list, drafts, None)
     }
 
@@ -395,7 +404,7 @@ mod tests {
         assert_eq!(draft.from, Some(Address::new("me@work.org")));
         assert_eq!(draft.body, "Dear Bob,\nsoon.\n");
         // Sent as itself.
-        let (_, request) = sent(&app.update(Msg::Action(Action::SendMessage)));
+        let (_, request) = sent(&act(&mut app, Action::SendMessage));
         let Request::Send(draft) = request else {
             panic!("expected a send, got {request:?}");
         };
@@ -436,8 +445,8 @@ mod tests {
         };
         assert_eq!(compose.parts(), 3);
         assert!(compose.draft.drop_attachments.is_empty());
-        app.update(Msg::Action(Action::NextEntry));
-        app.update(Msg::Action(Action::DetachFile));
+        act(&mut app, Action::NextEntry);
+        act(&mut app, Action::DetachFile);
         let Screen::Compose(compose) = app.screen() else {
             panic!("expected the compose menu");
         };
@@ -462,7 +471,7 @@ mod tests {
         let mut app = app();
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
         opened(&mut app, fetch, fetched("d1"));
-        let (_, request) = sent(&app.update(Msg::Action(Action::PostponeMessage)));
+        let (_, request) = sent(&act(&mut app, Action::PostponeMessage));
         let Request::SaveDraft(draft) = request else {
             panic!("expected a draft saved, got {request:?}");
         };
@@ -475,12 +484,11 @@ mod tests {
     #[test]
     fn every_page_of_drafts_is_looked_through() {
         let mut app = app();
-        let (open, _) = sent(&app.update(Msg::Action(Action::RecallMessage)));
-        let drafts_folder = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
+        let (open, _) = sent(&act(&mut app, Action::RecallMessage));
         let (list, _) = sent(&respond(
             &mut app,
             open,
-            Event::FolderOpened(Ok(drafts_folder)),
+            Event::FolderOpened(Ok(drafts_folder())),
         ));
         let (next, request) = sent(&listed(
             &mut app,
@@ -505,8 +513,8 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert_eq!(app.menu(), crate::keymap::Menu::Postpone);
-        app.update(Msg::Action(Action::NextEntry));
-        let (_, request) = sent(&app.update(Msg::Action(Action::DisplayMessage)));
+        act(&mut app, Action::NextEntry);
+        let (_, request) = sent(&act(&mut app, Action::DisplayMessage));
         assert_eq!(request, Request::FetchMessage(MessageId::new("d2")));
         assert_eq!(app.screen(), &Screen::Index);
         // Or none.
@@ -515,19 +523,18 @@ mod tests {
             &mut app,
             vec![postponed("d1", "Plans"), postponed("d2", "Lunch")],
         );
-        app.update(Msg::Action(Action::Exit));
+        act(&mut app, Action::Exit);
         assert_eq!(app.screen(), &Screen::Index);
     }
 
     #[test]
     fn a_recall_gives_way_to_what_the_user_does_meanwhile() {
         let mut app = app();
-        let (open, _) = sent(&app.update(Msg::Action(Action::RecallMessage)));
+        let (open, _) = sent(&act(&mut app, Action::RecallMessage));
         // The user starts a new message before Drafts is opened.
-        app.update(Msg::Action(Action::Mail));
+        act(&mut app, Action::Mail);
         assert!(app.input.is_some());
-        let drafts_folder = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
-        assert!(respond(&mut app, open, Event::FolderOpened(Ok(drafts_folder))).is_empty());
+        assert!(respond(&mut app, open, Event::FolderOpened(Ok(drafts_folder()))).is_empty());
         assert_eq!(app.recall, None);
         assert_eq!(app.screen(), &Screen::Index);
     }
@@ -535,10 +542,9 @@ mod tests {
     #[test]
     fn a_recall_gives_way_to_another_folder() {
         let mut app = app();
-        let (open, _) = sent(&app.update(Msg::Action(Action::RecallMessage)));
+        let (open, _) = sent(&act(&mut app, Action::RecallMessage));
         app.change_folder(FolderPath::WellKnown(WellKnownFolder::SentItems, vec![]));
-        let drafts_folder = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
-        respond(&mut app, open, Event::FolderOpened(Ok(drafts_folder)));
+        respond(&mut app, open, Event::FolderOpened(Ok(drafts_folder())));
         assert_eq!(app.recall, None);
         assert!(!matches!(
             app.screen(),
@@ -548,16 +554,11 @@ mod tests {
 
     #[test]
     fn a_pager_on_a_recalled_message_postponed_again_closes() {
-        let path = FolderPath::WellKnown(WellKnownFolder::Drafts, vec![]);
-        let (mut app, effects) = App::open(80, 24, path, Settings::default());
-        let open = first_request(&effects);
-        let drafts = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
-        let list = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(drafts))));
-        listed(&mut app, list, vec![postponed("d1", "Plans")], None);
-        app.update(Msg::Action(Action::DisplayMessage));
+        let mut app = drafts_app();
+        act(&mut app, Action::DisplayMessage);
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
         opened(&mut app, fetch, fetched("d1"));
-        let (save, _) = sent(&app.update(Msg::Action(Action::PostponeMessage)));
+        let (save, _) = sent(&act(&mut app, Action::PostponeMessage));
         let effects = respond(
             &mut app,
             save,
@@ -586,19 +587,14 @@ mod tests {
     /// Sends `d1`, recalled while Drafts is open (from its pager if
     /// `from_pager`).
     fn drafts_listed_again_after_sending(from_pager: bool) {
-        let path = FolderPath::WellKnown(WellKnownFolder::Drafts, vec![]);
-        let (mut app, effects) = App::open(80, 24, path, Settings::default());
-        let open = first_request(&effects);
-        let drafts = mock::folder("drafts", "Drafts", Some(WellKnownFolder::Drafts));
-        let list = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(drafts))));
-        listed(&mut app, list, vec![postponed("d1", "Plans")], None);
+        let mut app = drafts_app();
         if from_pager {
-            app.update(Msg::Action(Action::DisplayMessage));
+            act(&mut app, Action::DisplayMessage);
             assert!(matches!(app.screen(), Screen::Pager(_)));
         }
         let (fetch, _) = sent(&recall(&mut app, vec![postponed("d1", "Plans")]));
         opened(&mut app, fetch, fetched("d1"));
-        let (send, _) = sent(&app.update(Msg::Action(Action::SendMessage)));
+        let (send, _) = sent(&act(&mut app, Action::SendMessage));
         let effects = respond(&mut app, send, Event::Sent(Ok(()), false));
         assert_eq!(app.screen(), &Screen::Index);
         assert!(
@@ -619,7 +615,7 @@ mod tests {
     #[test]
     fn a_recall_waiting_for_a_sign_in_starts_again() {
         let mut app = app();
-        let (open, _) = sent(&app.update(Msg::Action(Action::RecallMessage)));
+        let (open, _) = sent(&act(&mut app, Action::RecallMessage));
         respond(&mut app, open, Event::FolderOpened(Err(expired())));
         assert_eq!(app.recall, None);
         let (open, request) = sent(&app.retry_recall());
