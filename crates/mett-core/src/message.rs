@@ -197,6 +197,9 @@ pub struct MessageSummary {
     pub has_attachments: bool,
     /// Whether it is an unsent draft, dated when it was created.
     pub draft: bool,
+    /// When it last changed (arrived, was moved, read, flagged), if the
+    /// backend says.
+    pub modified: Option<DateTime<Utc>>,
 }
 
 /// The format of a message body.

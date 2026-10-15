@@ -536,9 +536,8 @@ pub struct App {
     /// The messages in the index before a check had it listed again, to
     /// tell what arrived.
     known_before_refresh: Option<HashSet<MessageId>>,
-    /// The request reading the mailboxes' counts, and the folder open
-    /// when it was sent.
-    checking: Option<(RequestId, Option<mett_core::FolderId>)>,
+    /// The request reading the mailboxes' counts.
+    checking: Option<RequestId>,
     /// The mailboxes are to be checked again once that request is done:
     /// a folder was opened meanwhile.
     recheck: bool,

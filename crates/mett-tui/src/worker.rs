@@ -85,6 +85,8 @@ pub enum Request {
 }
 
 /// The outcome of a [`Request`].
+// Events are handled one at a time, so their size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Event {
     /// Outcome of [`Request::OpenFolder`].
@@ -181,7 +183,7 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         } => {
             let (newest, changed) = tokio::join!(
                 store.list_messages(&folder, page.clone()),
-                store.changed_messages(&folder, since, page),
+                changes(store, &folder, since, page),
             );
             Event::FolderPolled(newest.and_then(|newest| {
                 Ok(Polled {
@@ -241,6 +243,33 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             Event::MailboxesChecked(checked)
         }
     }
+}
+
+/// How many pages of changes a check reads before listing the whole
+/// folder again is cheaper.
+const CHANGE_PAGES: usize = 10;
+
+/// The messages of `folder` changed since `since`: up to
+/// [`CHANGE_PAGES`] pages, with a cursor if there are more.
+async fn changes<S: MailStore>(
+    store: &S,
+    folder: &FolderId,
+    since: DateTime<Utc>,
+    page: Page,
+) -> Result<MessagePage> {
+    let size = page.size();
+    let mut changed = store.changed_messages(folder, since, page).await?;
+    for _ in 1..CHANGE_PAGES {
+        let Some(cursor) = changed.next.take() else {
+            break;
+        };
+        let more = store
+            .changed_messages(folder, since, Page::after(cursor, size))
+            .await?;
+        changed.messages.extend(more.messages);
+        changed.next = more.next;
+    }
+    Ok(changed)
 }
 
 /// Purges `ids` from the folder `from` (see [`Request::Purge`]), one at a

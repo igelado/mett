@@ -63,7 +63,35 @@ pub(super) struct MailboxState {
     pub(super) error: Option<String>,
 }
 
+impl MailboxState {
+    /// Unread mail that arrived or changed until `until` has been seen.
+    fn see(&mut self, until: Option<DateTime<Utc>>) {
+        let seen = self.seen.flatten();
+        self.seen = Some(seen.max(until));
+    }
+}
+
 impl App {
+    /// The open folder is being left: the unread mail its index shows has
+    /// been seen, even if no check has said so yet.
+    pub(super) fn leaving_folder(&mut self) {
+        let Some(open) = &self.folder else {
+            return;
+        };
+        let until = self
+            .messages
+            .iter()
+            .chain(&self.hidden)
+            .filter(|m| !m.flags.read)
+            .filter_map(|m| m.modified)
+            .max();
+        for state in self.mailbox_state.values_mut() {
+            if state.folder.as_ref().is_some_and(|f| f.id == open.id) {
+                state.see(until);
+            }
+        }
+    }
+
     /// Sets the timer for the next check, unless it is set or checking is
     /// off.
     pub(super) fn arm_poll(&mut self) -> Vec<Effect> {
@@ -110,7 +138,7 @@ impl App {
         }
         let folder = folder.id.clone();
         let started = Utc::now();
-        let since = self.poll_since.unwrap_or(started) - OVERLAP;
+        let since = self.poll_since.unwrap_or(started - OVERLAP);
         let request = self.request(Request::PollFolder {
             folder: folder.clone(),
             page: Page::first(self.page_size),
@@ -129,7 +157,7 @@ impl App {
     pub(super) fn listing_started(&mut self) {
         // The listing shows what a check on its way would find.
         self.polling = None;
-        self.poll_since = Some(Utc::now());
+        self.poll_since = Some(Utc::now() - OVERLAP);
     }
 
     /// Reads the counts of the mailboxes to check, unless that is on its
@@ -156,8 +184,7 @@ impl App {
             return Vec::new();
         }
         let request = self.request(Request::CheckMailboxes(mailboxes));
-        let open = self.folder.as_ref().map(|f| f.id.clone());
-        self.checking = Some((effect_id(&request), open));
+        self.checking = Some(effect_id(&request));
         vec![request]
     }
 
@@ -195,9 +222,10 @@ impl App {
                 return Vec::new();
             }
         };
-        // The next check asks for what changed after this one began.
-        self.poll_since = Some(started);
-        let effects = self.merge_polled(page);
+        // The next check asks for what changed after this one began (from
+        // a while before, for the clocks to differ).
+        self.poll_since = Some(started - OVERLAP);
+        let effects = self.merge_polled(page, started);
         self.forget_index_changes();
         effects
     }
@@ -222,7 +250,7 @@ impl App {
         }
     }
 
-    fn merge_polled(&mut self, polled: Polled) -> Vec<Effect> {
+    fn merge_polled(&mut self, polled: Polled, started: DateTime<Utc>) -> Vec<Effect> {
         let Polled { newest, changed } = polled;
         let mut fresh = newest.messages;
         let mut changes = changed.messages;
@@ -254,6 +282,9 @@ impl App {
                 self.status = NEW_MAIL.into();
             }
             let effects = self.refresh();
+            // The listing takes in those changes: the next check doesn't
+            // ask for them again (they would only make it list again).
+            self.poll_since = Some(started);
             // New mail may be on pages not seen yet: the listing tells.
             self.known_before_refresh = Some(known);
             return effects;
@@ -389,16 +420,13 @@ impl App {
         id: RequestId,
         checked: Vec<(FolderPath, mett_core::Result<Checked>)>,
     ) -> Vec<Effect> {
-        let Some((_, open_then)) = self.checking.take_if(|(request, _)| *request == id) else {
+        if self.checking.take_if(|request| *request == id).is_none() {
             return Vec::new();
-        };
+        }
         let mut arrived = Vec::new();
         let mut failure = None;
         for (path, result) in checked {
-            // Open now, or when the check was made: what it found was seen.
-            let found = result.as_ref().ok().map(|c| &c.folder);
-            let open = self.is_open(&path, found)
-                || found.is_some_and(|f| open_then.as_ref() == Some(&f.id));
+            let open = self.is_open(&path, result.as_ref().ok().map(|c| &c.folder));
             let state = self.mailbox_state.entry(path.clone()).or_default();
             match result {
                 Ok(Checked {
@@ -412,7 +440,7 @@ impl App {
                     state.newest_unread = newest_unread;
                     if open {
                         // Seen, as it is open.
-                        state.seen = Some(newest_unread);
+                        state.see(newest_unread);
                         state.new = false;
                     } else {
                         // Unread mail that arrived (or changed) after the
@@ -498,7 +526,7 @@ impl App {
             let same = state.folder.as_ref().is_some_and(|f| f.id == open.id) || *mailbox == path;
             if same {
                 state.new = false;
-                state.seen = Some(state.newest_unread);
+                state.see(state.newest_unread);
                 state.folder = Some(open.clone());
             }
         }
@@ -1151,10 +1179,25 @@ mod tests {
             switch,
             Event::FolderOpened(Ok(folder("work", "Work", 1))),
         );
-        let (visit_check, _) = requests(&effects)
-            .into_iter()
+        let sent = requests(&effects);
+        let (visit_check, _) = sent
+            .iter()
             .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+            .cloned()
             .unwrap();
+        // The new mail is listed: the user sees it.
+        let (list, _) = sent
+            .iter()
+            .find(|(_, r)| matches!(r, Request::ListMessages { .. }))
+            .cloned()
+            .unwrap();
+        let mut arrived = summary("w1", 3);
+        arrived.modified = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(3));
+        respond(
+            &mut app,
+            list,
+            Event::MessagesListed(Ok(page(vec![arrived]))),
+        );
         app.change_folder(inbox());
         let (switch, _) = app.switching.clone().unwrap();
         respond(
@@ -1172,6 +1215,42 @@ mod tests {
         );
         assert_eq!(app.mailboxes_with_new_mail(), 0);
         assert!(!app.status.starts_with("New mail"), "{}", app.status);
+    }
+
+    #[test]
+    fn mail_arriving_after_leaving_is_new_even_if_a_check_straddles_it() {
+        let (mut app, first) = app();
+        respond(
+            &mut app,
+            first,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 1, Some(1))),
+                (work(), checked("work", "Work", 0, None)),
+            ]),
+        );
+        // A check starts while the Inbox is open; the user leaves; mail
+        // arrives in the Inbox before the check reads it.
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let (check, _) = requests(&effects)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+            .unwrap();
+        app.change_folder(work());
+        let (switch, _) = app.switching.clone().unwrap();
+        respond(
+            &mut app,
+            switch,
+            Event::FolderOpened(Ok(folder("work", "Work", 0))),
+        );
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 2, Some(9))),
+                (work(), checked("work", "Work", 0, None)),
+            ]),
+        );
+        assert_eq!(app.mailboxes_with_new_mail(), 1);
     }
 
     #[test]

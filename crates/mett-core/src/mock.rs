@@ -4,7 +4,6 @@
 //! can be tested against [`MemoryStore`] without a network connection.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -30,9 +29,6 @@ struct State {
     messages: Vec<Message>,
     moves: u64,
     sent: Vec<Draft>,
-    /// When each message last changed, for
-    /// [`MailStore::changed_messages`].
-    modified: HashMap<MessageId, DateTime<Utc>>,
 }
 
 impl MemoryStore {
@@ -54,10 +50,9 @@ impl MemoryStore {
     }
 
     /// Adds a message, as if it arrived (or last changed) at `modified`.
-    pub fn deliver(&self, message: Message, modified: DateTime<Utc>) {
-        let mut state = self.state();
-        state.modified.insert(message.summary.id.clone(), modified);
-        state.messages.push(message);
+    pub fn deliver(&self, mut message: Message, modified: DateTime<Utc>) {
+        message.summary.modified = Some(modified);
+        self.state().messages.push(message);
     }
 
     /// The drafts sent so far, oldest first.
@@ -118,7 +113,6 @@ impl State {
             .id
             .clone();
         let id = self.fresh_id(&MessageId::new(which.as_str()));
-        self.modified.insert(id.clone(), Utc::now());
         // A forward carries the original's attachments along, as Graph's
         // createForward does.
         let has_attachments = match &draft.origin {
@@ -142,6 +136,7 @@ impl State {
                 },
                 has_attachments,
                 draft: which == WellKnownFolder::Drafts,
+                modified: Some(Utc::now()),
             },
             cc: draft.cc.clone(),
             bcc: draft.bcc.clone(),
@@ -182,7 +177,7 @@ impl MailStore for MemoryStore {
             .messages
             .iter()
             .filter(|m| &m.summary.folder == folder && !m.summary.flags.read)
-            .filter_map(|m| state.modified.get(&m.summary.id).copied())
+            .filter_map(|m| m.summary.modified)
             .max())
     }
 
@@ -244,7 +239,7 @@ impl MailStore for MemoryStore {
             .iter()
             .filter(|m| &m.summary.folder == folder)
             .filter_map(|m| {
-                let modified = *state.modified.get(&m.summary.id)?;
+                let modified = m.summary.modified?;
                 (modified >= since).then(|| (modified, m.summary.clone()))
             })
             .collect();
@@ -261,8 +256,9 @@ impl MailStore for MemoryStore {
 
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
         let mut state = self.state();
-        update.apply(&mut state.message_mut(id)?.summary.flags);
-        state.modified.insert(id.clone(), Utc::now());
+        let summary = &mut state.message_mut(id)?.summary;
+        update.apply(&mut summary.flags);
+        summary.modified = Some(Utc::now());
         Ok(())
     }
 
@@ -274,8 +270,7 @@ impl MailStore for MemoryStore {
         let message = state.message_mut(id)?;
         message.summary.id = new_id.clone();
         message.summary.folder = to.clone();
-        state.modified.remove(id);
-        state.modified.insert(new_id.clone(), Utc::now());
+        message.summary.modified = Some(Utc::now());
         Ok(new_id)
     }
 
@@ -285,9 +280,9 @@ impl MailStore for MemoryStore {
         let mut copy = state.message_mut(id)?.clone();
         copy.summary.id = state.fresh_id(id);
         copy.summary.folder = to.clone();
+        copy.summary.modified = Some(Utc::now());
         let new_id = copy.summary.id.clone();
         state.messages.push(copy);
-        state.modified.insert(new_id.clone(), Utc::now());
         Ok(new_id)
     }
 
@@ -362,6 +357,7 @@ pub fn message(id: &str, folder: &str, subject: &str, received: DateTime<Utc>) -
             flags: Flags::default(),
             has_attachments: false,
             draft: false,
+            modified: None,
         },
         cc: Vec::new(),
         bcc: Vec::new(),
