@@ -1231,5 +1231,56 @@ async fn failing_to_get_a_token_leaves_mail_unsent() {
     assert!(matches!(err, Error::NotSent(_)), "{err:?}");
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
     let err = store.send(&reply).await.unwrap_err();
-    assert!(matches!(err, Error::NotSent(_)), "{err:?}");
+    assert!(
+        matches!(&err, Error::NotSent(m) if !m.contains("Drafts")),
+        "nothing reached Graph: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_create_reply_response_may_leave_a_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store(&server).send(&reply).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::NotSent(m) if m.contains("may be left in Drafts")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn giving_up_deletes_the_kept_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
+    store.discard_kept(&reply).await.unwrap();
+    // Nothing kept any more.
+    store.discard_kept(&reply).await.unwrap();
 }

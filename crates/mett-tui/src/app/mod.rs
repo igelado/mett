@@ -856,6 +856,10 @@ impl App {
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::Sent(result) => return self.on_delivered(id, result),
             Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
+            Event::KeptDiscarded(Err(e)) => {
+                self.status = format!("A draft of the message is left in Drafts: {e}");
+            }
+            Event::KeptDiscarded(Ok(())) => {}
             Event::FlagsUpdated(result) => {
                 let Some(message) = self.flag_updates.remove(&id) else {
                     return Vec::new();

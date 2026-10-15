@@ -215,7 +215,9 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   draft in Sent Items, so `copy` only applies to new messages. When a send
   or update of that draft has no clear outcome (the response was lost),
   the draft is kept, and sending or postponing the message again updates
-  it rather than making another.
+  it rather than making another; leaving the message without postponing it
+  deletes it. (If the response to creating the draft is lost, mett can't
+  tell which draft it made, and says one may be left in Drafts.)
 
 *Implemented so far:* mail is sent through the account of `spoolfile`, and
 a copy is kept in its Sent Items when `copy` allows. `record` and

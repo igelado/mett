@@ -115,6 +115,14 @@ pub trait MailSender: Send + Sync {
     /// Sends `draft`, keeping a copy in the sent-items folder if
     /// [`Draft::save_copy`] asks for one.
     fn send(&self, draft: &Draft) -> impl Future<Output = Result<()>> + Send;
+
+    /// Deletes what earlier attempts to send or save `draft` (the same
+    /// [`Draft::attempt`]) left behind with the backend, now that the user
+    /// has given up on it. Backends that leave nothing behind do nothing.
+    fn discard_kept(&self, draft: &Draft) -> impl Future<Output = Result<()>> + Send {
+        let _ = draft;
+        std::future::ready(Ok(()))
+    }
 }
 
 /// An OAuth2 access token.

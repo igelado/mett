@@ -40,6 +40,9 @@ pub enum Request {
     Send(Draft),
     /// Save a message in the drafts folder.
     SaveDraft(Draft),
+    /// Delete what failed attempts to send or save a message the user gave
+    /// up on left behind.
+    DiscardKept(Draft),
 }
 
 /// The outcome of a [`Request`].
@@ -57,6 +60,8 @@ pub enum Event {
     Sent(Result<()>),
     /// Outcome of [`Request::SaveDraft`].
     DraftSaved(Result<MessageId>),
+    /// Outcome of [`Request::DiscardKept`].
+    KeptDiscarded(Result<()>),
 }
 
 /// An [`Event`] for the request with `id`.
@@ -98,6 +103,7 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         }
         Request::Send(draft) => Event::Sent(store.send(&draft).await),
         Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
+        Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
     }
 }
 

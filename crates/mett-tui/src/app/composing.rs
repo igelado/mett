@@ -114,6 +114,9 @@ pub struct Compose {
     pub(super) unauthorized: Option<Delivery>,
     /// It forwards a message with attachments, which go with it.
     pub forwarded_attachments: bool,
+    /// A failed attempt to send or postpone it may have left a server
+    /// draft behind, to delete if the user gives up on it.
+    pub(super) left_draft: bool,
 }
 
 /// What happens to a finished message.
@@ -454,9 +457,14 @@ impl App {
             Question::AbortUnmodified => return self.open_compose_menu(),
             Question::Postpone if answer => return self.deliver(Delivery::Postpone),
             Question::Postpone => {
-                self.screens.pop();
                 self.status = "Mail not sent.".into();
-                return Vec::new();
+                // Given up on: so is a draft a failed attempt left.
+                return match self.screens.pop() {
+                    Some(Screen::Compose(compose)) if compose.left_draft => {
+                        vec![self.request(Request::DiscardKept(compose.draft))]
+                    }
+                    _ => Vec::new(),
+                };
             }
             Question::Copy => {
                 if let Some(draft) = self.draft_mut() {
@@ -552,6 +560,7 @@ impl App {
                 delivery: None,
                 unauthorized: None,
                 forwarded_attachments,
+                left_draft: false,
             }));
         }
         Vec::new()
@@ -685,6 +694,8 @@ impl App {
                 if matches!(e, mett_core::Error::Auth(_)) {
                     compose.unauthorized = delivery;
                 }
+                // Replies and forwards go through a server draft.
+                compose.left_draft |= compose.draft.origin.is_some();
                 // A lost response doesn't mean nothing happened.
                 self.status = match (delivery, &e) {
                     (Some(Delivery::Send), mett_core::Error::Network(_)) if saved_copy => format!(
@@ -698,6 +709,9 @@ impl App {
                     // It failed before being handed over.
                     (Some(Delivery::Send), mett_core::Error::NotSent(why)) => {
                         format!("The message wasn't sent: {why}.")
+                    }
+                    (Some(Delivery::Postpone), mett_core::Error::NotSent(why)) => {
+                        format!("The message wasn't postponed: {why}.")
                     }
                     (Some(Delivery::Postpone), mett_core::Error::Network(_)) => format!(
                         "The message may have been saved ({e}). Check Drafts before postponing it again."
@@ -1085,6 +1099,37 @@ mod tests {
         act(&mut app, Action::SendMessage);
         let effects = key(&mut app, KeyCode::Char('n'));
         assert!(matches!(request(&effects).1, Request::Send(d) if d.subject.is_empty()));
+    }
+
+    #[test]
+    fn giving_up_on_a_reply_deletes_the_draft_a_failure_left() {
+        let mut app = app(settings());
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        // As for a reply, which goes through a server draft.
+        if let Some(Screen::Compose(compose)) = app.screens.last_mut() {
+            compose.draft.origin = Some(DraftOrigin::Reply("m1".into()));
+        }
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Network("timed out".into()))),
+        }));
+        act(&mut app, Action::Exit);
+        let effects = key(&mut app, KeyCode::Char('n'));
+        let (id, request) = request(&effects);
+        assert!(matches!(request, Request::DiscardKept(d) if d.body == "text"));
+        assert_eq!(app.status, "Mail not sent.");
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::KeptDiscarded(Err(Error::Network("offline".into()))),
+        }));
+        assert!(
+            app.status
+                .starts_with("A draft of the message is left in Drafts")
+        );
     }
 
     #[test]

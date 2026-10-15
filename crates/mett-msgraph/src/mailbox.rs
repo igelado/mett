@@ -198,9 +198,21 @@ impl<A: Authenticator> GraphMailStore<A> {
         request: RequestBuilder,
         about: About<'_>,
     ) -> Result<T> {
+        self.json_with(request, about, |e| e).await
+    }
+
+    /// Like [`Self::json`], passing errors from before the request is made
+    /// through `before` (see [`Self::send_with`]).
+    async fn json_with<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        about: About<'_>,
+        before: fn(Error) -> Error,
+    ) -> Result<T> {
         let body = self
-            .send(request, about)
+            .send_with(request, about, before)
             .await?
+            .0
             .bytes()
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
@@ -530,6 +542,10 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
 }
 
 impl<A: Authenticator> MailSender for GraphMailStore<A> {
+    async fn discard_kept(&self, draft: &Draft) -> Result<()> {
+        self.discard_kept_draft(draft).await
+    }
+
     async fn send(&self, draft: &Draft) -> Result<()> {
         let Some(origin) = &draft.origin else {
             let url = self.url(&["me", "sendMail"]);
@@ -597,12 +613,22 @@ impl<A: Authenticator> GraphMailStore<A> {
             }
         }
         let url = self.url(&["me", "messages", original.as_str(), action]);
+        // A lost response may still have made a draft, which mett can't
+        // tell apart from others: say so. Failing before the request is
+        // made leaves nothing.
         let created: IdOnly = self
-            .json(
+            .json_with(
                 self.request(Method::POST, url),
                 About::message(original.as_str()),
+                unsent,
             )
-            .await?;
+            .await
+            .map_err(|e| match e {
+                Error::Network(e) => {
+                    Error::Network(format!("{e}; a draft of it may be left in Drafts"))
+                }
+                e => e,
+            })?;
         let id = MessageId::new(created.id);
         // Replace what Graph filled in (recipients, a quoted HTML body) with
         // what the user wrote.
@@ -634,6 +660,32 @@ impl<A: Authenticator> GraphMailStore<A> {
         )
         .await
         .map(drop)
+    }
+
+    /// Deletes the server draft kept for `draft`, if any. It is kept still
+    /// if that fails.
+    async fn discard_kept_draft(&self, draft: &Draft) -> Result<()> {
+        let Some(origin) = &draft.origin else {
+            return Ok(());
+        };
+        let key = (origin.clone(), draft.attempt);
+        let Some(id) = self.kept.lock().expect("lock").remove(&key) else {
+            return Ok(());
+        };
+        let url = self.url(&["me", "messages", id.as_str()]);
+        let deleted = self
+            .send(
+                self.request(Method::DELETE, url),
+                About::message(id.as_str()),
+            )
+            .await;
+        match deleted {
+            Ok(_) | Err(Error::NotFound { .. }) => Ok(()),
+            Err(e) => {
+                self.keep(origin, draft, id);
+                Err(e)
+            }
+        }
     }
 
     /// Remembers a server draft kept after an attempt whose outcome is
