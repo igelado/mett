@@ -137,7 +137,9 @@ impl SignIn {
     /// keys are on the help line.
     pub fn rows(&self, width: usize) -> Vec<(String, Row)> {
         let mut lines: Vec<(String, Row)> = Vec::new();
-        match &self.prompt {
+        // After a failure, the link or code is spent: don't offer it.
+        let prompt = self.prompt.as_ref().filter(|_| self.failure.is_none());
+        match prompt {
             Some(SignInPrompt::OpenBrowser { url }) => {
                 lines.push((
                     "Sign in in your browser. If it did not open, visit:".into(),
@@ -181,6 +183,9 @@ impl SignIn {
 
     /// What `c` copies: the sign-in link, or the device code.
     fn copyable(&self) -> Option<String> {
+        if self.failure.is_some() {
+            return None;
+        }
         match self.prompt.as_ref()? {
             SignInPrompt::OpenBrowser { url } => Some(url.to_string()),
             SignInPrompt::EnterCode { user_code, .. } => Some(user_code.clone()),
@@ -375,9 +380,12 @@ impl App {
                 outcome: Ok(()), ..
             } => {
                 // Just close the window: the status line may already show
-                // how the request that needed the sign-in went.
+                // how the request that needed the sign-in went. But a
+                // cancellation that came too late didn't happen.
                 self.sign_in = None;
-                self.cancelled = false;
+                if std::mem::take(&mut self.cancelled) && self.status == "Sign-in cancelled." {
+                    self.status.clear();
+                }
                 Vec::new()
             }
             SignInEvent::Finished {
@@ -425,6 +433,7 @@ impl App {
                 self.status = "Sign-in cancelled.".into();
                 return vec![Effect::CancelSignIn];
             }
+            Action::OpenBrowser if failed => {}
             Action::OpenBrowser => {
                 let url = match &window.prompt {
                     Some(SignInPrompt::OpenBrowser { url }) => url.to_string(),
@@ -1845,5 +1854,26 @@ mod tests {
             ),
             "{effects:?}"
         );
+    }
+
+    #[test]
+    fn a_failed_sign_in_offers_no_stale_link() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        app.update(Msg::SignIn(finished(Err("denied".into()))));
+        assert!(act(&mut app, Action::OpenBrowser).is_empty());
+        assert!(act(&mut app, Action::CopyLink).is_empty());
+        let rows = app.sign_in.as_ref().unwrap().rows(80);
+        assert!(rows.iter().all(|(_, kind)| *kind != Row::Link), "{rows:?}");
+    }
+
+    #[test]
+    fn a_cancellation_too_late_is_forgotten() {
+        let (mut app, _) = App::new(80, 23);
+        app.update(Msg::SignIn(browser_prompt()));
+        act(&mut app, Action::Exit);
+        assert_eq!(app.status, "Sign-in cancelled.");
+        app.update(Msg::SignIn(finished(Ok(()))));
+        assert_eq!(app.status, "");
     }
 }

@@ -179,7 +179,10 @@ fn available(app: &App, action: Action) -> bool {
     };
     match action {
         Action::Retry => window.failure.is_some(),
-        Action::OpenBrowser | Action::CopyLink => window.prompt.is_some(),
+        // After a failure, the link or code is spent: only Retry helps.
+        Action::OpenBrowser | Action::CopyLink => {
+            window.prompt.is_some() && window.failure.is_none()
+        }
         _ => true,
     }
 }
@@ -504,7 +507,7 @@ mod tests {
             outcome: Err("denied".into()),
         }));
         let lines = sized_screen(&app, 60, 12);
-        assert_eq!(lines[0], "q:Close  o:Browser  c:Copy  <Enter>:Retry");
+        assert_eq!(lines[0], "q:Close  <Enter>:Retry");
         let window = lines.join("\n");
         assert!(window.contains("Sign-in failed: denied"), "{window}");
     }
