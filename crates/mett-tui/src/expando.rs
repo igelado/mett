@@ -74,6 +74,8 @@ pub struct Entry<'a> {
     pub date_format: &'a str,
     /// For the pager, where it is in the message (`%P`).
     pub position: Option<&'a str>,
+    /// Where it is in its thread, if the index shows threads.
+    pub thread: Option<&'a crate::app::Threaded>,
 }
 
 /// The name of `address`, or the address itself without one.
@@ -104,7 +106,19 @@ impl Expandos for Entry<'_> {
             'm' => self.total.to_string(),
             'n' => author.map(display_name).unwrap_or_default().to_owned(),
             'P' => self.position.unwrap_or_default().to_owned(),
-            's' => summary.subject.clone(),
+            // The thread's lines, then the subject, unless it is its
+            // parent's.
+            's' => match self.thread {
+                Some(thread) if thread.same_subject => thread.tree.clone(),
+                Some(thread) => format!("{}{}", thread.tree, summary.subject),
+                None => summary.subject.clone(),
+            },
+            // How many messages a collapsed thread folds away.
+            'M' => self
+                .thread
+                .filter(|t| t.folded > 0)
+                .map(|t| t.folded.to_string())
+                .unwrap_or_default(),
             'S' => if self.deleted {
                 "D"
             } else if flags.flagged {
@@ -173,6 +187,8 @@ pub struct Status<'a> {
     pub changed: bool,
     /// `%P`: where the index is in the folder.
     pub position: &'a str,
+    /// `%s` and `%S`: `sort` and `sort_aux`.
+    pub sort: (&'a str, &'a str),
 }
 
 impl Expandos for Status<'_> {
@@ -204,6 +220,8 @@ impl Expandos for Status<'_> {
             'n' | 'u' => count(self.new),
             'P' => self.position.to_owned(),
             'r' => if self.changed { "*" } else { "-" }.to_owned(),
+            's' => self.sort.0.to_owned(),
+            'S' => self.sort.1.to_owned(),
             'V' => self.limit.unwrap_or_default().to_owned(),
             'v' => format!("mett {}", env!("CARGO_PKG_VERSION")),
             _ => String::new(),
@@ -268,6 +286,7 @@ mod tests {
             total: 10,
             date_format: "%Y",
             position: None,
+            thread: None,
         };
         let line = expand("%3C %Z %-8.8F|%a|%u|%v|%n|%S|%t|%m", &entry, 80);
         assert_eq!(
@@ -292,6 +311,7 @@ mod tests {
             incomplete: false,
             changed: true,
             position: "all",
+            sort: ("date", "date"),
         };
         let line = expand(&Display::default().status_format, &status, 50);
         assert_eq!(
@@ -327,6 +347,7 @@ mod tests {
             incomplete: false,
             changed: false,
             position: "all",
+            sort: ("date", "date"),
         };
         let line = expand("%?M?%M/?%m%?V? [Limit: %V]?", &status, 50);
         assert_eq!(line, "0/5 [Limit: ~F]");

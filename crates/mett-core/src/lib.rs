@@ -21,6 +21,7 @@ pub use folder::{Folder, UnknownWellKnownFolder, WellKnownFolder};
 pub use ids::{AccountId, FolderId, MessageId, PageCursor};
 pub use message::{
     Address, AddressError, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary,
+    ThreadPosition,
 };
 pub use ports::{
     AccessToken, Authenticator, MailSender, MailStore, MessagePage, Page, RECENT_UNREAD,

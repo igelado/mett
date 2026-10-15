@@ -686,6 +686,9 @@ impl App {
         self.folder = None;
         self.messages.clear();
         self.hidden.clear();
+        self.folded.clear();
+        self.threads.clear();
+        self.collapsed.clear();
         self.positions.clear();
         self.limit = None;
         self.limited.clear();
@@ -970,6 +973,7 @@ impl App {
             .messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .map(|m| &m.id)
             .collect();
         self.deleted.retain(|id| listed.contains(id));
@@ -994,6 +998,7 @@ impl App {
             .count();
         self.messages.retain(|m| !gone.contains(&m.id));
         self.hidden.retain(|m| !gone.contains(&m.id));
+        self.folded.retain(|m| !gone.contains(&m.id));
         for id in gone {
             self.deleted.remove(id);
         }
@@ -1003,6 +1008,8 @@ impl App {
             _ => self.selected.saturating_sub(before),
         }
         .min(self.messages.len().saturating_sub(1));
+        // Their threads change.
+        self.arrange();
     }
 
     /// Opens the folder browser.

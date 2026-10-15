@@ -19,6 +19,7 @@ mod keymap;
 mod lineedit;
 mod pattern;
 mod signin;
+mod sort;
 mod text;
 mod view;
 mod worker;
@@ -316,10 +317,17 @@ fn settings_keeping(
             .active(color::mono_terminal(&|name| std::env::var(name).ok()))
             .clone(),
     };
+    let ordering = app::Ordering {
+        sort: sort::Sort::parse(config.string("sort"), true).map_err(|e| format!("sort: {e}"))?,
+        aux: sort::Sort::parse(config.string("sort_aux"), false)
+            .map_err(|e| format!("sort_aux: {e}"))?,
+        ascii: config.flag("ascii_chars"),
+    };
     Ok(Settings {
         page_size,
         mailboxes,
         display,
+        ordering,
         sync_interval,
         compose,
         account: account.clone(),

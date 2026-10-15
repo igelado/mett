@@ -10,6 +10,7 @@ mod keys;
 mod mailbox;
 mod newmail;
 mod search;
+mod threads;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -24,6 +25,7 @@ pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
 pub use self::newmail::MailboxEntry;
 pub use self::search::{Limit, highlighted};
+pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
 use crate::compose::Kind;
 use crate::config::Quad;
@@ -72,6 +74,8 @@ pub struct Settings {
     pub mailboxes: Vec<MailboxEntry>,
     /// How the screen is drawn.
     pub display: crate::expando::Display,
+    /// How the index is ordered.
+    pub ordering: Ordering,
     /// How often to check for new mail (`msgraph_sync_interval`), or
     /// `None` not to.
     pub sync_interval: Option<std::time::Duration>,
@@ -102,6 +106,7 @@ impl Default for Settings {
             shortcuts: Shortcuts::default(),
             mailboxes: Vec::new(),
             display: crate::expando::Display::default(),
+            ordering: Ordering::default(),
             sync_interval: None,
         }
     }
@@ -418,6 +423,14 @@ pub struct App {
     pub limit: Option<Limit>,
     /// The messages that the limit hides, newest first.
     hidden: Vec<MessageSummary>,
+    /// The messages folded into collapsed threads.
+    folded: Vec<MessageSummary>,
+    /// How the index is ordered.
+    pub ordering: Ordering,
+    /// Where each message is in its thread, when the index shows threads.
+    threads: HashMap<MessageId, Threaded>,
+    /// The first messages of the collapsed threads.
+    collapsed: HashSet<MessageId>,
     /// Whether the limit showed each message it was applied to, kept
     /// across listings so that they show the same messages.
     limited: HashMap<MessageId, bool>,
@@ -616,6 +629,10 @@ impl App {
             left_drafts: Vec::new(),
             limit: None,
             hidden: Vec::new(),
+            folded: Vec::new(),
+            ordering: settings.ordering,
+            threads: HashMap::new(),
+            collapsed: HashSet::new(),
             limited: HashMap::new(),
             positions: HashMap::new(),
             last_search: None,
@@ -1101,6 +1118,9 @@ impl App {
         if let Some(effects) = self.on_mailbox_action(action) {
             return effects;
         }
+        if let Some(effects) = self.on_thread_action(action) {
+            return effects;
+        }
         if let Some(effects) = self.on_search_action(action) {
             return effects;
         }
@@ -1150,6 +1170,9 @@ impl App {
 
     fn on_pager_action(&mut self, action: Action) -> Vec<Effect> {
         if let Some(effects) = self.on_mailbox_action(action) {
+            return effects;
+        }
+        if let Some(effects) = self.on_thread_action(action) {
             return effects;
         }
         if let Some(effects) = self.on_search_action(action) {
@@ -1778,6 +1801,7 @@ impl App {
         self.messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .find(|s| &s.id == id)
     }
 
@@ -1786,12 +1810,13 @@ impl App {
         self.messages
             .iter_mut()
             .chain(&mut self.hidden)
+            .chain(&mut self.folded)
             .find(|s| &s.id == id)
     }
 
     /// Every message of the folder listed so far, shown or not.
     pub fn folder_messages(&self) -> impl Iterator<Item = &MessageSummary> {
-        self.messages.iter().chain(&self.hidden)
+        self.messages.iter().chain(&self.hidden).chain(&self.folded)
     }
 
     /// Whether part of the folder could not be listed. The index then
@@ -1823,6 +1848,7 @@ impl App {
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
         self.display = settings.display;
+        self.apply_ordering(settings.ordering);
         self.apply_mailboxes(settings.mailboxes, settings.sync_interval);
     }
 
@@ -1833,7 +1859,11 @@ impl App {
         // As in mutt, the limit's choice of messages stays: only new ones
         // are matched against it.
         if self.limit.is_some() {
-            let shown = self.messages.iter().map(|m| (m.id.clone(), true));
+            let shown = self
+                .messages
+                .iter()
+                .chain(&self.folded)
+                .map(|m| (m.id.clone(), true));
             let hidden = self.hidden.iter().map(|m| (m.id.clone(), false));
             self.limited.extend(shown.chain(hidden));
         }
@@ -1841,6 +1871,8 @@ impl App {
         self.saved_flags.clear();
         self.removed_while_listing.clear();
         self.hidden.clear();
+        self.folded.clear();
+        self.threads.clear();
         self.positions.clear();
         self.selected = 0;
         self.pending = None;
@@ -2082,10 +2114,11 @@ mod tests {
 
     use super::*;
 
+    /// `n` messages, newest first, as Graph lists them.
     fn summaries(n: usize) -> Vec<MessageSummary> {
         (0..n)
             .map(|i| {
-                let received = DateTime::UNIX_EPOCH + TimeDelta::minutes(i as i64);
+                let received = DateTime::UNIX_EPOCH + TimeDelta::minutes((n - i) as i64);
                 mock::message(&format!("m{i}"), "in", &format!("subject {i}"), received).summary
             })
             .collect()

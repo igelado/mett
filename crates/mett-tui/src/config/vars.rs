@@ -120,6 +120,7 @@ const fn var(name: &'static str, kind: Kind, default: &'static str) -> Var {
 pub const VARS: &[Var] = &[
     var("abort_nosubject", Kind::Quad, "ask-yes"),
     var("abort_unmodified", Kind::Quad, "yes"),
+    var("ascii_chars", Kind::Bool, "no"),
     var("askbcc", Kind::Bool, "no"),
     var("askcc", Kind::Bool, "no"),
     var("attribution", Kind::String, "On %d, %n wrote:"),
@@ -173,6 +174,8 @@ pub const VARS: &[Var] = &[
     var("resolve", Kind::Bool, "yes"),
     var("sig_dashes", Kind::Bool, "yes"),
     var("signature", Kind::Path, "~/.signature"),
+    var("sort", Kind::String, "reverse-date"),
+    var("sort_aux", Kind::String, "date"),
     var("spoolfile", Kind::Path, ""),
     var(
         "status_format",

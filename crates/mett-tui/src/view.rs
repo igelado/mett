@@ -433,6 +433,7 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
                 total,
                 date_format: &app.display.date_format,
                 position: None,
+                thread: app.thread_of(&message.id),
             };
             // Padded to the right edge, so that the row's colors cover it.
             let mut text = format::expand(&app.display.index_format, &entry, width);
@@ -459,6 +460,7 @@ fn index_status(app: &App, height: usize, width: usize) -> String {
     let height = height.max(1);
     let first = app.selected / height * height;
     let position = expando::position(first, height, app.messages.len());
+    let (sort, aux) = (app.ordering.sort.name(), app.ordering.aux.name());
     let status = Status {
         folder: app.folder.as_ref().map_or("", |f| f.name.as_str()),
         total: app.total_messages(),
@@ -472,6 +474,7 @@ fn index_status(app: &App, height: usize, width: usize) -> String {
         incomplete: app.incomplete(),
         changed: app.deleted_count() > 0 || app.saving(),
         position: &position,
+        sort: (&sort, &aux),
     };
     format::expand(&app.display.status_format, &status, width)
 }
@@ -608,6 +611,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         total: app.total_messages(),
         date_format: &app.display.date_format,
         position: Some(&position),
+        thread: None,
     };
     format::expand(&app.display.pager_format, &entry, width)
 }
@@ -690,8 +694,13 @@ mod tests {
         };
         let messages = (0..n)
             .map(|i| {
-                let mut m =
-                    mock::message(&format!("m{i}"), "in", &format!("Subject {i}"), received(i));
+                // Newest first, as Graph lists them.
+                let mut m = mock::message(
+                    &format!("m{i}"),
+                    "in",
+                    &format!("Subject {i}"),
+                    received(-i),
+                );
                 m.summary.from = Some(Address::new("alice@contoso.com").with_name("Alice Example"));
                 m.summary.flags.flagged = i == 1;
                 m.summary
@@ -861,7 +870,7 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            format!("   2 N!  {} Alice Example    Subject 1", index_date(1))
+            format!("   2 N!  {} Alice Example    Subject 1", index_date(-1))
         );
         assert_eq!(
             lines[6],

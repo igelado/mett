@@ -82,6 +82,10 @@ actions! {
     ChangeFolder => "change-folder", "Open another folder";
     BrowseMailboxes => "browse-mailboxes", "Choose a folder from a list";
     ToggleMailboxes => "toggle-mailboxes", "Switch between the mailboxes and every folder";
+    NextThread => "next-thread", "Move to the next thread";
+    PreviousThread => "previous-thread", "Move to the previous thread";
+    CollapseThread => "collapse-thread", "Collapse or uncollapse the current thread";
+    CollapseAll => "collapse-all", "Collapse or uncollapse every thread";
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";

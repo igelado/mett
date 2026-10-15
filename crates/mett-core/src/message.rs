@@ -201,6 +201,20 @@ pub struct MessageSummary {
     /// When it last changed (arrived, was moved, read, flagged), if the
     /// backend says.
     pub modified: Option<DateTime<Utc>>,
+    /// Where it is in its conversation, for threading, if the backend
+    /// knows.
+    pub thread: Option<ThreadPosition>,
+}
+
+/// Where a message is in its conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ThreadPosition {
+    /// The conversation it belongs to.
+    pub conversation: String,
+    /// Its path in the conversation's tree, from the start of the
+    /// conversation: a message's parent is the message whose path is this
+    /// one without its last step. Empty if only the conversation is known.
+    pub path: Vec<Vec<u8>>,
 }
 
 /// The format of a message body.

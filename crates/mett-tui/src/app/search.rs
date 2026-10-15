@@ -301,7 +301,7 @@ impl App {
     /// Limits the index to the messages matching `text`, or shows them all
     /// again for an empty pattern, `all` or `~A`. A bad pattern changes
     /// nothing.
-    fn set_limit(&mut self, text: &str) {
+    pub(super) fn set_limit(&mut self, text: &str) {
         let text = text.trim();
         let pattern = if text.is_empty() || text == "all" || text == "~A" {
             None
@@ -319,6 +319,7 @@ impl App {
         // mail that arrived since in its place).
         let mut all = std::mem::take(&mut self.messages);
         all.append(&mut self.hidden);
+        all.append(&mut self.folded);
         all.sort_by_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
         self.messages = all;
         self.limit = None;
@@ -334,6 +335,7 @@ impl App {
                 self.status = NO_MATCHES.into();
             }
         }
+        self.arrange();
         self.limit_index_to(selected.as_ref());
     }
 
@@ -359,11 +361,12 @@ impl App {
         self.limit = Some(limit);
     }
 
-    /// Selects the message `id` if it is shown, or the first one.
+    /// Selects the message `id` if it is shown (or the collapsed thread
+    /// it is in), or the first one.
     fn limit_index_to(&mut self, id: Option<&mett_core::MessageId>) {
-        self.selected = id
-            .and_then(|id| self.messages.iter().position(|m| &m.id == id))
-            .unwrap_or(0);
+        let id = id.map(|id| self.thread_of(id).map_or(id, |t| &t.root).clone());
+        let shown = |id: &mett_core::MessageId| self.messages.iter().position(|m| &m.id == id);
+        self.selected = id.and_then(|id| shown(&id)).unwrap_or(0);
     }
 
     /// Adds newly listed messages to the index, or aside if the index is
@@ -373,8 +376,15 @@ impl App {
             let next = self.positions.len();
             self.positions.entry(message.id.clone()).or_insert(next);
         }
+        // The first page starts at the top, wherever its first message
+        // goes.
+        let first = self.messages.is_empty() && self.hidden.is_empty() && self.folded.is_empty();
         if self.limit.is_none() {
             self.messages.extend(messages);
+            self.arrange();
+            if first {
+                self.selected = 0;
+            }
             return;
         }
         for message in messages {
@@ -383,6 +393,10 @@ impl App {
             } else {
                 self.hidden.push(message);
             }
+        }
+        self.arrange();
+        if first {
+            self.selected = 0;
         }
         // A later page had matches after all.
         if !self.messages.is_empty() && self.status == NO_MATCHES {
@@ -406,7 +420,7 @@ impl App {
 
     /// The number of messages in the folder, shown or not.
     pub fn total_messages(&self) -> usize {
-        self.messages.len() + self.hidden.len()
+        self.messages.len() + self.hidden.len() + self.folded.len()
     }
 }
 

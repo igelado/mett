@@ -100,6 +100,7 @@ impl App {
             .messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .filter(|m| !m.flags.read)
             .collect();
         let seen = self.seen.entry(open.id.clone()).or_default();
@@ -315,6 +316,7 @@ impl App {
             .messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .map(|m| m.id.clone())
             .collect();
         // A message in both lists comes as it was last changed.
@@ -402,6 +404,7 @@ impl App {
             .messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .filter(|m| !listed.contains(&m.id))
             .filter(|m| covered(m))
             // Moves and purges on their way take it out themselves.
@@ -422,7 +425,12 @@ impl App {
                 }
             }
         }
-        for summary in self.messages.iter_mut().chain(&mut self.hidden) {
+        for summary in self
+            .messages
+            .iter_mut()
+            .chain(&mut self.hidden)
+            .chain(&mut self.folded)
+        {
             if let Some(update) = updates.get(&summary.id) {
                 *summary = (*update).clone();
             }
@@ -430,6 +438,8 @@ impl App {
         for message in arrived {
             self.insert_arrived(message);
         }
+        // In order, and in their threads.
+        self.arrange();
         // Stay on the same message.
         if let Some(at) = selected.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
             self.selected = at;
@@ -475,7 +485,12 @@ impl App {
     fn insert_arrived(&mut self, message: MessageSummary) {
         let position =
             |m: &MessageSummary| self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
-        let mut order: Vec<&MessageSummary> = self.messages.iter().chain(&self.hidden).collect();
+        let mut order: Vec<&MessageSummary> = self
+            .messages
+            .iter()
+            .chain(&self.hidden)
+            .chain(&self.folded)
+            .collect();
         order.sort_by_key(|m| position(m));
         // Among the messages like it (drafts are a group of their own):
         // before the first older one, or after the last of them.
@@ -525,6 +540,7 @@ impl App {
             .messages
             .iter()
             .chain(&self.hidden)
+            .chain(&self.folded)
             .any(|m| !m.flags.read && !known.contains(&m.id));
         if arrived {
             self.announce(NEW_MAIL);
@@ -882,6 +898,13 @@ mod tests {
         (app, sent[1].0)
     }
 
+    fn unsorted() -> crate::app::Ordering {
+        crate::app::Ordering {
+            sort: crate::sort::Sort::parse("unsorted", true).unwrap(),
+            ..crate::app::Ordering::default()
+        }
+    }
+
     fn ids(app: &App) -> Vec<&str> {
         app.messages.iter().map(|m| m.id.as_str()).collect()
     }
@@ -1032,6 +1055,8 @@ mod tests {
     #[test]
     fn a_draft_beyond_the_newest_page_stays() {
         let (mut app, _) = app();
+        // In the order the folder is listed in.
+        app.apply_ordering(unsorted());
         let id = poll(&mut app);
         // A draft created after m1 was sent, but listed after the sent
         // mail, as Graph sorts unsent drafts.
@@ -1053,6 +1078,8 @@ mod tests {
     #[test]
     fn drafts_are_placed_and_removed_among_drafts() {
         let (mut app, _) = app();
+        // In the order the folder is listed in.
+        app.apply_ordering(unsorted());
         let draft = |id: &str, minutes| {
             let mut m = summary(id, minutes);
             m.draft = true;
@@ -1221,6 +1248,8 @@ mod tests {
     #[test]
     fn lifting_a_limit_keeps_new_mail_in_place() {
         let (mut app, _) = app();
+        // In the order the folder is listed in.
+        app.apply_ordering(unsorted());
         // Listed out of date order, as drafts can be.
         let mut draft = summary("d", 9);
         draft.draft = true;
@@ -2049,6 +2078,8 @@ mod tests {
     #[test]
     fn sent_mail_goes_before_the_drafts() {
         let (mut app, _) = app();
+        // In the order the folder is listed in.
+        app.apply_ordering(unsorted());
         app.messages.clear();
         app.positions.clear();
         let mut draft = summary("d", 9);
