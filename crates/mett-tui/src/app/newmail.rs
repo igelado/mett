@@ -584,7 +584,8 @@ impl App {
             // Said once the message line is free; until then, the next
             // check tries again.
             if self.status.is_empty() {
-                self.status = format!("Couldn't check {name}: {e}");
+                // An error, which new mail doesn't hide.
+                self.fail(format!("Couldn't check {name}: {e}"));
                 if let Some(state) = self.mailbox_state.get_mut(&path) {
                     state.reported = true;
                 }
@@ -631,14 +632,15 @@ impl App {
     pub fn mailboxes_with_new_mail(&self) -> usize {
         self.mailboxes
             .iter()
-            .filter(|m| self.has_new_mail(&m.path))
+            .filter(|m| self.has_new_mail(m))
             .count()
     }
 
-    fn has_new_mail(&self, path: &FolderPath) -> bool {
-        // A mailbox that isn't checked (`-nopoll`) can't tell.
-        let polled = self.mailboxes.iter().any(|m| m.path == *path && m.poll);
-        polled && self.mailbox_state.get(path).is_some_and(|s| s.new)
+    /// Whether `mailbox` has new mail. One that isn't checked (`-nopoll`)
+    /// can't tell, even if the folder is listed again under another name
+    /// that is.
+    fn has_new_mail(&self, mailbox: &MailboxEntry) -> bool {
+        mailbox.poll && self.mailbox_state.get(&mailbox.path).is_some_and(|s| s.new)
     }
 
     /// The mailbox to offer when asked which folder to open: the next one
@@ -651,7 +653,7 @@ impl App {
         let count = self.mailboxes.len();
         (0..count)
             .map(|i| &self.mailboxes[(start + i) % count])
-            .find(|m| self.has_new_mail(&m.path))
+            .find(|m| self.has_new_mail(m))
     }
 
     /// The mailboxes, as the browser shows them, with their counts if
@@ -667,7 +669,7 @@ impl App {
                     name: m.name.clone(),
                     id: folder.map(|f| f.id.clone()),
                     counts: folder.map(|f| (f.unread_count, f.total_count)),
-                    new: self.has_new_mail(&m.path),
+                    new: self.has_new_mail(m),
                     path: m.text.clone(),
                     target: m.path.clone(),
                 }
@@ -1958,6 +1960,20 @@ mod tests {
     }
 
     #[test]
+    fn nopoll_counts_for_its_own_entry() {
+        let (mut app, check) = app();
+        // Work again, by another name, not checked.
+        let mut again = app.mailboxes[1].clone();
+        again.text = "Work".into();
+        again.poll = false;
+        app.mailboxes.push(again);
+        check_work(&mut app, check, &[("m9", 9)]);
+        assert!(app.has_new_mail(&app.mailboxes[1]));
+        assert!(!app.has_new_mail(&app.mailboxes[2]));
+        assert_eq!(app.mailboxes_with_new_mail(), 1);
+    }
+
+    #[test]
     fn the_browser_starts_on_the_mailboxes() {
         let (mut app, check) = app();
         respond(
@@ -1969,7 +1985,10 @@ mod tests {
             ]),
         );
         assert!(app.status.starts_with("Couldn't check =Work"));
-        assert!(!app.has_new_mail(&work()));
+        assert!(!app.has_new_mail(&app.mailboxes[1]));
+        // New mail elsewhere leaves the failure on the message line.
+        app.announce("New mail in =Elsewhere.");
+        assert!(app.status.starts_with("Couldn't check =Work"));
         let effects = app.update(Msg::Action(Action::BrowseMailboxes));
         // With fresh counts.
         assert!(matches!(
