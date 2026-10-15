@@ -321,6 +321,7 @@ impl App {
         all.sort_by_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
         self.messages = all;
         self.limit = None;
+        self.limited.clear();
         // Replaces an earlier "No messages matched" or bad pattern.
         self.status.clear();
         if let Some(pattern) = pattern {
@@ -376,9 +377,11 @@ impl App {
             return;
         };
         for message in messages {
-            let shown = limit.pattern.matches(&Candidate {
-                summary: &message,
-                deleted: self.deleted.contains(&message.id),
+            let shown = self.limited.get(&message.id).copied().unwrap_or_else(|| {
+                limit.pattern.matches(&Candidate {
+                    summary: &message,
+                    deleted: self.deleted.contains(&message.id),
+                })
             });
             if shown {
                 self.messages.push(message);
@@ -1365,5 +1368,38 @@ mod tests {
         }));
         assert_eq!(app.messages[app.selected].id.as_str(), "m1");
         assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn a_relist_keeps_the_limit_s_messages() {
+        let mut app = app();
+        act(&mut app, Action::Limit);
+        answer(&mut app, "~N");
+        let shown = ids(&app)
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(shown, ["m0", "m1"]);
+        // m0 is read now; a relist (say, new mail) brings it back read.
+        let effects = app.relist();
+        let Some(Effect::Request(list, _)) = effects.first().cloned() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let messages = (0..6)
+            .map(|i| {
+                let mut m =
+                    mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary;
+                m.flags.read = i != 1;
+                m
+            })
+            .collect();
+        app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages,
+                next: None,
+            })),
+        }));
+        assert_eq!(ids(&app), ["m0", "m1"], "still shown, as in mutt");
     }
 }

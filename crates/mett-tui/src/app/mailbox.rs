@@ -668,6 +668,7 @@ impl App {
         self.hidden.clear();
         self.positions.clear();
         self.limit = None;
+        self.limited.clear();
         self.pending_search = None;
         self.selected = 0;
         self.deleted.clear();

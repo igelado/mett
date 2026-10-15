@@ -365,6 +365,9 @@ pub struct App {
     pub limit: Option<Limit>,
     /// The messages that the limit hides, newest first.
     hidden: Vec<MessageSummary>,
+    /// Whether the limit showed each message it was applied to, kept
+    /// across listings so that they show the same messages.
+    limited: HashMap<MessageId, bool>,
     /// Where each message was in the folder's listing, to restore the
     /// order when the limit is lifted.
     positions: HashMap<MessageId, usize>,
@@ -518,6 +521,7 @@ impl App {
             left_drafts: Vec::new(),
             limit: None,
             hidden: Vec::new(),
+            limited: HashMap::new(),
             positions: HashMap::new(),
             last_search: None,
             last_pager_search: None,
@@ -1612,6 +1616,13 @@ impl App {
     /// arrived in it.
     fn relist(&mut self) -> Vec<Effect> {
         self.reselect = None;
+        // As in mutt, the limit's choice of messages stays: only new ones
+        // are matched against it.
+        if self.limit.is_some() {
+            let shown = self.messages.iter().map(|m| (m.id.clone(), true));
+            let hidden = self.hidden.iter().map(|m| (m.id.clone(), false));
+            self.limited.extend(shown.chain(hidden));
+        }
         self.messages.clear();
         self.saved_flags.clear();
         self.removed_while_listing.clear();
