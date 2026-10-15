@@ -382,7 +382,15 @@ fn render_attachments(menu: &AttachMenu, colors: &Colors, frame: &mut Frame, are
 fn render_text(view: &TextView, frame: &mut Frame, area: Rect) -> String {
     let width = usize::from(area.width);
     let height = usize::from(area.height);
-    let rows = text::wrap_all(&view.lines, width.max(1));
+    // Wrapped by the app to the terminal's width; here only if the
+    // drawing area differs.
+    let rewrapped;
+    let rows = if view.rows_width == Some(width.max(1)) {
+        &view.rows
+    } else {
+        rewrapped = text::wrap_all(&view.lines, width.max(1));
+        &rewrapped
+    };
     let top = view.scroll.min(rows.len().saturating_sub(height));
     let lines: Vec<Line> = rows
         .iter()

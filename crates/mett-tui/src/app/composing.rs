@@ -636,7 +636,9 @@ impl App {
         let Some(Screen::Compose(compose)) = self.screens.last() else {
             return Vec::new();
         };
-        if mett_msgraph::needs_server_draft(&compose.draft) {
+        // A server draft left by an earlier attempt is what is sent, even
+        // if the message would now go without one.
+        if mett_msgraph::needs_server_draft(&compose.draft) || compose.left_draft {
             return self.answer(Question::Copy, true);
         }
         let prompt = "Save a copy of this message?".to_owned();
@@ -1743,6 +1745,25 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn a_left_server_draft_is_sent_with_its_copy() {
+        let mut app = app(compose::Settings {
+            copy: Quad::No,
+            ..settings()
+        });
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        // An earlier attempt left a server draft, which Graph keeps a copy
+        // of when it sends it.
+        if let Some(Screen::Compose(compose)) = app.screens.last_mut() {
+            compose.left_draft = true;
+        }
+        let (_, sent) = request(&act(&mut app, Action::SendMessage));
+        assert!(matches!(sent, Request::Send(d) if d.save_copy));
     }
 
     #[test]

@@ -1312,9 +1312,16 @@ impl App {
         // Pagers under other screens too: their rows (and search
         // highlights) must match the width they will be drawn at.
         for screen in &mut self.screens {
-            if let Screen::Pager(pager) = screen {
-                pager.layout(width);
-                pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+            match screen {
+                Screen::Pager(pager) => {
+                    pager.layout(width);
+                    pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+                }
+                Screen::Text(view) => {
+                    view.layout(width);
+                    view.scroll = view.scroll.min(view.rows.len().saturating_sub(height));
+                }
+                _ => {}
             }
         }
         // A taller help screen shows more lines, not empty space.

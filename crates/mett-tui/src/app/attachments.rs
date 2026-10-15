@@ -46,6 +46,35 @@ pub struct TextView {
     pub lines: Vec<String>,
     /// The first row shown, after wrapping.
     pub scroll: usize,
+    /// The lines wrapped to `rows_width`, kept so that a long file isn't
+    /// wrapped again at every key.
+    pub rows: Vec<String>,
+    /// The width `rows` were wrapped to.
+    pub rows_width: Option<usize>,
+}
+
+impl TextView {
+    /// A view of `lines`, wrapped to `width`.
+    pub fn new(title: String, lines: Vec<String>, width: usize) -> TextView {
+        let mut view = TextView {
+            title,
+            lines,
+            scroll: 0,
+            rows: Vec::new(),
+            rows_width: None,
+        };
+        view.layout(width);
+        view
+    }
+
+    /// Wraps the lines again if the width changed.
+    pub(super) fn layout(&mut self, width: usize) {
+        let width = width.max(1);
+        if self.rows_width != Some(width) {
+            self.rows = text::wrap_all(&self.lines, width);
+            self.rows_width = Some(width);
+        }
+    }
 }
 
 /// What to do with an attachment once fetched.
@@ -242,11 +271,11 @@ impl App {
             }],
             Use::View => match shown_as_text(&attachment, &data) {
                 Some(lines) => {
-                    self.screens.push(Screen::Text(TextView {
-                        title: format!("{} [{}]", attachment.name, attachment.content_type),
+                    self.screens.push(Screen::Text(TextView::new(
+                        format!("{} [{}]", attachment.name, attachment.content_type),
                         lines,
-                        scroll: 0,
-                    }));
+                        self.width,
+                    )));
                     Vec::new()
                 }
                 // Anything else opens in the program the system has for
@@ -302,8 +331,8 @@ impl App {
         let Some(Screen::Text(view)) = self.screens.last_mut() else {
             return Vec::new();
         };
-        let rows = text::wrap_all(&view.lines, width.max(1)).len();
-        let last = rows.saturating_sub(height);
+        view.layout(width);
+        let last = view.rows.len().saturating_sub(height);
         match action {
             Action::Exit | Action::Quit => {
                 self.screens.pop();

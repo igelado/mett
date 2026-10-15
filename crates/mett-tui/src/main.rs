@@ -700,27 +700,58 @@ impl Deferred {
     }
 }
 
-/// Writes `data` to `path`; a file there is replaced only if `overwrite`.
+/// Writes `data` to `path`; a file there is replaced only if `overwrite`,
+/// and only once the new one is written in full.
 fn save_file(path: std::path::PathBuf, data: Vec<u8>, overwrite: bool) -> app::FileOutcome {
-    use std::io::Write;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
+    let written = if overwrite {
+        replace_file(&path, &data)
     } else {
-        options.create_new(true);
-    }
-    match options
-        .open(&path)
-        .and_then(|mut file| file.write_all(&data))
-    {
+        write_new_file(&path, &data)
+    };
+    match written {
         Ok(()) => app::FileOutcome::Done(path),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             app::FileOutcome::Exists(path, data)
         }
         Err(e) => app::FileOutcome::Failed(format!("{}: {e}", path.display())),
     }
+}
+
+/// Writes `data` to a new file at `path`, which is removed again if that
+/// fails partway.
+fn write_new_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(data).inspect_err(|_| {
+        let _ = std::fs::remove_file(path);
+    })
+}
+
+/// Writes `data` beside `path`, then puts it in its place: a failure
+/// leaves the file there as it was.
+fn replace_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    static WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("not a file name"))?;
+    let count = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_file_name(format!(
+        ".{}.mett-{}-{count}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    write_new_file(&temporary, data)?;
+    // The file keeps its permissions.
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&temporary, metadata.permissions());
+    }
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
 }
 
 /// Writes an attachment to a directory of its own, readable only by the
@@ -1044,6 +1075,26 @@ fn discard_pending_input() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn replacing_a_file_keeps_it_until_the_new_one_is_written() {
+        let dir = std::env::temp_dir().join(format!("mett-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "old").unwrap();
+        assert!(matches!(
+            save_file(path.clone(), b"new".to_vec(), false),
+            app::FileOutcome::Exists(..)
+        ));
+        assert!(matches!(
+            save_file(path.clone(), b"new".to_vec(), true),
+            app::FileOutcome::Done(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        // Nothing left beside it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     use super::*;
 
     #[test]
