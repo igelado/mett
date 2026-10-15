@@ -288,9 +288,12 @@ async fn run<S: mett_core::MailStore + 'static>(
                 let effects = app.update(Msg::SignIn(event));
                 dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
             }
-            // A failed sign-in stays up even with nothing left pending, so
-            // the user can retry the change it held up.
-            if !app.saving() && app.sign_in.is_none() {
+            // A sign-in window keeps mett here only while a change is
+            // still unsaved, so the user can sign in or retry it; other
+            // sign-ins don't matter any more.
+            let unsaved = !app.save_failures().is_empty();
+            let waiting = app.saving() || (unsaved && app.sign_in.is_some());
+            if !waiting {
                 break;
             }
             draw(&mut terminal, &app, &keymap)?;
