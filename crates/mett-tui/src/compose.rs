@@ -2,7 +2,6 @@
 //! forwards, as mutt builds them. Everything here is pure, so the app's
 //! compose flow is tested without an editor or a mailbox.
 
-use chrono::Local;
 use mett_core::{AccountId, Address, Message};
 
 use crate::config::{Config, Quad};
@@ -26,6 +25,8 @@ pub struct Settings {
     pub sig_dashes: bool,
     /// `attribution`: the line before quoted text.
     pub attribution: String,
+    /// `date_format`, for `%d` in `attribution` and `forward_format`.
+    pub date_format: String,
     /// `indent_string`: the prefix of quoted lines.
     pub indent_string: String,
     /// `forward_format`: the subject of forwarded messages.
@@ -62,6 +63,7 @@ impl Default for Settings {
             signature: None,
             sig_dashes: true,
             attribution: "On %d, %n wrote:".into(),
+            date_format: "!%a, %b %d, %Y at %I:%M:%S%p %Z".into(),
             indent_string: "> ".into(),
             forward_format: "[%a: %s]".into(),
             include: Quad::AskYes,
@@ -123,6 +125,7 @@ impl Settings {
             signature,
             sig_dashes: config.flag("sig_dashes"),
             attribution: config.string("attribution").to_owned(),
+            date_format: config.string("date_format").to_owned(),
             indent_string: config.string("indent_string").to_owned(),
             forward_format: config.string("forward_format").to_owned(),
             include: config.quad("include"),
@@ -138,7 +141,7 @@ impl Settings {
         })
     }
 
-    fn is_me(&self, address: &Address) -> bool {
+    pub fn is_me(&self, address: &Address) -> bool {
         let email = address.email.to_lowercase();
         self.me.contains(&email)
             || self.alternates.iter().any(|alternate| {
@@ -166,7 +169,7 @@ pub enum Kind {
 /// Expands mutt's `%` expandos for `message` in `format`: `%n` (the
 /// author's name, or address), `%a` (the author's address), `%s` (the
 /// subject), `%d` (the date) and `%%`. Unknown expandos are kept.
-pub fn expand(format: &str, message: &Message) -> String {
+pub fn expand(format: &str, message: &Message, date_format: &str) -> String {
     let summary = &message.summary;
     let mut out = String::new();
     let mut chars = format.chars();
@@ -184,14 +187,7 @@ pub fn expand(format: &str, message: &Message) -> String {
             ),
             Some('a') => out.push_str(summary.from.as_ref().map_or("", |a| a.email.as_str())),
             Some('s') => out.push_str(&summary.subject),
-            Some('d') => out.push_str(
-                &summary
-                    .received
-                    .with_timezone(&Local)
-                    // mutt's default `date_format`.
-                    .format("%a, %b %d, %Y at %I:%M:%S%p %Z")
-                    .to_string(),
-            ),
+            Some('d') => out.push_str(&crate::format::date(summary.received, date_format)),
             Some('%') => out.push('%'),
             Some(other) => {
                 out.push('%');
@@ -218,7 +214,7 @@ pub fn reply_subject(original: &str) -> String {
 
 /// The original message's text, quoted, after the attribution line.
 pub fn quoted(message: &Message, settings: &Settings) -> String {
-    let mut out = expand(&settings.attribution, message);
+    let mut out = expand(&settings.attribution, message, &settings.date_format);
     out.push('\n');
     for line in text::body_lines(&message.body) {
         // Quoting an empty line adds no trailing space, as mutt does.
@@ -480,12 +476,15 @@ mod tests {
     #[test]
     fn expands_attribution_expandos() {
         let message = message();
+        let mutt = Settings::default().date_format;
         assert_eq!(
-            expand("%n <%a> wrote about %s, 100%%:", &message),
+            expand("%n <%a> wrote about %s, 100%%:", &message, &mutt),
             "Bob <bob@x.org> wrote about Lunch, 100%:"
         );
-        assert!(expand("%d", &message).contains("Jun 15, 2020"));
-        assert_eq!(expand("%q %", &message), "%q %");
+        assert!(expand("%d", &message, &mutt).contains("Jun 15, 2020"));
+        // As `date_format` says.
+        assert_eq!(expand("%d", &message, "%Y"), "2020");
+        assert_eq!(expand("%q %", &message, &mutt), "%q %");
     }
 
     #[test]

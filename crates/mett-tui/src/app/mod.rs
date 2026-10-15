@@ -70,6 +70,8 @@ pub struct Settings {
     pub shortcuts: Shortcuts,
     /// The folders to check for new mail (`mailboxes`).
     pub mailboxes: Vec<MailboxEntry>,
+    /// How the screen is drawn.
+    pub display: crate::expando::Display,
     /// How often to check for new mail (`msgraph_sync_interval`), or
     /// `None` not to.
     pub sync_interval: Option<std::time::Duration>,
@@ -99,6 +101,7 @@ impl Default for Settings {
             resolve: true,
             shortcuts: Shortcuts::default(),
             mailboxes: Vec::new(),
+            display: crate::expando::Display::default(),
             sync_interval: None,
         }
     }
@@ -217,6 +220,10 @@ pub struct Pager {
     pub highlight: Option<(usize, std::ops::Range<usize>)>,
     /// A search made before the message arrived, to run when it does.
     pub pending_search: Option<String>,
+    /// The first line of the body, after the headers and the blank line.
+    pub body_start: usize,
+    /// The line the signature starts at (`-- `), if there is one.
+    pub signature: Option<usize>,
 }
 
 impl Pager {
@@ -344,9 +351,13 @@ pub struct App {
     pub sign_in: Option<SignIn>,
     /// The key bindings, which `:bind` and `:macro` change.
     pub keymap: Keymap,
+    /// How the screen is drawn: formats and colors.
+    pub display: crate::expando::Display,
     /// The last error reported on the message line, so that the view can
     /// tell it from other messages.
     pub error: Option<String>,
+    /// `alternates`, compiled: the index asks for every row.
+    alternates: Vec<regex::Regex>,
     /// Keys and functions a macro or `push` queued, played before new
     /// input.
     strokes: VecDeque<Stroke>,
@@ -579,7 +590,9 @@ impl App {
             quit: false,
             sign_in: None,
             keymap: Keymap::mutt_defaults(),
+            display: settings.display,
             error: None,
+            alternates: compile_alternates(&settings.compose.alternates),
             strokes: VecDeque::new(),
             sign_in_strokes: VecDeque::new(),
             configuring: 0,
@@ -761,7 +774,7 @@ impl App {
         // A question on the message line takes typed keys only: a macro's
         // function can't open another screen or question over it.
         if self.input.is_some() && menu != Menu::SignIn {
-            self.status = "Not available in a prompt.".into();
+            self.fail("Not available in a prompt.");
             return Vec::new();
         }
         // Any new action in a menu replaces a pending move, and a reply or
@@ -1099,9 +1112,9 @@ impl App {
             Action::NextEntry if self.more_to_list() => {
                 return self.wait_for(self.next_entry());
             }
-            Action::NextEntry => self.status = "You are on the last message.".into(),
+            Action::NextEntry => self.fail("You are on the last message."),
             Action::PreviousEntry if self.selected > 0 => self.selected -= 1,
-            Action::PreviousEntry => self.status = "You are on the first message.".into(),
+            Action::PreviousEntry => self.fail("You are on the first message."),
             Action::FirstEntry => self.selected = 0,
             Action::LastEntry => {
                 self.selected = last;
@@ -1154,10 +1167,10 @@ impl App {
                 if self.more_to_list() {
                     return self.wait_for(self.next_entry());
                 }
-                self.status = "You are on the last message.".into();
+                self.fail("You are on the last message.");
             }
             Action::PreviousEntry if self.selected == 0 => {
-                self.status = "You are on the first message.".into();
+                self.fail("You are on the first message.");
             }
             Action::NextEntry | Action::PreviousEntry => {
                 if action == Action::NextEntry {
@@ -1213,7 +1226,7 @@ impl App {
     /// Opens the pager on the selected message.
     fn open_selected(&mut self) -> Vec<Effect> {
         let Some(summary) = self.messages.get(self.selected) else {
-            self.status = "No messages.".into();
+            self.fail("No messages.");
             return Vec::new();
         };
         let id = summary.id.clone();
@@ -1234,6 +1247,8 @@ impl App {
             search_match: None,
             highlight: None,
             pending_search: None,
+            body_start: 0,
+            signature: None,
         }));
         vec![fetch]
     }
@@ -1424,7 +1439,7 @@ impl App {
                     // Retry deletes it once signed in.
                     let retry = draft.filter(|_| matches!(e, Error::Auth(_)));
                     self.left_drafts.push((left.clone(), retry));
-                    self.status = left;
+                    self.fail(left);
                 }
             }
             Event::FlagsUpdated(result) => {
@@ -1487,6 +1502,15 @@ impl App {
             unreachable!("found above");
         };
         pager.lines = text::pager_lines(&message);
+        pager.body_start = pager
+            .lines
+            .iter()
+            .position(String::is_empty)
+            .map_or(pager.lines.len(), |blank| blank + 1);
+        pager.signature = pager.lines[pager.body_start..]
+            .iter()
+            .position(|line| line == "-- ")
+            .map(|at| pager.body_start + at);
         pager.rows_width = None;
         pager.layout(self.width);
         let message_id = message.summary.id.clone();
@@ -1765,6 +1789,11 @@ impl App {
             .find(|s| &s.id == id)
     }
 
+    /// Every message of the folder listed so far, shown or not.
+    pub fn folder_messages(&self) -> impl Iterator<Item = &MessageSummary> {
+        self.messages.iter().chain(&self.hidden)
+    }
+
     /// Whether part of the folder could not be listed. The index then
     /// shows only the messages loaded so far.
     pub fn incomplete(&self) -> bool {
@@ -1784,6 +1813,7 @@ impl App {
 
     pub(super) fn apply_settings(&mut self, settings: Settings) {
         self.page_size = settings.page_size;
+        self.alternates = compile_alternates(&settings.compose.alternates);
         self.settings = settings.compose;
         // The configuration doesn't know what the mailbox told.
         self.add_mailbox_addresses();
@@ -1792,6 +1822,7 @@ impl App {
         self.delete = settings.delete;
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
+        self.display = settings.display;
         self.apply_mailboxes(settings.mailboxes, settings.sync_interval);
     }
 
@@ -1990,6 +2021,15 @@ impl App {
         self.status = text.into();
         self.error = Some(self.status.clone());
     }
+
+    /// Whether the user sent mail from `address`.
+    pub fn is_me(&self, address: &mett_core::Address) -> bool {
+        self.settings.me.contains(&address.email.to_lowercase())
+            || self
+                .alternates
+                .iter()
+                .any(|alternate| alternate.is_match(&address.email))
+    }
 }
 
 /// `earlier` with what `later` changes too.
@@ -2014,6 +2054,20 @@ fn effect_id(effect: &Effect) -> RequestId {
         Effect::Request(id, _) => *id,
         _ => unreachable!("not a request: {effect:?}"),
     }
+}
+
+/// `alternates` as regular expressions, ignoring case (those that don't
+/// compile were reported when they were set, and match nothing).
+fn compile_alternates(alternates: &[String]) -> Vec<regex::Regex> {
+    alternates
+        .iter()
+        .filter_map(|alternate| {
+            regex::RegexBuilder::new(alternate)
+                .case_insensitive(true)
+                .build()
+                .ok()
+        })
+        .collect()
 }
 
 fn body_height(height: u16) -> usize {

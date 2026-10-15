@@ -82,7 +82,7 @@ impl App {
             }
             Action::SearchNext => match self.last_search().clone() {
                 Some(text) => return Some(self.new_search(&text)),
-                None => self.status = "No search pattern.".into(),
+                None => self.fail("No search pattern."),
             },
             Action::Limit if matches!(self.screen(), Screen::Index) => {
                 let current = self
@@ -159,7 +159,7 @@ impl App {
         let pattern = match Pattern::parse(text) {
             Ok(pattern) => pattern,
             Err(e) => {
-                self.status = e.to_string();
+                self.fail(e.to_string());
                 return Vec::new();
             }
         };
@@ -207,7 +207,7 @@ impl App {
                 self.status = "Searching...".into();
                 return effects;
             }
-            None => self.status = "Not found.".into(),
+            None => self.fail("Not found."),
         }
         Vec::new()
     }
@@ -233,7 +233,7 @@ impl App {
         let regex = match pattern::regex(text) {
             Ok(regex) => regex,
             Err(e) => {
-                self.status = e.to_string();
+                self.fail(e.to_string());
                 return;
             }
         };
@@ -247,7 +247,7 @@ impl App {
         pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
         let count = pager.lines.len();
         if count == 0 {
-            self.status = "Not found.".into();
+            self.fail("Not found.");
             return;
         }
         // After the last match, or from the line at the top of the screen.
@@ -294,7 +294,7 @@ impl App {
                 pager.search_match = Some((line, next));
                 pager.highlight = Some((line, start..end));
             }
-            None => self.status = "Not found.".into(),
+            None => self.fail("Not found."),
         }
     }
 
@@ -309,7 +309,7 @@ impl App {
             match Pattern::parse(text) {
                 Ok(pattern) => Some(pattern),
                 Err(e) => {
-                    self.status = e.to_string();
+                    self.fail(e.to_string());
                     return;
                 }
             }

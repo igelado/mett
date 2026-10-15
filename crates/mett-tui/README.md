@@ -57,8 +57,8 @@ set msgraph_client_id = <your app's client ID>
 
 So far `set`, `unset`, `toggle`, `reset`, `source`, `alternates` (the
 user's other addresses, for replies), `mailboxes` and `unmailboxes` (with
-`-label`, `-notify`/`-nonotify` and `-poll`/`-nopoll`), `bind`, `macro`,
-`push` and `exec` are supported, with mutt's quoting, `$` expansion, backticks and `my_`
+`-label`, `-notify`/`-nonotify` and `-poll`/`-nopoll`), `color`, `mono`,
+`uncolor` and `unmono`, `bind`, `macro`, `push` and `exec` are supported, with mutt's quoting, `$` expansion, backticks and `my_`
 variables. `bind` and `macro` take mutt's menus (`generic`, `index`,
 `pager`, `compose`, `browser`) plus mett's `signin` and `help`, and mutt's
 key notation (`\Cx`, `^x`, `\e`, `<PageDown>`, `<F1>`; `^M`, `^I` and
@@ -68,6 +68,37 @@ Enter does unless bound); a macro's
 supported yet. Other mutt
 commands and unknown variables are ignored with a warning, so a mettrc can
 `source` an existing muttrc.
+
+### Display
+
+`index_format`, `pager_format` and `status_format` take mutt's format
+strings: `%-15.15L` widths, `%?X?then&else?` conditionals, `%>X`, `%*X` and
+`%|X` fills, and dates as `%{fmt}`, `%[fmt]` or `%(fmt)` (all in local
+time; `date_format` is used by `%d` and `%D`). The expandos mett knows:
+
+| Format | Expandos |
+|--------|----------|
+| `index_format`, `pager_format` | `%a` sender's address, `%C` number, `%d`/`%D` date, `%F`/`%L` sender (or `To` recipient, for the user's own mail), `%f` sender with address, `%m` messages in the folder, `%n` sender's name, `%s` subject, `%S` status (`D`, `!`, `N`), `%t` first recipient, `%u` sender's user name, `%v` sender's first name, `%X` attachments (1 or 0), `%Z` flags (`D`/`N`, `!`, `+` for attachments); in `pager_format`, `%P` how far down. |
+| `status_format` | `%b` mailboxes with new mail, `%d` marked for deletion, `%F` flagged, `%f` folder, `%h` host name, `%M` shown by the limit, `%m` messages, `%n`/`%u` unread, `%P` how far down, `%r` `*` with changes waiting (`-` otherwise), `%V` the limit, `%v` mett's version, and mett's `%I`, set when part of the folder couldn't be listed. |
+
+Expandos mett can't fill yet (such as sizes and line counts) are empty, so
+`%?l?...?` conditionals take their `else` part.
+
+`color OBJECT [ATTRIBUTE ...] FOREGROUND BACKGROUND [EXPRESSION]` (an
+expression with spaces quoted, as in mutt) sets the
+colors of `normal`, `indicator`, `status` (and the help line), `error`,
+`message`, `prompt`, `search`, `hdrdefault`, `quoted` to `quoted9` (by
+`quote_regex`), `signature` and `attachment`; `index` takes a pattern (the
+last that matches counts), and `header` and `body` a regular expression.
+Colors are `default`, the eight basic colors (with `bright` for the light
+ones), `colorN` and `"#rrggbb"` (quoted, as `#` otherwise starts a comment); attributes are `bold`, `underline`,
+`reverse`, `standout`, `blink`, `italic` and `none`. `uncolor` removes
+`index`, `header` and `body` rules (`*` for all) or sets an object back to
+its default. As in mutt, `mono` and `unmono` set the attributes used
+instead on a terminal without colors (`TERM` such as `vt100` or `dumb`,
+or `NO_COLOR` set). Objects and patterns mett doesn't do yet (such as
+`color compose ...` or `color index ... ~T`) are ignored with a warning.
+`tree`, `tilde` and `markers` are accepted but not drawn yet.
 
 `mett -D` prints every setting after reading the configuration, which is a
 quick way to check it:

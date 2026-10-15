@@ -4,19 +4,25 @@
 //! The layout follows mutt: a help line at the top, the index or pager in
 //! the middle, a status bar, and a message line at the bottom.
 
-use chrono::Local;
-use mett_core::{Address, MessageSummary};
+use std::ops::Range;
+
+use mett_core::Address;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
 use crate::app::{App, Browser, Compose, Help, Input, Pager, Row, Screen, SignIn, highlighted};
+use crate::color::Colors;
+use crate::expando::{self, Display, Entry, Status};
+use crate::format;
 use crate::keymap::{Keymap, Menu};
-use crate::text::{fit, truncate, wrap_all};
+use crate::pattern::Candidate;
+use crate::text::{self, truncate};
 
 /// The actions shown in each menu's help line.
 const HELP: &[(Menu, &[(Action, &str)])] = &[
@@ -80,8 +86,6 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
     ),
 ];
 
-const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
-
 /// Text to print over the drawn screen, starting at a cell, and left for
 /// the terminal to wrap.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,25 +109,35 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         Constraint::Length(1),
     ])
     .areas(frame.area());
+    let colors = &app.display.colors;
+    // Text without colors of its own is `normal`.
+    frame.render_widget(Block::new().style(colors.normal), frame.area());
 
     frame.render_widget(
-        Paragraph::new(help_line(app, keymap, app.menu())).style(REVERSED),
+        Paragraph::new(help_line(app, keymap, app.menu())).style(colors.status),
         help,
     );
     let status_line = match app.screen() {
         Screen::Index => {
             render_index(app, frame, body);
-            index_status(app)
+            index_status(app, usize::from(body.height), usize::from(body.width))
         }
         Screen::Pager(pager) => render_pager(app, pager, frame, body),
-        Screen::Compose(compose) => render_compose(compose, frame, body),
-        Screen::Browser(browser) => render_browser(browser, frame, body),
+        Screen::Compose(compose) => render_compose(compose, colors, frame, body),
+        Screen::Browser(browser) => render_browser(browser, colors, frame, body),
         Screen::Help(help) => render_help(app, help, frame, body),
     };
-    frame.render_widget(Paragraph::new(status_line).style(REVERSED), status);
+    frame.render_widget(Paragraph::new(status_line).style(colors.status), status);
     match &app.input {
-        Some(input) => render_input(input, frame, message),
-        None => frame.render_widget(Paragraph::new(app.status.as_str()), message),
+        Some(input) => render_input(input, colors.prompt, frame, message),
+        None => {
+            let style = if app.error.as_deref() == Some(app.status.as_str()) {
+                colors.error
+            } else {
+                colors.message
+            };
+            frame.render_widget(Paragraph::new(app.status.as_str()).style(style), message);
+        }
     }
     // The window may cover everything but the help line, which lists its
     // keys: on a small terminal, the sign-in instructions matter more than
@@ -131,7 +145,7 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
     if let Some(window) = &app.sign_in {
         let [_, below_help] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
-        return render_sign_in(window, keymap, frame, below_help);
+        return render_sign_in(window, keymap, colors.normal, frame, below_help);
     }
     None
 }
@@ -153,7 +167,7 @@ fn render_help(app: &App, help: &Help, frame: &mut Frame, area: Rect) -> String 
 /// Draws the folder browser and returns its status line. Each line is like
 /// mutt's: the position, the unread and total counts, and the name,
 /// indented by depth.
-fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
+fn render_browser(browser: &Browser, colors: &Colors, frame: &mut Frame, area: Rect) -> String {
     if browser.entries.is_empty() {
         let text = if browser.listing() {
             "Listing folders..."
@@ -191,7 +205,7 @@ fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
             );
             let line = Line::raw(truncate(&line, width));
             if i == browser.selected {
-                line.style(REVERSED)
+                line.style(colors.indicator)
             } else {
                 line
             }
@@ -203,14 +217,15 @@ fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
 
 /// Draws a question on the message line, with the cursor where the answer
 /// is typed.
-fn render_input(input: &Input, frame: &mut Frame, area: Rect) {
+fn render_input(input: &Input, prompt_style: Style, frame: &mut Frame, area: Rect) {
     let width = usize::from(area.width);
     let (line, cursor) = match input {
         Input::Line { prompt, editor, .. } => {
             let prompt = truncate(prompt, width.saturating_sub(1));
             let (text, column) = editor.view(width.saturating_sub(prompt.width()));
             let cursor = prompt.width() + column;
-            (format!("{prompt}{text}"), cursor)
+            let line = Line::from(vec![Span::styled(prompt, prompt_style), Span::raw(text)]);
+            (line, cursor)
         }
         Input::YesNo {
             prompt, default, ..
@@ -218,7 +233,7 @@ fn render_input(input: &Input, frame: &mut Frame, area: Rect) {
             let choices = if *default { "([yes]/no)" } else { "(yes/[no])" };
             let line = truncate(&format!("{prompt} {choices}: "), width);
             let cursor = line.width();
-            (line, cursor)
+            (Line::styled(line, prompt_style), cursor)
         }
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -230,7 +245,7 @@ fn render_input(input: &Input, frame: &mut Frame, area: Rect) {
 
 /// Draws the compose menu and returns its status line: the headers, then
 /// the message's parts (for now, only its text).
-fn render_compose(compose: &Compose, frame: &mut Frame, area: Rect) -> String {
+fn render_compose(compose: &Compose, colors: &Colors, frame: &mut Frame, area: Rect) -> String {
     let draft = &compose.draft;
     let list = |addresses: &[Address]| Address::format_list(addresses);
     let from = draft
@@ -258,15 +273,18 @@ fn render_compose(compose: &Compose, frame: &mut Frame, area: Rect) -> String {
             &format!("- I     1 <message text>  [text/plain, utf-8, {size}]"),
             width,
         ))
-        .style(REVERSED),
+        .style(colors.indicator),
     );
     let mut parts = 1;
     if compose.forwarded_attachments {
         parts += 1;
-        lines.push(Line::raw(truncate(
-            "- A     2 <the forwarded message's attachments>",
-            width,
-        )));
+        lines.push(
+            Line::raw(truncate(
+                "- A     2 <the forwarded message's attachments>",
+                width,
+            ))
+            .style(colors.attachment),
+        );
     }
     frame.render_widget(Paragraph::new(lines), area);
     format!("-- mett: Compose  [Approx. msg size: {size}   Atts: {parts}]---")
@@ -290,6 +308,7 @@ fn format_size(bytes: usize) -> String {
 fn render_sign_in(
     window: &SignIn,
     keymap: &Keymap,
+    normal: Style,
     frame: &mut Frame,
     area: Rect,
 ) -> Option<Overlay> {
@@ -335,7 +354,7 @@ fn render_sign_in(
         .areas(area);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(visible).block(
+        Paragraph::new(visible).style(normal).block(
             Block::new()
                 .borders(Borders::TOP | Borders::BOTTOM)
                 .title(title),
@@ -396,6 +415,8 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
     // Like mutt, scroll a page at a time.
     let first = app.selected / height * height;
     let width = usize::from(area.width);
+    let colors = &app.display.colors;
+    let total = app.total_messages();
     let lines: Vec<Line> = app
         .messages
         .iter()
@@ -404,75 +425,55 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
         .take(height)
         .map(|(i, message)| {
             let deleted = app.is_deleted(&message.id);
-            let line = Line::raw(index_entry(i + 1, message, deleted, width));
+            let entry = Entry {
+                number: i + 1,
+                summary: message,
+                deleted,
+                from_me: message.from.as_ref().is_some_and(|a| app.is_me(a)),
+                total,
+                date_format: &app.display.date_format,
+                position: None,
+            };
+            // Padded to the right edge, so that the row's colors cover it.
+            let mut text = format::expand(&app.display.index_format, &entry, width);
+            let used = text.width();
+            text.push_str(&" ".repeat(width.saturating_sub(used)));
+            let line = Line::raw(text);
             if i == app.selected {
-                line.style(REVERSED)
+                line.style(colors.indicator)
             } else {
-                line
+                line.style(colors.index_style(|pattern| {
+                    pattern.matches(&Candidate {
+                        summary: message,
+                        deleted,
+                    })
+                }))
             }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// One index line, like mutt's default `%4C %Z %{%b %d} %-15.15L %s`.
-fn index_entry(number: usize, message: &MessageSummary, deleted: bool, width: usize) -> String {
-    let flags = format!(
-        "{}{}{}",
-        if deleted {
-            'D'
-        } else if message.flags.read {
-            ' '
-        } else {
-            'N'
-        },
-        if message.flags.flagged { '!' } else { ' ' },
-        if message.has_attachments { '+' } else { ' ' },
-    );
-    let date = message.received.with_timezone(&Local).format("%b %d");
-    let from = message.from.as_ref().map_or("", display_name);
-    // Columns are measured in terminal cells, so wide characters line up.
-    let line = format!(
-        "{number:>4} {flags} {date} {}  {}",
-        fit(from, 15),
-        message.subject
-    );
-    truncate(&line, width)
-}
-
-fn display_name(address: &Address) -> &str {
-    address
-        .name
-        .as_deref()
-        .filter(|n| !n.is_empty())
-        .unwrap_or(&address.email)
-}
-
-fn index_status(app: &App) -> String {
-    let folder = app.folder.as_ref().map_or("", |f| f.name.as_str());
-    let new = app.messages.iter().filter(|m| !m.flags.read).count();
-    let incomplete = if app.incomplete() {
-        " [incomplete]"
-    } else {
-        ""
+/// The status bar under the index, from `status_format`.
+fn index_status(app: &App, height: usize, width: usize) -> String {
+    let height = height.max(1);
+    let first = app.selected / height * height;
+    let position = expando::position(first, height, app.messages.len());
+    let status = Status {
+        folder: app.folder.as_ref().map_or("", |f| f.name.as_str()),
+        total: app.total_messages(),
+        shown: app.limit.as_ref().map(|_| app.messages.len()),
+        // The whole folder, as in mutt, whatever the limit shows.
+        new: app.folder_messages().filter(|m| !m.flags.read).count(),
+        deleted: app.deleted_count(),
+        flagged: app.folder_messages().filter(|m| m.flags.flagged).count(),
+        incoming: app.mailboxes_with_new_mail(),
+        limit: app.limit.as_ref().map(|limit| limit.text.as_str()),
+        incomplete: app.incomplete(),
+        changed: app.deleted_count() > 0 || app.saving(),
+        position: &position,
     };
-    let deleted = match app.deleted_count() {
-        0 => String::new(),
-        n => format!(" Del:{n}"),
-    };
-    let (count, limit) = match &app.limit {
-        Some(limit) => (
-            format!("{}/{}", app.messages.len(), app.total_messages()),
-            format!(" [Limit: {}]", limit.text),
-        ),
-        None => (app.messages.len().to_string(), String::new()),
-    };
-    // Mailboxes with new mail, as mutt's `%b`.
-    let incoming = match app.mailboxes_with_new_mail() {
-        0 => String::new(),
-        n => format!(" Inc:{n}"),
-    };
-    format!("-*-mett: {folder} [Msgs:{count} New:{new}{deleted}{incoming}]{limit}{incomplete}---")
+    format::expand(&app.display.status_format, &status, width)
 }
 
 /// Draws the pager body and returns its status line.
@@ -484,75 +485,166 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     // The app keeps the message wrapped to the terminal width; wrap here
     // only if the drawing area differs, so no text is clipped.
     let width = usize::from(area.width);
-    let rewrapped;
-    let lines = if pager.rows_width == Some(width) {
-        &pager.rows
+    let cached = pager.rows_width == Some(width);
+    let rewrapped: Vec<(usize, Range<usize>)> = if cached {
+        Vec::new()
     } else {
-        rewrapped = wrap_all(&pager.lines, width);
-        &rewrapped
+        pager
+            .lines
+            .iter()
+            .enumerate()
+            .flat_map(|(line, text)| {
+                text::wrap_ranges(text, width)
+                    .into_iter()
+                    .map(move |range| (line, range))
+            })
+            .collect()
+    };
+    let total = if cached {
+        pager.rows.len()
+    } else {
+        rewrapped.len()
     };
     let height = usize::from(area.height);
-    let last_top = lines.len().saturating_sub(height);
+    let last_top = total.saturating_sub(height);
     let top = pager.scroll.min(last_top);
+    let end = (top + height).min(total);
+    // Only the rows on screen are looked at: each is part of a line.
+    let rows: Vec<(usize, (usize, Range<usize>))> = (top..end)
+        .map(|row| {
+            let part = if cached {
+                let line = pager.line_rows.partition_point(|&first| first <= row) - 1;
+                (line, pager.row_ranges[row].clone())
+            } else {
+                rewrapped[row].clone()
+            };
+            (row, part)
+        })
+        .collect();
     // The last search's match, where the rows are the app's.
-    let found = if pager.rows_width == Some(width) {
+    let found = if cached {
         highlighted(pager)
     } else {
         Vec::new()
     };
-    let visible: Vec<Line> = lines
+    let colors = &app.display.colors;
+    // `color body` matches, found once for each line on screen.
+    let mut matches: std::collections::HashMap<usize, Vec<(Range<usize>, Style)>> =
+        std::collections::HashMap::new();
+    let visible: Vec<Line> = rows
         .iter()
-        .enumerate()
-        .skip(top)
-        .take(height)
-        .map(|(row, l)| match found.iter().find(|(r, _)| *r == row) {
-            Some((_, range)) => Line::from(vec![
-                Span::raw(&l[..range.start]),
-                Span::styled(
-                    &l[range.clone()],
-                    Style::new().add_modifier(Modifier::REVERSED),
-                ),
-                Span::raw(&l[range.end..]),
-            ]),
-            None => Line::raw(l.as_str()),
+        .map(|(row, (line, range))| {
+            let text = &pager.lines[*line];
+            let (style, body) = line_style(pager, *line, &app.display);
+            // Byte by byte, what colors each part of the row.
+            let mut marks: Vec<Option<Style>> = vec![None; range.len()];
+            let mut mark = |start: usize, end: usize, style: Style| {
+                let (start, end) = (start.max(range.start), end.min(range.end));
+                for slot in marks
+                    .iter_mut()
+                    .take(end.saturating_sub(range.start))
+                    .skip(start.saturating_sub(range.start))
+                {
+                    *slot = Some(style);
+                }
+            };
+            if body {
+                for (found, rule) in matches.entry(*line).or_insert_with(|| {
+                    colors
+                        .body
+                        .iter()
+                        .flat_map(|rule| {
+                            rule.regex
+                                .find_iter(text)
+                                .map(move |m| (m.range(), rule.style))
+                        })
+                        .collect()
+                }) {
+                    mark(found.start, found.end, style.patch(*rule));
+                }
+            }
+            for (_, found) in found.iter().filter(|(r, _)| r == row) {
+                mark(
+                    range.start + found.start,
+                    range.start + found.end,
+                    style.patch(colors.search),
+                );
+            }
+            let row_text = &text[range.clone()];
+            // Runs of one style, cut only between graphemes (a match in
+            // part of one colors all of it), so that each is drawn whole.
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run: Option<(usize, Style)> = None;
+            for (at, grapheme) in row_text.grapheme_indices(true) {
+                let marked = marks[at..at + grapheme.len()].iter().find_map(|m| *m);
+                let this = marked.unwrap_or(style);
+                match run {
+                    Some((_, current)) if current == this => {}
+                    Some((start, current)) => {
+                        spans.push(Span::styled(row_text[start..at].to_owned(), current));
+                        run = Some((at, this));
+                    }
+                    None => run = Some((at, this)),
+                }
+            }
+            if let Some((start, current)) = run {
+                spans.push(Span::styled(row_text[start..].to_owned(), current));
+            }
+            Line::from(spans).style(style)
         })
         .collect();
     frame.render_widget(Paragraph::new(visible), area);
 
-    let position = if lines.len() <= height {
-        "all".to_owned()
-    } else if top >= last_top {
-        "end".to_owned()
-    } else {
-        format!("{}%", (top + height) * 100 / lines.len())
+    let position = expando::position(top, height, total);
+    // The message as the index currently shows it, as in mutt's `%Z`: its
+    // flags may have changed since it was fetched.
+    let index = app.messages.iter().position(|m| m.id == pager.id);
+    let summary = index.map_or(&message.summary, |i| &app.messages[i]);
+    let entry = Entry {
+        number: index.unwrap_or(app.selected) + 1,
+        summary,
+        deleted: app.is_deleted(&pager.id),
+        from_me: summary.from.as_ref().is_some_and(|a| app.is_me(a)),
+        total: app.total_messages(),
+        date_format: &app.display.date_format,
+        position: Some(&position),
     };
-    let from = message.summary.from.as_ref().map_or("", display_name);
-    // The flags of the message as the index currently shows them, as in
-    // mutt's `%Z`: D for marked for deletion, N for unread, ! for flagged.
-    let flags = app
-        .messages
-        .get(app.selected)
-        .map_or(Default::default(), |m| m.flags);
-    let deleted = app.is_deleted(&message.summary.id);
-    format!(
-        "-{}{}- {}/{}: {from}  {}   -- ({position})",
-        if deleted {
-            'D'
-        } else if flags.read {
-            '-'
-        } else {
-            'N'
-        },
-        if flags.flagged { '!' } else { '-' },
-        app.selected + 1,
-        app.messages.len(),
-        message.summary.subject
-    )
+    format::expand(&app.display.pager_format, &entry, width)
+}
+
+/// How a line of the message in the pager is drawn, and whether it is in
+/// the body (which `color body` colors): headers with `color header` or
+/// `hdrdefault`, quoted text by its depth, and the signature.
+fn line_style(pager: &Pager, line: usize, display: &Display) -> (Style, bool) {
+    let colors = &display.colors;
+    let text = &pager.lines[line];
+    if line < pager.body_start {
+        return (colors.header_style(text), false);
+    }
+    if pager.signature.is_some_and(|start| line >= start) {
+        return (colors.normal.patch(colors.signature), true);
+    }
+    let depth = display
+        .quote
+        .find(text)
+        .filter(|found| found.start() == 0)
+        .map_or(0, |found| {
+            found
+                .as_str()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .count()
+        });
+    if depth > 0 {
+        (colors.quoted_style(depth), true)
+    } else {
+        (colors.normal, true)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, TimeDelta, Utc};
+    use chrono::{DateTime, Local, TimeDelta, Utc};
     use mett_core::mock;
     use mett_core::{MessagePage, WellKnownFolder};
     use mett_msgraph::SignInPrompt;
@@ -642,6 +734,123 @@ mod tests {
             .collect()
     }
 
+    /// The style of each cell of `app` drawn.
+    fn styles(app: &App) -> ratatui::buffer::Buffer {
+        sized_styles(app, HEIGHT)
+    }
+
+    fn sized_styles(app: &App, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(app, frame);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn colored(app: &mut App, commands: &[&str]) {
+        for command in commands {
+            let words: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+            let (name, args) = words.split_first().unwrap();
+            assert_eq!(name, "color");
+            app.display.colors.color(args).unwrap();
+        }
+    }
+
+    #[test]
+    fn colors_the_index_and_the_status_bar() {
+        use ratatui::style::Color;
+        let mut app = app(3);
+        colored(
+            &mut app,
+            &[
+                "color index red default ~F",
+                "color indicator black yellow",
+                "color status white blue",
+            ],
+        );
+        let buffer = styles(&app);
+        assert_eq!(buffer[(5, 1)].bg, Color::Yellow, "the selected entry");
+        let right = buffer.area.width - 1;
+        assert_eq!(buffer[(right, 1)].bg, Color::Yellow, "to the right edge");
+        assert_eq!(buffer[(5, 2)].fg, Color::Red, "the flagged one");
+        assert_eq!(buffer[(5, 3)].fg, Color::Reset);
+        assert_eq!(buffer[(0, 6)].bg, Color::Blue);
+        assert_eq!(buffer[(0, 0)].bg, Color::Blue, "the help line too");
+        // Errors in their own color.
+        colored(&mut app, &["color error brightred default"]);
+        app.status = "Mail sent.".into();
+        assert_eq!(styles(&app)[(0, 7)].fg, Color::Reset, "not an error");
+        // As in mutt, this is an error.
+        app.update(Msg::Action(Action::PreviousEntry));
+        assert_eq!(styles(&app)[(0, 7)].fg, Color::LightRed);
+        let effects = app.update(Msg::Action(Action::DisplayMessage));
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Err(mett_core::Error::Network("down".into()))),
+        }));
+        assert_eq!(styles(&app)[(0, 7)].fg, Color::LightRed, "{}", app.status);
+    }
+
+    #[test]
+    fn colors_headers_quotes_and_the_signature() {
+        use ratatui::style::Color;
+        let mut app = app(1);
+        colored(
+            &mut app,
+            &[
+                "color hdrdefault cyan default",
+                "color header yellow default ^From:",
+                "color quoted green default",
+                "color quoted1 magenta default",
+                "color signature blue default",
+                "color body brightwhite default wor..",
+                "color body red default afe",
+            ],
+        );
+        app.update(Msg::Resize {
+            width: WIDTH,
+            height: 16,
+        });
+        let effects = app.update(Msg::Action(Action::DisplayMessage));
+        let Effect::Request(fetch, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let mut message = mock::message("m0", "in", "Hi", received(0));
+        message.summary.from = Some(Address::new("alice@contoso.com"));
+        message.body.content = "> a\n>> b\nhello world\ncafe\u{301} ok\n-- \nAlice".into();
+        app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(message)),
+        }));
+        let buffer = sized_styles(&app, 16);
+        let lines = sized_screen(&app, WIDTH, 16);
+        let row = |text: &str| {
+            let y = lines.iter().position(|l| l.starts_with(text)).unwrap();
+            u16::try_from(y).unwrap()
+        };
+        assert_eq!(buffer[(0, row("Date:"))].fg, Color::Cyan);
+        assert_eq!(buffer[(0, row("From:"))].fg, Color::Yellow);
+        assert_eq!(buffer[(0, row("> a"))].fg, Color::Green);
+        assert_eq!(buffer[(0, row(">> b"))].fg, Color::Magenta);
+        assert_eq!(buffer[(0, row("hello"))].fg, Color::Reset);
+        assert_eq!(
+            buffer[(6, row("hello"))].fg,
+            Color::White,
+            "matched by the body rule"
+        );
+        assert_eq!(buffer[(0, row("Alice"))].fg, Color::Blue);
+        // A match in part of a grapheme colors all of it, drawn whole.
+        let cafe = row("caf");
+        assert_eq!(buffer[(3, cafe)].symbol(), "e\u{301}");
+        assert_eq!(buffer[(3, cafe)].fg, Color::Red);
+        assert_eq!(buffer[(4, cafe)].symbol(), " ");
+    }
+
     #[test]
     fn draws_the_index_like_mutt() {
         let lines = screen(&app(2));
@@ -654,7 +863,22 @@ mod tests {
             lines[2],
             format!("   2 N!  {} Alice Example    Subject 1", index_date(1))
         );
-        assert_eq!(lines[6], "-*-mett: Inbox [Msgs:2 New:2]---");
+        assert_eq!(
+            lines[6],
+            status_bar("---mett: Inbox [Msgs:2 New:2 Flag:1]---", "(all)---")
+        );
+    }
+
+    /// A status bar `WIDTH` cells wide, with `left` and `right` and dashes
+    /// between, as `%>-` makes them.
+    fn status_bar(left: &str, right: &str) -> String {
+        filled(left, '-', right)
+    }
+
+    /// `left` and `right`, `WIDTH` cells apart, with `fill` between.
+    fn filled(left: &str, fill: char, right: &str) -> String {
+        let gap = usize::from(WIDTH) - left.width() - right.width();
+        format!("{left}{}{right}", fill.to_string().repeat(gap))
     }
 
     #[test]
@@ -705,12 +929,33 @@ mod tests {
         assert_eq!(lines[3], "Subject: Subject 0");
         assert_eq!(lines[5], "Body of Subject 0");
         // Shown, so now read.
-        assert_eq!(lines[6], "---- 1/1: Alice Example  Subject 0   -- (all)"); // Marked for deletion from the pager (the only message, so it stays).
+        let pager_status = |flags: &str| {
+            let left = format!("-{flags}- 1/1: Alice Example          Subject 0");
+            filled(&left, ' ', "  -- (all)")
+        };
+        assert_eq!(lines[6], pager_status("   "));
+        // Marked for deletion from the pager (the only message, so it stays).
         app.update(Msg::Action(Action::DeleteMessage));
-        assert_eq!(
-            screen(&app)[6],
-            "-D-- 1/1: Alice Example  Subject 0   -- (all)"
-        );
+        assert_eq!(screen(&app)[6], pager_status("D  "));
+    }
+
+    #[test]
+    fn the_sign_in_window_takes_the_normal_colors() {
+        use ratatui::style::Color;
+        let mut app = app(2);
+        colored(&mut app, &["color normal white blue"]);
+        app.update(Msg::SignIn(crate::signin::SignInEvent::Prompt {
+            account: mett_core::AccountId::new("alice@contoso.com"),
+            prompt: SignInPrompt::EnterCode {
+                verification_uri: "https://microsoft.com/devicelogin".into(),
+                user_code: "ABCD-EFGH".into(),
+                message: String::new(),
+            },
+        }));
+        let buffer = styles(&app);
+        let lines = screen(&app);
+        let code = lines.iter().position(|l| l.contains("ABCD-EFGH")).unwrap();
+        assert_eq!(buffer[(0, u16::try_from(code).unwrap())].bg, Color::Blue);
     }
 
     #[test]
@@ -874,7 +1119,10 @@ mod tests {
         app.update(Msg::Action(Action::DeleteMessage));
         let lines = screen(&app);
         assert!(lines[1].starts_with("   1 D   "), "{lines:#?}");
-        assert_eq!(lines[6], "-*-mett: Inbox [Msgs:2 New:2 Del:1]---");
+        assert_eq!(
+            lines[6],
+            status_bar("-*-mett: Inbox [Msgs:2 New:2 Del:1 Flag:1]---", "(all)---")
+        );
 
         let effects = app.update(Msg::Action(Action::BrowseMailboxes));
         let Effect::Request(list, _) = effects[0].clone() else {

@@ -140,7 +140,7 @@ impl App {
             .as_ref()
             .is_some_and(|id| self.transfers_of(id).any(|t| t == Transfer::Purge));
         if action == Action::UndeleteMessage && purging {
-            self.status = "The message is already being purged.".into();
+            self.fail("The message is already being purged.");
             return Some(Vec::new());
         }
         let busy = match action {
@@ -160,7 +160,7 @@ impl App {
             _ => false,
         };
         if busy {
-            self.status = "The message is still being moved, copied or purged.".into();
+            self.fail("The message is still being moved, copied or purged.");
             return Some(Vec::new());
         }
         // A message written now would be lost when the other folder opens
@@ -170,19 +170,19 @@ impl App {
             Action::Mail | Action::Reply | Action::GroupReply | Action::Forward
         );
         if composing && self.switching.is_some() {
-            self.status = "Opening folder; wait a moment.".into();
+            self.fail("Opening folder; wait a moment.");
             return Some(Vec::new());
         }
         // Leaving the folder (opening another, or purging first): marks
         // made now would be lost or left behind.
         if matches!(action, Action::DeleteMessage | Action::UndeleteMessage) && self.leaving() {
-            self.status = "Leaving the folder; wait a moment.".into();
+            self.fail("Leaving the folder; wait a moment.");
             return Some(Vec::new());
         }
         let effects = match action {
             Action::DeleteMessage | Action::UndeleteMessage => {
                 let Some(id) = self.acted_on() else {
-                    self.status = "No messages.".into();
+                    self.fail("No messages.");
                     return Some(Vec::new());
                 };
                 if action == Action::DeleteMessage {
@@ -202,7 +202,7 @@ impl App {
                     .acted_on()
                     .and_then(|id| self.summary(&id).map(|summary| (id, summary.flags)))
                 else {
-                    self.status = "No messages.".into();
+                    self.fail("No messages.");
                     return Some(Vec::new());
                 };
                 let (id, flags) = flags;
@@ -230,7 +230,7 @@ impl App {
             Action::SyncMailbox => self.purge(None),
             Action::SaveMessage | Action::CopyMessage => {
                 if self.messages.is_empty() {
-                    self.status = "No messages.".into();
+                    self.fail("No messages.");
                     return Some(Vec::new());
                 }
                 let question = if action == Action::SaveMessage {
@@ -341,7 +341,7 @@ impl App {
         let path = match browsed.map_or_else(|| self.mailbox_path(&text), Ok) {
             Ok(path) => path,
             Err(e) => {
-                self.status = e.to_string();
+                self.fail(e.to_string());
                 return Vec::new();
             }
         };
@@ -397,7 +397,7 @@ impl App {
             if then.is_some() {
                 self.then = then;
             }
-            self.status = "Deleted messages are already being purged.".into();
+            self.fail("Deleted messages are already being purged.");
             return Vec::new();
         }
         if self.deleted.is_empty() {
@@ -939,7 +939,10 @@ impl App {
             if transfer == Transfer::Purge && failed > unauthorized_count {
                 self.then = None;
             }
-            self.status = format!("{failed} of {} failed: {e}", messages(total, "message"));
+            self.fail(format!(
+                "{failed} of {} failed: {e}",
+                messages(total, "message")
+            ));
             return Vec::new();
         }
         self.status = match transfer {
@@ -1049,7 +1052,7 @@ impl App {
             return self.list_folders_in_browser(purpose);
         }
         if self.mailboxes.is_empty() {
-            self.status = "No mailboxes are defined.".into();
+            self.fail("No mailboxes are defined.");
             return Vec::new();
         }
         let entries = self.mailbox_entries();

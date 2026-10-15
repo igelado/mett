@@ -35,7 +35,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "cd",
     "charset-hook",
     "close-hook",
-    "color",
     "crypt-hook",
     "echo",
     "fcc-hook",
@@ -51,7 +50,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "mbox-hook",
     "message-hook",
     "mime_lookup",
-    "mono",
     "my_hdr",
     "nospam",
     "open-hook",
@@ -70,7 +68,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "unalternative_order",
     "unattachments",
     "unauto_view",
-    "uncolor",
     "ungroup",
     "unhook",
     "unignore",
@@ -137,6 +134,8 @@ pub struct Config {
     pub errors: Vec<String>,
     /// `alternates`: regular expressions for the user's other addresses.
     alternates: Vec<String>,
+    /// `color` and `mono`.
+    colors: crate::color::Palette,
     /// `mailboxes`, in the order given.
     mailboxes: Vec<Mailbox>,
     /// `bind` and `macro` commands not yet taken by the key bindings.
@@ -174,6 +173,7 @@ impl Config {
             user: HashMap::new(),
             errors: Vec::new(),
             alternates: Vec::new(),
+            colors: crate::color::Palette::default(),
             mailboxes: Vec::new(),
             key_commands: Vec::new(),
             pushed: Vec::new(),
@@ -237,6 +237,11 @@ impl Config {
     /// The user's other addresses, as regular expressions (`alternates`).
     pub fn alternates(&self) -> &[String] {
         &self.alternates
+    }
+
+    /// How each part of the screen is drawn (`color`, `mono`).
+    pub fn colors(&self) -> &crate::color::Palette {
+        &self.colors
     }
 
     /// The mailboxes to check for new mail (`mailboxes`).
@@ -405,6 +410,50 @@ impl Config {
                         }
                     }
                 }),
+                "color" | "mono" | "uncolor" | "unmono" => {
+                    // An object mett doesn't do yet is ignored before the
+                    // rest is expanded, so its backticks never run.
+                    let object = args.first().map(|word| self.expand(word)).transpose();
+                    let unsupported = match &object {
+                        Ok(Some(object)) => match crate::color::object_supported(object) {
+                            Err(crate::color::ColorError::Unsupported(what)) => Some(what),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(what) = unsupported {
+                        self.warn_once("color", &what, format!("{what}; ignored"));
+                        Ok(())
+                    } else {
+                        // The object is expanded once (its backticks run
+                        // once).
+                        let words = object.and_then(|object| {
+                            object
+                                .into_iter()
+                                .map(Ok)
+                                .chain(args.iter().skip(1).map(|word| self.expand(word)))
+                                .collect::<Result<Vec<_>, _>>()
+                        });
+                        words.and_then(|words| {
+                            let palette = &mut self.colors;
+                            let result = match name.as_str() {
+                                "color" => palette.color.color(&words),
+                                "mono" => palette.mono.mono(&words),
+                                "uncolor" => palette.color.uncolor(&words),
+                                _ => palette.mono.uncolor(&words),
+                            };
+                            match result {
+                                Ok(()) => Ok(()),
+                                // As other things mett doesn't do yet.
+                                Err(crate::color::ColorError::Unsupported(what)) => {
+                                    self.warn_once("color", &what, format!("{what}; ignored"));
+                                    Ok(())
+                                }
+                                Err(e) => Err(e.to_string().replacen("uncolor", name.as_str(), 1)),
+                            }
+                        })
+                    }
+                }
                 "mailboxes" => self.add_mailboxes(args),
                 "unmailboxes" => self.each(args, |c, path| {
                     if path == "*" {
@@ -972,9 +1021,8 @@ mod tests {
 
     #[test]
     fn reports_bad_values_as_errors_and_unknowns_as_warnings() {
-        let config = load(
-            "set timeout=soon\nset no_such_var=1\ncolor index red default ~N\nfrobnicate\nset from\n",
-        );
+        let config =
+            load("set timeout=soon\nset no_such_var=1\nscore ~N 10\nfrobnicate\nset from\n");
         assert_eq!(config.errors.len(), 2, "{:?}", config.errors);
         assert!(config.errors[0].starts_with("/conf/mettrc:1: timeout"));
         assert!(config.errors[1].contains("from: needs a value"));
@@ -983,7 +1031,7 @@ mod tests {
             config
                 .warnings
                 .iter()
-                .any(|w| w.contains("color is not supported yet"))
+                .any(|w| w.contains("score is not supported yet"))
         );
         assert!(
             config
@@ -1071,17 +1119,17 @@ mod tests {
             Ok(vec!["my_x=\"hi\"".into()])
         );
         // Ignored commands are reported each time they are typed.
-        let first = config.run_line("color a b c").unwrap();
+        let first = config.run_line("score a b c").unwrap();
         assert_eq!(first.len(), 1);
-        assert_eq!(config.run_line("color a b c"), Ok(first));
+        assert_eq!(config.run_line("score a b c"), Ok(first));
     }
 
     #[test]
     fn warns_about_each_ignored_item_once() {
-        let config = load("color a b c\ncolor d e f\nset imap_user=x\nset imap_user=y\n");
+        let config = load("score a b c\nscore d e f\nset imap_user=x\nset imap_user=y\n");
         assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
         // A variable and a command with the same name are different items.
-        let both = load("set color=1\ncolor a b c\n");
+        let both = load("set score=1\nscore a b c\n");
         assert_eq!(both.warnings.len(), 2, "{:?}", both.warnings);
         assert!(config.warnings[0].starts_with("/conf/mettrc:1:"));
         assert!(config.warnings[1].starts_with("/conf/mettrc:3:"));
@@ -1137,7 +1185,7 @@ mod tests {
         let marker = std::env::temp_dir().join(format!("mett-ran-{}", std::process::id()));
         let _ = fs::remove_file(&marker);
         let config = load(&format!(
-            "set imap_pass=`touch {0}; false`\ncolor index x `touch {0}`\n",
+            "set imap_pass=`touch {0}; false`\nscore x `touch {0}`\n",
             marker.display()
         ));
         assert!(config.errors.is_empty(), "{:?}", config.errors);
@@ -1158,6 +1206,37 @@ mod tests {
         // The dump reads back to the same settings.
         let again = load(&dump.join("\n"));
         assert_eq!(again.dump(), dump);
+    }
+
+    #[test]
+    fn colors_mett_does_not_do_yet_are_warnings() {
+        let config = load(
+            "color compose header red default\ncolor index red default ~T\ncolor status red blue\nmono status bold\n",
+        );
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
+        assert_ne!(config.colors().color, crate::color::Colors::default());
+        assert_ne!(config.colors().mono, crate::color::Colors::default());
+        assert!(load("color status mauve blue\n").errors[0].contains("mauve"));
+        // A color by its RGB value is quoted: `#` starts a comment.
+        let rgb = load("color status '#ff0000' default\n");
+        assert!(rgb.errors.is_empty(), "{:?}", rgb.errors);
+        assert_eq!(
+            rgb.colors().color.status.fg,
+            Some(ratatui::style::Color::Rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn ignored_colors_never_run_their_backticks() {
+        let marker = std::env::temp_dir().join(format!("mett-color-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let config = load(&format!(
+            "color sidebar_new red `touch {}`\n",
+            marker.display()
+        ));
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert!(!marker.exists(), "an ignored backtick ran");
     }
 
     #[test]
