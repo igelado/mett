@@ -179,6 +179,9 @@ pub struct Pager {
     pub request: RequestId,
     /// The first visible row, after wrapping.
     pub scroll: usize,
+    /// The user set the message read or unread while it was loading:
+    /// showing it doesn't mark it read.
+    pub read_chosen: bool,
 }
 
 impl Pager {
@@ -1005,6 +1008,7 @@ impl App {
             rows_width: None,
             request: effect_id(&fetch),
             scroll: 0,
+            read_chosen: false,
         }));
         vec![fetch]
     }
@@ -1222,8 +1226,13 @@ impl App {
         pager.rows_width = None;
         pager.layout(self.width);
         let message_id = message.summary.id.clone();
+        let chosen = pager.read_chosen;
         pager.message = Some(message);
-        // Now that it has been shown, mark it read, as mutt does.
+        // Now that it has been shown, mark it read, as mutt does (unless
+        // the user said otherwise meanwhile).
+        if chosen {
+            return Vec::new();
+        }
         self.mark_read(message_id)
     }
 

@@ -182,6 +182,14 @@ impl App {
                         read: None,
                     }
                 } else {
+                    // Chosen while the message loads: showing it won't
+                    // undo it.
+                    if let Some(Screen::Pager(pager)) = self.screens.last_mut()
+                        && pager.message.is_none()
+                        && pager.id == id
+                    {
+                        pager.read_chosen = true;
+                    }
                     FlagsUpdate {
                         read: Some(!flags.read),
                         flagged: None,
@@ -3203,5 +3211,23 @@ mod tests {
             event: Event::Purged(Ok(vec![("m1".into(), Ok(()))])),
         }));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn unread_chosen_while_loading_stays_unread() {
+        let mut app = app(settings());
+        app.messages[0].flags.read = true;
+        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
+        let (toggle, _) = sent(&act(&mut app, Action::ToggleNew));
+        let effects = app.update(Msg::Response(Response {
+            id: fetch,
+            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
+        }));
+        assert!(effects.is_empty(), "not marked read again: {effects:?}");
+        app.update(Msg::Response(Response {
+            id: toggle,
+            event: Event::FlagsUpdated(Ok(())),
+        }));
+        assert!(!app.messages[0].flags.read);
     }
 }
