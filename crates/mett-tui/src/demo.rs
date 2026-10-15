@@ -12,6 +12,9 @@ const PEOPLE: &[(&str, &str)] = &[
     ("Dave Devops", "dave@northwind.example"),
 ];
 
+/// The demo user, to whom the sample mail is addressed.
+const YOU: &str = "you@contoso.com";
+
 const SUBJECTS: &[&str] = &[
     "Welcome to mett",
     "Weekly sync notes",
@@ -22,6 +25,18 @@ const SUBJECTS: &[&str] = &[
     "Your expense report was approved",
     "Design review: pager layout",
 ];
+
+/// How to write messages in the demo: as the user the sample mail is
+/// addressed to, so that replies leave them out.
+pub fn settings() -> crate::app::Settings {
+    crate::app::Settings {
+        compose: crate::compose::Settings {
+            me: vec![YOU.to_owned()],
+            ..crate::compose::Settings::default()
+        },
+        ..crate::app::Settings::default()
+    }
+}
 
 /// A sample mailbox: an Inbox with messages of various ages and flags, one
 /// of them HTML, an empty Archive, and Drafts and Sent Items for what is
@@ -53,7 +68,7 @@ pub fn mailbox() -> MemoryStore {
         let received = now - TimeDelta::hours(7 * i as i64);
         let mut message = mock::message(&format!("demo-{i}"), "inbox", subject, received);
         message.summary.from = Some(Address::new(email).with_name(name));
-        message.summary.to = vec![Address::new("you@contoso.com").with_name("You")];
+        message.summary.to = vec![Address::new(YOU).with_name("You")];
         message.summary.flags.read = i > 3;
         message.summary.flags.flagged = i % 9 == 2;
         message.summary.has_attachments = i % 5 == 4;
@@ -78,4 +93,26 @@ pub fn mailbox() -> MemoryStore {
         store = store.with_message(message);
     }
     store
+}
+
+#[cfg(test)]
+mod tests {
+    use mett_core::{FolderId, MailStore, Page};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn group_replies_leave_the_demo_user_out() {
+        let store = mailbox();
+        let page = store
+            .list_messages(&FolderId::new("inbox"), Page::first(1))
+            .await
+            .unwrap();
+        let message = store.fetch_message(&page.messages[0].id).await.unwrap();
+        let (to, cc) = crate::compose::reply_recipients(&message, true, true, &settings().compose);
+        assert!(
+            !to.iter().chain(&cc).any(|a| a.email == YOU),
+            "{to:?} {cc:?}"
+        );
+    }
 }

@@ -171,7 +171,7 @@ fn main() -> ExitCode {
     let (_, sign_in) = mpsc::unbounded_channel();
     let session = Session {
         folder: FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new()),
-        settings: Settings::default(),
+        settings: demo::settings(),
         editor: Editor::new("", "", &|name| std::env::var(name).ok()),
         sign_in,
         cancel: None,

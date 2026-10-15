@@ -1172,3 +1172,35 @@ async fn another_reply_to_the_same_message_gets_its_own_draft() {
         MessageId::new("d1")
     );
 }
+
+#[tokio::test]
+async fn a_draft_that_cannot_be_deleted_is_kept_for_the_next_attempt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let denied = || {
+        ResponseTemplate::new(403).set_body_json(json!({
+            "error": { "code": "ErrorAccessDenied", "message": "denied" }
+        }))
+    };
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(denied())
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(denied())
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.save_draft(&reply).await.unwrap_err();
+    // Trying again updates that draft rather than making another.
+    store.save_draft(&reply).await.unwrap_err();
+}

@@ -546,8 +546,13 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
                     "{e}; if it wasn't sent, it is in Drafts"
                 )));
             }
-            // Graph refused it: it wasn't sent.
-            Err(_) => self.discard(&id).await,
+            // Graph refused it: it wasn't sent. A draft that can't be
+            // deleted either is kept, for the next attempt.
+            Err(_) => {
+                if !self.discard(&id).await {
+                    self.keep(origin, draft, id);
+                }
+            }
             Ok(_) => {}
         }
         sent.map(drop)
@@ -595,7 +600,11 @@ impl<A: Authenticator> GraphMailStore<A> {
                 Err(e)
             }
             Err(e) => {
-                self.discard(&id).await;
+                // One that can't be deleted (access was denied, say) is kept
+                // for the next attempt, rather than left behind.
+                if !self.discard(&id).await {
+                    self.keep(origin, draft, id);
+                }
                 Err(e)
             }
         }
@@ -622,16 +631,17 @@ impl<A: Authenticator> GraphMailStore<A> {
     }
 
     /// Deletes a server draft that could not be completed, so it doesn't
-    /// linger in Drafts. Failing to is not worth reporting over the error
-    /// that caused it.
-    async fn discard(&self, id: &MessageId) {
+    /// linger in Drafts, and returns whether it is gone. Failing to is not
+    /// worth reporting over the error that caused it.
+    async fn discard(&self, id: &MessageId) -> bool {
         let url = self.url(&["me", "messages", id.as_str()]);
-        let _ = self
+        let deleted = self
             .send(
                 self.request(Method::DELETE, url),
                 About::message(id.as_str()),
             )
             .await;
+        matches!(deleted, Ok(_) | Err(Error::NotFound { .. }))
     }
 }
 
