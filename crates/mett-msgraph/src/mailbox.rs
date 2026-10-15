@@ -354,6 +354,28 @@ impl<A: Authenticator> GraphMailStore<A> {
 const ROOT: &str = "msgfolderroot";
 
 impl<A: Authenticator> MailStore for GraphMailStore<A> {
+    async fn own_addresses(&self) -> Result<Vec<String>> {
+        let mut url = self.url(&["me"]);
+        url.query_pairs_mut()
+            .append_pair("$select", "mail,userPrincipalName,proxyAddresses");
+        let me: Me = self
+            .json(self.request(Method::GET, url), About::MAILBOX)
+            .await?;
+        // `proxyAddresses` holds every alias, as `SMTP:` (the primary one)
+        // or `smtp:`; other kinds (`x500:`, `sip:`) aren't mail addresses.
+        let aliases = me.proxy_addresses.into_iter().filter_map(|proxy| {
+            let (kind, address) = proxy.split_once(':')?;
+            kind.eq_ignore_ascii_case("smtp")
+                .then(|| address.to_owned())
+        });
+        Ok(me
+            .mail
+            .into_iter()
+            .chain(me.user_principal_name)
+            .chain(aliases)
+            .collect())
+    }
+
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let roles = self.roles().await?;
         let top = |mut url: Url| {
@@ -857,6 +879,16 @@ struct ErrorResponse {
 struct ErrorBody {
     code: String,
     message: String,
+}
+
+/// The signed-in user's addresses.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Me {
+    mail: Option<String>,
+    user_principal_name: Option<String>,
+    #[serde(default)]
+    proxy_addresses: Vec<String>,
 }
 
 #[derive(Deserialize)]

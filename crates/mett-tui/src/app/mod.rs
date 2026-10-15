@@ -286,6 +286,8 @@ pub struct App {
     /// Requests deleting drafts of messages the user gave up on, with the
     /// message; quitting waits for them.
     discarding: HashMap<RequestId, mett_core::Draft>,
+    /// Whether the mailbox has been asked for the user's own addresses.
+    asked_addresses: bool,
     /// Drafts of messages the user gave up on that couldn't be deleted,
     /// reported on exit like changes that couldn't be saved; with the
     /// message, if deleting it again after a sign-in may work.
@@ -362,6 +364,7 @@ impl App {
             relist_on_return: false,
             reselect: None,
             discarding: HashMap::new(),
+            asked_addresses: false,
             left_drafts: Vec::new(),
             path,
             opening: None,
@@ -852,6 +855,13 @@ impl App {
                         if self.status.starts_with("Loading ") {
                             self.status.clear();
                         }
+                        // Once the user can reply: their own addresses, so
+                        // that a reply to their own mail goes to its
+                        // recipients (the sign-in name may not be one).
+                        if !self.asked_addresses {
+                            self.asked_addresses = true;
+                            effects.push(self.request(Request::OwnAddresses));
+                        }
                     }
                     effects.extend(self.apply_pending());
                     return effects;
@@ -876,6 +886,15 @@ impl App {
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::Sent(result) => return self.on_delivered(id, result),
             Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
+            // Without them, the configured ones do.
+            Event::OwnAddresses(result) => {
+                for address in result.unwrap_or_default() {
+                    let address = address.to_lowercase();
+                    if !self.settings.me.contains(&address) {
+                        self.settings.me.push(address);
+                    }
+                }
+            }
             Event::KeptDiscarded(result) => {
                 let draft = self.discarding.remove(&id);
                 if let Err(e) = result {
@@ -1561,7 +1580,14 @@ mod tests {
         let effects = deliver_last_page(&mut app, second, more);
         assert_eq!(app.selected, 1);
         assert!(
-            matches!(effects.as_slice(), [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m1"),
+            matches!(
+                effects.as_slice(),
+                [
+                    // Asked once the whole folder is listed.
+                    Effect::Request(_, Request::OwnAddresses),
+                    Effect::Request(_, Request::FetchMessage(id)),
+                ] if id.as_str() == "m1"
+            ),
             "{effects:?}"
         );
     }
@@ -2162,5 +2188,27 @@ mod tests {
         let window = app.sign_in.as_ref().unwrap();
         let room = (app.body_height + CHROME_ROWS).saturating_sub(3);
         assert!(window.scroll <= window.rows(app.width).len().saturating_sub(room));
+    }
+
+    #[test]
+    fn the_mailbox_tells_the_users_own_addresses_once() {
+        let (mut app, second) = loading_more(1);
+        let effects = deliver_last_page(&mut app, second, Vec::new());
+        let [Effect::Request(id, Request::OwnAddresses)] = effects.as_slice() else {
+            panic!("expected OwnAddresses, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: *id,
+            event: Event::OwnAddresses(Ok(vec!["Alice@Contoso.com".into()])),
+        }));
+        assert!(app.settings.me.contains(&"alice@contoso.com".to_owned()));
+        // Not asked again when the folder is listed again.
+        let effects = app.relist();
+        let (list, _) = match effects.as_slice() {
+            [Effect::Request(id, request)] => (*id, request.clone()),
+            _ => panic!("{effects:?}"),
+        };
+        let effects = deliver_last_page(&mut app, list, Vec::new());
+        assert!(effects.is_empty(), "{effects:?}");
     }
 }

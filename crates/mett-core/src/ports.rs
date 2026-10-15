@@ -67,6 +67,13 @@ pub struct MessagePage {
 
 /// Access to a mailbox.
 pub trait MailStore: Send + Sync {
+    /// The mailbox owner's own addresses, as far as the backend knows
+    /// them (say, aliases): mail from them is the user's. Backends that
+    /// can't tell return none.
+    fn own_addresses(&self) -> impl Future<Output = Result<Vec<String>>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
     /// Lists all folders in the mailbox.
     fn list_folders(&self) -> impl Future<Output = Result<Vec<Folder>>> + Send;
 

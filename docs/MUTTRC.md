@@ -162,6 +162,10 @@ alternates    [-group name] regexp [ ... ]
 unalternates  [ * | regexp ... ]
 ```
 
+Besides `from` and `alternates`, mett counts as the user's own the
+addresses the mailbox reports (with Office365: the account's mail address,
+sign-in name and aliases).
+
 ### 4.4 Key bindings and macros
 
 ```

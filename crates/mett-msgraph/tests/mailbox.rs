@@ -1315,3 +1315,35 @@ async fn national_clouds_delete_drafts_into_deleted_items() {
     let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
     store.send(&reply).await.unwrap_err();
 }
+
+#[tokio::test]
+async fn finds_the_users_own_addresses() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .and(query_param(
+            "$select",
+            "mail,userPrincipalName,proxyAddresses",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "mail": "Alice.Smith@contoso.com",
+            "userPrincipalName": "asmith@contoso.onmicrosoft.com",
+            "proxyAddresses": [
+                "SMTP:Alice.Smith@contoso.com",
+                "smtp:alice@contoso.com",
+                "x500:/o=ExchangeLabs/cn=Recipients/cn=alice",
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let addresses = store(&server).own_addresses().await.unwrap();
+    assert_eq!(
+        addresses,
+        [
+            "Alice.Smith@contoso.com",
+            "asmith@contoso.onmicrosoft.com",
+            "Alice.Smith@contoso.com",
+            "alice@contoso.com",
+        ]
+    );
+}

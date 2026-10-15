@@ -43,6 +43,8 @@ pub enum Request {
     /// Delete what failed attempts to send or save a message the user gave
     /// up on left behind.
     DiscardKept(Draft),
+    /// Find the mailbox owner's own addresses.
+    OwnAddresses,
 }
 
 /// The outcome of a [`Request`].
@@ -62,6 +64,8 @@ pub enum Event {
     DraftSaved(Result<MessageId>),
     /// Outcome of [`Request::DiscardKept`].
     KeptDiscarded(Result<()>),
+    /// Outcome of [`Request::OwnAddresses`].
+    OwnAddresses(Result<Vec<String>>),
 }
 
 /// An [`Event`] for the request with `id`.
@@ -104,6 +108,7 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::Send(draft) => Event::Sent(store.send(&draft).await),
         Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
         Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
+        Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
     }
 }
 
