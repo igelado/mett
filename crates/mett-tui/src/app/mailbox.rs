@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use mett_core::{Error, FlagsUpdate, Folder, FolderId, MessageId, Page};
 
 use super::composing::{Input, Question};
-use super::{App, Effect, Screen, Target, effect_id};
+use super::{App, Effect, Screen, effect_id};
 use crate::action::Action;
 use crate::config::Quad;
 use crate::config::mailbox::{FolderPath, MailboxError, configured_path};
@@ -260,7 +260,7 @@ impl App {
             // The next message may still be loading: move there once it
             // arrives, as `j` does.
             if self.more_to_list() {
-                return self.wait_for(Target::Entry(self.selected + 1));
+                return self.wait_for(self.next_entry());
             }
             return Vec::new();
         }
@@ -665,6 +665,11 @@ impl App {
         self.reselect = None;
         self.folder = None;
         self.messages.clear();
+        self.hidden.clear();
+        self.positions.clear();
+        self.limit = None;
+        self.limited.clear();
+        self.pending_search = None;
         self.selected = 0;
         self.deleted.clear();
         self.listing = None;
@@ -672,6 +677,7 @@ impl App {
         self.unlisted = None;
         self.pending = None;
         self.unfetched = None;
+        self.unfetched_search = None;
         self.relist_on_return = false;
         self.saved_flags.clear();
         self.removed_while_listing.clear();
@@ -937,7 +943,12 @@ impl App {
     /// longer has (they were moved or deleted elsewhere), so purging
     /// doesn't keep trying them.
     pub(super) fn forget_missing_marks(&mut self) {
-        let listed: HashSet<&MessageId> = self.messages.iter().map(|m| &m.id).collect();
+        let listed: HashSet<&MessageId> = self
+            .messages
+            .iter()
+            .chain(&self.hidden)
+            .map(|m| &m.id)
+            .collect();
         self.deleted.retain(|id| listed.contains(id));
     }
 
@@ -959,6 +970,7 @@ impl App {
             .filter(|m| gone.contains(&m.id))
             .count();
         self.messages.retain(|m| !gone.contains(&m.id));
+        self.hidden.retain(|m| !gone.contains(&m.id));
         for id in gone {
             self.deleted.remove(id);
         }

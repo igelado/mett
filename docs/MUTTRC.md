@@ -301,6 +301,11 @@ They are made of `~X` (or `=X`, `%X`) operators combined with:
 | `~v` | Messages in collapsed threads. |
 | `~g`, `~G`, `~k`, `~V` | Signed / encrypted / has PGP key / verified. |
 
+mett supports `~A`, `~f`, `~t`, `~s`, `~N`, `~U`, `~R`, `~F` and `~D`, with
+`|`, `!` and parentheses, for `/` (search) and `l` (limit). As in mutt,
+`EXPR` ignores case unless it has an upper-case letter, and text without a
+pattern searches the sender and the subject.
+
 `=b`, `=B` and `=h` are like the `~` forms, but on IMAP the search runs on the
 server. `%X` matches against members of a group (`-group`) instead of a
 regex.

@@ -14,6 +14,7 @@ mod demo;
 mod editor;
 mod keymap;
 mod lineedit;
+mod pattern;
 mod signin;
 mod text;
 mod view;

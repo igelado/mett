@@ -81,6 +81,9 @@ actions! {
     CopyMessage => "copy-message", "Copy the message to another folder";
     ChangeFolder => "change-folder", "Open another folder";
     BrowseMailboxes => "browse-mailboxes", "Choose a folder from a list";
+    Search => "search", "Search with a pattern (in the pager, the text)";
+    SearchNext => "search-next", "Find the next match of the last search";
+    Limit => "limit", "Show only the messages matching a pattern";
 }
 
 #[cfg(test)]

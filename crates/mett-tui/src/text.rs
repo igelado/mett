@@ -63,47 +63,57 @@ pub fn wrap_all(lines: &[String], width: usize) -> Vec<String> {
 /// several code points), and widths are display cells, so wide (CJK, emoji)
 /// characters count double.
 pub fn wrap(line: &str, width: usize) -> Vec<String> {
+    wrap_ranges(line, width)
+        .into_iter()
+        .map(|range| line[range].to_owned())
+        .collect()
+}
+
+/// [`wrap`], as the byte range of `line` that each row shows: rows are
+/// pieces of the line, without the spaces dropped where it wraps.
+pub fn wrap_ranges(line: &str, width: usize) -> Vec<std::ops::Range<usize>> {
     if width == 0 {
-        return vec![line.to_owned()];
+        return std::iter::once(0..line.len()).collect();
     }
     let mut rows = Vec::new();
-    let mut row = String::new();
+    // The row so far is `line[start..end]`.
+    let mut start = 0;
     let mut row_width = 0;
-    // Byte offset in `row` just after its last space.
+    // Byte offset in `line` just after the row's last space.
     let mut break_at = None;
-    for g in line.graphemes(true) {
+    for (end, g) in line.grapheme_indices(true) {
         let w = g.width();
-        if row_width + w > width && !row.is_empty() {
+        if row_width + w > width && end > start {
             if g == " " {
                 // The row ends at this space, which is dropped.
-                rows.push(std::mem::take(&mut row));
+                rows.push(start..end);
+                start = end + g.len();
                 row_width = 0;
                 break_at = None;
                 continue;
             }
             // Move the last word to a new row, unless only indentation
             // comes before it (which would leave a blank row).
-            if let Some(i) = break_at.filter(|&i| !row[..i].trim().is_empty()) {
-                let rest = row.split_off(i);
-                rows.push(row.trim_end().to_owned());
-                row_width = rest.width();
-                row = rest;
+            if let Some(i) = break_at.filter(|&i| !line[start..i].trim().is_empty()) {
+                rows.push(start..start + line[start..i].trim_end().len());
+                start = i;
+                row_width = line[start..end].width();
             }
             break_at = None;
             // Still too wide (no break point, or the word itself is too
             // long): break right here.
-            if row_width + w > width && !row.is_empty() {
-                rows.push(std::mem::take(&mut row));
+            if row_width + w > width && end > start {
+                rows.push(start..end);
+                start = end;
                 row_width = 0;
             }
         }
-        row.push_str(g);
         row_width += w;
         if g == " " {
-            break_at = Some(row.len());
+            break_at = Some(end + g.len());
         }
     }
-    rows.push(row);
+    rows.push(start..line.len());
     rows
 }
 
@@ -357,5 +367,15 @@ mod tests {
             html("<style>p { color: red }</style><!-- hidden --><p>shown</p><SCRIPT>x()</SCRIPT>"),
             ["shown"]
         );
+    }
+
+    #[test]
+    fn wrapped_rows_know_where_they_come_from() {
+        // The first of two spaces at the wrap is dropped; the second is
+        // shown.
+        assert_eq!(wrap_ranges("aaaa  bb", 4), [0..4, 5..8]);
+        assert_eq!(wrap("aaaa  bb", 4), ["aaaa", " bb"]);
+        assert_eq!(wrap_ranges("one two three", 8), [0..7, 8..13]);
+        assert_eq!(wrap_ranges("", 4).len(), 1);
     }
 }

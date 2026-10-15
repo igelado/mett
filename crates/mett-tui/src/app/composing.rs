@@ -79,6 +79,10 @@ pub enum Question {
     CopyTo,
     /// Whether to purge deleted messages (`delete`).
     Purge,
+    /// What to search for (`/`).
+    Search,
+    /// What to limit the index to (`l`).
+    Limit,
 }
 
 impl Question {
@@ -456,6 +460,7 @@ impl App {
                 self.unbrowsed = None;
                 self.question_message = None;
             }
+            Question::Search | Question::Limit => {}
             _ => self.composing = None,
         }
         Vec::new()
@@ -464,6 +469,9 @@ impl App {
     fn answer_line(&mut self, question: Question, text: String) -> Vec<Effect> {
         if question.is_mailbox() {
             return self.answer_mailbox(question, text);
+        }
+        if matches!(question, Question::Search | Question::Limit) {
+            return self.answer_search(question, text);
         }
         let setting_up = self.composing.is_some();
         let Some(draft) = self.draft_mut() else {
@@ -545,7 +553,9 @@ impl App {
             | Question::Subject
             | Question::OpenMailbox
             | Question::SaveTo
-            | Question::CopyTo => {}
+            | Question::CopyTo
+            | Question::Search
+            | Question::Limit => {}
         }
         self.advance()
     }

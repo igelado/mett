@@ -7,6 +7,7 @@
 
 mod composing;
 mod mailbox;
+mod search;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -18,6 +19,7 @@ use self::composing::Composing;
 pub use self::composing::{Compose, Input};
 pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
+pub use self::search::{Limit, highlighted};
 use crate::action::Action;
 use crate::compose::Kind;
 use crate::config::Quad;
@@ -182,13 +184,35 @@ pub struct Pager {
     /// The user set the message read or unread while it was loading:
     /// showing it doesn't mark it read.
     pub read_chosen: bool,
+    /// For each of `lines`, its first row in `rows`.
+    pub line_rows: Vec<usize>,
+    /// For each of `rows`, the bytes of its line it shows.
+    pub row_ranges: Vec<std::ops::Range<usize>>,
+    /// Where the last search match ended, as a line and a byte offset in
+    /// it: the next search starts there. (The match may be shown lower
+    /// down when it is near the end.)
+    pub search_match: Option<(usize, usize)>,
+    /// The text the last search found, as a line and a byte range in it,
+    /// shown highlighted.
+    pub highlight: Option<(usize, std::ops::Range<usize>)>,
+    /// A search made before the message arrived, to run when it does.
+    pub pending_search: Option<String>,
 }
 
 impl Pager {
     /// Re-wraps the message if the width changed.
     fn layout(&mut self, width: usize) {
         if self.rows_width != Some(width) {
-            self.rows = text::wrap_all(&self.lines, width);
+            self.rows.clear();
+            self.line_rows.clear();
+            self.row_ranges.clear();
+            for line in &self.lines {
+                self.line_rows.push(self.rows.len());
+                for range in text::wrap_ranges(line, width) {
+                    self.rows.push(line[range.clone()].to_owned());
+                    self.row_ranges.push(range);
+                }
+            }
             self.rows_width = Some(width);
         }
     }
@@ -337,6 +361,25 @@ pub struct App {
     /// reported on exit like changes that couldn't be saved; with the
     /// message, if deleting it again after a sign-in may work.
     left_drafts: Vec<(String, Option<mett_core::Draft>)>,
+    /// The pattern the index is limited to (`l`), if any.
+    pub limit: Option<Limit>,
+    /// The messages that the limit hides, newest first.
+    hidden: Vec<MessageSummary>,
+    /// Whether the limit showed each message it was applied to, kept
+    /// across listings so that they show the same messages.
+    limited: HashMap<MessageId, bool>,
+    /// Where each message was in the folder's listing, to restore the
+    /// order when the limit is lifted.
+    positions: HashMap<MessageId, usize>,
+    /// The last search (`/`), which `n` repeats.
+    last_search: Option<String>,
+    /// The last search in the pager, which `n` there repeats.
+    last_pager_search: Option<String>,
+    /// A search that found nothing yet, waiting for more of the folder.
+    pending_search: Option<String>,
+    /// The search began with nothing in the index: it starts at the
+    /// first message, not after the selected one.
+    search_from_top: bool,
     /// Messages marked for deletion, purged by `$` or when leaving.
     deleted: HashSet<MessageId>,
     /// Changes to the mailbox waiting to be made, in order. They are
@@ -425,6 +468,8 @@ pub struct App {
     /// The message that last failed to open, so that opening it can be
     /// retried.
     unfetched: Option<MessageId>,
+    /// The pager search that was waiting for that message.
+    unfetched_search: Option<String>,
     /// When the user asks to retry, the requests that had not reported
     /// back yet; what failed among them is retried once they all have.
     retry_after: HashSet<RequestId>,
@@ -474,6 +519,14 @@ impl App {
             addresses_request: None,
             awaiting_addresses: None,
             left_drafts: Vec::new(),
+            limit: None,
+            hidden: Vec::new(),
+            limited: HashMap::new(),
+            positions: HashMap::new(),
+            last_search: None,
+            last_pager_search: None,
+            pending_search: None,
+            search_from_top: false,
             deleted: HashSet::new(),
             writes: VecDeque::new(),
             writing: None,
@@ -507,6 +560,7 @@ impl App {
             transfer_failures: HashMap::new(),
             folder_ids: HashMap::new(),
             unfetched: None,
+            unfetched_search: None,
             retry_after: HashSet::new(),
             next_request: 0,
             last_draft: 0,
@@ -547,6 +601,16 @@ impl App {
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         let mut effects = self.handle(msg);
+        // A search given up on (the user moved on, or left the message it
+        // waited for) stops saying it is searching.
+        let searching = self.pending_search.is_some()
+            || self
+                .screens
+                .iter()
+                .any(|s| matches!(s, Screen::Pager(p) if p.pending_search.is_some()));
+        if !searching && self.status == "Searching..." {
+            self.status.clear();
+        }
         // The open folder gained messages while another screen was up:
         // list it again once the index is back.
         if self.relist_on_return && self.screen() == &Screen::Index {
@@ -611,6 +675,9 @@ impl App {
             );
             if moving && matches!(self.menu(), Menu::Index | Menu::Pager) {
                 self.reselect = None;
+            }
+            if self.pending_search.take().is_some() && self.status == "Searching..." {
+                self.status.clear();
             }
             self.compose_fetch = None;
             self.awaiting_addresses = None;
@@ -842,9 +909,13 @@ impl App {
         // selected. (Opening another message forgets the failure.) The
         // screen, not the menu: another sign-in window may be over it.
         let failed = self.unfetched.take();
+        let search = self.unfetched_search.take();
         let selected = self.messages.get(self.selected).map(|s| &s.id);
         if failed.is_some() && failed.as_ref() == selected && self.screen() == &Screen::Index {
             effects.extend(self.open_selected());
+            if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
+                pager.pending_search = search;
+            }
         }
         effects
     }
@@ -895,13 +966,16 @@ impl App {
         if let Some(effects) = self.on_mailbox_action(action) {
             return effects;
         }
+        if let Some(effects) = self.on_search_action(action) {
+            return effects;
+        }
         let last = self.messages.len().saturating_sub(1);
         let page = self.body_height.max(1);
         match action {
             Action::Quit => return self.quit(),
             Action::NextEntry if self.selected < last => self.selected += 1,
             Action::NextEntry if self.more_to_list() => {
-                return self.wait_for(Target::Entry(self.selected + 1));
+                return self.wait_for(self.next_entry());
             }
             Action::NextEntry => self.status = "You are on the last message.".into(),
             Action::PreviousEntry if self.selected > 0 => self.selected -= 1,
@@ -941,6 +1015,9 @@ impl App {
         if let Some(effects) = self.on_mailbox_action(action) {
             return effects;
         }
+        if let Some(effects) = self.on_search_action(action) {
+            return effects;
+        }
         let page = self.body_height.max(1);
         match action {
             Action::Quit => return self.quit(),
@@ -951,7 +1028,7 @@ impl App {
             // message.
             Action::NextEntry if self.selected + 1 >= self.messages.len() => {
                 if self.more_to_list() {
-                    return self.wait_for(Target::Entry(self.selected + 1));
+                    return self.wait_for(self.next_entry());
                 }
                 self.status = "You are on the last message.".into();
             }
@@ -992,9 +1069,13 @@ impl App {
     /// the last page stays full and scrolling back responds at once.
     fn clamp_scroll(&mut self) {
         let (width, height) = (self.width, self.body_height);
-        if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
-            pager.layout(width);
-            pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+        // Pagers under other screens too: their rows (and search
+        // highlights) must match the width they will be drawn at.
+        for screen in &mut self.screens {
+            if let Screen::Pager(pager) = screen {
+                pager.layout(width);
+                pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+            }
         }
     }
 
@@ -1006,6 +1087,7 @@ impl App {
         };
         let id = summary.id.clone();
         self.unfetched = None;
+        self.unfetched_search = None;
         let fetch = self.request(Request::FetchMessage(id.clone()));
         self.screens.push(Screen::Pager(Pager {
             id,
@@ -1016,6 +1098,11 @@ impl App {
             request: effect_id(&fetch),
             scroll: 0,
             read_chosen: false,
+            line_rows: Vec::new(),
+            row_ranges: Vec::new(),
+            search_match: None,
+            highlight: None,
+            pending_search: None,
         }));
         vec![fetch]
     }
@@ -1059,7 +1146,7 @@ impl App {
                     let mut messages = page.messages;
                     messages.retain(|m| !self.removed_while_listing.contains(&m.id));
                     self.overlay_wanted_flags(&mut messages);
-                    self.messages.extend(messages);
+                    self.add_listed(messages);
                     self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
@@ -1078,6 +1165,8 @@ impl App {
                         }
                     }
                     effects.extend(self.apply_pending());
+                    // A search waiting for more messages looks again.
+                    effects.extend(self.continue_search());
                     return effects;
                 }
                 Err(e) => {
@@ -1088,6 +1177,11 @@ impl App {
                     // Pages asked for again come after the saves.
                     self.saved_flags.clear();
                     self.removed_while_listing.clear();
+                    // A search waiting for the page goes on once a sign-in
+                    // lets it load.
+                    if !matches!(e, Error::Auth(_)) {
+                        self.pending_search = None;
+                    }
                     self.report(e);
                 }
             },
@@ -1194,6 +1288,11 @@ impl App {
             }
             Event::FolderOpened(Err(e)) => {
                 self.opening = None;
+                // A search waiting for the folder goes on once a sign-in
+                // lets it open.
+                if !matches!(e, Error::Auth(_)) {
+                    self.pending_search = None;
+                }
                 self.report(e);
             }
             Event::MessagesListed(_) => {}
@@ -1221,6 +1320,8 @@ impl App {
             Err(e) => {
                 if let Screen::Pager(pager) = self.screens.remove(position) {
                     self.unfetched = Some(pager.id);
+                    // A search waiting for it runs when it opens again.
+                    self.unfetched_search = pager.pending_search;
                 }
                 self.report(e);
                 return Vec::new();
@@ -1235,6 +1336,9 @@ impl App {
         let message_id = message.summary.id.clone();
         let chosen = pager.read_chosen;
         pager.message = Some(message);
+        if let Some(text) = pager.pending_search.take() {
+            self.search_pager(position, &text);
+        }
         // Now that it has been shown, mark it read, as mutt does (unless
         // the user said otherwise meanwhile).
         if chosen {
@@ -1270,23 +1374,25 @@ impl App {
             }
             _ => None,
         };
-        let Some(summary) = self.messages.iter_mut().find(|s| s.id == message_id) else {
+        // The message may be hidden by the limit, when retrying.
+        let Some(summary) = self.summary_mut(&message_id) else {
             return Vec::new();
         };
-        let mut flags = summary.flags;
+        let before = summary.flags;
+        let mut flags = before;
         if let Some(sent) = in_flight {
             sent.apply(&mut flags);
         }
         update.apply(&mut flags);
-        if flags == summary.flags {
+        if flags == before {
             return Vec::new();
         }
+        summary.flags = flags;
         // What the mailbox has, as far as mett knows, while changes are
         // on their way.
         self.mailbox_flags
             .entry(message_id.clone())
-            .or_insert(summary.flags);
-        summary.flags = flags;
+            .or_insert(before);
         self.wanted_flags.insert(message_id.clone(), flags);
         // Changing back what failed to change gives up on it.
         if let Some((_, failed)) = self.save_failures.get_mut(&message_id) {
@@ -1483,14 +1589,21 @@ impl App {
         }
     }
 
-    /// The summary of a message in the index.
+    /// The summary of a message in the folder, shown or hidden by the
+    /// limit.
     fn summary(&self, id: &MessageId) -> Option<&MessageSummary> {
-        self.messages.iter().find(|s| &s.id == id)
+        self.messages
+            .iter()
+            .chain(&self.hidden)
+            .find(|s| &s.id == id)
     }
 
-    /// The summary of a message in the index, to change.
+    /// The summary of a message in the folder, to change.
     fn summary_mut(&mut self, id: &MessageId) -> Option<&mut MessageSummary> {
-        self.messages.iter_mut().find(|s| &s.id == id)
+        self.messages
+            .iter_mut()
+            .chain(&mut self.hidden)
+            .find(|s| &s.id == id)
     }
 
     /// Whether part of the folder could not be listed. The index then
@@ -1503,9 +1616,18 @@ impl App {
     /// arrived in it.
     fn relist(&mut self) -> Vec<Effect> {
         self.reselect = None;
+        // As in mutt, the limit's choice of messages stays: only new ones
+        // are matched against it.
+        if self.limit.is_some() {
+            let shown = self.messages.iter().map(|m| (m.id.clone(), true));
+            let hidden = self.hidden.iter().map(|m| (m.id.clone(), false));
+            self.limited.extend(shown.chain(hidden));
+        }
         self.messages.clear();
         self.saved_flags.clear();
         self.removed_while_listing.clear();
+        self.hidden.clear();
+        self.positions.clear();
         self.selected = 0;
         self.pending = None;
         self.unlisted = None;
@@ -1563,6 +1685,16 @@ impl App {
         self.listing.is_some() || self.unlisted.is_some()
     }
 
+    /// The entry after the selected one, or the first if the index shows
+    /// none yet (a limit may hide all the messages loaded so far).
+    fn next_entry(&self) -> Target {
+        if self.messages.is_empty() {
+            Target::Entry(0)
+        } else {
+            Target::Entry(self.selected + 1)
+        }
+    }
+
     /// Remembers that the user asked for the next message, and makes sure
     /// more messages are on their way.
     fn wait_for(&mut self, target: Target) -> Vec<Effect> {
@@ -1582,7 +1714,9 @@ impl App {
         let last = self.messages.len().saturating_sub(1);
         let loading = self.listing.is_some();
         let selected = match target {
-            Target::Entry(entry) if entry <= last => entry,
+            // Loaded (the index may still be empty, with a limit hiding
+            // all the messages loaded so far).
+            Target::Entry(entry) if entry < self.messages.len() => entry,
             Target::Entry(_) | Target::Last if !loading => last,
             Target::Last => {
                 self.selected = last;
