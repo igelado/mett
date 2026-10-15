@@ -280,9 +280,19 @@ async fn run<S: mett_core::MailStore + 'static>(
     if app.saving() {
         app.status = "Saving changes...".into();
         let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
-        // A failed sign-in stays up even with nothing left pending, so the
-        // user can retry the change it held up.
-        while app.saving() || app.sign_in.is_some() {
+        loop {
+            // A failed save's sign-in failure is sent before the save's own
+            // response; take it in first, so the window opens and the
+            // save can be retried even after nothing is left pending.
+            while let Ok(event) = sign_in_rx.try_recv() {
+                let effects = app.update(Msg::SignIn(event));
+                dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+            }
+            // A failed sign-in stays up even with nothing left pending, so
+            // the user can retry the change it held up.
+            if !app.saving() && app.sign_in.is_none() {
+                break;
+            }
             draw(&mut terminal, &app, &keymap)?;
             let msg = tokio::select! {
                 // Saving may need the user to sign in: the sign-in window
