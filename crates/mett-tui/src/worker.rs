@@ -209,29 +209,57 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
         Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
         Request::CheckMailboxes(mailboxes) => {
-            let mut checked = Vec::new();
-            // The folder tree, listed once for every path that needs it.
-            let mut listed = None;
-            for (path, id, since) in mailboxes {
-                let found = match id.clone() {
-                    // A folder deleted (or moved away) since is looked for
-                    // by its path again.
-                    // So is one renamed or moved since (another may be at
-                    // its path now).
-                    Some(id) => match store.folder(&id).await {
-                        Err(Error::NotFound { .. }) => {
-                            resolve_listed(store, &path, &mut listed).await
-                        }
-                        Ok(folder) => match at_path(store, &path, &folder).await {
-                            Ok(true) => Ok(folder),
-                            Ok(false) => resolve_listed(store, &path, &mut listed).await,
-                            Err(e) => Err(e),
-                        },
-                        found => found,
+            Event::MailboxesChecked(check_mailboxes(store, mailboxes).await)
+        }
+    }
+}
+
+/// How many mailboxes are checked at once: a slow one doesn't hold up the
+/// others, nor do many at once flood Graph.
+const CHECKS_AT_ONCE: usize = 4;
+
+/// Checks `mailboxes` (see [`Request::CheckMailboxes`]), a few at a time.
+async fn check_mailboxes<S: MailStore>(
+    store: &S,
+    mailboxes: Vec<(FolderPath, Option<FolderId>, Option<DateTime<Utc>>)>,
+) -> Vec<(FolderPath, Result<Checked>)> {
+    // The folders, by the IDs known. A folder deleted (or moved away)
+    // since is looked for by its path again; so is one renamed or moved
+    // since (another may be at its path now).
+    let known = join_bounded(
+        mailboxes
+            .iter()
+            .map(|(path, id, _)| async move {
+                let id = id.as_ref()?;
+                match store.folder(id).await {
+                    Err(Error::NotFound { .. }) => None,
+                    Ok(folder) => match at_path(store, path, &folder).await {
+                        Ok(true) => Some(Ok(folder)),
+                        Ok(false) => None,
+                        Err(e) => Some(Err(e)),
                     },
-                    None => resolve_listed(store, &path, &mut listed).await,
-                };
-                let found = match found {
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect(),
+        CHECKS_AT_ONCE,
+    )
+    .await;
+    // The others, by their paths: the folder tree is listed once for all.
+    let mut listed = None;
+    let mut found = Vec::new();
+    for ((path, _, _), known) in mailboxes.iter().zip(known) {
+        found.push(match known {
+            Some(found) => found,
+            None => resolve_listed(store, path, &mut listed).await,
+        });
+    }
+    join_bounded(
+        mailboxes
+            .into_iter()
+            .zip(found)
+            .map(|((path, id, since), found)| async move {
+                let checked = match found {
                     Ok(folder) => {
                         // Changes since what was seen of the folder asked
                         // about, not of another now at its path.
@@ -243,11 +271,46 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
                     }
                     Err(e) => Err(e),
                 };
-                checked.push((path, found));
+                (path, checked)
+            })
+            .collect(),
+        CHECKS_AT_ONCE,
+    )
+    .await
+}
+
+/// Runs `futures`, at most `limit` at a time, and gives their outputs in
+/// order.
+async fn join_bounded<F: std::future::Future>(futures: Vec<F>, limit: usize) -> Vec<F::Output> {
+    let mut futures: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        // Futures do nothing until polled: polling the first `limit`
+        // unfinished ones runs only those.
+        let mut running = 0;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_some() {
+                continue;
             }
-            Event::MailboxesChecked(checked)
+            if running == limit {
+                break;
+            }
+            match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(done) => *output = Some(done),
+                std::task::Poll::Pending => running += 1,
+            }
         }
-    }
+        if running == 0 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every future finished"))
+        .collect()
 }
 
 /// How many pages of changes a check reads before listing the whole
@@ -437,6 +500,26 @@ mod tests {
             .with_folder(mock::folder("arc", "Archive", None))
     }
 
+    #[tokio::test]
+    async fn runs_a_few_at_a_time_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let futures = (0..10)
+            .map(|i| {
+                let (running, most) = (&running, &most);
+                async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    i
+                }
+            })
+            .collect();
+        let done = join_bounded(futures, 3).await;
+        assert_eq!(done, (0..10).collect::<Vec<_>>());
+        assert_eq!(most.load(Ordering::SeqCst), 3);
+    }
     #[tokio::test]
     async fn resolves_folder_paths() {
         let store = tree();
