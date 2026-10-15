@@ -529,6 +529,20 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         Ok(MessageId::new(moved.id))
     }
 
+    async fn copy_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
+        let url = self.url(&["me", "messages", id.as_str(), "copy"]);
+        let body = MoveRequest {
+            destination_id: to.as_str(),
+        };
+        let copied: IdOnly = self
+            .json(
+                self.request(Method::POST, url).json(&body),
+                About::message(id.as_str()),
+            )
+            .await?;
+        Ok(MessageId::new(copied.id))
+    }
+
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         // DELETE would only move it to Deleted Items; the port promises a
         // permanent delete, which Graph offers only in the global cloud.

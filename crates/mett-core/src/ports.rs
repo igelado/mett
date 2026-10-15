@@ -108,6 +108,14 @@ pub trait MailStore: Send + Sync {
         to: &FolderId,
     ) -> impl Future<Output = Result<MessageId>> + Send;
 
+    /// Copies a message to another folder and returns the copy's
+    /// identifier.
+    fn copy_message(
+        &self,
+        id: &MessageId,
+        to: &FolderId,
+    ) -> impl Future<Output = Result<MessageId>> + Send;
+
     /// Deletes a message permanently. To move it to the trash instead, use
     /// [`MailStore::move_message`].
     fn delete_message(&self, id: &MessageId) -> impl Future<Output = Result<()>> + Send;

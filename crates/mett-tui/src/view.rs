@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::action::Action;
-use crate::app::{App, Compose, Input, Pager, Row, Screen, SignIn};
+use crate::app::{App, Browser, Compose, Input, Pager, Row, Screen, SignIn};
 use crate::keymap::{Keymap, Menu};
 use crate::text::{fit, truncate, wrap_all};
 
@@ -35,6 +35,15 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
             (Action::Exit, "Exit"),
             (Action::PreviousPage, "PrevPg"),
             (Action::NextPage, "NextPg"),
+            (Action::NextEntry, "Next"),
+            (Action::PreviousEntry, "Prev"),
+        ],
+    ),
+    (
+        Menu::Browser,
+        &[
+            (Action::Exit, "Exit"),
+            (Action::DisplayMessage, "Select"),
             (Action::NextEntry, "Next"),
             (Action::PreviousEntry, "Prev"),
         ],
@@ -99,6 +108,7 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
         }
         Screen::Pager(pager) => render_pager(app, pager, frame, body),
         Screen::Compose(compose) => render_compose(compose, frame, body),
+        Screen::Browser(browser) => render_browser(browser, frame, body),
     };
     frame.render_widget(Paragraph::new(status_line).style(REVERSED), status);
     match &app.input {
@@ -114,6 +124,51 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
         return render_sign_in(window, keymap, frame, below_help);
     }
     None
+}
+
+/// Draws the folder browser and returns its status line. Each line is like
+/// mutt's: the position, the unread and total counts, and the name,
+/// indented by depth.
+fn render_browser(browser: &Browser, frame: &mut Frame, area: Rect) -> String {
+    if browser.entries.is_empty() {
+        let text = if browser.listing() {
+            "Listing folders..."
+        } else {
+            "No folders."
+        };
+        frame.render_widget(Paragraph::new(text), area);
+        return "---mett: Folders---".into();
+    }
+    let height = usize::from(area.height).max(1);
+    let first = browser.selected / height * height;
+    let width = usize::from(area.width);
+    let lines: Vec<Line> = browser
+        .entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, entry)| {
+            let folder = &entry.folder;
+            let new = if folder.unread_count > 0 { 'N' } else { ' ' };
+            let line = format!(
+                "{:>4} {new} {:>5}/{:<6} {}{}",
+                i + 1,
+                folder.unread_count,
+                folder.total_count,
+                "  ".repeat(entry.depth),
+                folder.name
+            );
+            let line = Line::raw(truncate(&line, width));
+            if i == browser.selected {
+                line.style(REVERSED)
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+    format!("---mett: Folders [{}]---", browser.entries.len())
 }
 
 /// Draws a question on the message line, with the cursor where the answer
@@ -318,7 +373,8 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
         .skip(first)
         .take(height)
         .map(|(i, message)| {
-            let line = Line::raw(index_entry(i + 1, message, width));
+            let deleted = app.is_deleted(&message.id);
+            let line = Line::raw(index_entry(i + 1, message, deleted, width));
             if i == app.selected {
                 line.style(REVERSED)
             } else {
@@ -330,10 +386,16 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 /// One index line, like mutt's default `%4C %Z %{%b %d} %-15.15L %s`.
-fn index_entry(number: usize, message: &MessageSummary, width: usize) -> String {
+fn index_entry(number: usize, message: &MessageSummary, deleted: bool, width: usize) -> String {
     let flags = format!(
         "{}{}{}",
-        if message.flags.read { ' ' } else { 'N' },
+        if deleted {
+            'D'
+        } else if message.flags.read {
+            ' '
+        } else {
+            'N'
+        },
         if message.flags.flagged { '!' } else { ' ' },
         if message.has_attachments { '+' } else { ' ' },
     );
@@ -364,8 +426,12 @@ fn index_status(app: &App) -> String {
     } else {
         ""
     };
+    let deleted = match app.deleted_count() {
+        0 => String::new(),
+        n => format!(" Del:{n}"),
+    };
     format!(
-        "-*-mett: {folder} [Msgs:{} New:{new}]{incomplete}---",
+        "-*-mett: {folder} [Msgs:{} New:{new}{deleted}]{incomplete}---",
         app.messages.len()
     )
 }
@@ -406,14 +472,21 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     };
     let from = message.summary.from.as_ref().map_or("", display_name);
     // The flags of the message as the index currently shows them, as in
-    // mutt's `%Z`: N for unread, ! for flagged.
+    // mutt's `%Z`: D for marked for deletion, N for unread, ! for flagged.
     let flags = app
         .messages
         .get(app.selected)
         .map_or(Default::default(), |m| m.flags);
+    let deleted = app.is_deleted(&message.summary.id);
     format!(
         "-{}{}- {}/{}: {from}  {}   -- ({position})",
-        if flags.read { '-' } else { 'N' },
+        if deleted {
+            'D'
+        } else if flags.read {
+            '-'
+        } else {
+            'N'
+        },
         if flags.flagged { '!' } else { '-' },
         app.selected + 1,
         app.messages.len(),
@@ -576,7 +649,12 @@ mod tests {
         assert_eq!(lines[3], "Subject: Subject 0");
         assert_eq!(lines[5], "Body of Subject 0");
         // Shown, so now read.
-        assert_eq!(lines[6], "---- 1/1: Alice Example  Subject 0   -- (all)");
+        assert_eq!(lines[6], "---- 1/1: Alice Example  Subject 0   -- (all)"); // Marked for deletion from the pager (the only message, so it stays).
+        app.update(Msg::Action(Action::DeleteMessage));
+        assert_eq!(
+            screen(&app)[6],
+            "-D-- 1/1: Alice Example  Subject 0   -- (all)"
+        );
     }
 
     #[test]
@@ -732,5 +810,50 @@ mod tests {
         let lines = sized_screen(&app, WIDTH, 13);
         assert_eq!(lines[9], "- A     2 <the forwarded message's attachments>");
         assert!(lines[11].contains("Atts: 2"), "{lines:#?}");
+    }
+
+    #[test]
+    fn marks_deleted_messages_and_lists_folders() {
+        let mut app = app(2);
+        app.update(Msg::Action(Action::DeleteMessage));
+        let lines = screen(&app);
+        assert!(lines[1].starts_with("   1 D   "), "{lines:#?}");
+        assert_eq!(lines[6], "-*-mett: Inbox [Msgs:2 New:2 Del:1]---");
+
+        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        assert_eq!(screen(&app)[1], "Listing folders...");
+        let mut inbox = mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
+        inbox.unread_count = 2;
+        inbox.total_count = 10;
+        let projects = mett_core::Folder {
+            parent: Some("in".into()),
+            ..mock::folder("p", "Projects", None)
+        };
+        app.update(Msg::Response(Response {
+            id: list,
+            event: Event::FoldersListed(Ok(vec![inbox, projects])),
+        }));
+        let lines = screen(&app);
+        assert_eq!(lines[0], "q:Exit  <Enter>:Select  j:Next  k:Prev");
+        assert_eq!(lines[1], "   1 N     2/10     Inbox");
+        assert_eq!(lines[2], "   2       0/0        Projects");
+        assert_eq!(lines[6], "---mett: Folders [2]---");
+    }
+
+    #[test]
+    fn an_empty_folder_list_says_so() {
+        let mut app = app(1);
+        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: list,
+            event: Event::FoldersListed(Ok(Vec::new())),
+        }));
+        assert_eq!(screen(&app)[1], "No folders.");
     }
 }

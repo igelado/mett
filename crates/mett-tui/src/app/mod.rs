@@ -6,8 +6,9 @@
 //! carry out. This keeps the UI logic testable without a terminal.
 
 mod composing;
+mod mailbox;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 use mett_msgraph::SignInPrompt;
@@ -15,8 +16,11 @@ use ratatui::crossterm::event::KeyEvent;
 
 use self::composing::Composing;
 pub use self::composing::{Compose, Input};
+pub use self::mailbox::Browser;
+use self::mailbox::{AfterPurge, Transfer, Write};
 use crate::action::Action;
 use crate::compose::Kind;
+use crate::config::Quad;
 use crate::config::mailbox::FolderPath;
 use crate::keymap::Menu;
 use crate::signin::SignInEvent;
@@ -45,6 +49,31 @@ pub struct Settings {
     pub page_size: u32,
     /// How to write messages.
     pub compose: crate::compose::Settings,
+    /// The account whose folders are used.
+    pub account: AccountId,
+    /// mutt's `folder`: what `=` in a mailbox path stands for.
+    pub folder: String,
+    /// mutt's `trash`: where purged messages go, or `None` to delete them
+    /// for good.
+    pub trash: Option<FolderPath>,
+    /// mutt's `delete`: whether to purge deleted messages.
+    pub delete: Quad,
+    /// mutt's `resolve`: move to the next message after marking one.
+    pub resolve: bool,
+    /// What the `!`, `>` and `<` mailbox shortcuts stand for.
+    pub shortcuts: Shortcuts,
+}
+
+/// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
+/// `!`, `>` and `<` stand for (`docs/MUTTRC.md` §5).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shortcuts {
+    /// `!`.
+    pub spoolfile: String,
+    /// `>`.
+    pub mbox: String,
+    /// `<`.
+    pub record: String,
 }
 
 impl Default for Settings {
@@ -52,6 +81,12 @@ impl Default for Settings {
         Self {
             page_size: PAGE_SIZE,
             compose: crate::compose::Settings::default(),
+            account: AccountId::new("demo@example.com"),
+            folder: String::new(),
+            trash: None,
+            delete: Quad::AskYes,
+            resolve: true,
+            shortcuts: Shortcuts::default(),
         }
     }
 }
@@ -122,6 +157,8 @@ pub enum Screen {
     Pager(Pager),
     /// The compose menu, for a message about to be sent.
     Compose(Compose),
+    /// The folder browser.
+    Browser(Browser),
 }
 
 /// Pager state.
@@ -142,6 +179,9 @@ pub struct Pager {
     pub request: RequestId,
     /// The first visible row, after wrapping.
     pub scroll: usize,
+    /// The user set the message read or unread while it was loading:
+    /// showing it doesn't mark it read.
+    pub read_chosen: bool,
 }
 
 impl Pager {
@@ -297,6 +337,47 @@ pub struct App {
     /// reported on exit like changes that couldn't be saved; with the
     /// message, if deleting it again after a sign-in may work.
     left_drafts: Vec<(String, Option<mett_core::Draft>)>,
+    /// Messages marked for deletion, purged by `$` or when leaving.
+    deleted: HashSet<MessageId>,
+    /// Changes to the mailbox waiting to be made, in order. They are
+    /// made one at a time, as mutt does: one may depend on another (a
+    /// move gives a message a new ID; a purge mustn't overtake a copy).
+    writes: VecDeque<Write>,
+    /// The change being made, and its request.
+    writing: Option<(RequestId, Write)>,
+    /// The folder being opened instead of the open one, and the request
+    /// finding it.
+    switching: Option<(RequestId, FolderPath)>,
+    /// The message a save or copy question is about.
+    question_message: Option<MessageId>,
+    /// The folder change that failed for want of a sign-in, to try again
+    /// on Retry.
+    unswitched: Option<FolderPath>,
+    /// A folder chosen in the browser to answer a question, with its path
+    /// as shown there.
+    browsed: Option<(String, FolderPath)>,
+    /// The browser whose folders couldn't be listed for want of a sign-in,
+    /// to open again on Retry.
+    unbrowsed: Option<mailbox::Choose>,
+    /// Moves, copies and purges that failed for want of a sign-in, to
+    /// retry.
+    failed_transfers: Vec<(Transfer, Request)>,
+    /// What to do once deleted messages are purged.
+    then: Option<AfterPurge>,
+    /// See [`Settings::account`].
+    account: AccountId,
+    /// See [`Settings::folder`].
+    mailbox_root: String,
+    /// See [`Settings::trash`].
+    trash: Option<FolderPath>,
+    /// See [`Settings::shortcuts`].
+    shortcuts: Shortcuts,
+    /// The folder open before this one, for the `-` shortcut.
+    previous: Option<FolderPath>,
+    /// See [`Settings::delete`].
+    delete: Quad,
+    /// See [`Settings::resolve`].
+    resolve: bool,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -315,12 +396,32 @@ pub struct App {
     /// Changes that failed to save, by message, kept apart from the status
     /// line so that later messages can't hide them. A later successful save
     /// of the same message clears its entry.
-    save_failures: HashMap<MessageId, String>,
+    save_failures: HashMap<MessageId, (String, FlagsUpdate)>,
     /// Where the user asked to move while more messages were loading; the
     /// selection moves there once they arrive.
     pending: Option<Target>,
-    /// Pending flag updates, so a failure can be undone in the index.
-    flag_updates: HashMap<RequestId, MessageId>,
+    /// The mailbox's flags, as far as mett knows, for messages whose flag
+    /// changes are on their way, so a failure can be undone in the index.
+    mailbox_flags: HashMap<MessageId, mett_core::Flags>,
+    /// The flags the user last asked for, for messages whose updates are
+    /// on their way.
+    wanted_flags: HashMap<MessageId, mett_core::Flags>,
+    /// Flags saved while the folder was being listed, as far as known:
+    /// pages asked for before may still have the old ones. Forgotten once
+    /// the listing is done.
+    saved_flags: HashMap<MessageId, FlagsUpdate>,
+    /// Messages moved or purged away while the folder was being listed:
+    /// pages asked for before may still have them. Forgotten once the
+    /// listing is done.
+    removed_while_listing: HashSet<MessageId>,
+    /// Moves, copies and purges that failed, by message, reported on exit
+    /// like changes that couldn't be saved.
+    /// Keyed by where the message was to go (none for a purge): a copy
+    /// elsewhere doesn't make up for one that failed.
+    transfer_failures: HashMap<(MessageId, Transfer, Option<FolderPath>), String>,
+    /// The folders that mailbox paths moved or copied to turned out to be,
+    /// to tell when two paths name the same folder.
+    folder_ids: HashMap<FolderPath, mett_core::FolderId>,
     /// The message that last failed to open, so that opening it can be
     /// retried.
     unfetched: Option<MessageId>,
@@ -373,6 +474,23 @@ impl App {
             addresses_request: None,
             awaiting_addresses: None,
             left_drafts: Vec::new(),
+            deleted: HashSet::new(),
+            writes: VecDeque::new(),
+            writing: None,
+            failed_transfers: Vec::new(),
+            unbrowsed: None,
+            switching: None,
+            unswitched: None,
+            question_message: None,
+            browsed: None,
+            then: None,
+            account: settings.account,
+            mailbox_root: settings.folder,
+            trash: settings.trash,
+            shortcuts: settings.shortcuts,
+            previous: None,
+            delete: settings.delete,
+            resolve: settings.resolve,
             path,
             opening: None,
             width: usize::from(width),
@@ -382,7 +500,12 @@ impl App {
             unlisted: None,
             save_failures: HashMap::new(),
             pending: None,
-            flag_updates: HashMap::new(),
+            mailbox_flags: HashMap::new(),
+            wanted_flags: HashMap::new(),
+            saved_flags: HashMap::new(),
+            removed_while_listing: HashSet::new(),
+            transfer_failures: HashMap::new(),
+            folder_ids: HashMap::new(),
             unfetched: None,
             retry_after: HashSet::new(),
             next_request: 0,
@@ -410,6 +533,7 @@ impl App {
             Screen::Index => Menu::Index,
             Screen::Pager(_) => Menu::Pager,
             Screen::Compose(_) => Menu::Compose,
+            Screen::Browser(_) => Menu::Browser,
         }
     }
 
@@ -471,8 +595,9 @@ impl App {
         // move anywhere, so leave them.
         if self.menu() != Menu::SignIn {
             self.pending = None;
-            // Moving through the index replaces going back to the message
-            // a background refresh left (other actions leave it be).
+            // Moving through the index, or opening a message, replaces
+            // going back to the message a background refresh left (other
+            // actions leave it be).
             let moving = matches!(
                 action,
                 Action::NextEntry
@@ -481,6 +606,8 @@ impl App {
                     | Action::LastEntry
                     | Action::NextPage
                     | Action::PreviousPage
+                    // Opening a message chooses it too.
+                    | Action::DisplayMessage
             );
             if moving && matches!(self.menu(), Menu::Index | Menu::Pager) {
                 self.reselect = None;
@@ -496,6 +623,7 @@ impl App {
             Menu::Pager => self.on_pager_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
             Menu::Compose => self.on_compose_action(action),
+            Menu::Browser => self.on_browser_action(action),
         }
     }
 
@@ -621,10 +749,10 @@ impl App {
                 // saving changes and deleting drafts matter, and only their
                 // responses are still handled.
                 self.retry_after = if self.quit {
-                    self.flag_updates
-                        .keys()
-                        .chain(self.discarding.keys())
-                        .copied()
+                    self.writing
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(self.discarding.keys().copied())
                         .collect()
                 } else {
                     self.in_flight()
@@ -651,10 +779,12 @@ impl App {
             .into_iter()
             .chain(self.listing)
             .chain(fetching)
-            .chain(self.flag_updates.keys().copied())
+            .chain(self.writing.as_ref().map(|(id, _)| *id))
             .chain(self.delivery_request())
             .chain(self.compose_fetch.as_ref().map(|(id, _, _)| *id))
             .chain(self.discarding.keys().copied())
+            .chain(self.browser_request())
+            .chain(self.switching.as_ref().map(|(id, _)| *id))
             .collect()
     }
 
@@ -688,12 +818,19 @@ impl App {
         if self.quit {
             let mut effects = self.retry_saves();
             effects.extend(self.retry_discards());
+            effects.extend(self.retry_transfers());
             return effects;
         }
         // Everything that failed is retried, not just the first thing.
+        // Saves and moves don't depend on the open folder.
         let mut effects = self.retry_delivery();
         effects.extend(self.retry_discards());
         effects.extend(self.retry_compose_fetch());
+        effects.extend(self.retry_saves());
+        effects.extend(self.retry_transfers());
+        effects.extend(self.retry_switch());
+        // The folders are listed whether or not one is open.
+        effects.extend(self.retry_browser());
         if self.folder.is_none() {
             if self.opening.is_none() {
                 effects.extend(self.open_folder());
@@ -701,7 +838,6 @@ impl App {
             return effects;
         }
         effects.extend(self.retry_listing());
-        effects.extend(self.retry_saves());
         // Open the message that failed to open, if it is still the one
         // selected. (Opening another message forgets the failure.) The
         // screen, not the menu: another sign-in window may be over it.
@@ -713,23 +849,56 @@ impl App {
         effects
     }
 
-    /// Saves again the changes that failed to save. Messages whose changes
-    /// failed are marked unread again; mark them read once more. (Their
-    /// failures are cleared once that succeeds.)
+    /// Whether a flag change of `message` is waiting its turn or on its way.
+    fn flags_pending(&self, message: &MessageId) -> bool {
+        self.writing
+            .iter()
+            .map(|(_, write)| write)
+            .chain(&self.writes)
+            .any(|write| matches!(write, Write::Flags(id, _) if id == message))
+    }
+
+    /// Makes again the changes that failed to save, which the index undid.
+    /// (Their failures are cleared once that succeeds.)
     fn retry_saves(&mut self) -> Vec<Effect> {
-        let mut unsaved: Vec<MessageId> = self.save_failures.keys().cloned().collect();
-        unsaved.sort();
+        let mut unsaved: Vec<(MessageId, FlagsUpdate)> = self
+            .save_failures
+            .iter()
+            .map(|(id, (_, update))| (id.clone(), *update))
+            .collect();
+        unsaved.sort_by(|a, b| a.0.cmp(&b.0));
         unsaved
             .into_iter()
-            .flat_map(|message| self.mark_read(message))
+            .flat_map(|(message, update)| {
+                // Its folder may not be open any more: save it all the
+                // same, once (a retry may come again before it is done).
+                if let Some(summary) = self.summary(&message) {
+                    // The mailbox may have it after all (the response was
+                    // lost): a fresh listing shows it, and that settles it.
+                    let mut flags = summary.flags;
+                    update.apply(&mut flags);
+                    if flags == summary.flags && !self.flags_pending(&message) {
+                        self.save_failures.remove(&message);
+                        return Vec::new();
+                    }
+                    self.update_flags(message, update)
+                } else if self.flags_pending(&message) {
+                    Vec::new()
+                } else {
+                    self.write(Write::Flags(message, update))
+                }
+            })
             .collect()
     }
 
     fn on_index_action(&mut self, action: Action) -> Vec<Effect> {
+        if let Some(effects) = self.on_mailbox_action(action) {
+            return effects;
+        }
         let last = self.messages.len().saturating_sub(1);
         let page = self.body_height.max(1);
         match action {
-            Action::Quit => self.quit = true,
+            Action::Quit => return self.quit(),
             Action::NextEntry if self.selected < last => self.selected += 1,
             Action::NextEntry if self.more_to_list() => {
                 return self.wait_for(Target::Entry(self.selected + 1));
@@ -769,9 +938,12 @@ impl App {
     }
 
     fn on_pager_action(&mut self, action: Action) -> Vec<Effect> {
+        if let Some(effects) = self.on_mailbox_action(action) {
+            return effects;
+        }
         let page = self.body_height.max(1);
         match action {
-            Action::Quit => self.quit = true,
+            Action::Quit => return self.quit(),
             Action::Exit => {
                 self.screens.pop();
             }
@@ -843,6 +1015,7 @@ impl App {
             rows_width: None,
             request: effect_id(&fetch),
             scroll: 0,
+            read_chosen: false,
         }));
         vec![fetch]
     }
@@ -856,6 +1029,14 @@ impl App {
 
     fn handle_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
+            Event::FolderOpened(result)
+                if self
+                    .switching
+                    .as_ref()
+                    .is_some_and(|(request, _)| *request == id) =>
+            {
+                return self.on_switched(result);
+            }
             Event::FolderOpened(_) if self.opening != Some(id) => {}
             Event::FolderOpened(Ok(folder)) => {
                 self.opening = None;
@@ -875,7 +1056,10 @@ impl App {
             }
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
-                    self.messages.extend(page.messages);
+                    let mut messages = page.messages;
+                    messages.retain(|m| !self.removed_while_listing.contains(&m.id));
+                    self.overlay_wanted_flags(&mut messages);
+                    self.messages.extend(messages);
                     self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
@@ -884,6 +1068,9 @@ impl App {
                     } else {
                         self.listing = None;
                         self.listing_page = None;
+                        self.saved_flags.clear();
+                        self.removed_while_listing.clear();
+                        self.forget_missing_marks();
                         // Clear the "Loading" message, but not an error that
                         // was reported while the folder was loading.
                         if self.status.starts_with("Loading ") {
@@ -898,6 +1085,9 @@ impl App {
                     self.reselect = None;
                     self.listing = None;
                     self.unlisted = self.listing_page.take();
+                    // Pages asked for again come after the saves.
+                    self.saved_flags.clear();
+                    self.removed_while_listing.clear();
                     self.report(e);
                 }
             },
@@ -911,6 +1101,41 @@ impl App {
                 return self.on_compose_fetched(kind, message, result);
             }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
+            Event::FoldersListed(result) => return self.on_folders_listed(id, result),
+            Event::Transferred(result) => {
+                // The messages leave the index, or it is listed again; the
+                // new IDs matter to changes still to make, or that failed.
+                let moved = self.writing.as_ref().is_some_and(|(request, write)| {
+                    *request == id && matches!(write, Write::Transfer(Transfer::Save, _))
+                });
+                let result = result.map(|(to, results)| {
+                    if moved {
+                        // Moved now: an earlier failure to move them is
+                        // done with, not to follow them.
+                        for (old, new) in &results {
+                            if new.is_ok() {
+                                self.transfer_failures.retain(|(id, transfer, _), _| {
+                                    !(id == old && *transfer == Transfer::Save)
+                                });
+                            }
+                        }
+                        let renamed: Vec<_> = results
+                            .iter()
+                            .filter_map(|(old, new)| Some((old.clone(), new.clone().ok()?)))
+                            .collect();
+                        self.follow_moves(&renamed);
+                    }
+                    let results = results
+                        .into_iter()
+                        .map(|(id, result)| (id, result.map(drop)))
+                        .collect();
+                    (Some(to), results)
+                });
+                return self.on_transferred(id, result);
+            }
+            Event::Purged(result) => {
+                return self.on_transferred(id, result.map(|results| (None, results)));
+            }
             Event::Sent(result) => return self.on_delivered(id, result),
             Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
             // Without them, the configured ones do.
@@ -958,23 +1183,14 @@ impl App {
                 }
             }
             Event::FlagsUpdated(result) => {
-                let Some(message) = self.flag_updates.remove(&id) else {
+                let Some((_, Write::Flags(message, update))) =
+                    self.writing.take_if(|(request, _)| *request == id)
+                else {
                     return Vec::new();
                 };
-                match result {
-                    Ok(()) => {
-                        self.save_failures.remove(&message);
-                    }
-                    Err(e) => {
-                        // Undo the optimistic change, so the index is right
-                        // and reopening the message tries again.
-                        if let Some(summary) = self.messages.iter_mut().find(|s| s.id == message) {
-                            summary.flags.read = false;
-                        }
-                        self.save_failures.insert(message, e.to_string());
-                        self.report(e);
-                    }
-                }
+                let mut effects = self.on_flags_updated(message, update, result);
+                effects.extend(self.write_next());
+                return effects;
             }
             Event::FolderOpened(Err(e)) => {
                 self.opening = None;
@@ -1017,29 +1233,264 @@ impl App {
         pager.rows_width = None;
         pager.layout(self.width);
         let message_id = message.summary.id.clone();
+        let chosen = pager.read_chosen;
         pager.message = Some(message);
-        // Now that it has been shown, mark it read, as mutt does.
+        // Now that it has been shown, mark it read, as mutt does (unless
+        // the user said otherwise meanwhile).
+        if chosen {
+            return Vec::new();
+        }
         self.mark_read(message_id)
     }
 
     /// Marks a message read, updating the index straight away.
     fn mark_read(&mut self, message_id: MessageId) -> Vec<Effect> {
+        let update = FlagsUpdate {
+            read: Some(true),
+            flagged: None,
+        };
+        self.update_flags(message_id, update)
+    }
+
+    /// Changes a message's flags, updating the index straight away. Nothing
+    /// is sent if they already are as asked.
+    pub(super) fn update_flags(
+        &mut self,
+        message_id: MessageId,
+        update: FlagsUpdate,
+    ) -> Vec<Effect> {
+        // A change on its way for a message mett had no flags for (sent
+        // while its folder was closed) is what the user wants too: the
+        // listing shown may predate it.
+        let in_flight = match &self.writing {
+            Some((_, Write::Flags(id, sent)))
+                if *id == message_id && !self.mailbox_flags.contains_key(&message_id) =>
+            {
+                Some(*sent)
+            }
+            _ => None,
+        };
         let Some(summary) = self.messages.iter_mut().find(|s| s.id == message_id) else {
             return Vec::new();
         };
-        if summary.flags.read {
+        let mut flags = summary.flags;
+        if let Some(sent) = in_flight {
+            sent.apply(&mut flags);
+        }
+        update.apply(&mut flags);
+        if flags == summary.flags {
             return Vec::new();
         }
-        summary.flags.read = true;
-        let update = self.request(Request::UpdateFlags(
-            message_id.clone(),
-            FlagsUpdate {
-                read: Some(true),
-                flagged: None,
+        // What the mailbox has, as far as mett knows, while changes are
+        // on their way.
+        self.mailbox_flags
+            .entry(message_id.clone())
+            .or_insert(summary.flags);
+        summary.flags = flags;
+        self.wanted_flags.insert(message_id.clone(), flags);
+        // Changing back what failed to change gives up on it.
+        if let Some((_, failed)) = self.save_failures.get_mut(&message_id) {
+            if failed
+                .read
+                .is_some_and(|read| update.read.is_some_and(|new| new != read))
+            {
+                failed.read = None;
+            }
+            if failed
+                .flagged
+                .is_some_and(|flagged| update.flagged.is_some_and(|new| new != flagged))
+            {
+                failed.flagged = None;
+            }
+            if *failed == FlagsUpdate::default() {
+                self.save_failures.remove(&message_id);
+            }
+        }
+        // A change still waiting its turn takes this one along.
+        let queued = self.writes.iter_mut().find_map(|write| match write {
+            Write::Flags(id, queued) if *id == message_id => Some(queued),
+            _ => None,
+        });
+        if let Some(queued) = queued {
+            *queued = merged(*queued, update);
+            return Vec::new();
+        }
+        self.write(Write::Flags(message_id, update))
+    }
+
+    /// What to send of a flag change, now that its turn has come: what the
+    /// user wants and the mailbox doesn't have (which may be nothing, or
+    /// include an earlier change that failed), or `update` for a message
+    /// mett knows nothing more about.
+    pub(super) fn flags_to_send(&self, message: &MessageId, update: FlagsUpdate) -> FlagsUpdate {
+        match (
+            self.wanted_flags.get(message),
+            self.mailbox_flags.get(message),
+        ) {
+            (Some(wanted), Some(mailbox)) => FlagsUpdate {
+                read: (wanted.read != mailbox.read).then_some(wanted.read),
+                flagged: (wanted.flagged != mailbox.flagged).then_some(wanted.flagged),
             },
-        ));
-        self.flag_updates.insert(effect_id(&update), message_id);
-        vec![update]
+            _ => update,
+        }
+    }
+
+    /// Handles the outcome of a flag change to a message whose other flags
+    /// mett doesn't know: the index, if it shows the message now, takes
+    /// just the fields that were saved.
+    fn on_unknown_flags_updated(
+        &mut self,
+        message: MessageId,
+        update: FlagsUpdate,
+        result: mett_core::Result<()>,
+    ) -> Vec<Effect> {
+        match result {
+            Ok(()) => {
+                if let Some(summary) = self.summary_mut(&message) {
+                    update.apply(&mut summary.flags);
+                }
+                // Pages of a listing on their way may predate it.
+                if self.listing.is_some() {
+                    let saved = self.saved_flags.get(&message).copied().unwrap_or_default();
+                    self.saved_flags
+                        .insert(message.clone(), merged(saved, update));
+                }
+                if let Some((_, failed)) = self.save_failures.get_mut(&message) {
+                    if update.read.is_some() {
+                        failed.read = None;
+                    }
+                    if update.flagged.is_some() {
+                        failed.flagged = None;
+                    }
+                    if *failed == FlagsUpdate::default() {
+                        self.save_failures.remove(&message);
+                    }
+                }
+            }
+            Err(e) => {
+                let failed = self
+                    .save_failures
+                    .get(&message)
+                    .map_or(update, |(_, before)| merged(*before, update));
+                self.save_failures.insert(message, (e.to_string(), failed));
+                self.report(e);
+            }
+        }
+        Vec::new()
+    }
+
+    /// Handles the outcome of a flag change.
+    fn on_flags_updated(
+        &mut self,
+        message: MessageId,
+        update: FlagsUpdate,
+        result: mett_core::Result<()>,
+    ) -> Vec<Effect> {
+        // Sent for a message mett has no flags for (its folder wasn't
+        // open): only the fields it changed are known.
+        let Some(mut mailbox) = self.mailbox_flags.get(&message).copied() else {
+            return self.on_unknown_flags_updated(message, update, result);
+        };
+        let saved = result.is_ok();
+        match result {
+            Ok(()) => {
+                update.apply(&mut mailbox);
+                // Whatever failed before of what was saved now is done.
+                if let Some((_, failed)) = self.save_failures.get_mut(&message) {
+                    if update.read.is_some() {
+                        failed.read = None;
+                    }
+                    if update.flagged.is_some() {
+                        failed.flagged = None;
+                    }
+                    if *failed == FlagsUpdate::default() {
+                        self.save_failures.remove(&message);
+                    }
+                }
+            }
+            Err(e) => {
+                // What the user has changed back meanwhile isn't wanted any
+                // more; the rest is kept with what failed before, to try
+                // again together.
+                let update = match self.wanted_flags.get(&message) {
+                    Some(wanted) => FlagsUpdate {
+                        read: update.read.filter(|read| *read == wanted.read),
+                        flagged: update.flagged.filter(|flagged| *flagged == wanted.flagged),
+                    },
+                    None => update,
+                };
+                let failed = self
+                    .save_failures
+                    .get(&message)
+                    .map_or(update, |(_, before)| merged(*before, update));
+                if failed != FlagsUpdate::default() {
+                    self.save_failures
+                        .insert(message.clone(), (e.to_string(), failed));
+                }
+                self.report(e);
+            }
+        }
+        let queued = self
+            .writes
+            .iter()
+            .any(|write| matches!(write, Write::Flags(id, _) if *id == message));
+        if queued {
+            // The next change sends whatever still differs, which
+            // includes what just failed. Pages of the listing on its way
+            // may predate what was saved.
+            if saved && self.listing.is_some() {
+                self.saved_flags.insert(message.clone(), whole(mailbox));
+            }
+            self.mailbox_flags.insert(message, mailbox);
+        } else {
+            self.flags_settled(&message, mailbox, saved);
+        }
+        Vec::new()
+    }
+
+    /// Forgets the flag bookkeeping of a message whose changes are done,
+    /// and shows what the mailbox has: after a failure, so the index is
+    /// right and doing it again tries again; after a save, in case a
+    /// listing taken before it showed the old flags.
+    pub(super) fn flags_settled(
+        &mut self,
+        message: &MessageId,
+        mailbox: mett_core::Flags,
+        saved: bool,
+    ) {
+        self.mailbox_flags.remove(message);
+        self.wanted_flags.remove(message);
+        if let Some(summary) = self.summary_mut(message) {
+            summary.flags = mailbox;
+        }
+        // Pages of the listing on its way may predate the save (or an
+        // earlier one, which a failure since doesn't undo).
+        if self.listing.is_some() && (saved || self.saved_flags.contains_key(message)) {
+            self.saved_flags.insert(message.clone(), whole(mailbox));
+        }
+    }
+
+    /// Shows freshly listed messages with the flags the user asked for,
+    /// while those changes are on their way, or that were saved while the
+    /// folder was listed: the listing may predate them.
+    fn overlay_wanted_flags(&self, messages: &mut [MessageSummary]) {
+        for message in messages {
+            if let Some(flags) = self.wanted_flags.get(&message.id) {
+                message.flags = *flags;
+            } else if let Some(saved) = self.saved_flags.get(&message.id) {
+                saved.apply(&mut message.flags);
+            }
+        }
+    }
+
+    /// The summary of a message in the index.
+    fn summary(&self, id: &MessageId) -> Option<&MessageSummary> {
+        self.messages.iter().find(|s| &s.id == id)
+    }
+
+    /// The summary of a message in the index, to change.
+    fn summary_mut(&mut self, id: &MessageId) -> Option<&mut MessageSummary> {
+        self.messages.iter_mut().find(|s| &s.id == id)
     }
 
     /// Whether part of the folder could not be listed. The index then
@@ -1053,6 +1504,8 @@ impl App {
     fn relist(&mut self) -> Vec<Effect> {
         self.reselect = None;
         self.messages.clear();
+        self.saved_flags.clear();
+        self.removed_while_listing.clear();
         self.selected = 0;
         self.pending = None;
         self.unlisted = None;
@@ -1147,7 +1600,7 @@ impl App {
         self.selected = selected;
         // The screen, not the menu: the sign-in window may be over it.
         match self.screen() {
-            Screen::Index | Screen::Compose(_) => Vec::new(),
+            Screen::Index | Screen::Compose(_) | Screen::Browser(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()
@@ -1174,8 +1627,9 @@ impl App {
         let mut failures: Vec<_> = self
             .save_failures
             .values()
-            .chain(self.left_drafts.iter().map(|(left, _)| left))
-            .cloned()
+            .map(|(error, _)| error.clone())
+            .chain(self.transfer_failures.values().cloned())
+            .chain(self.left_drafts.iter().map(|(left, _)| left.clone()))
             .collect();
         failures.sort();
         failures
@@ -1196,7 +1650,10 @@ impl App {
     /// Whether changes to the mailbox are still being saved. mett waits
     /// for them before exiting, so they aren't lost.
     pub fn saving(&self) -> bool {
-        !self.flag_updates.is_empty() || self.delivering() || !self.discarding.is_empty()
+        self.writing.is_some()
+            || !self.writes.is_empty()
+            || self.delivering()
+            || !self.discarding.is_empty()
     }
 
     fn report(&mut self, error: Error) {
@@ -1206,6 +1663,22 @@ impl App {
             return;
         }
         self.status = error.to_string();
+    }
+}
+
+/// `earlier` with what `later` changes too.
+/// All of `flags`, as an update.
+fn whole(flags: mett_core::Flags) -> FlagsUpdate {
+    FlagsUpdate {
+        read: Some(flags.read),
+        flagged: Some(flags.flagged),
+    }
+}
+
+fn merged(earlier: FlagsUpdate, later: FlagsUpdate) -> FlagsUpdate {
+    FlagsUpdate {
+        read: later.read.or(earlier.read),
+        flagged: later.flagged.or(earlier.flagged),
     }
 }
 
@@ -1541,17 +2014,18 @@ mod tests {
         let first = open(&mut app, 1);
         act(&mut app, Action::Exit);
         act(&mut app, Action::NextEntry);
-        let second = open(&mut app, 1);
-        let ([Effect::Request(first, _)], [Effect::Request(second, _)]) =
-            (first.as_slice(), second.as_slice())
-        else {
-            panic!("expected one flag update per message");
+        // One change at a time: the second waits for the first.
+        assert!(open(&mut app, 1).is_empty());
+        let [Effect::Request(first, _)] = first.as_slice() else {
+            panic!("expected a flag update, got {first:?}");
         };
-
-        app.update(Msg::Response(Response {
+        let second = app.update(Msg::Response(Response {
             id: *first,
             event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
         }));
+        let [Effect::Request(second, _)] = second.as_slice() else {
+            panic!("expected a flag update, got {second:?}");
+        };
         // A later success doesn't hide the earlier failure.
         app.update(Msg::Response(Response {
             id: *second,

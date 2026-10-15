@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use mett_core::{Address, Draft, DraftOrigin, Message, WellKnownFolder};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::mailbox::Choose;
 use super::{App, Effect, Screen, effect_id};
 use crate::action::Action;
 use crate::compose::{self, Kind};
@@ -70,6 +71,25 @@ pub enum Question {
     Postpone,
     /// Whether to keep a copy of the sent message (`copy`).
     Copy,
+    /// The folder to open (`c`).
+    OpenMailbox,
+    /// The folder to move the message to (`s`).
+    SaveTo,
+    /// The folder to copy the message to (`C`).
+    CopyTo,
+    /// Whether to purge deleted messages (`delete`).
+    Purge,
+}
+
+impl Question {
+    /// Whether the answer is a mailbox, so that the folder browser can
+    /// help.
+    fn is_mailbox(self) -> bool {
+        matches!(
+            self,
+            Question::OpenMailbox | Question::SaveTo | Question::CopyTo
+        )
+    }
 }
 
 /// A message being set up, before the compose menu.
@@ -383,6 +403,15 @@ impl App {
                 editor, question, ..
             } => {
                 let question = *question;
+                // Tab, or `?` on an empty line, shows the folders to choose
+                // from, as in mutt.
+                let browse = key.code == KeyCode::Tab
+                    || (key.code == KeyCode::Char('?') && editor.text().is_empty());
+                if question.is_mailbox() && browse {
+                    let typed = editor.text();
+                    self.input = None;
+                    return self.open_browser(Choose::Answer(question, typed));
+                }
                 match editor.key(key) {
                     Outcome::Editing => Vec::new(),
                     Outcome::Done(text) => {
@@ -391,7 +420,7 @@ impl App {
                     }
                     Outcome::Cancelled => {
                         self.input = None;
-                        self.cancel_question()
+                        self.cancel_question(question)
                     }
                 }
             }
@@ -402,7 +431,7 @@ impl App {
                 let answer = match key.code {
                     _ if cancel => {
                         self.input = None;
-                        return self.cancel_question();
+                        return self.cancel_question(question);
                     }
                     KeyCode::Enter => *default,
                     KeyCode::Char('y' | 'Y') => true,
@@ -416,13 +445,26 @@ impl App {
     }
 
     /// The user gave up on a question: give up on the message being set
-    /// up, or leave the compose menu as it was.
-    fn cancel_question(&mut self) -> Vec<Effect> {
-        self.composing = None;
+    /// up, or leave things as they were.
+    fn cancel_question(&mut self, question: Question) -> Vec<Effect> {
+        match question {
+            Question::Purge => self.cancel_purge(),
+            // A folder chosen in the browser goes with the question.
+            // So does a browser to open again after a sign-in.
+            Question::OpenMailbox | Question::SaveTo | Question::CopyTo => {
+                self.browsed = None;
+                self.unbrowsed = None;
+                self.question_message = None;
+            }
+            _ => self.composing = None,
+        }
         Vec::new()
     }
 
     fn answer_line(&mut self, question: Question, text: String) -> Vec<Effect> {
+        if question.is_mailbox() {
+            return self.answer_mailbox(question, text);
+        }
         let setting_up = self.composing.is_some();
         let Some(draft) = self.draft_mut() else {
             return Vec::new();
@@ -495,11 +537,15 @@ impl App {
                 }
                 return self.deliver(Delivery::Send);
             }
+            Question::Purge => return self.answer_purge(answer),
             Question::AbortNoSubject
             | Question::To
             | Question::Cc
             | Question::Bcc
-            | Question::Subject => {}
+            | Question::Subject
+            | Question::OpenMailbox
+            | Question::SaveTo
+            | Question::CopyTo => {}
         }
         self.advance()
     }

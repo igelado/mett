@@ -127,6 +127,25 @@ fn main() -> ExitCode {
         let editor = Editor::new(config.string("editor"), config.string("tmpdir"), &|name| {
             std::env::var(name).ok()
         });
+        let trash = match config.string("trash") {
+            "" => None,
+            // mutt's shortcuts work here too (`^` and `-` name no folder
+            // before one is open, and are taken as written).
+            trash => match config::mailbox::configured_path(
+                trash,
+                config.string("folder"),
+                &spoolfile.account,
+                config.string("spoolfile"),
+                config.string("mbox"),
+                config.string("record"),
+            ) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    eprintln!("mett: trash: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
         let page_size = match config.get("msgraph_page_size") {
             Some(config::Value::Number(n)) if *n > 0 => match u32::try_from(*n) {
                 Ok(size) => size,
@@ -156,7 +175,20 @@ fn main() -> ExitCode {
         };
         let session = Session {
             folder: spoolfile.folder,
-            settings: Settings { page_size, compose },
+            settings: Settings {
+                page_size,
+                compose,
+                account: spoolfile.account.clone(),
+                folder: config.string("folder").to_owned(),
+                trash,
+                delete: config.quad("delete"),
+                resolve: config.flag("resolve"),
+                shortcuts: app::Shortcuts {
+                    spoolfile: config.string("spoolfile").to_owned(),
+                    mbox: config.string("mbox").to_owned(),
+                    record: config.string("record").to_owned(),
+                },
+            },
             editor,
             sign_in,
             cancel: Some(cancel),
@@ -364,6 +396,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                                 | worker::Event::Sent(_)
                                 | worker::Event::DraftSaved(_)
                                 | worker::Event::KeptDiscarded(_)
+                                | worker::Event::Transferred(_)
+                                | worker::Event::Purged(_)
                         ) =>
                     {
                         Msg::Response(response)
