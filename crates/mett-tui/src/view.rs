@@ -467,14 +467,21 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     };
     let from = message.summary.from.as_ref().map_or("", display_name);
     // The flags of the message as the index currently shows them, as in
-    // mutt's `%Z`: N for unread, ! for flagged.
+    // mutt's `%Z`: D for marked for deletion, N for unread, ! for flagged.
     let flags = app
         .messages
         .get(app.selected)
         .map_or(Default::default(), |m| m.flags);
+    let deleted = app.is_deleted(&message.summary.id);
     format!(
         "-{}{}- {}/{}: {from}  {}   -- ({position})",
-        if flags.read { '-' } else { 'N' },
+        if deleted {
+            'D'
+        } else if flags.read {
+            '-'
+        } else {
+            'N'
+        },
         if flags.flagged { '!' } else { '-' },
         app.selected + 1,
         app.messages.len(),
@@ -637,7 +644,12 @@ mod tests {
         assert_eq!(lines[3], "Subject: Subject 0");
         assert_eq!(lines[5], "Body of Subject 0");
         // Shown, so now read.
-        assert_eq!(lines[6], "---- 1/1: Alice Example  Subject 0   -- (all)");
+        assert_eq!(lines[6], "---- 1/1: Alice Example  Subject 0   -- (all)"); // Marked for deletion from the pager (the only message, so it stays).
+        app.update(Msg::Action(Action::DeleteMessage));
+        assert_eq!(
+            screen(&app)[6],
+            "-D-- 1/1: Alice Example  Subject 0   -- (all)"
+        );
     }
 
     #[test]

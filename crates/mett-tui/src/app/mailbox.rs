@@ -854,6 +854,8 @@ impl App {
             return Vec::new();
         }
         match self.then.take() {
+            // Messages marked while it ran are purged too, before leaving.
+            Some(then) if !self.deleted.is_empty() => self.purge(Some(then)),
             Some(then) => self.after_purge(then),
             None => Vec::new(),
         }
@@ -3175,5 +3177,31 @@ mod tests {
         }));
         act(&mut app, Action::Exit);
         assert!(!lists_folders(&app.retry()));
+    }
+
+    #[test]
+    fn a_mark_made_during_a_purge_is_purged_before_quitting() {
+        let mut app = yes();
+        act(&mut app, Action::DeleteMessage);
+        app.selected = 0;
+        let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
+        // m1 is marked while m0 is purged, then the user quits.
+        app.selected = 1;
+        act(&mut app, Action::DeleteMessage);
+        act(&mut app, Action::Quit);
+        let effects = app.update(Msg::Response(Response {
+            id: purge,
+            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
+        }));
+        assert!(!app.quit, "m1 first");
+        let (second, request) = sent(&effects);
+        assert!(
+            matches!(request, Request::Purge { ref ids, .. } if ids == &[MessageId::new("m1")])
+        );
+        app.update(Msg::Response(Response {
+            id: second,
+            event: Event::Purged(Ok(vec![("m1".into(), Ok(()))])),
+        }));
+        assert!(app.quit);
     }
 }
