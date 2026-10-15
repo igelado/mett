@@ -668,6 +668,19 @@ fn run_command(
 ) -> app::Reconfigured {
     let before = config.clone();
     let mut outcome = config.run_line(command);
+    // A command that fails changes nothing: what it did before failing is
+    // undone.
+    if outcome.is_err() {
+        *config = before;
+        let _ = config.take_key_commands();
+        let _ = config.take_pushed();
+        return app::Reconfigured {
+            outcome,
+            settings: settings_keeping(config, account, Some(signature.clone())),
+            key_commands: Vec::new(),
+            pushed: Vec::new(),
+        };
+    }
     let changed = config.changed_since(&before);
     // The mailbox and its sign-in were set up when mett started.
     if let Ok(warnings) = &mut outcome {
@@ -985,5 +998,21 @@ mod tests {
             "still the demo user"
         );
         assert_eq!(after.compose.signature, None, "not the user's signature");
+    }
+
+    #[test]
+    fn a_failing_command_changes_nothing() {
+        let (mut config, settings) = demo_config(Some("/home/alice".into()));
+        let mut signature = settings.compose.signature.clone();
+        let before = config.clone();
+        // The first command works, the second doesn't: neither stays.
+        let done = run_command(
+            &mut config,
+            &settings.account,
+            &mut signature,
+            "set resolve=no; set timeout=soon",
+        );
+        assert!(done.outcome.is_err());
+        assert!(config.changed_since(&before).is_empty());
     }
 }

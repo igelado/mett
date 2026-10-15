@@ -1245,9 +1245,12 @@ impl App {
                     if !matches!(e, Error::Auth(_)) {
                         self.pending_search = None;
                     }
+                    // Keys waiting for the folder play anyway, unless a
+                    // sign-in is to load it after all.
+                    if !matches!(e, Error::Auth(_)) {
+                        self.loaded();
+                    }
                     self.report(e);
-                    // Keys waiting for the folder play anyway.
-                    self.loaded();
                 }
             },
             Event::MessageFetched(result)
@@ -1358,9 +1361,12 @@ impl App {
                 if !matches!(e, Error::Auth(_)) {
                     self.pending_search = None;
                 }
+                // Keys waiting for the folder play anyway, unless a sign-in
+                // is to open it after all.
+                if !matches!(e, Error::Auth(_)) {
+                    self.loaded();
+                }
                 self.report(e);
-                // Keys waiting for the folder play anyway.
-                self.loaded();
             }
             Event::MessagesListed(_) => {}
         }

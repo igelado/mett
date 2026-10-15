@@ -875,4 +875,20 @@ mod tests {
         assert!(app.waiting());
         assert!(app.next_stroke().is_none());
     }
+
+    #[test]
+    fn startup_keys_wait_for_a_sign_in_to_open_the_folder() {
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let (mut app, effects) = App::open(80, 10, inbox, Settings::default());
+        app.push_after_load(crate::keymap::parse_strokes("<last-entry>").unwrap());
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Err(mett_core::Error::Auth("expired".into()))),
+        }));
+        assert!(app.next_stroke().is_none(), "not before the folder is open");
+        assert!(!app.after_load.is_empty(), "still waiting");
+    }
 }
