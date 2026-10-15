@@ -3357,11 +3357,15 @@ mod tests {
                 ))),
             }));
         }
-        let copies = app
-            .retry()
+        // One retry is kept (changes go out one at a time, so look at what
+        // is kept, not just what is sent first).
+        let kept: Vec<_> = app
+            .failed_transfers
             .iter()
-            .filter(|e| matches!(e, Effect::Request(_, Request::Transfer { .. })))
-            .count();
-        assert_eq!(copies, 1);
+            .flat_map(|(_, retry)| transfer_ids(retry).to_vec())
+            .collect();
+        assert_eq!(kept, [MessageId::new("m0")]);
+        app.retry();
+        assert_eq!(app.writes.len() + usize::from(app.writing.is_some()), 1);
     }
 }
