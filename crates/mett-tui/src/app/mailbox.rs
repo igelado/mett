@@ -11,7 +11,6 @@ use super::{App, Effect, Screen, Target, effect_id};
 use crate::action::Action;
 use crate::config::Quad;
 use crate::config::mailbox::{FolderPath, MailboxError, configured_path};
-use crate::lineedit::LineEditor;
 use crate::worker::{Request, RequestId};
 
 /// A move, copy or purge waiting for the worker.
@@ -296,11 +295,7 @@ impl App {
             Question::CopyTo => "Copy to mailbox ('?' for list): ",
             _ => "Open mailbox ('?' for list): ",
         };
-        self.input = Some(Input::Line {
-            prompt: prompt.to_owned(),
-            editor: LineEditor::new(current),
-            question,
-        });
+        self.ask(question, prompt, current);
     }
 
     /// The folder a typed mailbox names, with mutt's shortcuts: `^` is
@@ -1193,14 +1188,10 @@ impl App {
         let Some(Screen::Browser(browser)) = self.screens.last_mut() else {
             return Vec::new();
         };
-        let last = browser.entries.len().saturating_sub(1);
+        if super::navigate(&mut browser.selected, action, browser.entries.len(), page) {
+            return Vec::new();
+        }
         match action {
-            Action::NextEntry => browser.selected = (browser.selected + 1).min(last),
-            Action::PreviousEntry => browser.selected = browser.selected.saturating_sub(1),
-            Action::FirstEntry => browser.selected = 0,
-            Action::LastEntry => browser.selected = last,
-            Action::NextPage => browser.selected = (browser.selected + page).min(last),
-            Action::PreviousPage => browser.selected = browser.selected.saturating_sub(page),
             Action::DisplayMessage => {
                 let Some(entry) = browser.entries.get(browser.selected) else {
                     return Vec::new();

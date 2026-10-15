@@ -166,11 +166,7 @@ impl App {
 
     /// `Q`: asks what to query for.
     pub(super) fn ask_query(&mut self) {
-        self.input = Some(Input::Line {
-            prompt: "Query: ".into(),
-            editor: LineEditor::new(""),
-            question: Question::Query,
-        });
+        self.ask(Question::Query, "Query: ", "");
     }
 
     /// Queries for `text`, listing the results to `purpose`.
@@ -204,24 +200,9 @@ impl App {
             ..
         } = purpose
         {
-            self.ask_address(*question, typed, rest);
+            self.ask_line(*question, typed, rest);
         }
         Vec::new()
-    }
-
-    /// Asks an address question again, with `text` typed before the
-    /// cursor and `rest` after it.
-    fn ask_address(&mut self, question: Question, text: &str, rest: &str) {
-        let prompt = match question {
-            Question::Cc => "Cc: ",
-            Question::Bcc => "Bcc: ",
-            _ => "To: ",
-        };
-        self.input = Some(Input::Line {
-            prompt: prompt.into(),
-            editor: LineEditor::with_cursor(text, rest),
-            question,
-        });
     }
 
     /// The request querying for the list on screen, while it is pending.
@@ -238,15 +219,17 @@ impl App {
         id: RequestId,
         result: Result<Vec<Address>, String>,
     ) -> Vec<Effect> {
-        let Some(position) = self
+        let found = self
             .screens
-            .iter()
-            .rposition(|s| matches!(s, Screen::Query(m) if m.request == Some(id)))
-        else {
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| match s {
+                Screen::Query(menu) if menu.request == Some(id) => Some((i, menu)),
+                _ => None,
+            });
+        let Some((position, menu)) = found else {
             return Vec::new();
-        };
-        let Screen::Query(menu) = &mut self.screens[position] else {
-            unreachable!("found above");
         };
         menu.request = None;
         let failure = match result {
@@ -280,14 +263,10 @@ impl App {
         let Some(Screen::Query(menu)) = self.screens.last_mut() else {
             return Vec::new();
         };
-        let last = menu.entries.len().saturating_sub(1);
+        if super::navigate(&mut menu.selected, action, menu.entries.len(), page) {
+            return Vec::new();
+        }
         match action {
-            Action::NextEntry => menu.selected = (menu.selected + 1).min(last),
-            Action::PreviousEntry => menu.selected = menu.selected.saturating_sub(1),
-            Action::FirstEntry => menu.selected = 0,
-            Action::LastEntry => menu.selected = last,
-            Action::NextPage => menu.selected = (menu.selected + page).min(last),
-            Action::PreviousPage => menu.selected = menu.selected.saturating_sub(page),
             Action::Exit | Action::Quit => {
                 let Some(Screen::Query(menu)) = self.screens.pop() else {
                     unreachable!("checked above");
@@ -322,7 +301,7 @@ impl App {
                         // The rest of the entry goes; the entries after
                         // it stay.
                         let rest = alias::after_entry(&typed, &rest).to_owned();
-                        self.ask_address(question, &text, &rest);
+                        self.ask_line(question, &text, &rest);
                         Vec::new()
                     }
                     Purpose::Mail => {
@@ -373,38 +352,27 @@ impl App {
             .collect::<String>()
             .to_lowercase();
         self.new_alias = Some(Address::format_list(&[from]));
-        self.input = Some(Input::Line {
-            prompt: "Alias as: ".into(),
-            editor: LineEditor::new(&key),
-            question: Question::AliasName,
-        });
+        self.ask(Question::AliasName, "Alias as: ", &key);
         Vec::new()
     }
 
     /// The alias's name was given: asks for its address.
     pub(super) fn answer_alias_name(&mut self, key: String) -> Vec<Effect> {
+        let address = self.new_alias.take().unwrap_or_default();
         let key = key.trim().to_owned();
         if key.is_empty() {
-            self.new_alias = None;
             return Vec::new();
         }
         if !alias::valid_key(&key) {
             self.fail(format!("{key:?} can't be an alias's name."));
-            self.new_alias = None;
             return Vec::new();
         }
         if alias::find(&self.aliases, &key).is_some() {
             self.fail("You already have an alias defined with that name!");
-            self.new_alias = None;
             return Vec::new();
         }
-        let address = self.new_alias.take().unwrap_or_default();
         self.alias_key = Some(key);
-        self.input = Some(Input::Line {
-            prompt: "Address: ".into(),
-            editor: LineEditor::new(&address),
-            question: Question::AliasAddress,
-        });
+        self.ask(Question::AliasAddress, "Address: ", &address);
         Vec::new()
     }
 

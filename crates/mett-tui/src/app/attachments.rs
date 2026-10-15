@@ -9,7 +9,6 @@ use mett_core::{Attachment, AttachmentKind, MessageId, OutgoingAttachment};
 use super::composing::{Input, Question};
 use super::{App, Effect, Screen, effect_id};
 use crate::action::Action;
-use crate::lineedit::LineEditor;
 use crate::text;
 use crate::worker::{Request, RequestId};
 
@@ -123,19 +122,16 @@ impl App {
     /// and fetching the one asked for (if its menu is still there).
     pub(super) fn retry_attachments(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
-        let unlisted: Vec<usize> = (0..self.screens.len())
-            .filter(|&i| matches!(&self.screens[i], Screen::Attachments(m) if m.unlisted))
-            .collect();
-        for position in unlisted {
-            let Screen::Attachments(menu) = &self.screens[position] else {
-                unreachable!("found above");
+        for position in 0..self.screens.len() {
+            let message = match &self.screens[position] {
+                Screen::Attachments(menu) if menu.unlisted => menu.message.clone(),
+                _ => continue,
             };
-            let request = self.request(Request::ListAttachments(menu.message.clone()));
-            let Screen::Attachments(menu) = &mut self.screens[position] else {
-                unreachable!("found above");
-            };
-            menu.unlisted = false;
-            menu.listing = Some(effect_id(&request));
+            let request = self.request(Request::ListAttachments(message));
+            if let Screen::Attachments(menu) = &mut self.screens[position] {
+                menu.unlisted = false;
+                menu.listing = Some(effect_id(&request));
+            }
             effects.push(request);
         }
         // While its menu is there (under the help, say).
@@ -157,15 +153,17 @@ impl App {
         result: mett_core::Result<Vec<Attachment>>,
     ) -> Vec<Effect> {
         // The menu may be under another screen (help) by now.
-        let Some(position) = self
+        let found = self
             .screens
-            .iter()
-            .rposition(|s| matches!(s, Screen::Attachments(m) if m.listing == Some(id)))
-        else {
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| match s {
+                Screen::Attachments(menu) if menu.listing == Some(id) => Some((i, menu)),
+                _ => None,
+            });
+        let Some((position, menu)) = found else {
             return Vec::new();
-        };
-        let Screen::Attachments(menu) = &mut self.screens[position] else {
-            unreachable!("found above");
         };
         menu.listing = None;
         match result {
@@ -212,14 +210,10 @@ impl App {
         let Some(Screen::Attachments(menu)) = self.screens.last_mut() else {
             return Vec::new();
         };
-        let last = menu.entries.len().saturating_sub(1);
+        if super::navigate(&mut menu.selected, action, menu.entries.len(), page) {
+            return Vec::new();
+        }
         match action {
-            Action::NextEntry => menu.selected = (menu.selected + 1).min(last),
-            Action::PreviousEntry => menu.selected = menu.selected.saturating_sub(1),
-            Action::FirstEntry => menu.selected = 0,
-            Action::LastEntry => menu.selected = last,
-            Action::NextPage => menu.selected = (menu.selected + page).min(last),
-            Action::PreviousPage => menu.selected = menu.selected.saturating_sub(page),
             Action::Exit | Action::Quit => {
                 self.screens.pop();
                 self.fetching = None;
@@ -238,11 +232,11 @@ impl App {
                     self.fail("It is a link to a file kept elsewhere; open it in Outlook.");
                     return Vec::new();
                 }
-                self.input = Some(Input::Line {
-                    prompt: "Save to file: ".into(),
-                    editor: LineEditor::new(&file_name(&attachment)),
-                    question: Question::SaveAttachment,
-                });
+                self.ask(
+                    Question::SaveAttachment,
+                    "Save to file: ",
+                    &file_name(&attachment),
+                );
             }
             _ => {}
         }
@@ -320,9 +314,7 @@ impl App {
                 return Vec::new();
             }
         };
-        if self.status == "Fetching attachment..." {
-            self.status.clear();
-        }
+        self.clear_status_if(&["Fetching attachment..."]);
         match to {
             Use::Save(path) => {
                 let op = self.wait_for_file(path.clone());
@@ -428,11 +420,7 @@ impl App {
 
     /// `a` in the compose menu: asks for a file to attach.
     pub(super) fn ask_attach_file(&mut self) {
-        self.input = Some(Input::Line {
-            prompt: "Attach file: ".into(),
-            editor: LineEditor::new(""),
-            question: Question::AttachFile,
-        });
+        self.ask(Question::AttachFile, "Attach file: ", "");
     }
 
     /// Reads the file to attach.
@@ -479,9 +467,7 @@ impl App {
         if !self.file_waited(op) {
             return Vec::new();
         }
-        if self.status == "Attaching..." {
-            self.status.clear();
-        }
+        self.clear_status_if(&["Attaching..."]);
         let data = match result {
             Ok(data) => data,
             Err(e) => {
@@ -587,8 +573,6 @@ fn shown_as_text(attachment: &Attachment, data: &[u8]) -> Option<Vec<String>> {
     Some(text::body_lines(&mett_core::Body { kind, content }))
 }
 
-/// A safe file name for an attachment: its name without directories, or
-/// a name for one without.
 /// A content type without its parameters (`text/calendar; charset=...`),
 /// in lower case.
 fn media_type(content_type: &str) -> String {
@@ -600,6 +584,8 @@ fn media_type(content_type: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// A safe file name for an attachment: its name without directories, or
+/// a name for one without.
 fn file_name(attachment: &Attachment) -> String {
     let name = attachment
         .name

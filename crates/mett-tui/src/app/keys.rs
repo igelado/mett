@@ -2,14 +2,16 @@
 //! macro's keys played one by one), the help screen, and mettrc commands
 //! typed at the `:` prompt.
 
+use std::borrow::Cow;
+use std::collections::VecDeque;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::composing::{Input, Question};
+use super::composing::Question;
 use super::{App, Effect, Msg, Screen, Settings};
 use crate::action::Action;
 use crate::config::KeyCommand;
 use crate::keymap::{Binding, Key, Menu, Stroke};
-use crate::lineedit::LineEditor;
 
 /// How many queued keys play in a row before mett suspects a macro loop.
 const MAX_PLAYED: usize = 10_000;
@@ -108,9 +110,7 @@ impl App {
                 } else {
                     &mut self.strokes
                 };
-                for stroke in strokes.into_iter().rev() {
-                    queue.push_front(stroke);
-                }
+                push_front_all(queue, strokes);
                 Vec::new()
             }
             None => {
@@ -136,9 +136,7 @@ impl App {
     pub fn next_stroke(&mut self) -> Option<Msg> {
         if self.sign_in.is_none() {
             // The window closed: the rest of its macro goes on, first.
-            for stroke in std::mem::take(&mut self.sign_in_strokes).into_iter().rev() {
-                self.strokes.push_front(stroke);
-            }
+            push_front_all(&mut self.strokes, std::mem::take(&mut self.sign_in_strokes));
         }
         let stroke = if self.sign_in.is_some() && !self.sign_in_strokes.is_empty() {
             self.sign_in_strokes.pop_front()
@@ -200,10 +198,7 @@ impl App {
     /// Queues keys to play next, in mutt's notation, as `push` does: before
     /// the rest of a macro that pushed them.
     pub fn push_keys(&mut self, keys: &str) -> Result<(), String> {
-        let strokes = crate::keymap::parse_strokes(keys)?;
-        for stroke in strokes.into_iter().rev() {
-            self.strokes.push_front(stroke);
-        }
+        push_front_all(&mut self.strokes, crate::keymap::parse_strokes(keys)?);
         Ok(())
     }
 
@@ -253,32 +248,29 @@ impl App {
 
     /// Opens the help screen for the current menu.
     pub(super) fn open_help(&mut self) -> Vec<Effect> {
-        // The folder list would arrive under the help screen, which
-        // can't take it.
-        if self.browser_request().is_some() {
-            self.fail("Listing folders; wait a moment.");
-            return Vec::new();
-        }
-        // The message would arrive under the help screen; a retry after
-        // a failed sign-in looks for it on top.
-        if matches!(self.screen(), Screen::Pager(p) if p.message.is_none()) {
-            self.fail("Loading message; wait a moment.");
-            return Vec::new();
-        }
-        // A delivery's sign-in retry looks for its compose menu on top.
-        if self.delivering() {
-            self.fail("Sending message; wait a moment.");
-            return Vec::new();
-        }
-        // Opening another folder starts it afresh, without the help.
-        if self.switching.is_some() {
-            self.fail("Opening folder; wait a moment.");
-            return Vec::new();
-        }
-        // A lookup's answer may take its menu away (and bring back the
-        // question it came from): not from under the help.
-        if matches!(self.screens.last(), Some(Screen::Query(menu)) if menu.request.is_some()) {
-            self.fail("Looking up addresses; wait a moment.");
+        let busy = [
+            // The folder list would arrive under the help screen, which
+            // can't take it.
+            (self.browser_request().is_some(), "Listing folders"),
+            // The message would arrive under the help screen; a retry
+            // after a failed sign-in looks for it on top.
+            (
+                matches!(self.screen(), Screen::Pager(p) if p.message.is_none()),
+                "Loading message",
+            ),
+            // A delivery's sign-in retry looks for its compose menu on top.
+            (self.delivering(), "Sending message"),
+            // Opening another folder starts it afresh, without the help.
+            (self.switching.is_some(), "Opening folder"),
+            // A lookup's answer may take its menu away (and bring back the
+            // question it came from): not from under the help.
+            (
+                matches!(self.screens.last(), Some(Screen::Query(menu)) if menu.request.is_some()),
+                "Looking up addresses",
+            ),
+        ];
+        if let Some((_, busy)) = busy.into_iter().find(|(busy, _)| *busy) {
+            self.fail(format!("{busy}; wait a moment."));
             return Vec::new();
         }
         let menu = self.menu();
@@ -293,22 +285,20 @@ impl App {
         self.keymap
             .entries(menu)
             .into_iter()
-            .map(|(key, binding)| match binding {
-                Binding::Action(action) => format!(
-                    "{:<12} {:<20} {}",
-                    key.to_string(),
-                    action.name(),
-                    action.description()
-                ),
-                Binding::Macro {
-                    strokes,
-                    description,
-                } => format!(
-                    "{:<12} {:<20} {}",
-                    key.to_string(),
-                    "macro",
-                    description.clone().unwrap_or_else(|| macro_text(strokes))
-                ),
+            .map(|(key, binding)| {
+                let (name, what): (_, Cow<str>) = match binding {
+                    Binding::Action(action) => (action.name(), action.description().into()),
+                    Binding::Macro {
+                        strokes,
+                        description,
+                    } => (
+                        "macro",
+                        description
+                            .as_deref()
+                            .map_or_else(|| macro_text(strokes).into(), Cow::from),
+                    ),
+                };
+                format!("{:<12} {:<20} {what}", key.to_string(), name)
             })
             .collect()
     }
@@ -344,11 +334,7 @@ impl App {
 
     /// Asks for a mettrc command (`:`).
     pub(super) fn ask_command(&mut self) -> Vec<Effect> {
-        self.input = Some(Input::Line {
-            prompt: ":".to_owned(),
-            editor: LineEditor::new(""),
-            question: Question::Command,
-        });
+        self.ask(Question::Command, ":", "");
         Vec::new()
     }
 
@@ -403,6 +389,16 @@ impl App {
     }
 }
 
+/// Puts `strokes` in front of `queue`, in order.
+fn push_front_all(
+    queue: &mut VecDeque<Stroke>,
+    strokes: impl IntoIterator<Item = Stroke, IntoIter: DoubleEndedIterator>,
+) {
+    for stroke in strokes.into_iter().rev() {
+        queue.push_front(stroke);
+    }
+}
+
 /// A macro's keys, for the help screen when it has no description.
 fn macro_text(strokes: &[Stroke]) -> String {
     strokes
@@ -421,6 +417,7 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
 
     use super::*;
+    use crate::app::composing::Input;
     use crate::config::mailbox::FolderPath;
     use crate::worker::{Event, Response};
 

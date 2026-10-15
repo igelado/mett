@@ -134,10 +134,8 @@ enum Step {
     Include,
     /// Fill in a reply's recipients.
     Recipients,
-    To,
-    Cc,
-    Bcc,
-    Subject,
+    /// Ask for the recipients or the subject.
+    Ask(Question),
     Edit,
 }
 
@@ -306,14 +304,14 @@ impl App {
             _ => {}
         }
         if ask_recipients {
-            steps.push_back(Step::To);
+            steps.push_back(Step::Ask(Question::To));
             if settings.askcc {
-                steps.push_back(Step::Cc);
+                steps.push_back(Step::Ask(Question::Cc));
             }
             if settings.askbcc {
-                steps.push_back(Step::Bcc);
+                steps.push_back(Step::Ask(Question::Bcc));
             }
-            steps.push_back(Step::Subject);
+            steps.push_back(Step::Ask(Question::Subject));
         }
         steps.push_back(Step::Edit);
         self.composing = Some(Composing {
@@ -350,17 +348,11 @@ impl App {
                         continue;
                     }
                     let prompt = format!("Reply to {}?", Address::format_list(&original.reply_to));
-                    match self.decide(self.settings.reply_to, prompt, Question::ReplyTo) {
-                        Some(answer) => self.composing_mut().use_reply_to = answer,
-                        None => return Vec::new(),
-                    }
+                    return self.settle(self.settings.reply_to, prompt, Question::ReplyTo);
                 }
                 Step::Include => {
-                    let prompt = "Include message in reply?".to_owned();
-                    match self.decide(self.settings.include, prompt, Question::Include) {
-                        Some(answer) => self.composing_mut().include = answer,
-                        None => return Vec::new(),
-                    }
+                    let prompt = "Include message in reply?";
+                    return self.settle(self.settings.include, prompt, Question::Include);
                 }
                 Step::Recipients => {
                     if let Some(original) = &composing.original {
@@ -377,18 +369,12 @@ impl App {
                 }
                 // Once the address questions are done, give up on a
                 // message without recipients, as mutt does.
-                Step::Subject | Step::Edit if !composing.draft.has_recipients() => {
+                Step::Ask(Question::Subject) | Step::Edit if !composing.draft.has_recipients() => {
                     return self.abort("No recipients were specified.");
                 }
-                Step::To | Step::Cc | Step::Bcc | Step::Subject => {
-                    let question = match step {
-                        Step::To => Question::To,
-                        Step::Cc => Question::Cc,
-                        Step::Bcc => Question::Bcc,
-                        _ => Question::Subject,
-                    };
+                Step::Ask(question) => {
                     let current = field(&composing.draft, question);
-                    self.ask_line(question, &current);
+                    self.ask_line(question, &current, "");
                     return Vec::new();
                 }
                 Step::Edit => {
@@ -411,23 +397,35 @@ impl App {
         self.composing.as_mut().expect("a message is being set up")
     }
 
-    /// Settles a quad-option: its answer, or `None` if the user is asked.
-    fn decide(&mut self, quad: Quad, prompt: String, question: Question) -> Option<bool> {
+    /// Settles a quad-option: answers `question` as it says, or asks the
+    /// user.
+    fn settle(&mut self, quad: Quad, prompt: impl Into<String>, question: Question) -> Vec<Effect> {
         match quad {
-            Quad::Yes => Some(true),
-            Quad::No => Some(false),
+            Quad::Yes => self.answer(question, true),
+            Quad::No => self.answer(question, false),
             Quad::AskYes | Quad::AskNo => {
                 self.input = Some(Input::YesNo {
-                    prompt,
+                    prompt: prompt.into(),
                     default: quad == Quad::AskYes,
                     question,
                 });
-                None
+                Vec::new()
             }
         }
     }
 
-    fn ask_line(&mut self, question: Question, current: &str) {
+    /// Asks `question` on the message line, with `current` typed.
+    pub(super) fn ask(&mut self, question: Question, prompt: &str, current: &str) {
+        self.input = Some(Input::Line {
+            prompt: prompt.to_owned(),
+            editor: LineEditor::new(current),
+            question,
+        });
+    }
+
+    /// Asks for the recipients or the subject, with `text` typed before
+    /// the cursor and `rest` after it.
+    pub(super) fn ask_line(&mut self, question: Question, text: &str, rest: &str) {
         let prompt = match question {
             Question::To => "To: ",
             Question::Cc => "Cc: ",
@@ -436,7 +434,7 @@ impl App {
         };
         self.input = Some(Input::Line {
             prompt: prompt.to_owned(),
-            editor: LineEditor::new(current),
+            editor: LineEditor::with_cursor(text, rest),
             question,
         });
     }
@@ -555,22 +553,14 @@ impl App {
     }
 
     fn answer_line(&mut self, question: Question, text: String) -> Vec<Effect> {
-        if question.is_mailbox() {
-            return self.answer_mailbox(question, text);
-        }
-        if matches!(question, Question::Search | Question::Limit) {
-            return self.answer_search(question, text);
-        }
-        if question == Question::Command {
-            return self.answer_command(text);
-        }
-        if question == Question::AttachFile {
-            return self.answer_attach_file(text);
-        }
-        if question == Question::SaveAttachment {
-            return self.answer_save_attachment(text);
-        }
         match question {
+            Question::OpenMailbox | Question::SaveTo | Question::CopyTo => {
+                return self.answer_mailbox(question, text);
+            }
+            Question::Search | Question::Limit => return self.answer_search(question, text),
+            Question::Command => return self.answer_command(text),
+            Question::AttachFile => return self.answer_attach_file(text),
+            Question::SaveAttachment => return self.answer_save_attachment(text),
             Question::Query => return self.start_query(&text, super::query::Purpose::Mail),
             Question::AliasName => return self.answer_alias_name(text),
             Question::AliasAddress => return self.answer_alias_address(text),
@@ -591,7 +581,7 @@ impl App {
                         // Ask again, keeping what was typed, and say why on
                         // the line itself, where the question hides the
                         // status.
-                        self.ask_line(question, &text);
+                        self.ask_line(question, &text, "");
                         if let Some(Input::Line { prompt, .. }) = &mut self.input {
                             *prompt = format!("{e}. {prompt}");
                         }
@@ -607,13 +597,8 @@ impl App {
             _ => {
                 draft.subject = text;
                 if setting_up && draft.subject.is_empty() {
-                    let prompt = "No subject, abort?".to_owned();
                     let quad = self.settings.abort_nosubject;
-                    match self.decide(quad, prompt, Question::AbortNoSubject) {
-                        Some(true) => return self.abort("No subject, aborting."),
-                        Some(false) => {}
-                        None => return Vec::new(),
-                    }
+                    return self.settle(quad, "No subject, abort?", Question::AbortNoSubject);
                 }
             }
         }
@@ -686,11 +671,8 @@ impl App {
         if mett_msgraph::needs_server_draft(&compose.draft) || compose.kept_draft {
             return self.answer(Question::Copy, true);
         }
-        let prompt = "Save a copy of this message?".to_owned();
-        match self.decide(self.settings.copy, prompt, Question::Copy) {
-            Some(copy) => self.answer(Question::Copy, copy),
-            None => Vec::new(),
-        }
+        let prompt = "Save a copy of this message?";
+        self.settle(self.settings.copy, prompt, Question::Copy)
     }
 
     /// Deletes what failed attempts to send or postpone `draft` left
@@ -742,13 +724,8 @@ impl App {
         let unmodified = composing.template.as_ref() == Some(&text);
         composing.draft.body = text;
         if unmodified {
-            let prompt = "Abort unmodified message?".to_owned();
             let quad = self.settings.abort_unmodified;
-            match self.decide(quad, prompt, Question::AbortUnmodified) {
-                Some(true) => return self.abort("Aborted unmodified message."),
-                Some(false) => {}
-                None => return Vec::new(),
-            }
+            return self.settle(quad, "Abort unmodified message?", Question::AbortUnmodified);
         }
         self.open_compose_menu()
     }
@@ -789,22 +766,15 @@ impl App {
                 // As in mutt, a subject left out is checked again when
                 // sending (it may have been cleared in the menu).
                 if !subject {
-                    let prompt = "No subject, abort sending?".to_owned();
+                    let prompt = "No subject, abort sending?";
                     let quad = self.settings.abort_nosubject;
-                    return match self.decide(quad, prompt, Question::AbortSendNoSubject) {
-                        Some(answer) => self.answer(Question::AbortSendNoSubject, answer),
-                        None => Vec::new(),
-                    };
+                    return self.settle(quad, prompt, Question::AbortSendNoSubject);
                 }
                 return self.send_or_ask_copy();
             }
             Action::Exit => {
-                let prompt = "Postpone this message?".to_owned();
-                if let Some(postpone) =
-                    self.decide(self.settings.postpone, prompt, Question::Postpone)
-                {
-                    return self.answer(Question::Postpone, postpone);
-                }
+                let prompt = "Postpone this message?";
+                return self.settle(self.settings.postpone, prompt, Question::Postpone);
             }
             Action::PostponeMessage => return self.deliver(Delivery::Postpone),
             Action::EditMessage => return vec![Effect::Edit(draft.body.clone())],
@@ -816,7 +786,7 @@ impl App {
                     _ => Question::Subject,
                 };
                 let current = field(draft, question);
-                self.ask_line(question, &current);
+                self.ask_line(question, &current, "");
             }
             Action::AttachFile => self.ask_attach_file(),
             Action::DetachFile => self.detach_file(),
@@ -988,15 +958,7 @@ impl App {
 
     /// Whether a message is being sent or postponed.
     pub(super) fn delivering(&self) -> bool {
-        self.screens.iter().any(|s| {
-            matches!(
-                s,
-                Screen::Compose(Compose {
-                    delivery: Some(_),
-                    ..
-                })
-            )
-        })
+        self.delivery_request().is_some()
     }
 }
 
