@@ -641,8 +641,13 @@ impl App {
                 }
                 // A lost response doesn't mean nothing happened.
                 self.status = match (delivery, &e) {
-                    (Some(Delivery::Send), mett_core::Error::Network(_)) => format!(
+                    (Some(Delivery::Send), mett_core::Error::Network(_)) if saved_copy => format!(
                         "The message may have been sent ({e}). Check Sent Items before sending it again."
+                    ),
+                    // Without a copy, Sent Items can't tell.
+                    (Some(Delivery::Send), mett_core::Error::Network(_)) => format!(
+                        "The message may have been sent ({e}), without a copy in Sent Items. \
+                         Check with its recipients before sending it again."
                     ),
                     (Some(Delivery::Postpone), mett_core::Error::Network(_)) => format!(
                         "The message may have been saved ({e}). Check Drafts before postponing it again."
@@ -1259,5 +1264,23 @@ mod tests {
             "{}",
             app.status
         );
+    }
+
+    #[test]
+    fn a_lost_send_without_a_copy_says_sent_items_cannot_tell() {
+        let mut app = app(compose::Settings {
+            copy: Quad::No,
+            ..settings()
+        });
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Edited(Ok("text".into())));
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Network("timed out".into()))),
+        }));
+        assert!(app.status.contains("without a copy"), "{}", app.status);
     }
 }
