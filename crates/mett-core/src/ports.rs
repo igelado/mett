@@ -9,6 +9,7 @@ use std::future::Future;
 
 use chrono::{DateTime, TimeDelta, Utc};
 
+use crate::draft::Draft;
 use crate::error::Result;
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{FolderId, MessageId, PageCursor};
@@ -66,6 +67,13 @@ pub struct MessagePage {
 
 /// Access to a mailbox.
 pub trait MailStore: Send + Sync {
+    /// The mailbox owner's own addresses, as far as the backend knows
+    /// them (say, aliases): mail from them is the user's. Backends that
+    /// can't tell return none.
+    fn own_addresses(&self) -> impl Future<Output = Result<Vec<String>>> + Send {
+        std::future::ready(Ok(Vec::new()))
+    }
+
     /// Lists all folders in the mailbox.
     fn list_folders(&self) -> impl Future<Output = Result<Vec<Folder>>> + Send;
 
@@ -103,6 +111,27 @@ pub trait MailStore: Send + Sync {
     /// Deletes a message permanently. To move it to the trash instead, use
     /// [`MailStore::move_message`].
     fn delete_message(&self, id: &MessageId) -> impl Future<Output = Result<()>> + Send;
+
+    /// Saves `draft` in the drafts folder (mutt's `postponed`) and returns
+    /// the saved message's identifier.
+    fn save_draft(&self, draft: &Draft) -> impl Future<Output = Result<MessageId>> + Send;
+}
+
+/// Sends mail.
+pub trait MailSender: Send + Sync {
+    /// Sends `draft`, keeping a copy in the sent-items folder if
+    /// [`Draft::save_copy`] asks for one. (A backend may keep one
+    /// regardless for some messages: Office365 always does for replies and
+    /// forwards.)
+    fn send(&self, draft: &Draft) -> impl Future<Output = Result<()>> + Send;
+
+    /// Deletes what earlier attempts to send or save `draft` (the same
+    /// [`Draft::attempt`]) left behind with the backend, now that the user
+    /// has given up on it. Backends that leave nothing behind do nothing.
+    fn discard_kept(&self, draft: &Draft) -> impl Future<Output = Result<()>> + Send {
+        let _ = draft;
+        std::future::ready(Ok(()))
+    }
 }
 
 /// An OAuth2 access token.

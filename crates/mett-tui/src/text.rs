@@ -13,6 +13,15 @@ use unicode_width::UnicodeWidthStr;
 /// default, a blank line, then the body. They are not wrapped yet; see
 /// [`wrap`].
 pub fn pager_lines(message: &Message) -> Vec<String> {
+    let mut lines = header_lines(message, true);
+    lines.push(String::new());
+    lines.extend(body_lines(&message.body));
+    lines
+}
+
+/// The headers the pager shows. `bcc` includes the `Bcc:` recipients,
+/// which only the sender's copy has and which must not be passed on.
+pub fn header_lines(message: &Message, bcc: bool) -> Vec<String> {
     let addresses = |list: &[Address]| {
         list.iter()
             .map(ToString::to_string)
@@ -36,9 +45,10 @@ pub fn pager_lines(message: &Message) -> Vec<String> {
     if !message.cc.is_empty() {
         lines.push(format!("Cc: {}", addresses(&message.cc)));
     }
+    if bcc && !message.bcc.is_empty() {
+        lines.push(format!("Bcc: {}", addresses(&message.bcc)));
+    }
     lines.push(format!("Subject: {}", summary.subject));
-    lines.push(String::new());
-    lines.extend(body_lines(&message.body));
     lines
 }
 

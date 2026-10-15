@@ -8,13 +8,16 @@ use std::sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
+use crate::draft::{Draft, DraftOrigin};
 use crate::error::{Error, Result};
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{FolderId, MessageId, PageCursor};
 use crate::message::{Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary};
-use crate::ports::{MailStore, MessagePage, Page};
+use crate::ports::{MailSender, MailStore, MessagePage, Page};
 
-/// A [`MailStore`] that keeps everything in memory.
+/// A [`MailStore`] and [`MailSender`] that keeps everything in memory.
+/// Sent drafts are recorded (see [`MemoryStore::sent`]), and copies and
+/// saved drafts land in the well-known sent-items and drafts folders.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     state: Mutex<State>,
@@ -25,6 +28,7 @@ struct State {
     folders: Vec<Folder>,
     messages: Vec<Message>,
     moves: u64,
+    sent: Vec<Draft>,
 }
 
 impl MemoryStore {
@@ -43,6 +47,11 @@ impl MemoryStore {
     pub fn with_message(self, message: Message) -> Self {
         self.state().messages.push(message);
         self
+    }
+
+    /// The drafts sent so far, oldest first.
+    pub fn sent(&self) -> Vec<Draft> {
+        self.state().sent.clone()
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -86,6 +95,51 @@ impl State {
                 return candidate;
             }
         }
+    }
+
+    /// Stores `draft` as a message in the well-known folder `which`.
+    fn store_draft(&mut self, draft: &Draft, which: WellKnownFolder) -> Result<MessageId> {
+        let folder = self
+            .folders
+            .iter()
+            .find(|f| f.well_known == Some(which))
+            .ok_or_else(|| Error::not_found("folder", which))?
+            .id
+            .clone();
+        let id = self.fresh_id(&MessageId::new(which.as_str()));
+        // A forward carries the original's attachments along, as Graph's
+        // createForward does.
+        let has_attachments = match &draft.origin {
+            Some(DraftOrigin::Forward(original)) => self
+                .messages
+                .iter()
+                .any(|m| &m.summary.id == original && m.summary.has_attachments),
+            _ => false,
+        };
+        self.messages.push(Message {
+            summary: MessageSummary {
+                id: id.clone(),
+                folder,
+                subject: draft.subject.clone(),
+                from: draft.from.clone(),
+                to: draft.to.clone(),
+                received: Utc::now(),
+                flags: Flags {
+                    read: true,
+                    flagged: false,
+                },
+                has_attachments,
+            },
+            cc: draft.cc.clone(),
+            bcc: draft.bcc.clone(),
+            reply_to: Vec::new(),
+            internet_message_id: None,
+            body: Body {
+                kind: BodyKind::Text,
+                content: draft.body.clone(),
+            },
+        });
+        Ok(id)
     }
 
     fn message_mut(&mut self, id: &MessageId) -> Result<&mut Message> {
@@ -175,6 +229,24 @@ impl MailStore for MemoryStore {
         }
         Ok(())
     }
+
+    async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
+        self.state().store_draft(draft, WellKnownFolder::Drafts)
+    }
+}
+
+impl MailSender for MemoryStore {
+    async fn send(&self, draft: &Draft) -> Result<()> {
+        if !draft.has_recipients() {
+            return Err(Error::Backend("the message has no recipients".into()));
+        }
+        let mut state = self.state();
+        if draft.save_copy {
+            state.store_draft(draft, WellKnownFolder::SentItems)?;
+        }
+        state.sent.push(draft.clone());
+        Ok(())
+    }
 }
 
 /// Listing order: newest first, with ties broken by ID.
@@ -220,6 +292,8 @@ pub fn message(id: &str, folder: &str, subject: &str, received: DateTime<Utc>) -
             has_attachments: false,
         },
         cc: Vec::new(),
+        bcc: Vec::new(),
+        reply_to: Vec::new(),
         internet_message_id: None,
         body: Body {
             kind: BodyKind::Text,
@@ -249,6 +323,72 @@ mod tests {
 
     fn subjects(page: &MessagePage) -> Vec<&str> {
         page.messages.iter().map(|m| m.subject.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn sends_and_saves_drafts() {
+        let store = store()
+            .with_folder(folder("drafts", "Drafts", Some(WellKnownFolder::Drafts)))
+            .with_folder(folder("sent", "Sent", Some(WellKnownFolder::SentItems)));
+        let draft = Draft {
+            to: vec![crate::Address::new("bob@x.org")],
+            subject: "hi".into(),
+            save_copy: true,
+            ..Draft::default()
+        };
+        store.send(&draft).await.unwrap();
+        assert_eq!(store.sent(), std::slice::from_ref(&draft));
+        let sent = store
+            .list_messages(&FolderId::new("sent"), Page::first(10))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&sent), ["hi"]);
+
+        let id = store.save_draft(&draft).await.unwrap();
+        assert_eq!(
+            store.fetch_message(&id).await.unwrap().summary.folder,
+            FolderId::new("drafts")
+        );
+        assert!(store.send(&Draft::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_forward_keeps_the_original_s_attachments() {
+        let mut original = message("m4", "in", "report", at(4));
+        original.summary.has_attachments = true;
+        let store = store().with_message(original).with_folder(folder(
+            "drafts",
+            "Drafts",
+            Some(WellKnownFolder::Drafts),
+        ));
+        let forward = Draft {
+            to: vec![crate::Address::new("bob@x.org")],
+            subject: "Fwd: report".into(),
+            origin: Some(DraftOrigin::Forward(MessageId::new("m4"))),
+            ..Draft::default()
+        };
+        let id = store.save_draft(&forward).await.unwrap();
+        assert!(
+            store
+                .fetch_message(&id)
+                .await
+                .unwrap()
+                .summary
+                .has_attachments
+        );
+        let reply = Draft {
+            origin: Some(DraftOrigin::Reply(MessageId::new("m4"))),
+            ..forward
+        };
+        let id = store.save_draft(&reply).await.unwrap();
+        assert!(
+            !store
+                .fetch_message(&id)
+                .await
+                .unwrap()
+                .summary
+                .has_attachments
+        );
     }
 
     #[tokio::test]

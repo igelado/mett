@@ -10,7 +10,11 @@ against Microsoft Graph:
   user's mailbox (`/me`). It lists folders and messages (newest first, paged
   by Graph's `@odata.nextLink`), fetches messages (with Graph converting
   HTML bodies to text), updates read and flagged state, moves messages, and
-  deletes them permanently.
+  deletes them permanently. It also implements `MailSender`: new mail goes
+  out with `sendMail`, while replies and forwards are created with
+  `createReply` or `createForward`, filled in and sent, so that Outlook
+  threads them and forwards keep their attachments. Postponed messages are
+  saved as drafts in the Drafts folder.
 
 The configuration it implements (`msgraph_*` variables) is described in
 [docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md) §4.

@@ -3,13 +3,14 @@
 //!
 //! The UI sends [`Request`]s tagged with a [`RequestId`] and receives a
 //! [`Response`] for each, so it can match results and drop stale ones. The
-//! worker is generic over the [`MailStore`] port, so the UI is tested
-//! against the in-memory store.
+//! worker is generic over the [`MailStore`] and [`MailSender`] ports, so
+//! the UI is tested against the in-memory store.
 
 use std::sync::Arc;
 
 use mett_core::{
-    Error, FlagsUpdate, Folder, FolderId, MailStore, Message, MessageId, MessagePage, Page, Result,
+    Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId,
+    MessagePage, Page, Result,
 };
 use tokio::sync::mpsc;
 
@@ -35,6 +36,15 @@ pub enum Request {
     FetchMessage(MessageId),
     /// Change a message's flags.
     UpdateFlags(MessageId, FlagsUpdate),
+    /// Send a message.
+    Send(Draft),
+    /// Save a message in the drafts folder.
+    SaveDraft(Draft),
+    /// Delete what failed attempts to send or save a message the user gave
+    /// up on left behind.
+    DiscardKept(Draft),
+    /// Find the mailbox owner's own addresses.
+    OwnAddresses,
 }
 
 /// The outcome of a [`Request`].
@@ -48,6 +58,14 @@ pub enum Event {
     MessageFetched(Result<Message>),
     /// Outcome of [`Request::UpdateFlags`].
     FlagsUpdated(Result<()>),
+    /// Outcome of [`Request::Send`].
+    Sent(Result<()>),
+    /// Outcome of [`Request::SaveDraft`].
+    DraftSaved(Result<MessageId>),
+    /// Outcome of [`Request::DiscardKept`].
+    KeptDiscarded(Result<()>),
+    /// Outcome of [`Request::OwnAddresses`].
+    OwnAddresses(Result<Vec<String>>),
 }
 
 /// An [`Event`] for the request with `id`.
@@ -61,7 +79,7 @@ pub struct Response {
 
 /// Serves requests until the request channel closes. Each request runs as
 /// its own task, so a slow fetch doesn't hold up the others.
-pub async fn run<S: MailStore + 'static>(
+pub async fn run<S: MailStore + MailSender + 'static>(
     store: Arc<S>,
     mut requests: mpsc::UnboundedReceiver<(RequestId, Request)>,
     responses: mpsc::UnboundedSender<Response>,
@@ -77,7 +95,7 @@ pub async fn run<S: MailStore + 'static>(
     }
 }
 
-async fn serve<S: MailStore>(store: &S, request: Request) -> Event {
+async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event {
     match request {
         Request::OpenFolder(path) => Event::FolderOpened(resolve(store, &path).await),
         Request::ListMessages { folder, page } => {
@@ -87,6 +105,10 @@ async fn serve<S: MailStore>(store: &S, request: Request) -> Event {
         Request::UpdateFlags(id, update) => {
             Event::FlagsUpdated(store.update_flags(&id, update).await)
         }
+        Request::Send(draft) => Event::Sent(store.send(&draft).await),
+        Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
+        Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
+        Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
     }
 }
 

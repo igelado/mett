@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
 use lexer::{Command, Expander, Lexer, Word};
-pub use vars::{Kind, VARS, Value};
+pub use vars::{Kind, Quad, VARS, Value};
 
 /// How deeply `source` may nest, to stop loops.
 const MAX_SOURCE_DEPTH: usize = 16;
@@ -28,7 +28,6 @@ const MAX_SOURCE_DEPTH: usize = 16;
 const NOT_YET_SUPPORTED: &[&str] = &[
     "account-hook",
     "alias",
-    "alternates",
     "alternative_order",
     "append-hook",
     "attachments",
@@ -73,7 +72,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "subjectrx",
     "subscribe",
     "unalias",
-    "unalternates",
     "unalternative_order",
     "unattachments",
     "unauto_view",
@@ -102,6 +100,8 @@ pub struct Config {
     /// Problems that stop the configuration from being used, as
     /// `file:line: message`.
     pub errors: Vec<String>,
+    /// `alternates`: regular expressions for the user's other addresses.
+    alternates: Vec<String>,
     /// Things that were ignored, such as unsupported mutt commands.
     pub warnings: Vec<String>,
     /// Warnings from the command being run, waiting for its location.
@@ -109,6 +109,9 @@ pub struct Config {
     /// Ignored commands and variables already warned about: each is
     /// reported once, where it first appears.
     warned: std::collections::HashSet<String>,
+    /// Variables given a value by `set`, `unset` or `toggle`, as opposed
+    /// to their defaults.
+    assigned: std::collections::HashSet<&'static str>,
     home: Option<String>,
 }
 
@@ -126,9 +129,11 @@ impl Config {
             values: HashMap::new(),
             user: HashMap::new(),
             errors: Vec::new(),
+            alternates: Vec::new(),
             warnings: Vec::new(),
             pending: Vec::new(),
             warned: Default::default(),
+            assigned: Default::default(),
             home,
         };
         for var in VARS {
@@ -142,12 +147,36 @@ impl Config {
         self.values.get(name)
     }
 
+    /// Whether a known variable was given a value by the configuration,
+    /// rather than left at (or reset to) its default.
+    pub fn was_set(&self, name: &str) -> bool {
+        self.assigned.contains(name)
+    }
+
     /// The value of a known string or path variable, or `""`.
     pub fn string(&self, name: &str) -> &str {
         match self.get(name) {
             Some(Value::Str(s)) => s,
             _ => "",
         }
+    }
+
+    /// The value of a known boolean variable.
+    pub fn flag(&self, name: &str) -> bool {
+        self.get(name) == Some(&Value::Bool(true))
+    }
+
+    /// The value of a known quad-option, or `no`.
+    pub fn quad(&self, name: &str) -> Quad {
+        match self.get(name) {
+            Some(Value::Quad(q)) => *q,
+            _ => Quad::No,
+        }
+    }
+
+    /// The user's other addresses, as regular expressions (`alternates`).
+    pub fn alternates(&self) -> &[String] {
+        &self.alternates
     }
 
     /// Reads and runs the mettrc at `path`.
@@ -239,6 +268,26 @@ impl Config {
                 "unset" => self.each(args, |c, name| c.unset(name)),
                 "toggle" => self.each(args, |c, name| c.toggle(name)),
                 "reset" => self.each(args, |c, name| c.reset_named(name)),
+                "alternates" => self.patterns(args).and_then(|regexes| {
+                    for regex in regexes {
+                        regex::Regex::new(&regex).map_err(|e| {
+                            format!("alternates: bad regular expression {regex:?}: {e}")
+                        })?;
+                        if !self.alternates.contains(&regex) {
+                            self.alternates.push(regex);
+                        }
+                    }
+                    Ok(())
+                }),
+                "unalternates" => self.patterns(args).map(|regexes| {
+                    for regex in regexes {
+                        if regex == "*" {
+                            self.alternates.clear();
+                        } else {
+                            self.alternates.retain(|a| *a != regex);
+                        }
+                    }
+                }),
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
                         let path = self.resolve_source(&path, origin.file);
@@ -275,6 +324,22 @@ impl Config {
     }
 
     /// Expands a word now, with the values set so far.
+    /// The expanded patterns of `alternates`-like commands, leaving out
+    /// `-group NAME` (mett has no address groups yet).
+    fn patterns(&self, args: &[Word]) -> Result<Vec<String>, String> {
+        let mut patterns = Vec::new();
+        let mut words = args.iter();
+        while let Some(word) = words.next() {
+            let word = self.expand(word)?;
+            if word == "-group" {
+                words.next();
+            } else {
+                patterns.push(word);
+            }
+        }
+        Ok(patterns)
+    }
+
     fn expand(&self, word: &Word) -> Result<String, String> {
         word.expand(&Expand { config: self })
     }
@@ -345,6 +410,12 @@ impl Config {
             match vars::find(arg) {
                 Some(var) if var.kind == Kind::Bool => {
                     self.values.insert(var.name, Value::Bool(true));
+                    self.assigned.insert(var.name);
+                    Ok(())
+                }
+                Some(var) if var.kind == Kind::Quad => {
+                    self.values.insert(var.name, Value::Quad(Quad::Yes));
+                    self.assigned.insert(var.name);
                     Ok(())
                 }
                 Some(var) => Err(format!("{}: needs a value", var.name)),
@@ -367,6 +438,7 @@ impl Config {
         let value = self.expand(value)?;
         let value = vars::parse(var, &value, self.home.as_deref())?;
         self.values.insert(var.name, value);
+        self.assigned.insert(var.name);
         Ok(())
     }
 
@@ -380,10 +452,12 @@ impl Config {
         };
         let value = match var.kind {
             Kind::Bool => Value::Bool(false),
+            Kind::Quad => Value::Quad(Quad::No),
             Kind::Number => Value::Number(0),
             Kind::String | Kind::Path => Value::Str(String::new()),
         };
         self.values.insert(var.name, value);
+        self.assigned.insert(var.name);
         Ok(())
     }
 
@@ -392,9 +466,19 @@ impl Config {
             Some(var) if var.kind == Kind::Bool => {
                 let current = self.values.get(var.name) == Some(&Value::Bool(true));
                 self.values.insert(var.name, Value::Bool(!current));
+                self.assigned.insert(var.name);
                 Ok(())
             }
-            Some(var) => Err(format!("{}: only booleans can be toggled", var.name)),
+            Some(var) if var.kind == Kind::Quad => {
+                let current = self.quad(var.name);
+                self.values.insert(var.name, Value::Quad(current.toggled()));
+                self.assigned.insert(var.name);
+                Ok(())
+            }
+            Some(var) => Err(format!(
+                "{}: only booleans and quad-options can be toggled",
+                var.name
+            )),
             None => self.unknown_variable(name),
         }
     }
@@ -424,6 +508,7 @@ impl Config {
         let value =
             vars::parse(var, var.default, self.home.as_deref()).expect("defaults are valid");
         self.values.insert(var.name, value);
+        self.assigned.remove(var.name);
     }
 
     /// Unknown variables are reported, but don't stop the configuration
@@ -463,8 +548,10 @@ impl Config {
     }
 }
 
+/// Whether `name` takes the `no` and `inv` prefixes: booleans and
+/// quad-options do.
 fn is_bool(name: &str) -> bool {
-    vars::find(name).is_some_and(|v| v.kind == Kind::Bool)
+    vars::find(name).is_some_and(|v| matches!(v.kind, Kind::Bool | Kind::Quad))
 }
 
 /// Expansion for the lexer: configuration variables first, then the
@@ -748,6 +835,19 @@ mod tests {
         // The dump reads back to the same settings.
         let again = load(&dump.join("\n"));
         assert_eq!(again.dump(), dump);
+    }
+
+    #[test]
+    fn sets_unsets_and_toggles_quad_options() {
+        let config = load("set include=ask-no\nset copy\nunset postpone\ntoggle reply_to\n");
+        assert_eq!(config.quad("include"), Quad::AskNo);
+        assert_eq!(config.quad("copy"), Quad::Yes);
+        assert_eq!(config.quad("postpone"), Quad::No);
+        assert_eq!(config.quad("reply_to"), Quad::AskNo);
+        let config = load("set noabort_unmodified invabort_nosubject\n");
+        assert_eq!(config.quad("abort_unmodified"), Quad::No);
+        assert_eq!(config.quad("abort_nosubject"), Quad::AskNo);
+        assert!(load("set include=maybe\n").errors.len() == 1);
     }
 
     #[test]

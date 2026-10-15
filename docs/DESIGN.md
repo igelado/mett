@@ -51,7 +51,7 @@ I/O and talks to the UI over channels.
 │  Async worker (actor): owns network + cache    │
 ├────────────────────────────────────────────────┤
 │  mett-core: domain model + ports (traits)      │
-│  MailStore, Authenticator, Sender, Renderer…   │
+│  MailStore, Authenticator, MailSender, …       │
 ├───────────────┬──────────────┬─────────────────┤
 │ mett-msgraph  │ cache crate¹ │ mock (tests)    │
 └───────────────┴──────────────┴─────────────────┘
@@ -87,8 +87,9 @@ together at startup, acting as the composition root.
 the application depends on, for example:
 
 - `MailStore`: list folders, list and fetch messages, move, delete and flag
-  them.
-- `Sender`: submit an outgoing message.
+  them, and save drafts.
+- `MailSender`: send an outgoing message (a `Draft`, which may reply to or
+  forward another message).
 - `Authenticator`: obtain and refresh access tokens.
 - `Renderer`: turn a message body (for example HTML) into terminal text.
 
@@ -208,6 +209,14 @@ Each screen has its own keymap, its own `update` logic and its own `view`.
     needs a clear owner.
 - **Mitigation:** shared state lives in the `App` model. Screens hold only
   state local to them.
+
+Questions on the message line (`To:`, `Postpone this message?`) are not
+screens: they sit over the current screen, as `App::input`, and take keys
+as typed rather than through the key bindings. Writing a message is a
+short sequence of such questions (`app/composing.rs`), then the external
+editor, then the compose screen. The editor is an `Effect`: the main loop
+hands the terminal over to it, pausing the thread that reads input, and
+sends the edited text back as a `Msg`, so the app itself does no I/O.
 
 ### 5.7 Strategy pattern for pluggable behaviour
 

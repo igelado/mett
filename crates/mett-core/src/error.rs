@@ -37,6 +37,13 @@ pub enum Error {
     #[error("network error: {0}")]
     Network(String),
 
+    /// A message wasn't sent: the backend could not be reached while it
+    /// was being prepared, before it was handed over. (A lost response to
+    /// the hand-over itself is a [`Error::Network`]: the message may have
+    /// gone out.)
+    #[error("not sent: {0}")]
+    NotSent(String),
+
     /// The backend returned an error not covered by another variant.
     #[error("backend error: {0}")]
     Backend(String),

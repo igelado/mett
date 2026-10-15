@@ -8,9 +8,12 @@
 mod account;
 mod action;
 mod app;
+mod compose;
 mod config;
 mod demo;
+mod editor;
 mod keymap;
+mod lineedit;
 mod signin;
 mod text;
 mod view;
@@ -23,8 +26,9 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyEventKind};
 use tokio::sync::mpsc;
 
-use crate::app::{App, Effect, Msg};
+use crate::app::{App, Effect, Msg, Settings};
 use crate::config::mailbox::FolderPath;
+use crate::editor::Editor;
 use crate::keymap::{Key, Keymap};
 use crate::signin::{CancelHandle, SignInEvent, TuiPrompter};
 use crate::worker::{Request, RequestId};
@@ -113,6 +117,16 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let compose = match compose::Settings::from_config(&config, &spoolfile.account) {
+            Ok(compose) => compose,
+            Err(e) => {
+                eprintln!("mett: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let editor = Editor::new(config.string("editor"), config.string("tmpdir"), &|name| {
+            std::env::var(name).ok()
+        });
         let page_size = match config.get("msgraph_page_size") {
             Some(config::Value::Number(n)) if *n > 0 => match u32::try_from(*n) {
                 Ok(size) => size,
@@ -142,7 +156,8 @@ fn main() -> ExitCode {
         };
         let session = Session {
             folder: spoolfile.folder,
-            page_size,
+            settings: Settings { page_size, compose },
+            editor,
             sign_in,
             cancel: Some(cancel),
         };
@@ -156,7 +171,8 @@ fn main() -> ExitCode {
     let (_, sign_in) = mpsc::unbounded_channel();
     let session = Session {
         folder: FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new()),
-        page_size: app::PAGE_SIZE,
+        settings: demo::settings(),
+        editor: Editor::new("", "", &|name| std::env::var(name).ok()),
         sign_in,
         cancel: None,
     };
@@ -167,8 +183,10 @@ fn main() -> ExitCode {
 struct Session {
     /// The folder to open.
     folder: FolderPath,
-    /// How many messages to list per request.
-    page_size: u32,
+    /// The app's settings.
+    settings: Settings,
+    /// The editor for writing messages.
+    editor: Editor,
     /// Events from the mailbox's sign-in.
     sign_in: mpsc::UnboundedReceiver<SignInEvent>,
     /// Cancels the sign-in in progress, for mailboxes that sign in.
@@ -186,7 +204,7 @@ fn runtime() -> Option<tokio::runtime::Runtime> {
 }
 
 /// Runs the TUI on `store`.
-fn start<S: mett_core::MailStore + 'static>(
+fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     runtime: &tokio::runtime::Runtime,
     store: Arc<S>,
     session: Session,
@@ -204,14 +222,15 @@ fn start<S: mett_core::MailStore + 'static>(
     }
 }
 
-async fn run<S: mett_core::MailStore + 'static>(
+async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     mut terminal: DefaultTerminal,
     store: Arc<S>,
     session: Session,
 ) -> std::io::Result<()> {
     let Session {
         folder,
-        page_size,
+        settings,
+        editor,
         sign_in: mut sign_in_rx,
         cancel,
     } = session;
@@ -221,24 +240,26 @@ async fn run<S: mett_core::MailStore + 'static>(
     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
     tokio::spawn(worker::run(store, request_rx, response_tx));
 
-    // Terminal input is read on a plain thread, since crossterm's reads
-    // block, and forwarded to the async loop.
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        loop {
-            let event = event::read();
-            let failed = event.is_err();
-            if input_tx.send(event).is_err() || failed {
-                break;
-            }
-        }
-    });
+    let (input, mut input_rx) = Input::start();
+    let (timer_tx, mut timer_rx) = mpsc::unbounded_channel();
 
     let size = terminal.size()?;
-    let (mut app, effects) = App::open(size.width, size.height, folder, page_size);
-    dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+    let (mut app, effects) = App::open(size.width, size.height, folder, settings);
+    let mut edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
 
     while !app.quit {
+        // The editor runs between messages, with the terminal handed over.
+        while let Some(text) = edit.take() {
+            let result = input.suspended(&mut terminal, &mut input_rx, || editor.edit(&text))?;
+            // The terminal may have been resized meanwhile.
+            let size = terminal.size()?;
+            app.update(Msg::Resize {
+                width: size.width,
+                height: size.height,
+            });
+            let effects = app.update(Msg::Edited(result));
+            edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
+        }
         draw(&mut terminal, &app, &keymap)?;
         let msg = tokio::select! {
             // Without input mett can't be used or quit, so a terminal read
@@ -247,6 +268,9 @@ async fn run<S: mett_core::MailStore + 'static>(
                 None => return Err(std::io::Error::other("terminal input closed")),
                 Some(event) => match event {
                 // Repeats too, so holding a key keeps moving.
+                // A question on the message line takes keys as typed.
+                TermEvent::Key(key) if key.kind != KeyEventKind::Release
+                    && app.input.is_some() && app.sign_in.is_none() => Msg::Key(key),
                 TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
                     match keymap.lookup(app.menu(), Key::from(key)) {
                         Some(action) => Msg::Action(action),
@@ -263,6 +287,7 @@ async fn run<S: mett_core::MailStore + 'static>(
             },
             Some(response) = response_rx.recv() => Msg::Response(response),
             Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
+            Some(timer) = timer_rx.recv() => Msg::Timer(timer),
             else => break,
         };
         if matches!(msg, Msg::Action(_)) {
@@ -270,7 +295,7 @@ async fn run<S: mett_core::MailStore + 'static>(
             app.status.clear();
         }
         let effects = app.update(msg);
-        dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+        edit = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
     }
 
     // Give pending changes (such as marking a message read) a moment to
@@ -289,7 +314,7 @@ async fn run<S: mett_core::MailStore + 'static>(
             continue;
         }
         let effects = app.update(Msg::SignIn(event));
-        dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+        dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
     }
     let unsaved = !app.save_failures().is_empty();
     if app.saving() || (unsaved && app.sign_in.is_some()) {
@@ -301,7 +326,7 @@ async fn run<S: mett_core::MailStore + 'static>(
             // save can be retried even after nothing is left pending.
             while let Ok(event) = sign_in_rx.try_recv() {
                 let effects = app.update(Msg::SignIn(event));
-                dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+                dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
             }
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
@@ -332,7 +357,15 @@ async fn run<S: mett_core::MailStore + 'static>(
                     // Only save results matter now. Anything else (say, a
                     // late message fetch) could start new work that would
                     // never be sent.
-                    Some(response) if matches!(response.event, worker::Event::FlagsUpdated(_)) => {
+                    Some(response)
+                        if matches!(
+                            response.event,
+                            worker::Event::FlagsUpdated(_)
+                                | worker::Event::Sent(_)
+                                | worker::Event::DraftSaved(_)
+                                | worker::Event::KeptDiscarded(_)
+                        ) =>
+                    {
                         Msg::Response(response)
                     }
                     Some(_) => continue,
@@ -345,7 +378,8 @@ async fn run<S: mett_core::MailStore + 'static>(
             };
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
-            dispatch(&mut app, &request_tx, cancel.as_ref(), effects);
+            // Nothing is edited any more.
+            let _ = dispatch(&mut app, &request_tx, &timer_tx, cancel.as_ref(), effects);
             // The wait starts again once the user is done signing in.
             if window_was_open || app.sign_in.is_some() {
                 deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
@@ -406,13 +440,16 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 /// How long to wait for pending changes when quitting.
 const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Carries out `effects`.
+/// Carries out `effects`, except editing, which needs the terminal: the
+/// text to edit, if any, is returned.
 fn dispatch(
     app: &mut App,
     requests: &mpsc::UnboundedSender<(RequestId, Request)>,
+    timers: &mpsc::UnboundedSender<app::Timer>,
     cancel: Option<&CancelHandle>,
     effects: Vec<Effect>,
-) {
+) -> Option<String> {
+    let mut edit = None;
     for effect in effects {
         match effect {
             Effect::Request(id, request) => {
@@ -436,6 +473,117 @@ fn dispatch(
                     app.status = format!("Could not copy: {e}");
                 }
             }
+            Effect::Edit(text) => edit = Some(text),
+            Effect::Later(after, timer) => {
+                let timers = timers.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    // The app may have quit; nothing to do then.
+                    let _ = timers.send(timer);
+                });
+            }
+        }
+    }
+    edit
+}
+
+/// The thread that reads terminal input. crossterm's reads block, so they
+/// happen on a plain thread and are forwarded to the async loop. The
+/// thread can be paused, so that it doesn't take keys meant for the
+/// editor.
+struct Input {
+    control: std::sync::mpsc::Sender<Pause>,
+}
+
+/// A request to stop reading input: the thread acknowledges it, then waits
+/// until `resume` is dropped.
+struct Pause {
+    paused: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+type InputEvents = mpsc::UnboundedReceiver<std::io::Result<TermEvent>>;
+
+impl Input {
+    /// How long a read waits before checking for a pause.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn start() -> (Self, InputEvents) {
+        let (events, received) = mpsc::unbounded_channel();
+        let (control, pauses) = std::sync::mpsc::channel::<Pause>();
+        std::thread::spawn(move || {
+            loop {
+                match pauses.try_recv() {
+                    Ok(pause) => {
+                        let _ = pause.paused.send(());
+                        // Returns once the sender is dropped.
+                        let _ = pause.resume.recv();
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+                let event = match event::poll(Self::POLL) {
+                    Ok(false) => continue,
+                    Ok(true) => event::read(),
+                    Err(e) => Err(e),
+                };
+                let failed = event.is_err();
+                if events.send(event).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        (Self { control }, received)
+    }
+
+    /// Runs `f` with the terminal restored to normal and input reading
+    /// paused, then takes the terminal back.
+    ///
+    /// Input that arrived before the pause is dropped: keys typed ahead
+    /// while the editor was starting are not meant for mett (a stray `y`
+    /// could send the message).
+    fn suspended<T>(
+        &self,
+        terminal: &mut DefaultTerminal,
+        events: &mut InputEvents,
+        f: impl FnOnce() -> T,
+    ) -> std::io::Result<T> {
+        let (paused, acknowledged) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel::<()>();
+        let result = tokio::task::block_in_place(|| {
+            if self
+                .control
+                .send(Pause {
+                    paused,
+                    resume: resumed,
+                })
+                .is_ok()
+            {
+                // The thread is between reads once it answers.
+                let _ = acknowledged.recv();
+            }
+            while events.try_recv().is_ok() {}
+            ratatui::restore();
+            let result = f();
+            // Take the terminal back while still paused, and drop what was
+            // typed as the editor exited: a key read after the compose
+            // menu is up would act on it (a stray `y` could send the
+            // message).
+            *terminal = ratatui::init();
+            discard_pending_input();
+            drop(resume);
+            result
+        });
+        terminal.clear()?;
+        Ok(result)
+    }
+}
+
+/// Reads and drops the terminal input that is already waiting.
+fn discard_pending_input() {
+    while matches!(event::poll(std::time::Duration::ZERO), Ok(true)) {
+        if event::read().is_err() {
+            break;
         }
     }
 }

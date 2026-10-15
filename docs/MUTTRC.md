@@ -85,7 +85,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `realname` | string | Display name for outgoing mail. |
 | | `use_from` | boolean | Generate the `From:` header. |
 | | `hostname` | string | Fully qualified host name, used for Message-IDs. |
-| | `signature` | path | Signature file. |
+| | `signature` | path | Signature file. Left unset, the default `~/.signature` may be missing; a file set in the mettrc (even that one) must exist. |
 | Mailboxes | `folder` | path | Base of the mailbox tree, often an `imaps://` URL. Default `~/Mail`. |
 | | `spoolfile` | path | Incoming mailbox, opened at startup. |
 | | `record` | path | Where copies of sent mail are saved. |
@@ -104,8 +104,17 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `ssl_force_tls` | boolean | Require encrypted connections. |
 | Caching | `header_cache` | path | Header cache database. |
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
-| Behaviour | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then `vi`. |
-| | `mail_check` | number | Seconds between new-mail checks. |
+| Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then `vi`. |
+| | `include` | quadoption | Quote the message in replies. |
+| | `attribution`, `indent_string` | string | The line before quoted text (`On %d, %n wrote:`), and the prefix of quoted lines (`> `). |
+| | `forward_format` | string | Subject of forwarded messages (`[%a: %s]`). |
+| | `reply_to` | quadoption | Reply to the `Reply-To:` address rather than the sender. (Not asked for one's own messages, whose replies go to their recipients.) |
+| | `fast_reply`, `askcc`, `askbcc` | boolean | Skip the recipient and subject questions when replying; ask for `Cc:` and `Bcc:`. |
+| | `metoo` | boolean | Keep one's own address in group replies. (A reply to one's own message goes to its other recipients, or to its one `Bcc:` recipient; several `Bcc:` recipients are never shown to each other.) |
+| | `sig_dashes` | boolean | Put `-- ` before the signature. |
+| | `abort_unmodified`, `abort_nosubject`, `postpone` | quadoption | Abort an unedited message or one without subject (asked again when sending without one, as in mutt); postpone when leaving the compose menu. |
+| | `tmpdir` | path | Where the editor's temporary files go. |
+| Behaviour | `mail_check` | number | Seconds between new-mail checks. |
 | | `timeout` | number | Seconds to wait for input before checking mail. |
 | | `sort`, `sort_aux` | sort order | Index sorting. |
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |
@@ -152,6 +161,10 @@ ungroup       [-group name] [ * | [-rx EXPR ...] [-addr address ...] ]
 alternates    [-group name] regexp [ ... ]
 unalternates  [ * | regexp ... ]
 ```
+
+Besides `from` and `alternates`, mett counts as the user's own the
+addresses the mailbox reports (with Office365: the account's mail address,
+sign-in name and aliases).
 
 ### 4.4 Key bindings and macros
 

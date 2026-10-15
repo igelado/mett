@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{
-    AccessToken, Authenticator, BodyKind, Error, FlagsUpdate, FolderId, MailStore, MessageId, Page,
-    PageCursor, WellKnownFolder,
+    AccessToken, Address, Authenticator, BodyKind, Draft, DraftOrigin, Error, FlagsUpdate,
+    FolderId, MailSender, MailStore, MessageId, Page, PageCursor, WellKnownFolder,
 };
 use mett_msgraph::{AuthSettings, GraphMailStore};
 use serde_json::{Value, json};
@@ -302,6 +302,7 @@ async fn fetches_a_message_as_text() {
     let mut body = message("m1", "2026-10-13T10:00:00Z");
     body["ccRecipients"] =
         json!([{ "emailAddress": { "name": "Carol", "address": "carol@contoso.com" } }]);
+    body["replyTo"] = json!([{ "emailAddress": { "address": "list@contoso.com" } }]);
     body["internetMessageId"] = json!("<abc@contoso.com>");
     body["body"] = json!({ "contentType": "text", "content": "Hello" });
     Mock::given(method("GET"))
@@ -318,6 +319,7 @@ async fn fetches_a_message_as_text() {
     assert_eq!(message.body.kind, BodyKind::Text);
     assert_eq!(message.body.content, "Hello");
     assert_eq!(message.cc[0].to_string(), "Carol <carol@contoso.com>");
+    assert_eq!(message.reply_to, [Address::new("list@contoso.com")]);
     assert_eq!(
         message.internet_message_id.as_deref(),
         Some("<abc@contoso.com>")
@@ -839,4 +841,509 @@ impl Authenticator for Recording {
             self.inner.token_rejected(token).await;
         }
     }
+}
+
+fn draft(origin: Option<DraftOrigin>) -> Draft {
+    Draft {
+        to: vec![Address::new("bob@fabrikam.com").with_name("Bob")],
+        cc: vec![Address::new("carol@fabrikam.com")],
+        subject: "Hello".into(),
+        body: "Hi Bob\n".into(),
+        origin,
+        save_copy: true,
+        ..Draft::default()
+    }
+}
+
+/// The Graph `message` that [`draft`] becomes.
+fn draft_json() -> Value {
+    json!({
+        "subject": "Hello",
+        "body": { "contentType": "Text", "content": "Hi Bob\n" },
+        "toRecipients": [{ "emailAddress": { "address": "bob@fabrikam.com", "name": "Bob" } }],
+        "ccRecipients": [{ "emailAddress": { "address": "carol@fabrikam.com" } }],
+        "bccRecipients": [],
+    })
+}
+
+#[tokio::test]
+async fn sends_new_mail_with_send_mail() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/sendMail"))
+        .and(body_json(
+            json!({ "message": draft_json(), "saveToSentItems": true }),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server).send(&draft(None)).await.unwrap();
+}
+
+#[tokio::test]
+async fn sends_replies_through_a_server_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .and(body_json(draft_json()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store(&server).send(&reply).await.unwrap();
+}
+
+#[tokio::test]
+async fn discards_the_server_draft_when_sending_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createForward"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": { "code": "ErrorInvalidRecipients", "message": "bad recipient" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let forward = draft(Some(DraftOrigin::Forward(MessageId::new("orig"))));
+    let err = store(&server).send(&forward).await.unwrap_err();
+    assert!(matches!(err, Error::Backend(m) if m.contains("bad recipient")));
+}
+
+#[tokio::test]
+async fn saves_drafts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages"))
+        .and(body_json(draft_json()))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "new" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "reply" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/reply"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "reply" })))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    assert_eq!(
+        store.save_draft(&draft(None)).await.unwrap(),
+        MessageId::new("new")
+    );
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    assert_eq!(
+        store.save_draft(&reply).await.unwrap(),
+        MessageId::new("reply")
+    );
+}
+
+#[tokio::test]
+async fn keeps_the_server_draft_when_the_send_outcome_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store(&server).send(&reply).await.unwrap_err();
+    assert!(matches!(err, Error::Network(m) if m.contains("in Drafts")));
+}
+
+#[tokio::test]
+async fn postponing_after_an_unknown_send_outcome_reuses_the_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
+    assert_eq!(
+        store.save_draft(&reply).await.unwrap(),
+        MessageId::new("d1")
+    );
+}
+
+#[tokio::test]
+async fn keeps_the_server_draft_when_its_update_outcome_is_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createForward"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let forward = draft(Some(DraftOrigin::Forward(MessageId::new("orig"))));
+    let err = store.save_draft(&forward).await.unwrap_err();
+    assert!(matches!(err, Error::Network(_)), "{err:?}");
+    // Trying again updates the same draft.
+    store.save_draft(&forward).await.unwrap_err();
+}
+
+#[tokio::test]
+async fn a_kept_draft_that_is_gone_is_made_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "ErrorItemNotFound", "message": "gone" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
+    assert_eq!(
+        store.save_draft(&reply).await.unwrap(),
+        MessageId::new("d2")
+    );
+}
+
+#[tokio::test]
+async fn a_failure_before_sending_is_not_sent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store(&server).send(&reply).await.unwrap_err();
+    assert!(matches!(err, Error::NotSent(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn another_reply_to_the_same_message_gets_its_own_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d2" })))
+        .mount(&server)
+        .await;
+    for id in ["d1", "d2"] {
+        Mock::given(method("PATCH"))
+            .and(path(format!("/v1.0/me/messages/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": id })))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let first = Draft {
+        attempt: 1,
+        ..draft(Some(DraftOrigin::Reply(MessageId::new("orig"))))
+    };
+    store.send(&first).await.unwrap_err();
+    let second = Draft {
+        attempt: 2,
+        ..first.clone()
+    };
+    assert_eq!(
+        store.save_draft(&second).await.unwrap(),
+        MessageId::new("d2")
+    );
+    // The first is still kept for its own message.
+    assert_eq!(
+        store.save_draft(&first).await.unwrap(),
+        MessageId::new("d1")
+    );
+}
+
+#[tokio::test]
+async fn a_draft_that_cannot_be_deleted_is_kept_for_the_next_attempt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let denied = || {
+        ResponseTemplate::new(403).set_body_json(json!({
+            "error": { "code": "ErrorAccessDenied", "message": "denied" }
+        }))
+    };
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(denied())
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+        .respond_with(denied())
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.save_draft(&reply).await.unwrap_err();
+    // Trying again updates that draft rather than making another.
+    store.save_draft(&reply).await.unwrap_err();
+}
+
+/// An authenticator that can't reach the identity platform.
+struct OfflineAuth;
+
+impl Authenticator for OfflineAuth {
+    async fn access_token(&self) -> mett_core::Result<AccessToken> {
+        Err(Error::Network("identity platform unreachable".into()))
+    }
+}
+
+#[tokio::test]
+async fn failing_to_get_a_token_leaves_mail_unsent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let settings = AuthSettings {
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(OfflineAuth));
+    let err = store.send(&draft(None)).await.unwrap_err();
+    assert!(matches!(err, Error::NotSent(_)), "{err:?}");
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store.send(&reply).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::NotSent(m) if !m.contains("Drafts")),
+        "nothing reached Graph: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_create_reply_response_may_leave_a_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    let err = store(&server).send(&reply).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::NotSent(m) if m.contains("may be left in Drafts")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn giving_up_deletes_the_kept_draft() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/permanentDelete"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
+    store.discard_kept(&reply).await.unwrap();
+    // Nothing kept any more.
+    store.discard_kept(&reply).await.unwrap();
+}
+
+#[tokio::test]
+async fn national_clouds_delete_drafts_into_deleted_items() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/orig/createReply"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "d1" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": { "code": "ErrorInvalidRecipients", "message": "bad recipient" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1.0/me/messages/d1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let settings = AuthSettings {
+        cloud: mett_msgraph::Cloud::UsGov,
+        graph_url: Some(Url::parse(&server.uri()).unwrap()),
+        ..AuthSettings::new("alice@contoso.com".into(), "client")
+    };
+    let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth));
+    let reply = draft(Some(DraftOrigin::Reply(MessageId::new("orig"))));
+    store.send(&reply).await.unwrap_err();
+}
+
+#[tokio::test]
+async fn finds_the_users_own_addresses() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me"))
+        .and(query_param(
+            "$select",
+            "mail,userPrincipalName,proxyAddresses",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "mail": "Alice.Smith@contoso.com",
+            "userPrincipalName": "asmith@contoso.onmicrosoft.com",
+            "proxyAddresses": [
+                "SMTP:Alice.Smith@contoso.com",
+                "smtp:alice@contoso.com",
+                "x500:/o=ExchangeLabs/cn=Recipients/cn=alice",
+            ],
+        })))
+        .mount(&server)
+        .await;
+    let addresses = store(&server).own_addresses().await.unwrap();
+    assert_eq!(
+        addresses,
+        [
+            "Alice.Smith@contoso.com",
+            "asmith@contoso.onmicrosoft.com",
+            "Alice.Smith@contoso.com",
+            "alice@contoso.com",
+        ]
+    );
 }

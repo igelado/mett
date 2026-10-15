@@ -5,12 +5,18 @@
 //! to a [`Msg`]; side effects come back as [`Effect`]s for the main loop to
 //! carry out. This keeps the UI logic testable without a terminal.
 
+mod composing;
+
 use std::collections::{HashMap, HashSet};
 
 use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 use mett_msgraph::SignInPrompt;
+use ratatui::crossterm::event::KeyEvent;
 
+use self::composing::Composing;
+pub use self::composing::{Compose, Input};
 use crate::action::Action;
+use crate::compose::Kind;
 use crate::config::mailbox::FolderPath;
 use crate::keymap::Menu;
 use crate::signin::SignInEvent;
@@ -32,6 +38,24 @@ enum Target {
 /// Rows used by the help line, the status bar and the message line.
 const CHROME_ROWS: usize = 3;
 
+/// What the app needs from the configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// How many messages to request per page.
+    pub page_size: u32,
+    /// How to write messages.
+    pub compose: crate::compose::Settings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            page_size: PAGE_SIZE,
+            compose: crate::compose::Settings::default(),
+        }
+    }
+}
+
 /// Input to [`App::update`].
 // Messages are handled one at a time, so their size doesn't matter.
 #[allow(clippy::large_enum_variant)]
@@ -43,6 +67,13 @@ pub enum Msg {
     Response(Response),
     /// The authenticator needs the user, or finished signing in.
     SignIn(SignInEvent),
+    /// A key press while a question is on the message line, which takes
+    /// keys as typed rather than through the key bindings.
+    Key(KeyEvent),
+    /// The editor finished: the edited text, or why it failed.
+    Edited(Result<String, String>),
+    /// A timer the app set went off.
+    Timer(Timer),
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -53,6 +84,8 @@ pub enum Msg {
 }
 
 /// A side effect for the main loop to carry out.
+// Effects are handed over as soon as they are made.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Send `Request` to the worker.
@@ -63,6 +96,19 @@ pub enum Effect {
     CancelSignIn,
     /// Put the text on the clipboard, through the terminal.
     Copy(String),
+    /// Edit the text in the user's editor, then send back
+    /// [`Msg::Edited`].
+    Edit(String),
+    /// Send back [`Msg::Timer`] after a while.
+    Later(std::time::Duration, Timer),
+}
+
+/// Something the app does after a while.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Timer {
+    /// List Sent Items again, if it is open: Graph files the copy of a
+    /// sent message a moment after accepting it.
+    RelistSentItems,
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -74,6 +120,8 @@ pub enum Screen {
     Index,
     /// The pager, showing one message.
     Pager(Pager),
+    /// The compose menu, for a message about to be sent.
+    Compose(Compose),
 }
 
 /// Pager state.
@@ -217,6 +265,38 @@ pub struct App {
     /// late, from requests that were waiting on the same sign-in, aren't
     /// shown either. Cleared by the next prompt or the user's next action.
     dismissed: bool,
+    /// The question on the message line, if any.
+    pub input: Option<Input>,
+    /// A message being set up for the compose menu.
+    composing: Option<Composing>,
+    /// The request fetching a message to reply to or forward.
+    compose_fetch: Option<(RequestId, Kind, MessageId)>,
+    /// The reply or forward whose message couldn't be fetched for want of
+    /// a sign-in, to start again on Retry.
+    compose_unfetched: Option<(MessageId, Kind)>,
+    /// How to write messages.
+    settings: crate::compose::Settings,
+    /// The open folder gained a message while a pager was open: list it
+    /// again once back in the index.
+    relist_on_return: bool,
+    /// The message selected before the folder was listed again in the
+    /// background, and where it was: the selection goes back to it (or
+    /// near where it was, if it is gone) as the listing comes in.
+    reselect: Option<(MessageId, usize)>,
+    /// Requests deleting drafts of messages the user gave up on, with the
+    /// message; quitting waits for them.
+    discarding: HashMap<RequestId, mett_core::Draft>,
+    /// Whether the mailbox has been asked for the user's own addresses.
+    asked_addresses: bool,
+    /// That request, while it is on its way.
+    addresses_request: Option<RequestId>,
+    /// A reply whose message has arrived, waiting for the user's own
+    /// addresses to choose its recipients.
+    awaiting_addresses: Option<(Kind, Message)>,
+    /// Drafts of messages the user gave up on that couldn't be deleted,
+    /// reported on exit like changes that couldn't be saved; with the
+    /// message, if deleting it again after a sign-in may work.
+    left_drafts: Vec<(String, Option<mett_core::Draft>)>,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -248,6 +328,8 @@ pub struct App {
     /// back yet; what failed among them is retried once they all have.
     retry_after: HashSet<RequestId>,
     next_request: u64,
+    /// The last [`mett_core::Draft::attempt`] given to a composed message.
+    last_draft: u64,
     /// How many messages to request per page.
     page_size: u32,
 }
@@ -258,12 +340,17 @@ impl App {
     #[cfg(test)]
     pub fn new(width: u16, height: u16) -> (Self, Vec<Effect>) {
         let inbox = FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new());
-        Self::open(width, height, inbox, PAGE_SIZE)
+        Self::open(width, height, inbox, Settings::default())
     }
 
-    /// A new app that opens the folder at `path`, listing `page_size`
-    /// messages per request, and the effects that start loading it.
-    pub fn open(width: u16, height: u16, path: FolderPath, page_size: u32) -> (Self, Vec<Effect>) {
+    /// A new app that opens the folder at `path`, and the effects that
+    /// start loading it.
+    pub fn open(
+        width: u16,
+        height: u16,
+        path: FolderPath,
+        settings: Settings,
+    ) -> (Self, Vec<Effect>) {
         let mut app = Self {
             screens: vec![Screen::Index],
             folder: None,
@@ -274,6 +361,18 @@ impl App {
             sign_in: None,
             cancelled: false,
             dismissed: false,
+            input: None,
+            composing: None,
+            compose_fetch: None,
+            compose_unfetched: None,
+            settings: settings.compose,
+            relist_on_return: false,
+            reselect: None,
+            discarding: HashMap::new(),
+            asked_addresses: false,
+            addresses_request: None,
+            awaiting_addresses: None,
+            left_drafts: Vec::new(),
             path,
             opening: None,
             width: usize::from(width),
@@ -287,7 +386,8 @@ impl App {
             unfetched: None,
             retry_after: HashSet::new(),
             next_request: 0,
-            page_size,
+            last_draft: 0,
+            page_size: settings.page_size,
         };
         let effects = app.open_folder();
         (app, effects)
@@ -309,6 +409,7 @@ impl App {
         match self.screen() {
             Screen::Index => Menu::Index,
             Screen::Pager(_) => Menu::Pager,
+            Screen::Compose(_) => Menu::Compose,
         }
     }
 
@@ -321,10 +422,33 @@ impl App {
 
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        let mut effects = self.handle(msg);
+        // The open folder gained messages while another screen was up:
+        // list it again once the index is back.
+        if self.relist_on_return && self.screen() == &Screen::Index {
+            self.relist_on_return = false;
+            effects.extend(self.refresh());
+        }
+        effects
+    }
+
+    fn handle(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
             Msg::SignIn(event) => self.on_sign_in(event),
+            Msg::Key(key) => self.on_key(key),
+            Msg::Edited(result) => self.on_edited(result),
+            Msg::Timer(Timer::RelistSentItems) => {
+                let open = self.folder.as_ref().and_then(|f| f.well_known);
+                if open == Some(mett_core::WellKnownFolder::SentItems) {
+                    if self.screen() == &Screen::Index {
+                        return self.refresh();
+                    }
+                    self.relist_on_return = true;
+                }
+                Vec::new()
+            }
             Msg::Resize { width, height } => {
                 self.width = usize::from(width);
                 self.body_height = body_height(height);
@@ -341,10 +465,28 @@ impl App {
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Effect> {
-        // Any new action in a menu replaces a pending move; the sign-in
-        // window's keys don't move anywhere, so leave it.
+        // Any new action in a menu replaces a pending move, and a reply or
+        // forward still waiting for its message: the user has moved on,
+        // perhaps to another message. The sign-in window's keys don't
+        // move anywhere, so leave them.
         if self.menu() != Menu::SignIn {
             self.pending = None;
+            // Moving through the index replaces going back to the message
+            // a background refresh left (other actions leave it be).
+            let moving = matches!(
+                action,
+                Action::NextEntry
+                    | Action::PreviousEntry
+                    | Action::FirstEntry
+                    | Action::LastEntry
+                    | Action::NextPage
+                    | Action::PreviousPage
+            );
+            if moving && matches!(self.menu(), Menu::Index | Menu::Pager) {
+                self.reselect = None;
+            }
+            self.compose_fetch = None;
+            self.awaiting_addresses = None;
             // What the user does next may need a sign-in that fails; show
             // that.
             self.dismissed = false;
@@ -353,6 +495,7 @@ impl App {
             Menu::Index => self.on_index_action(action),
             Menu::Pager => self.on_pager_action(action),
             Menu::SignIn => self.on_sign_in_action(action),
+            Menu::Compose => self.on_compose_action(action),
         }
     }
 
@@ -425,6 +568,9 @@ impl App {
             Action::Exit if failed => {
                 self.sign_in = None;
                 self.dismissed = true;
+                // Nor restart, on a later Retry, a reply or forward whose
+                // message couldn't be fetched.
+                self.compose_unfetched = None;
                 // The user gave up: don't let a retry that was waiting
                 // start another sign-in.
                 self.retry_after.clear();
@@ -472,10 +618,14 @@ impl App {
                 self.sign_in = None;
                 // Requests that needed the sign-in may not have reported
                 // back yet: retry them once they have. When quitting, only
-                // saving changes matters, and only their responses are
-                // still handled.
+                // saving changes and deleting drafts matter, and only their
+                // responses are still handled.
                 self.retry_after = if self.quit {
-                    self.flag_updates.keys().copied().collect()
+                    self.flag_updates
+                        .keys()
+                        .chain(self.discarding.keys())
+                        .copied()
+                        .collect()
                 } else {
                     self.in_flight()
                 };
@@ -502,6 +652,9 @@ impl App {
             .chain(self.listing)
             .chain(fetching)
             .chain(self.flag_updates.keys().copied())
+            .chain(self.delivery_request())
+            .chain(self.compose_fetch.as_ref().map(|(id, _, _)| *id))
+            .chain(self.discarding.keys().copied())
             .collect()
     }
 
@@ -533,15 +686,21 @@ impl App {
     /// changes.
     fn retry(&mut self) -> Vec<Effect> {
         if self.quit {
-            return self.retry_saves();
+            let mut effects = self.retry_saves();
+            effects.extend(self.retry_discards());
+            return effects;
         }
+        // Everything that failed is retried, not just the first thing.
+        let mut effects = self.retry_delivery();
+        effects.extend(self.retry_discards());
+        effects.extend(self.retry_compose_fetch());
         if self.folder.is_none() {
             if self.opening.is_none() {
-                return self.open_folder();
+                effects.extend(self.open_folder());
             }
-            return Vec::new();
+            return effects;
         }
-        let mut effects = self.retry_listing();
+        effects.extend(self.retry_listing());
         effects.extend(self.retry_saves());
         // Open the message that failed to open, if it is still the one
         // selected. (Opening another message forgets the failure.) The
@@ -593,21 +752,18 @@ impl App {
                 }
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
-            // Opening the folder failed: try again.
-            Action::DisplayMessage if self.folder.is_none() => {
-                // Opening the folder failed: try again. (While it is still
-                // opening, there is nothing to display yet.)
-                if self.opening.is_none() {
-                    return self.open_folder();
-                }
+            // Opening the folder failed: try again. (While it is still
+            // opening, there is nothing to display yet.)
+            Action::DisplayMessage if self.folder.is_none() && self.opening.is_none() => {
+                return self.open_folder();
             }
+            Action::DisplayMessage if self.folder.is_none() => {}
             Action::DisplayMessage => return self.open_selected(),
-            Action::Exit
-            | Action::NextLine
-            | Action::PreviousLine
-            | Action::OpenBrowser
-            | Action::CopyLink
-            | Action::Retry => {}
+            Action::Mail => return self.start_compose(Kind::New),
+            Action::Reply => return self.start_compose(Kind::Reply),
+            Action::GroupReply => return self.start_compose(Kind::GroupReply),
+            Action::Forward => return self.start_compose(Kind::Forward),
+            _ => {}
         }
         Vec::new()
     }
@@ -643,12 +799,11 @@ impl App {
             Action::PreviousLine => self.scroll_by(-1),
             Action::NextPage => self.scroll_by(page as isize),
             Action::PreviousPage => self.scroll_by(-(page as isize)),
-            Action::FirstEntry
-            | Action::LastEntry
-            | Action::DisplayMessage
-            | Action::OpenBrowser
-            | Action::CopyLink
-            | Action::Retry => {}
+            Action::Mail => return self.start_compose(Kind::New),
+            Action::Reply => return self.start_compose(Kind::Reply),
+            Action::GroupReply => return self.start_compose(Kind::GroupReply),
+            Action::Forward => return self.start_compose(Kind::Forward),
+            _ => {}
         }
         Vec::new()
     }
@@ -706,11 +861,22 @@ impl App {
                 self.opening = None;
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
-                return self.list(Page::first(self.page_size));
+                let mut effects = self.list(Page::first(self.page_size));
+                // Before the user can reply: their own addresses, so that a
+                // reply to their own mail goes to its recipients (the
+                // sign-in name may not be one of them).
+                if !self.asked_addresses {
+                    self.asked_addresses = true;
+                    let request = self.request(Request::OwnAddresses);
+                    self.addresses_request = Some(effect_id(&request));
+                    effects.push(request);
+                }
+                return effects;
             }
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
                     self.messages.extend(page.messages);
+                    self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
                         // Keep loading until the whole folder is listed.
@@ -729,12 +895,68 @@ impl App {
                 }
                 Err(e) => {
                     self.pending = None;
+                    self.reselect = None;
                     self.listing = None;
                     self.unlisted = self.listing_page.take();
                     self.report(e);
                 }
             },
+            Event::MessageFetched(result)
+                if self
+                    .compose_fetch
+                    .as_ref()
+                    .is_some_and(|(request, _, _)| *request == id) =>
+            {
+                let (_, kind, message) = self.compose_fetch.take().expect("checked above");
+                return self.on_compose_fetched(kind, message, result);
+            }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
+            Event::Sent(result) => return self.on_delivered(id, result),
+            Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
+            // Without them, the configured ones do.
+            Event::OwnAddresses(result) => {
+                if self.addresses_request == Some(id) {
+                    self.addresses_request = None;
+                }
+                let failed = match result {
+                    Ok(addresses) => {
+                        for address in addresses {
+                            let address = address.to_lowercase();
+                            if !self.settings.me.contains(&address) {
+                                self.settings.me.push(address);
+                            }
+                        }
+                        None
+                    }
+                    // Asked again by the next reply.
+                    Err(e) => {
+                        self.asked_addresses = false;
+                        Some(e)
+                    }
+                };
+                // A reply that waited for them can choose its recipients,
+                // with the addresses the user configured if the mailbox
+                // couldn't tell.
+                if let Some((kind, message)) = self.awaiting_addresses.take() {
+                    let effects = self.begin(kind, Some(message));
+                    if let Some(e) = failed {
+                        self.status = format!(
+                            "Couldn't learn your own addresses ({e}); a reply to your own mail may need its recipients checked."
+                        );
+                    }
+                    return effects;
+                }
+            }
+            Event::KeptDiscarded(result) => {
+                let draft = self.discarding.remove(&id);
+                if let Err(e) = result {
+                    let left = format!("A draft of the message is left in Drafts: {e}");
+                    // Retry deletes it once signed in.
+                    let retry = draft.filter(|_| matches!(e, Error::Auth(_)));
+                    self.left_drafts.push((left.clone(), retry));
+                    self.status = left;
+                }
+            }
             Event::FlagsUpdated(result) => {
                 let Some(message) = self.flag_updates.remove(&id) else {
                     return Vec::new();
@@ -769,22 +991,27 @@ impl App {
         result: mett_core::Result<Message>,
     ) -> Vec<Effect> {
         // Only the pager that asked for it cares; anything else is a stale
-        // response for a message the user already left.
-        let Some(Screen::Pager(pager)) = self.screens.last_mut() else {
+        // response for a message the user already left. The pager may be
+        // under the compose menu, if the user replied while it loaded.
+        let Some(position) = self
+            .screens
+            .iter()
+            .rposition(|s| matches!(s, Screen::Pager(p) if p.request == id))
+        else {
             return Vec::new();
         };
-        if pager.request != id {
-            return Vec::new();
-        }
         let message = match result {
             Ok(message) => message,
             Err(e) => {
-                let failed = pager.id.clone();
-                self.screens.pop();
-                self.unfetched = Some(failed);
+                if let Screen::Pager(pager) = self.screens.remove(position) {
+                    self.unfetched = Some(pager.id);
+                }
                 self.report(e);
                 return Vec::new();
             }
+        };
+        let Screen::Pager(pager) = &mut self.screens[position] else {
+            unreachable!("found above");
         };
         pager.lines = text::pager_lines(&message);
         pager.rows_width = None;
@@ -819,6 +1046,49 @@ impl App {
     /// shows only the messages loaded so far.
     pub fn incomplete(&self) -> bool {
         self.unlisted.is_some()
+    }
+
+    /// Lists the open folder again from the start, to show messages that
+    /// arrived in it.
+    fn relist(&mut self) -> Vec<Effect> {
+        self.reselect = None;
+        self.messages.clear();
+        self.selected = 0;
+        self.pending = None;
+        self.unlisted = None;
+        self.list(Page::first(self.page_size))
+    }
+
+    /// Lists the open folder again in the background, staying on the
+    /// selected message.
+    fn refresh(&mut self) -> Vec<Effect> {
+        // A refresh still on its way (the user hasn't moved since, or it
+        // would be forgotten) knows better than the index it cleared.
+        let selected = self.reselect.clone().or_else(|| {
+            self.messages
+                .get(self.selected)
+                .map(|m| (m.id.clone(), self.selected))
+        });
+        let effects = self.relist();
+        self.reselect = selected;
+        effects
+    }
+
+    /// Selects again the message selected before a [`Self::refresh`], once
+    /// it is listed; if it is gone by the end of the folder, the one now
+    /// where it was.
+    fn reselect(&mut self, done: bool) {
+        let Some((id, at)) = &self.reselect else {
+            return;
+        };
+        if let Some(found) = self.messages.iter().position(|m| &m.id == id) {
+            self.selected = found;
+        } else if done {
+            self.selected = (*at).min(self.messages.len().saturating_sub(1));
+        } else {
+            return;
+        }
+        self.reselect = None;
     }
 
     /// Lists `page` of the open folder.
@@ -877,7 +1147,7 @@ impl App {
         self.selected = selected;
         // The screen, not the menu: the sign-in window may be over it.
         match self.screen() {
-            Screen::Index => Vec::new(),
+            Screen::Index | Screen::Compose(_) => Vec::new(),
             Screen::Pager(_) => {
                 self.screens.pop();
                 self.open_selected()
@@ -885,9 +1155,28 @@ impl App {
         }
     }
 
+    /// Deletes again the drafts that couldn't be deleted for want of a
+    /// sign-in.
+    fn retry_discards(&mut self) -> Vec<Effect> {
+        let (retry, left): (Vec<_>, Vec<_>) = std::mem::take(&mut self.left_drafts)
+            .into_iter()
+            .partition(|(_, draft)| draft.is_some());
+        self.left_drafts = left;
+        retry
+            .into_iter()
+            .filter_map(|(_, draft)| draft)
+            .flat_map(|draft| self.discard_kept(draft))
+            .collect()
+    }
+
     /// Changes that could not be saved, one per message.
     pub fn save_failures(&self) -> Vec<String> {
-        let mut failures: Vec<_> = self.save_failures.values().cloned().collect();
+        let mut failures: Vec<_> = self
+            .save_failures
+            .values()
+            .chain(self.left_drafts.iter().map(|(left, _)| left))
+            .cloned()
+            .collect();
         failures.sort();
         failures
     }
@@ -907,7 +1196,7 @@ impl App {
     /// Whether changes to the mailbox are still being saved. mett waits
     /// for them before exiting, so they aren't lost.
     pub fn saving(&self) -> bool {
-        !self.flag_updates.is_empty()
+        !self.flag_updates.is_empty() || self.delivering() || !self.discarding.is_empty()
     }
 
     fn report(&mut self, error: Error) {
@@ -960,7 +1249,12 @@ mod tests {
             id: *open,
             event: Event::FolderOpened(Ok(folder)),
         }));
-        let [Effect::Request(list, Request::ListMessages { .. })] = effects.as_slice() else {
+        // The user's own addresses are asked for alongside.
+        let [
+            Effect::Request(list, Request::ListMessages { .. }),
+            Effect::Request(_, Request::OwnAddresses),
+        ] = effects.as_slice()
+        else {
             panic!("expected ListMessages, got {effects:?}");
         };
         app.update(Msg::Response(Response {
@@ -1343,7 +1637,10 @@ mod tests {
         let effects = deliver_last_page(&mut app, second, more);
         assert_eq!(app.selected, 1);
         assert!(
-            matches!(effects.as_slice(), [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m1"),
+            matches!(
+                effects.as_slice(),
+                [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m1"
+            ),
             "{effects:?}"
         );
     }
@@ -1944,5 +2241,37 @@ mod tests {
         let window = app.sign_in.as_ref().unwrap();
         let room = (app.body_height + CHROME_ROWS).saturating_sub(3);
         assert!(window.scroll <= window.rows(app.width).len().saturating_sub(room));
+    }
+
+    #[test]
+    fn the_mailbox_tells_the_users_own_addresses_once() {
+        let (mut app, effects) = App::new(80, 23);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        // Asked as soon as the folder opens, before any reply can be made.
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Some(Effect::Request(id, _)) = effects
+            .iter()
+            .find(|e| matches!(e, Effect::Request(_, Request::OwnAddresses)))
+        else {
+            panic!("expected OwnAddresses, got {effects:?}");
+        };
+        app.update(Msg::Response(Response {
+            id: *id,
+            event: Event::OwnAddresses(Ok(vec!["Alice@Contoso.com".into()])),
+        }));
+        assert!(app.settings.me.contains(&"alice@contoso.com".to_owned()));
+        // Not asked again when the folder is listed again.
+        let effects = app.relist();
+        let (list, _) = match effects.as_slice() {
+            [Effect::Request(id, request)] => (*id, request.clone()),
+            _ => panic!("{effects:?}"),
+        };
+        let effects = deliver_last_page(&mut app, list, Vec::new());
+        assert!(effects.is_empty(), "{effects:?}");
     }
 }

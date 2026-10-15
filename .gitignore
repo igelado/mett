@@ -21,6 +21,8 @@ CLAUDE.md
 *.tmp
 *.log
 tmp/
+# Messages mett hands to the editor, if `tmpdir` is inside a checkout
+mett-*-*.txt
 
 # Rust build output
 target/

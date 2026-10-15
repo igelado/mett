@@ -3,8 +3,10 @@
 Status: **partly implemented.** mett reads mettrc files (§1) with `set`,
 `unset`, `toggle`, `reset` and `source`, and opens the `msgraph://` folder
 in `spoolfile` (§3, without the Focused Inbox views), signing in with the
-§4.1–4.3 variables (except `msgraph_oauth_refresh_command`). Everything
-else is still a proposal.
+§4.1–4.3 variables (except `msgraph_oauth_refresh_command`). It sends mail
+through the spoolfile's account and postpones it to that account's Drafts
+(§5.2, without `record` and `postponed`). Everything else is still a
+proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc
 format described in [MUTTRC.md](MUTTRC.md) and adds the minimum extensions
@@ -207,6 +209,21 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   `record` value is honoured with an explicit save.
 - **Postponing:** `postponed` pointing at `@drafts` stores drafts as server
   drafts, so they are visible in Outlook.
+- **Replies and forwards** go through a server draft (Graph's
+  `createReply` or `createForward`), so that they thread under the original
+  and forwards keep its attachments. Graph always keeps a copy of a sent
+  draft in Sent Items, so `copy` only applies to new messages. When a send
+  or update of that draft has no clear outcome (the response was lost),
+  the draft is kept, and sending or postponing the message again updates
+  it rather than making another; leaving the message without postponing it
+  deletes it (for good where Graph allows, in the global cloud; elsewhere
+  into Deleted Items). (If the response to creating the draft is lost, mett can't
+  tell which draft it made, and says one may be left in Drafts.)
+
+*Implemented so far:* mail is sent through the account of `spoolfile`, and
+a copy is kept in its Sent Items when `copy` allows. `record` and
+`postponed` are not used yet: postponed messages always go to the
+account's Drafts folder.
 
 ## 6. New meanings for existing mutt concepts
 
