@@ -2329,7 +2329,7 @@ async fn a_file_taken_off_stays_known_until_it_is_gone() {
 }
 
 #[tokio::test]
-async fn an_upload_whose_answer_was_lost_is_known_by_name_and_type() {
+async fn an_upload_whose_answer_was_lost_is_left_alone() {
     // The upload's answer is lost: the attempt fails there.
     let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
     Mock::given(method("GET"))
@@ -2338,19 +2338,14 @@ async fn an_upload_whose_answer_was_lost_is_known_by_name_and_type() {
             "value": [
                 { "id": "a1", "name": "a.pdf", "size": 3 },
                 { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
-                { "id": "x1", "name": "other.pdf", "size": 3 },
             ],
         })))
-        .mount(&server)
-        .await;
-    Mock::given(method("DELETE"))
-        .and(path("/v1.0/me/messages/d1/attachments/n1"))
-        .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v1.0/me/messages/d1/attachments"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -2359,11 +2354,35 @@ async fn an_upload_whose_answer_was_lost_is_known_by_name_and_type() {
         .with_priority(1)
         .mount(&server)
         .await;
+    // n1 may be mett's, or another's: it stays, and the file goes on again.
     store.send(&message).await.unwrap();
-    assert_eq!(
-        deleted(&server).await,
-        ["/v1.0/me/messages/d1/attachments/n1"]
-    );
+    assert!(deleted(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_file_taken_off_after_a_lost_upload_is_not_sent_unsure() {
+    let (server, store, mut message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
+    Mock::given(method("GET"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                { "id": "a1", "name": "a.pdf", "size": 3 },
+                { "id": "n1", "name": "new.bin", "contentType": "application/octet-stream", "size": 3 },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .with_priority(1)
+        .expect(0)
+        .mount(&server)
+        .await;
+    message.attachments.clear();
+    let e = store.send(&message).await.unwrap_err();
+    assert!(e.to_string().contains("check it in Drafts"), "{e}");
+    assert!(deleted(&server).await.is_empty());
 }
 
 #[tokio::test]

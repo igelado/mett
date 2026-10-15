@@ -1077,7 +1077,10 @@ impl<A: Authenticator> GraphMailStore<A> {
         // so that nothing added elsewhere meanwhile comes off), but what
         // is to come off.
         let base = if recalled {
-            self.recalled_base(draft, &present, base.as_deref().unwrap_or_default())
+            match self.recalled_base(draft, &present, base.as_deref().unwrap_or_default()) {
+                Ok(recalled) => recalled,
+                Err(e) => return Err(self.give_up(draft, id, base, e).await),
+            }
         } else {
             base.unwrap_or_else(|| present.iter().map(|a| a.id.to_string()).collect())
         };
@@ -1284,12 +1287,19 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// attempt): all of them, but those of its own the user took off and
     /// mett's uploads of earlier attempts, which come off. Others, even
     /// ones added elsewhere since, stay.
+    ///
+    /// An upload whose answer was lost has no known ID, and an attachment
+    /// of its name and type may be it, or one added elsewhere (it may never
+    /// have been made): it stays, as mett can't tell. If the file is still
+    /// to go, it is attached again (it may then go twice). If the user took
+    /// it off, sending it could send what they didn't want: that fails,
+    /// for them to look in Outlook.
     fn recalled_base(
         &self,
         draft: &Draft,
         present: &[Attachment],
         before: &[String],
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>> {
         let key = (draft.origin.clone(), draft.attempt);
         let uploads = self
             .uploads
@@ -1298,40 +1308,30 @@ impl<A: Authenticator> GraphMailStore<A> {
             .get(&key)
             .cloned()
             .unwrap_or_default();
-        // Uploads whose answer came back are known by ID. One whose answer
-        // was lost is known only by name and type: the attachments that
-        // may be it are taken for mett's only if there are no more of them
-        // than such uploads. With more (a file of that name and type was
-        // added elsewhere too), none is: one of mett's may then go twice,
-        // rather than another's be lost.
         let known = |a: &Attachment| {
             uploads
                 .iter()
                 .any(|u| u.id.as_deref() == Some(a.id.as_str()))
         };
-        let maybe_lost = |a: &Attachment| !known(a) && !before.contains(&a.id.to_string());
-        let ours = |a: &Attachment| {
-            if known(a) {
-                return true;
+        for upload in uploads.iter().filter(|u| u.id.is_none()) {
+            let taken_off = !draft
+                .attachments
+                .iter()
+                .any(|f| f.name == upload.name && f.content_type == upload.content_type);
+            let unsure = present.iter().any(|a| !known(a) && upload.is(a, before));
+            if taken_off && unsure {
+                return Err(Error::Backend(format!(
+                    "can't tell whether {} (taken off) is still on the message: \
+                     check it in Drafts in Outlook",
+                    upload.name
+                )));
             }
-            let lost = uploads.iter().filter(|u| u.looks_like(a)).count();
-            lost > 0
-                && maybe_lost(a)
-                && present
-                    .iter()
-                    .filter(|p| {
-                        maybe_lost(p)
-                            && p.name == a.name
-                            && p.content_type.eq_ignore_ascii_case(&a.content_type)
-                    })
-                    .count()
-                    <= lost
-        };
-        present
+        }
+        Ok(present
             .iter()
-            .filter(|a| !draft.drop_attachments.contains(&a.id) && !ours(a))
+            .filter(|a| !draft.drop_attachments.contains(&a.id) && !known(a))
             .map(|a| a.id.to_string())
-            .collect()
+            .collect())
     }
 
     /// Forgets the uploads of `draft`, which is done with: sent, postponed,
