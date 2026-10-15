@@ -111,15 +111,16 @@ impl App {
     /// A change the user made to an unread message in the open folder was
     /// saved: it changed, but isn't new.
     pub(super) fn changed_here(&mut self, message: &MessageId) {
-        if let (Some(open), Some(summary)) = (&self.folder, self.summary(message)) {
-            if !summary.flags.read && summary.folder == open.id {
-                let id = summary.id.clone();
-                self.seen
-                    .entry(open.id.clone())
-                    .or_default()
-                    .messages
-                    .insert(id);
-            }
+        if let (Some(open), Some(summary)) = (&self.folder, self.summary(message))
+            && !summary.flags.read
+            && summary.folder == open.id
+        {
+            let id = summary.id.clone();
+            self.seen
+                .entry(open.id.clone())
+                .or_default()
+                .messages
+                .insert(id);
         }
     }
 
