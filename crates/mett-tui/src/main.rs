@@ -363,6 +363,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                             worker::Event::FlagsUpdated(_)
                                 | worker::Event::Sent(_)
                                 | worker::Event::DraftSaved(_)
+                                | worker::Event::KeptDiscarded(_)
                         ) =>
                     {
                         Msg::Response(response)

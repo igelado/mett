@@ -461,7 +461,11 @@ impl App {
                 // Given up on: so is a draft a failed attempt left.
                 return match self.screens.pop() {
                     Some(Screen::Compose(compose)) if compose.left_draft => {
-                        vec![self.request(Request::DiscardKept(compose.draft))]
+                        let request = self.request(Request::DiscardKept(compose.draft));
+                        if let Effect::Request(id, _) = &request {
+                            self.discarding.insert(*id);
+                        }
+                        vec![request]
                     }
                     _ => Vec::new(),
                 };
@@ -1122,10 +1126,12 @@ mod tests {
         let (id, request) = request(&effects);
         assert!(matches!(request, Request::DiscardKept(d) if d.body == "text"));
         assert_eq!(app.status, "Mail not sent.");
+        assert!(app.saving(), "quitting waits for it");
         app.update(Msg::Response(Response {
             id,
             event: Event::KeptDiscarded(Err(Error::Network("offline".into()))),
         }));
+        assert!(!app.saving());
         assert!(
             app.status
                 .starts_with("A draft of the message is left in Drafts")

@@ -283,6 +283,9 @@ pub struct App {
     /// background, and where it was: the selection goes back to it (or
     /// near where it was, if it is gone) as the listing comes in.
     reselect: Option<(MessageId, usize)>,
+    /// Requests deleting drafts of messages the user gave up on; quitting
+    /// waits for them.
+    discarding: HashSet<RequestId>,
     /// The folder to open, kept so that opening it can be retried.
     path: FolderPath,
     /// The request opening the folder, while it is pending.
@@ -354,6 +357,7 @@ impl App {
             settings: settings.compose,
             relist_on_return: false,
             reselect: None,
+            discarding: HashSet::new(),
             path,
             opening: None,
             width: usize::from(width),
@@ -856,10 +860,12 @@ impl App {
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
             Event::Sent(result) => return self.on_delivered(id, result),
             Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
-            Event::KeptDiscarded(Err(e)) => {
-                self.status = format!("A draft of the message is left in Drafts: {e}");
+            Event::KeptDiscarded(result) => {
+                self.discarding.remove(&id);
+                if let Err(e) = result {
+                    self.status = format!("A draft of the message is left in Drafts: {e}");
+                }
             }
-            Event::KeptDiscarded(Ok(())) => {}
             Event::FlagsUpdated(result) => {
                 let Some(message) = self.flag_updates.remove(&id) else {
                     return Vec::new();
@@ -1077,7 +1083,7 @@ impl App {
     /// Whether changes to the mailbox are still being saved. mett waits
     /// for them before exiting, so they aren't lost.
     pub fn saving(&self) -> bool {
-        !self.flag_updates.is_empty() || self.delivering()
+        !self.flag_updates.is_empty() || self.delivering() || !self.discarding.is_empty()
     }
 
     fn report(&mut self, error: Error) {
