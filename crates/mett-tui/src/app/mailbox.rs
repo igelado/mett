@@ -690,6 +690,7 @@ impl App {
         self.threads.clear();
         self.threaded_count = 0;
         self.collapsed.clear();
+        self.collapse_all = false;
         self.positions.clear();
         self.limit = None;
         self.limited.clear();

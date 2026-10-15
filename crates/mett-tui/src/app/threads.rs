@@ -112,7 +112,7 @@ impl App {
             let message = slots[node.index].take().expect("each message once");
             let root = ids[node.root].clone();
             let key = thread_key(&message, &root);
-            let fold = threaded && node.depth > 0 && self.collapsed.contains(&key);
+            let fold = threaded && node.depth > 0 && self.is_collapsed(&key);
             if threaded {
                 self.threads.insert(
                     message.id.clone(),
@@ -205,12 +205,27 @@ impl App {
         }
     }
 
+    /// Whether the thread `key` is collapsed.
+    fn is_collapsed(&self, key: &str) -> bool {
+        self.collapse_all != self.collapsed.contains(key)
+    }
+
+    /// Collapses or opens the thread `key`.
+    fn set_collapsed(&mut self, key: String, collapsed: bool) {
+        if collapsed == self.collapse_all {
+            self.collapsed.remove(&key);
+        } else {
+            self.collapsed.insert(key);
+        }
+    }
+
     /// Takes in a new order, if it changed.
     pub(super) fn apply_ordering(&mut self, ordering: Ordering) {
         if self.ordering != ordering {
             self.ordering = ordering;
             if !self.threaded() {
                 self.collapsed.clear();
+                self.collapse_all = false;
             }
             self.arrange();
         }
@@ -220,7 +235,7 @@ impl App {
     pub(super) fn uncollapse_to(&mut self, message: &MessageId) {
         if let Some(thread) = self.threads.get(message) {
             let key = thread.key.clone();
-            self.collapsed.remove(&key);
+            self.set_collapsed(key, false);
         }
         self.arrange();
         if let Some(at) = self.messages.iter().position(|m| &m.id == message) {
@@ -323,9 +338,8 @@ impl App {
                     .threads
                     .get(root)
                     .map_or_else(|| format!("message {root}"), |t| t.key.clone());
-                if !self.collapsed.remove(&key) {
-                    self.collapsed.insert(key);
-                }
+                let collapsed = self.is_collapsed(&key);
+                self.set_collapsed(key, !collapsed);
                 self.selected = start;
                 self.arrange();
                 return Some(Vec::new());
@@ -338,12 +352,15 @@ impl App {
                     .filter(|(id, t)| *id != &t.root)
                     .map(|(_, t)| t.key.clone())
                     .collect();
-                let all_collapsed = roots.iter().all(|key| self.collapsed.contains(key));
-                if all_collapsed {
-                    self.collapsed.clear();
+                // Those listed later too: every thread is, until opened.
+                // (With no replies listed yet, by what was asked last.)
+                let all_collapsed = if roots.is_empty() {
+                    self.collapse_all
                 } else {
-                    self.collapsed.extend(roots);
-                }
+                    roots.iter().all(|key| self.is_collapsed(key))
+                };
+                self.collapsed.clear();
+                self.collapse_all = !all_collapsed;
                 self.selected = start;
                 self.arrange();
                 return Some(Vec::new());
@@ -833,6 +850,21 @@ mod tests {
         };
         page(&mut app, more, vec![message("a0", 1, "a", &[0])]);
         assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0"]);
+    }
+
+    #[test]
+    fn collapsing_all_takes_in_threads_listed_later() {
+        let (mut app, next) = paged(vec![message("a1", 2, "a", &[0])]);
+        act(&mut app, Action::CollapseAll);
+        page(
+            &mut app,
+            next,
+            vec![message("a2", 1, "a", &[0, 1]), message("b0", 0, "b", &[0])],
+        );
+        assert_eq!(shown(&app), ["b0", "a1 (1)"]);
+        // And all open again.
+        act(&mut app, Action::CollapseAll);
+        assert_eq!(shown(&app).len(), 3);
     }
 
     #[test]

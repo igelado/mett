@@ -443,8 +443,11 @@ pub struct App {
     /// How many messages the threads were last built from: while a large
     /// folder is listed, they are built again only as it doubles.
     threaded_count: usize,
-    /// The first messages of the collapsed threads.
+    /// The threads (by key) collapsed, or with `collapse_all`, opened:
+    /// those that differ from the rest.
     collapsed: HashSet<String>,
+    /// `Esc V` collapsed every thread, including those listed since.
+    collapse_all: bool,
     /// Whether the limit showed each message it was applied to, kept
     /// across listings so that they show the same messages.
     limited: HashMap<MessageId, bool>,
@@ -649,6 +652,7 @@ impl App {
             threads: HashMap::new(),
             threaded_count: 0,
             collapsed: HashSet::new(),
+            collapse_all: false,
             limited: HashMap::new(),
             positions: HashMap::new(),
             last_search: None,
