@@ -84,7 +84,7 @@ pub trait MailStore: Send + Sync {
     /// new mail reads these.
     fn folder(&self, id: &FolderId) -> impl Future<Output = Result<Folder>> + Send;
 
-    /// The unread messages of a folder that arrived or changed after
+    /// The unread messages of a folder that arrived or changed at or after
     /// `since` (up to [`RECENT_UNREAD`]; without `since`, the last ones),
     /// most recently first, with when: unread mail that arrives (or is
     /// moved in, or marked unread) after the user last saw the folder is

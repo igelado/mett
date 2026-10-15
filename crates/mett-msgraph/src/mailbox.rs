@@ -444,7 +444,9 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         }
         let after = since.map_or_else(
             || "ge 1900-01-01T00:00:00Z".to_owned(),
-            |since| format!("gt {}", since.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            // Mail that changed when `since` did may not have been seen:
+            // which was is told by its ID.
+            |since| format!("ge {}", since.to_rfc3339_opts(SecondsFormat::Secs, true)),
         );
         let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
         url.query_pairs_mut()

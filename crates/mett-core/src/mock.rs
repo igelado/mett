@@ -182,7 +182,7 @@ impl MailStore for MemoryStore {
             .iter()
             .filter(|m| &m.summary.folder == folder && !m.summary.flags.read)
             .filter_map(|m| Some((m.summary.id.clone(), m.summary.modified?)))
-            .filter(|(_, modified)| since.is_none_or(|since| *modified > since))
+            .filter(|(_, modified)| since.is_none_or(|since| *modified >= since))
             .collect();
         recent.sort_by_key(|(_, modified)| Reverse(*modified));
         recent.truncate(crate::ports::RECENT_UNREAD);

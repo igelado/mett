@@ -79,9 +79,10 @@ pub(super) struct Seen {
 
 impl Seen {
     /// Whether unread `message`, which arrived or changed at `at`, is new:
-    /// the user hasn't seen it, and it is newer than what they have.
+    /// the user hasn't seen it, and it is no older than what they have
+    /// (mail that changed at the same time may be new too).
     fn is_new(&self, message: &MessageId, at: DateTime<Utc>) -> bool {
-        !self.messages.contains(message) && self.until.is_none_or(|until| at > until)
+        !self.messages.contains(message) && self.until.is_none_or(|until| at >= until)
     }
 }
 
@@ -777,7 +778,8 @@ mod tests {
             recent: newest
                 .map(|m| {
                     let at = DateTime::UNIX_EPOCH + TimeDelta::minutes(m);
-                    vec![(MessageId::new(format!("{id}-unread-{m}")), at)]
+                    // As the test folders name their messages.
+                    vec![(MessageId::new(format!("m{m}")), at)]
                 })
                 .unwrap_or_default(),
         })
@@ -1000,6 +1002,16 @@ mod tests {
             Event::MailboxesChecked(vec![(inbox(), Err(Error::Auth("expired".into())))]),
         );
         poll(&mut app);
+    }
+
+    #[test]
+    fn mail_that_changed_with_what_was_seen_may_be_new() {
+        let seen = Seen {
+            until: Some(DateTime::UNIX_EPOCH),
+            messages: HashSet::from([MessageId::new("m1")]),
+        };
+        assert!(!seen.is_new(&MessageId::new("m1"), DateTime::UNIX_EPOCH));
+        assert!(seen.is_new(&MessageId::new("m2"), DateTime::UNIX_EPOCH));
     }
 
     #[test]
@@ -1370,7 +1382,7 @@ mod tests {
             .find(|(_, r)| matches!(r, Request::ListMessages { .. }))
             .cloned()
             .unwrap();
-        let mut arrived = summary("w1", 3);
+        let mut arrived = summary("m3", 3);
         arrived.modified = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(3));
         respond(
             &mut app,
@@ -1815,7 +1827,7 @@ mod tests {
                     Ok(Checked {
                         folder: folder("work", "Work", 1),
                         recent: vec![(
-                            MessageId::new("work-unread-5"),
+                            MessageId::new("m5"),
                             DateTime::UNIX_EPOCH + TimeDelta::minutes(30),
                         )],
                     }),
