@@ -161,15 +161,18 @@ impl App {
         let Some(folder) = &self.folder else {
             return Vec::new();
         };
-        // Nor while part of it is still to be listed again: what a check
-        // adds, that listing would add again.
         if self.listing.is_some()
-            || self.unlisted.is_some()
             || self.polling.is_some()
             || self.opening.is_some()
             || self.switching.is_some()
         {
             return Vec::new();
+        }
+        // Part of it failed to list: that is tried again instead (what a
+        // check adds, that listing would add again), so a passing error
+        // doesn't stop new mail reaching the index.
+        if let Some(page) = self.unlisted.take() {
+            return self.list(page);
         }
         let folder = folder.id.clone();
         let started = Utc::now();
@@ -527,11 +530,11 @@ impl App {
                         // Said when unseen mail arrives (not when mail that
                         // was there already changes), or mail found while
                         // the folder was open turns out unseen; not at
-                        // first.
+                        // first, unless the user had seen the mailbox.
                         let arriving = state.recent.iter().any(|(id, at)| {
                             !before.contains(id) && seen.as_ref().is_none_or(|s| s.is_new(id, *at))
                         });
-                        if state.new && (arriving || !was_new) && !first {
+                        if state.new && (arriving || !was_new) && (!first || seen.is_some()) {
                             arrived.push(path);
                         }
                     }
@@ -1584,15 +1587,22 @@ mod tests {
     }
 
     #[test]
-    fn no_check_while_part_of_the_folder_is_to_be_listed_again() {
+    fn a_check_lists_again_what_failed_to_list() {
         let (mut app, _) = app();
         app.unlisted = Some(Page::first(10));
         let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let requests = requests(&effects);
         assert!(
-            !requests(&effects)
+            !requests
                 .iter()
                 .any(|(_, r)| matches!(r, Request::PollFolder { .. }))
         );
+        assert!(
+            requests
+                .iter()
+                .any(|(_, r)| matches!(r, Request::ListMessages { .. }))
+        );
+        assert!(app.unlisted.is_none());
     }
 
     /// Leaves the Inbox for Work, then has a check find the Inbox's
@@ -1668,6 +1678,30 @@ mod tests {
         );
         leave_and_check(&mut app, vec![("m9", 40), ("m1", 30)]);
         assert_eq!(app.mailboxes_with_new_mail(), 1);
+    }
+
+    #[test]
+    fn mail_arriving_after_a_visit_is_announced_at_the_first_check() {
+        // The user leaves the Inbox before the first check answers; mail
+        // arrives after what they saw.
+        let (mut app, check) = app();
+        app.change_folder(work());
+        let (switch, _) = app.switching.clone().unwrap();
+        respond(
+            &mut app,
+            switch,
+            Event::FolderOpened(Ok(folder("work", "Work", 0))),
+        );
+        respond(
+            &mut app,
+            check,
+            Event::MailboxesChecked(vec![
+                (inbox(), checked("in", "Inbox", 4, Some(50))),
+                (work(), checked("work", "Work", 0, None)),
+            ]),
+        );
+        assert_eq!(app.mailboxes_with_new_mail(), 1);
+        assert_eq!(app.status, "New mail in =@inbox.");
     }
 
     #[test]
