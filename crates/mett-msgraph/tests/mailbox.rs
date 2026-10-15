@@ -2365,3 +2365,23 @@ async fn an_upload_whose_answer_was_lost_is_known_by_name_and_type() {
         ["/v1.0/me/messages/d1/attachments/n1"]
     );
 }
+
+#[tokio::test]
+async fn an_upload_whose_answer_was_lost_is_not_guessed_among_look_alikes() {
+    let (server, store, message) = recalled_upload_lost_send(ResponseTemplate::new(503)).await;
+    // n1 and o1 both look like it: neither is taken off.
+    listed_on_retry(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/attachments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "n2" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/messages/d1/send"))
+        .respond_with(ResponseTemplate::new(202))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    store.send(&message).await.unwrap();
+    assert!(deleted(&server).await.is_empty());
+}

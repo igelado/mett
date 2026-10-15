@@ -79,20 +79,21 @@ impl Upload {
     /// Whether `attachment` is this upload. One whose answer was lost is
     /// matched by name and type, among attachments not in `base` (what
     /// the draft had of its own): Graph's `size` counts more than the
-    /// file's bytes, so it can't be compared. (A file of the same name and
-    /// type added in Outlook meanwhile would be taken for it.)
+    /// file's bytes, so it can't be compared.
     fn is(&self, attachment: &Attachment, base: &[String]) -> bool {
-        let id = attachment.id.to_string();
         match &self.id {
-            Some(uploaded) => *uploaded == id,
-            None => {
-                !base.contains(&id)
-                    && self.name == attachment.name
-                    && self
-                        .content_type
-                        .eq_ignore_ascii_case(&attachment.content_type)
-            }
+            Some(uploaded) => *uploaded == attachment.id.as_str(),
+            None => !base.contains(&attachment.id.to_string()) && self.looks_like(attachment),
         }
+    }
+
+    /// Whether this upload, whose answer was lost, may be `attachment`.
+    fn looks_like(&self, attachment: &Attachment) -> bool {
+        self.id.is_none()
+            && self.name == attachment.name
+            && self
+                .content_type
+                .eq_ignore_ascii_case(&attachment.content_type)
     }
 }
 
@@ -1287,11 +1288,38 @@ impl<A: Authenticator> GraphMailStore<A> {
             .get(&key)
             .cloned()
             .unwrap_or_default();
+        // Uploads whose answer came back are known by ID. One whose answer
+        // was lost is known only by name and type: the attachments that
+        // may be it are taken for mett's only if there are no more of them
+        // than such uploads. With more (a file of that name and type was
+        // added elsewhere too), none is: one of mett's may then go twice,
+        // rather than another's be lost.
+        let known = |a: &Attachment| {
+            uploads
+                .iter()
+                .any(|u| u.id.as_deref() == Some(a.id.as_str()))
+        };
+        let maybe_lost = |a: &Attachment| !known(a) && !before.contains(&a.id.to_string());
+        let ours = |a: &Attachment| {
+            if known(a) {
+                return true;
+            }
+            let lost = uploads.iter().filter(|u| u.looks_like(a)).count();
+            lost > 0
+                && maybe_lost(a)
+                && present
+                    .iter()
+                    .filter(|p| {
+                        maybe_lost(p)
+                            && p.name == a.name
+                            && p.content_type.eq_ignore_ascii_case(&a.content_type)
+                    })
+                    .count()
+                    <= lost
+        };
         present
             .iter()
-            .filter(|a| {
-                !draft.drop_attachments.contains(&a.id) && !uploads.iter().any(|u| u.is(a, before))
-            })
+            .filter(|a| !draft.drop_attachments.contains(&a.id) && !ours(a))
             .map(|a| a.id.to_string())
             .collect()
     }
