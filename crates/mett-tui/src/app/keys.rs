@@ -179,6 +179,9 @@ impl App {
     pub fn waiting(&self) -> bool {
         let loading_pager = matches!(self.screen(), Screen::Pager(p) if p.message.is_none());
         self.compose_fetch.is_some()
+            // A reply waiting for the user's own addresses to choose its
+            // recipients.
+            || self.awaiting_addresses.is_some()
             || self.opening.is_some()
             || self.switching.is_some()
             || self.listing.is_some()
@@ -861,5 +864,15 @@ mod tests {
             ));
             assert_eq!(app.status, "Not available in a prompt.");
         }
+    }
+
+    #[test]
+    fn macros_wait_for_a_reply_s_recipients() {
+        let mut app = app();
+        let message = mock::message("m0", "in", "s", DateTime::UNIX_EPOCH);
+        app.awaiting_addresses = Some((crate::compose::Kind::Reply, message));
+        app.push_keys("<last-entry>").unwrap();
+        assert!(app.waiting());
+        assert!(app.next_stroke().is_none());
     }
 }
