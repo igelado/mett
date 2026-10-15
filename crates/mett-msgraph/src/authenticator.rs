@@ -250,6 +250,9 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
     /// half stored.
     async fn sign_in_and_confirm(&self, state: &mut State) -> Result<AccessToken> {
         let checked = tokio::select! {
+            // A sign-in confirmed just as the user cancels is kept: it is
+            // done, and dropping it would only make them sign in again.
+            biased;
             checked = async {
                 let tokens = self.sign_in().await?;
                 let identity = self.check_identity(&tokens).await;

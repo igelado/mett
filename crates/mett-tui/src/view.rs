@@ -74,7 +74,7 @@ pub fn render(app: &App, keymap: &Keymap, frame: &mut Frame) -> Option<Overlay> 
     .areas(frame.area());
 
     frame.render_widget(
-        Paragraph::new(help_line(keymap, app.menu())).style(REVERSED),
+        Paragraph::new(help_line(app, keymap, app.menu())).style(REVERSED),
         help,
     );
     let status_line = match app.screen() {
@@ -169,14 +169,29 @@ fn render_sign_in(
     })
 }
 
+/// Whether `action` does anything now, so that the help line only offers
+/// what works: the sign-in window can't retry before a sign-in failed, nor
+/// open or copy a link it hasn't got.
+fn available(app: &App, action: Action) -> bool {
+    let Some(window) = &app.sign_in else {
+        return true;
+    };
+    match action {
+        Action::Retry => window.failure.is_some(),
+        Action::OpenBrowser | Action::CopyLink => window.prompt.is_some(),
+        _ => true,
+    }
+}
+
 /// `q:Quit  j:Next  …`, from the current key bindings.
-fn help_line(keymap: &Keymap, menu: Menu) -> String {
+fn help_line(app: &App, keymap: &Keymap, menu: Menu) -> String {
     let entries = HELP
         .iter()
         .find(|(m, _)| *m == menu)
         .map_or(&[][..], |(_, entries)| entries);
     entries
         .iter()
+        .filter(|(action, _)| available(app, *action))
         .filter_map(|(action, label)| {
             keymap
                 .key_for(menu, *action)
@@ -471,7 +486,7 @@ mod tests {
             },
         }));
         let lines = sized_screen(&app, 60, 12);
-        assert_eq!(lines[0], "q:Close  o:Browser  <Enter>:Retry");
+        assert_eq!(lines[0], "q:Close  o:Browser");
         let window = lines.join("\n");
         assert!(
             window.contains("Sign in to alice@contoso.com"),
@@ -487,7 +502,9 @@ mod tests {
             account: mett_core::AccountId::new("alice@contoso.com"),
             outcome: Err("denied".into()),
         }));
-        let window = sized_screen(&app, 60, 12).join("\n");
+        let lines = sized_screen(&app, 60, 12);
+        assert_eq!(lines[0], "q:Close  o:Browser  <Enter>:Retry");
+        let window = lines.join("\n");
         assert!(window.contains("Sign-in failed: denied"), "{window}");
     }
 

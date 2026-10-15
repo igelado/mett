@@ -570,8 +570,12 @@ impl App {
             }
             Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
             // Opening the folder failed: try again.
-            Action::DisplayMessage if self.folder.is_none() && self.opening.is_none() => {
-                return self.open_folder();
+            Action::DisplayMessage if self.folder.is_none() => {
+                // Opening the folder failed: try again. (While it is still
+                // opening, there is nothing to display yet.)
+                if self.opening.is_none() {
+                    return self.open_folder();
+                }
             }
             Action::DisplayMessage => return self.open_selected(),
             Action::Exit
@@ -1584,6 +1588,7 @@ mod tests {
         };
         // Pressing Enter while the folder is still opening does nothing.
         assert!(act(&mut app, Action::DisplayMessage).is_empty());
+        assert_eq!(app.status, "Opening folder...");
         app.update(Msg::Response(Response {
             id: open_inbox,
             event: Event::FolderOpened(Err(Error::Network("offline".into()))),
