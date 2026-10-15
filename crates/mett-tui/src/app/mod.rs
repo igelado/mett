@@ -1159,11 +1159,14 @@ impl App {
                 }
             }
             Action::NextPage => {
+                // A page on from where it started: pages to come may put
+                // messages before the last one listed.
+                let start = self.messages.get(self.selected).map(|m| m.id.clone());
                 let target = self.selected + page;
                 self.selected = target.min(last);
                 if target > last && self.more_to_list() {
-                    let target = match self.messages.get(last) {
-                        Some(message) => Target::After(message.id.clone(), target - last),
+                    let target = match start {
+                        Some(start) => Target::After(start, page),
                         None => Target::Entry(target),
                     };
                     return self.wait_for(target);

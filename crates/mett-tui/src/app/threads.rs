@@ -515,6 +515,53 @@ mod tests {
     }
 
     #[test]
+    fn a_collapsed_thread_stays_selected_when_its_first_message_goes() {
+        let mut app = app();
+        act(&mut app, Action::CollapseThread);
+        assert_eq!(shown(&app)[0], "a0 (2)");
+        app.remove_messages(&std::collections::HashSet::from([MessageId::new("a0")]));
+        assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+    }
+
+    #[test]
+    fn a_pending_page_down_counts_from_where_it_started() {
+        let settings = Settings {
+            ordering: Ordering {
+                sort: Sort::parse("subject", true).unwrap(),
+                ..Ordering::default()
+            },
+            ..Settings::default()
+        };
+        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
+        let (mut app, effects) = App::open(80, 5, inbox, settings);
+        let Effect::Request(open, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let effects = app.update(Msg::Response(Response {
+            id: open,
+            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        }));
+        let Effect::Request(list, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
+        let effects = app.update(Msg::Response(Response {
+            id: list,
+            event: Event::MessagesListed(Ok(MessagePage {
+                messages: vec![named("a"), named("z")],
+                next: Some(mett_core::PageCursor::new("in next")),
+            })),
+        }));
+        let Effect::Request(next, _) = effects[0].clone() else {
+            panic!("expected a request, got {effects:?}");
+        };
+        // Two rows a page, from a.
+        act(&mut app, Action::NextPage);
+        page(&mut app, next, vec![named("b"), named("zz")]);
+        assert_eq!(app.messages[app.selected].id.as_str(), "z");
+    }
+
+    #[test]
     fn a_pending_move_waits_for_mail_from_the_same_time() {
         let settings = Settings {
             ordering: Ordering {
