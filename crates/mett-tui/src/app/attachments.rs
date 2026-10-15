@@ -270,8 +270,9 @@ impl App {
         }
         match to {
             Use::Save(path) => {
-                self.file_wait = Some(path.clone());
+                let op = self.wait_for_file(path.clone());
                 vec![Effect::SaveFile {
+                    op,
                     path,
                     data,
                     overwrite: false,
@@ -298,17 +299,11 @@ impl App {
 
     /// Takes in how saving a file went; one that exists may be
     /// overwritten.
-    pub(super) fn on_file_saved(&mut self, outcome: FileOutcome) -> Vec<Effect> {
-        let path = match &outcome {
-            FileOutcome::Done(path)
-            | FileOutcome::Exists(path, _)
-            | FileOutcome::Failed(path, _) => path,
-        };
+    pub(super) fn on_file_saved(&mut self, op: FileOp, outcome: FileOutcome) -> Vec<Effect> {
         // One the user gave up waiting for is done with.
-        if self.file_wait.as_ref() != Some(path) {
+        if !self.file_waited(op) {
             return Vec::new();
         }
-        self.file_wait = None;
         match outcome {
             FileOutcome::Done(path) => {
                 self.status = format!("Saved to {}.", path.display());
@@ -335,8 +330,9 @@ impl App {
             self.status = "Not saved.".into();
             return Vec::new();
         }
-        self.file_wait = Some(path.clone());
+        let op = self.wait_for_file(path.clone());
         vec![Effect::SaveFile {
+            op,
             path,
             data,
             overwrite: true,
@@ -382,21 +378,42 @@ impl App {
         }
         let path = PathBuf::from(expand_home(path, self.home.as_deref()));
         self.status = "Attaching...".into();
-        self.file_wait = Some(path.clone());
-        vec![Effect::ReadFile(path)]
+        let op = self.wait_for_file(path.clone());
+        vec![Effect::ReadFile(op, path)]
+    }
+
+    /// Keys wait for the file at `path` to be read or saved, as the
+    /// returned operation.
+    fn wait_for_file(&mut self, path: PathBuf) -> FileOp {
+        self.last_file_op += 1;
+        let op = FileOp(self.last_file_op);
+        self.file_wait = Some((op, path));
+        op
+    }
+
+    /// Whether `op` is what keys wait for: then they don't any more.
+    fn file_waited(&mut self, op: FileOp) -> bool {
+        let waited = self
+            .file_wait
+            .as_ref()
+            .is_some_and(|(waiting, _)| *waiting == op);
+        if waited {
+            self.file_wait = None;
+        }
+        waited
     }
 
     /// Attaches a file read for the compose menu.
     pub(super) fn on_file_read(
         &mut self,
+        op: FileOp,
         path: PathBuf,
         result: Result<Vec<u8>, String>,
     ) -> Vec<Effect> {
         // One the user gave up waiting for is done with.
-        if self.file_wait.as_ref() != Some(&path) {
+        if !self.file_waited(op) {
             return Vec::new();
         }
-        self.file_wait = None;
         if self.status == "Attaching..." {
             self.status.clear();
         }
@@ -446,6 +463,11 @@ impl App {
         compose.selected = compose.selected.min(compose.parts() - 1);
     }
 }
+
+/// Which reading or saving of a file a result is for: the user may have
+/// given up on one, and asked for the same file again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileOp(pub u64);
 
 /// How saving a file went.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -690,25 +712,27 @@ mod tests {
         assert_eq!(
             effects,
             [Effect::SaveFile {
+                op: FileOp(1),
                 path: path.clone(),
                 data: b"hello".to_vec(),
                 overwrite: false,
             }]
         );
-        app.update(Msg::FileSaved(FileOutcome::Exists(
-            path.clone(),
-            b"hello".to_vec(),
-        )));
+        app.update(Msg::FileSaved(
+            FileOp(1),
+            FileOutcome::Exists(path.clone(), b"hello".to_vec()),
+        ));
         let effects = app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
         assert_eq!(
             effects,
             [Effect::SaveFile {
+                op: FileOp(2),
                 path: path.clone(),
                 data: b"hello".to_vec(),
                 overwrite: true,
             }]
         );
-        app.update(Msg::FileSaved(FileOutcome::Done(path)));
+        app.update(Msg::FileSaved(FileOp(2), FileOutcome::Done(path)));
         assert_eq!(app.status, "Saved to /home/alice/notes.txt.");
     }
 
@@ -760,7 +784,7 @@ mod tests {
         app.input = None;
         let effects = app.answer_attach_file("~/report.pdf".into());
         let path = PathBuf::from("/home/alice/report.pdf");
-        assert_eq!(effects, [Effect::ReadFile(path.clone())]);
+        assert_eq!(effects, [Effect::ReadFile(FileOp(1), path.clone())]);
         // Keys wait for it.
         assert!(
             app.update(Msg::Key(KeyEvent::from(KeyCode::Char('q'))))
@@ -768,7 +792,7 @@ mod tests {
         );
         assert!(matches!(app.screen(), Screen::Compose(_)));
         assert!(app.status.starts_with("Waiting for /home/alice/report.pdf"));
-        app.update(Msg::FileRead(path, Ok(b"%PDF".to_vec())));
+        app.update(Msg::FileRead(FileOp(1), path, Ok(b"%PDF".to_vec())));
         let Screen::Compose(compose) = app.screen() else {
             panic!("expected the compose menu");
         };
@@ -788,6 +812,7 @@ mod tests {
         // A file that can't be read is said.
         app.answer_attach_file("/nope".into());
         app.update(Msg::FileRead(
+            FileOp(2),
             PathBuf::from("/nope"),
             Err("not found".into()),
         ));
@@ -799,10 +824,25 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert_eq!(app.status, "Not waiting for /slow any more.");
-        app.update(Msg::FileRead(PathBuf::from("/slow"), Ok(b"x".to_vec())));
+        // Asked for again: only the new reading counts.
+        app.answer_attach_file("/slow".into());
+        app.update(Msg::FileRead(
+            FileOp(3),
+            PathBuf::from("/slow"),
+            Ok(b"old".to_vec()),
+        ));
         let Screen::Compose(compose) = app.screen() else {
             panic!("expected the compose menu");
         };
         assert!(compose.draft.attachments.is_empty());
+        app.update(Msg::FileRead(
+            FileOp(4),
+            PathBuf::from("/slow"),
+            Ok(b"new".to_vec()),
+        ));
+        let Screen::Compose(compose) = app.screen() else {
+            panic!("expected the compose menu");
+        };
+        assert_eq!(compose.draft.attachments[0].data, b"new");
     }
 }

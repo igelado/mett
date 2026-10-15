@@ -19,7 +19,7 @@ use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, Messa
 use mett_msgraph::SignInPrompt;
 use ratatui::crossterm::event::KeyEvent;
 
-pub use self::attachments::{AttachMenu, FileOutcome, TextView};
+pub use self::attachments::{AttachMenu, FileOp, FileOutcome, TextView};
 use self::composing::Composing;
 pub use self::composing::{Compose, Input};
 pub use self::keys::{Help, Reconfigured};
@@ -143,9 +143,9 @@ pub enum Msg {
     /// The editor finished: the edited text, or why it failed.
     Edited(Result<String, String>),
     /// A file was saved, or not.
-    FileSaved(FileOutcome),
+    FileSaved(FileOp, FileOutcome),
     /// A file was read, or not.
-    FileRead(std::path::PathBuf, Result<Vec<u8>, String>),
+    FileRead(FileOp, std::path::PathBuf, Result<Vec<u8>, String>),
     /// Something done apart from the app failed (opening a file, say).
     Failed(String),
     /// A timer the app set went off.
@@ -175,6 +175,8 @@ pub enum Effect {
     /// Write a file, then send back [`Msg::FileSaved`]. A file that exists
     /// is replaced only if `overwrite`.
     SaveFile {
+        /// Which saving it is.
+        op: FileOp,
         /// Where.
         path: std::path::PathBuf,
         /// What.
@@ -190,7 +192,7 @@ pub enum Effect {
         data: Vec<u8>,
     },
     /// Read a file, then send back [`Msg::FileRead`].
-    ReadFile(std::path::PathBuf),
+    ReadFile(FileOp, std::path::PathBuf),
     /// Edit the text in the user's editor, then send back
     /// [`Msg::Edited`].
     Edit(String),
@@ -599,7 +601,9 @@ pub struct App {
     fetching: Option<attachments::Fetching>,
     /// The file being read (to attach) or saved: keys wait for it, as in
     /// mutt, but `^G` gives up on it.
-    file_wait: Option<std::path::PathBuf>,
+    file_wait: Option<(FileOp, std::path::PathBuf)>,
+    /// The last [`FileOp`] given.
+    last_file_op: u64,
     /// A file not saved because one was there, waiting for the user to say
     /// whether to replace it.
     unsaved: Option<(std::path::PathBuf, Vec<u8>)>,
@@ -743,6 +747,7 @@ impl App {
             page_size: settings.page_size,
             fetching: None,
             file_wait: None,
+            last_file_op: 0,
             unsaved: None,
             home: settings.home,
             mailboxes: settings.mailboxes,
@@ -826,8 +831,8 @@ impl App {
             Msg::Key(key) => self.on_key_press(key),
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
-            Msg::FileSaved(outcome) => self.on_file_saved(outcome),
-            Msg::FileRead(path, result) => self.on_file_read(path, result),
+            Msg::FileSaved(op, outcome) => self.on_file_saved(op, outcome),
+            Msg::FileRead(op, path, result) => self.on_file_read(op, path, result),
             Msg::Failed(why) => {
                 self.fail(why);
                 Vec::new()
@@ -1521,8 +1526,10 @@ impl App {
             Event::Purged(result) => {
                 return self.on_transferred(id, result.map(|results| (None, results)));
             }
-            Event::Sent(result) => return self.on_delivered(id, result),
-            Event::DraftSaved(result) => return self.on_delivered(id, result.map(drop)),
+            Event::Sent(result, kept) => return self.on_delivered(id, result, kept),
+            Event::DraftSaved(result, kept) => {
+                return self.on_delivered(id, result.map(drop), kept);
+            }
             // Without them, the configured ones do.
             Event::OwnAddresses(result) => {
                 if self.addresses_request == Some(id) {

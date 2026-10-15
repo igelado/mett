@@ -758,6 +758,10 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         self.discard_kept_draft(draft).await
     }
 
+    fn keeps_draft(&self, draft: &Draft) -> bool {
+        self.has_kept(draft)
+    }
+
     async fn send(&self, draft: &Draft) -> Result<()> {
         // A server draft kept from an earlier attempt is sent, not left
         // behind.

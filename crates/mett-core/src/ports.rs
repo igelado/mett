@@ -185,6 +185,14 @@ pub trait MailSender: Send + Sync {
         let _ = draft;
         std::future::ready(Ok(()))
     }
+
+    /// Whether an attempt to send or save `draft` left something with the
+    /// backend that the next attempt goes on from (with Office365, a
+    /// server draft, which is sent with a copy in Sent Items).
+    fn keeps_draft(&self, draft: &Draft) -> bool {
+        let _ = draft;
+        false
+    }
 }
 
 /// An OAuth2 access token.

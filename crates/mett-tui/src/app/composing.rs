@@ -149,6 +149,9 @@ pub struct Compose {
     /// A failed attempt to send or postpone it may have left a server
     /// draft behind, to delete if the user gives up on it.
     pub(super) left_draft: bool,
+    /// The backend kept a draft from the last attempt, which the next one
+    /// goes on from.
+    pub(super) kept_draft: bool,
     /// The selected part: its text, the forwarded attachments if there
     /// are any, then the attached files.
     pub selected: usize,
@@ -164,6 +167,7 @@ impl Compose {
             unauthorized: None,
             forwarded_attachments,
             left_draft: false,
+            kept_draft: false,
             selected: 0,
         }
     }
@@ -636,9 +640,9 @@ impl App {
         let Some(Screen::Compose(compose)) = self.screens.last() else {
             return Vec::new();
         };
-        // A server draft left by an earlier attempt is what is sent, even
-        // if the message would now go without one.
-        if mett_msgraph::needs_server_draft(&compose.draft) || compose.left_draft {
+        // A server draft kept from an earlier attempt is what is sent,
+        // even if the message would now go without one.
+        if mett_msgraph::needs_server_draft(&compose.draft) || compose.kept_draft {
             return self.answer(Question::Copy, true);
         }
         let prompt = "Save a copy of this message?".to_owned();
@@ -812,6 +816,7 @@ impl App {
         &mut self,
         id: RequestId,
         result: mett_core::Result<()>,
+        kept: bool,
     ) -> Vec<Effect> {
         let Some(position) = self.screens.iter().position(|screen| {
             matches!(screen, Screen::Compose(Compose { delivery: Some((request, _)), .. }) if *request == id)
@@ -823,6 +828,7 @@ impl App {
         };
         let delivery = compose.delivery.take().map(|(_, d)| d);
         compose.unauthorized = None;
+        compose.kept_draft = kept;
         let saved_copy = compose.draft.save_copy;
         match result {
             Ok(()) => {
@@ -1081,7 +1087,7 @@ mod tests {
 
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert_eq!(app.screen(), &Screen::Index);
         assert_eq!(app.status, "Mail sent.");
@@ -1098,7 +1104,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Backend("bad recipient".into()))),
+            event: Event::Sent(Err(Error::Backend("bad recipient".into())), false),
         }));
         assert_eq!(compose(&app).delivery, None);
         assert_eq!(app.status, "backend error: bad recipient");
@@ -1134,14 +1140,14 @@ mod tests {
         assert!(matches!(request(&effects).1, Request::Send(d) if d.save_copy));
         app.update(Msg::Response(Response {
             id: request(&effects).0,
-            event: Event::Sent(Err(Error::Network("offline".into()))),
+            event: Event::Sent(Err(Error::Network("offline".into())), false),
         }));
 
         let (id, request) = request(&act(&mut app, Action::PostponeMessage));
         assert!(matches!(request, Request::SaveDraft(d) if d.body == "Sure.\n"));
         app.update(Msg::Response(Response {
             id,
-            event: Event::DraftSaved(Ok("d1".into())),
+            event: Event::DraftSaved(Ok("d1".into()), false),
         }));
         assert_eq!(app.status, "Message postponed.");
         assert!(matches!(app.screen(), Screen::Pager(_)));
@@ -1297,7 +1303,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         act(&mut app, Action::Exit);
         let effects = key(&mut app, KeyCode::Char('n'));
@@ -1330,7 +1336,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         act(&mut app, Action::Exit);
         let (id, _) = request(&key(&mut app, KeyCode::Char('n')));
@@ -1366,7 +1372,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         act(&mut app, Action::Exit);
         let (discard, _) = request(&key(&mut app, KeyCode::Char('n')));
@@ -1467,7 +1473,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert!(
             matches!(
@@ -1546,7 +1552,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         let list = effects
             .iter()
@@ -1579,7 +1585,7 @@ mod tests {
         }));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Auth("expired".into()))),
+            event: Event::Sent(Err(Error::Auth("expired".into())), false),
         }));
         let (_, again) = request(&act(&mut app, Action::Retry));
         assert_eq!(again, sent);
@@ -1605,7 +1611,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert!(
             matches!(effects.as_slice(), [Effect::Later(..)]),
@@ -1666,7 +1672,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         assert!(
             app.status.starts_with("The message may have been sent"),
@@ -1685,7 +1691,10 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::NotSent("network error: timed out".into()))),
+            event: Event::Sent(
+                Err(Error::NotSent("network error: timed out".into())),
+                false,
+            ),
         }));
         assert_eq!(
             app.status,
@@ -1707,7 +1716,7 @@ mod tests {
             };
             app.update(Msg::Response(Response {
                 id,
-                event: Event::Sent(Err(Error::Network("timed out".into()))),
+                event: Event::Sent(Err(Error::Network("timed out".into())), false),
             }));
             // Sending the same message again is the same attempt.
             let (id, Request::Send(again)) = request(&act(&mut app, Action::SendMessage)) else {
@@ -1716,7 +1725,7 @@ mod tests {
             assert_eq!(again.attempt, sent.attempt);
             app.update(Msg::Response(Response {
                 id,
-                event: Event::Sent(Ok(())),
+                event: Event::Sent(Ok(()), false),
             }));
             attempts.push(sent.attempt);
         }
@@ -1741,7 +1750,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         let effects = app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Ok(())),
+            event: Event::Sent(Ok(()), false),
         }));
         assert!(effects.is_empty());
         assert_eq!(app.messages.len(), 1);
@@ -1757,11 +1766,21 @@ mod tests {
         answer(&mut app, "bob@x.org");
         answer(&mut app, "Hi");
         app.update(Msg::Edited(Ok("text".into())));
-        // An earlier attempt left a server draft, which Graph keeps a copy
-        // of when it sends it.
-        if let Some(Screen::Compose(compose)) = app.screens.last_mut() {
-            compose.left_draft = true;
-        }
+        // A failed attempt that kept nothing leaves `copy` as it is…
+        let (id, sent) = request(&act(&mut app, Action::SendMessage));
+        assert!(matches!(sent, Request::Send(d) if !d.save_copy));
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Auth("expired".into())), false),
+        }));
+        let (id, sent) = request(&act(&mut app, Action::SendMessage));
+        assert!(matches!(sent, Request::Send(d) if !d.save_copy));
+        // …but one that kept a server draft sends that, which Graph keeps
+        // a copy of.
+        app.update(Msg::Response(Response {
+            id,
+            event: Event::Sent(Err(Error::Network("timed out".into())), true),
+        }));
         let (_, sent) = request(&act(&mut app, Action::SendMessage));
         assert!(matches!(sent, Request::Send(d) if d.save_copy));
     }
@@ -1792,7 +1811,7 @@ mod tests {
         }));
         app.update(Msg::Response(Response {
             id: send,
-            event: Event::Sent(Err(Error::Auth("expired".into()))),
+            event: Event::Sent(Err(Error::Auth("expired".into())), false),
         }));
         let effects = act(&mut app, Action::Retry);
         let requests: Vec<_> = effects
@@ -1816,7 +1835,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::PostponeMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::DraftSaved(Err(Error::Network("timed out".into()))),
+            event: Event::DraftSaved(Err(Error::Network("timed out".into())), false),
         }));
         assert!(
             app.status.starts_with("The message may have been saved"),
@@ -1838,7 +1857,7 @@ mod tests {
         let (id, _) = request(&act(&mut app, Action::SendMessage));
         app.update(Msg::Response(Response {
             id,
-            event: Event::Sent(Err(Error::Network("timed out".into()))),
+            event: Event::Sent(Err(Error::Network("timed out".into())), false),
         }));
         assert!(app.status.contains("without a copy"), "{}", app.status);
     }

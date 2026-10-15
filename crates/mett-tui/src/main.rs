@@ -635,8 +635,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                         if matches!(
                             response.event,
                             worker::Event::FlagsUpdated(_)
-                                | worker::Event::Sent(_)
-                                | worker::Event::DraftSaved(_)
+                                | worker::Event::Sent(..)
+                                | worker::Event::DraftSaved(..)
                                 | worker::Event::KeptDiscarded(_)
                                 | worker::Event::Transferred(_)
                                 | worker::Event::Purged(_)
@@ -876,6 +876,13 @@ fn remove_viewed() {
     }
 }
 
+/// Whether process `pid` may still be running (another mett, whose
+/// viewers still use their copies). Without `/proc` to tell, it may.
+fn running(pid: &str) -> bool {
+    let proc = std::path::Path::new("/proc");
+    !proc.is_dir() || proc.join(pid).exists()
+}
+
 /// Removes the copies of attachments that earlier runs left for their
 /// viewers, once they are old (named `mett-PID-NANOS-N`, by when).
 fn remove_viewed_before() {
@@ -902,6 +909,7 @@ fn remove_viewed_before() {
         if numeric(pid)
             && numeric(count)
             && now.saturating_sub(started) > VIEWED_LEFT.as_nanos()
+            && !running(pid)
             && entry.file_type().is_ok_and(|t| t.is_dir())
         {
             let _ = std::fs::remove_dir_all(entry.path());
@@ -1052,6 +1060,7 @@ fn dispatch(
             // Files are read and written on threads of their own: a slow
             // disk (or a FIFO) doesn't hold up the screen, nor quitting.
             Effect::SaveFile {
+                op,
                 path,
                 data,
                 overwrite,
@@ -1061,7 +1070,7 @@ fn dispatch(
                 std::thread::spawn(move || {
                     let saved = save_file(path, data, overwrite);
                     SAVING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    let _ = files.send(app::Msg::FileSaved(saved));
+                    let _ = files.send(app::Msg::FileSaved(op, saved));
                 });
             }
             Effect::OpenFile { name, data } => {
@@ -1072,11 +1081,11 @@ fn dispatch(
                     }
                 });
             }
-            Effect::ReadFile(path) => {
+            Effect::ReadFile(op, path) => {
                 let files = files.clone();
                 std::thread::spawn(move || {
                     let read = std::fs::read(&path).map_err(|e| e.to_string());
-                    let _ = files.send(app::Msg::FileRead(path, read));
+                    let _ = files.send(app::Msg::FileRead(op, path, read));
                 });
             }
             Effect::Command(command) => deferred.commands.push(command),

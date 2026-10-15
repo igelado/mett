@@ -47,7 +47,7 @@ impl App {
         // Ctrl-J is a newline: it does what Enter does, unless bound.
         let ctrl_j = Key::from(event) == Key::ctrl('j');
         // Keys wait for a file being read or saved; `^G` gives up on it.
-        if let Some(path) = &self.file_wait
+        if let Some((_, path)) = &self.file_wait
             && self.sign_in.is_none()
         {
             let key = Key::from(event);
@@ -858,6 +858,7 @@ mod tests {
             forwarded_attachments: false,
             selected: 0,
             left_draft: false,
+            kept_draft: false,
         }));
         app.update(Msg::Action(Action::Help));
         assert!(matches!(app.screen(), Screen::Compose(_)));

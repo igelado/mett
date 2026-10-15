@@ -125,10 +125,11 @@ pub enum Event {
     /// Outcome of [`Request::Purge`]: the trash folder could not be found,
     /// or for each message, whether it was purged.
     Purged(Result<Vec<(MessageId, Result<()>)>>),
-    /// Outcome of [`Request::Send`].
-    Sent(Result<()>),
-    /// Outcome of [`Request::SaveDraft`].
-    DraftSaved(Result<MessageId>),
+    /// Outcome of [`Request::Send`], and whether a draft is kept for the
+    /// next attempt (see [`MailSender::keeps_draft`]).
+    Sent(Result<()>, bool),
+    /// Outcome of [`Request::SaveDraft`], and whether a draft is kept.
+    DraftSaved(Result<MessageId>, bool),
     /// Outcome of [`Request::DiscardKept`].
     KeptDiscarded(Result<()>),
     /// Outcome of [`Request::OwnAddresses`].
@@ -226,8 +227,14 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::Purge { ids, from, trash } => {
             Event::Purged(purge(store, &ids, &from, trash.as_ref()).await)
         }
-        Request::Send(draft) => Event::Sent(store.send(&draft).await),
-        Request::SaveDraft(draft) => Event::DraftSaved(store.save_draft(&draft).await),
+        Request::Send(draft) => {
+            let sent = store.send(&draft).await;
+            Event::Sent(sent, store.keeps_draft(&draft))
+        }
+        Request::SaveDraft(draft) => {
+            let saved = store.save_draft(&draft).await;
+            Event::DraftSaved(saved, store.keeps_draft(&draft))
+        }
         Request::DiscardKept(draft) => Event::KeptDiscarded(store.discard_kept(&draft).await),
         Request::OwnAddresses => Event::OwnAddresses(store.own_addresses().await),
         Request::StillThere { folder, ids } => {
