@@ -813,6 +813,8 @@ impl App {
                     | Action::LastEntry
                     | Action::NextPage
                     | Action::PreviousPage
+                    | Action::NextThread
+                    | Action::PreviousThread
                     // Opening a message chooses it too.
                     | Action::DisplayMessage
             );

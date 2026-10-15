@@ -151,6 +151,18 @@ impl App {
         }
     }
 
+    /// Opens the collapsed thread `message` is folded into, and selects it.
+    pub(super) fn uncollapse_to(&mut self, message: &MessageId) {
+        if let Some(thread) = self.threads.get(message) {
+            let key = thread.key.clone();
+            self.collapsed.remove(&key);
+        }
+        self.arrange();
+        if let Some(at) = self.messages.iter().position(|m| &m.id == message) {
+            self.selected = at;
+        }
+    }
+
     /// Where the thread after the selected message starts, if it is
     /// listed.
     pub(super) fn next_thread_root(&self) -> Option<usize> {
@@ -386,6 +398,26 @@ mod tests {
         assert_eq!(shown(&app), ["a0 (2)", "b0 (1)"]);
         act(&mut app, Action::CollapseAll);
         assert_eq!(shown(&app).len(), 5);
+    }
+
+    #[test]
+    fn a_search_opens_the_collapsed_thread_it_finds() {
+        let mut app = app();
+        let a2 = app
+            .messages
+            .iter_mut()
+            .find(|m| m.id.as_str() == "a2")
+            .unwrap();
+        a2.subject = "Re: a, special".into();
+        act(&mut app, Action::CollapseAll);
+        // a2 is folded into a0's thread.
+        app.messages
+            .iter()
+            .for_each(|m| assert_ne!(m.id.as_str(), "a2"));
+        app.selected = 1;
+        app.new_search("~s special");
+        assert_eq!(app.messages[app.selected].id.as_str(), "a2");
+        assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0 (1)"]);
     }
 
     #[test]

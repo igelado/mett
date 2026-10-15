@@ -136,7 +136,7 @@ impl App {
 
     /// Starts looking for `text`, from the first message if the index is
     /// empty (it may be loading).
-    fn new_search(&mut self, text: &str) -> Vec<Effect> {
+    pub(super) fn new_search(&mut self, text: &str) -> Vec<Effect> {
         self.search_from_top = self.messages.is_empty();
         self.search(text)
     }
@@ -164,13 +164,7 @@ impl App {
             }
         };
         let count = self.messages.len();
-        let matches = |i: &usize| {
-            let summary = &self.messages[*i];
-            pattern.matches(&Candidate {
-                summary,
-                deleted: self.deleted.contains(&summary.id),
-            })
-        };
+        let matches = |i: &usize| self.search_match(&pattern, *i).is_some();
         // From the next message on, then (once the whole folder is listed:
         // the next match may be on a page still to come) wrapping around
         // to the top.
@@ -197,7 +191,12 @@ impl App {
                 } else {
                     String::new()
                 };
+                let id = self.search_match(&pattern, i).expect("found above");
                 self.selected = i;
+                // Found folded into a collapsed thread: the thread opens.
+                if self.messages[i].id != id {
+                    self.uncollapse_to(&id);
+                }
             }
             // More of the folder is on its way: look again when it comes.
             None if more => {
@@ -296,6 +295,29 @@ impl App {
             }
             None => self.fail("Not found."),
         }
+    }
+
+    /// What matches `pattern` at entry `i` of the index: the message, or
+    /// one folded under it into its collapsed thread.
+    fn search_match(&self, pattern: &Pattern, i: usize) -> Option<mett_core::MessageId> {
+        let matches = |summary: &MessageSummary| {
+            pattern.matches(&Candidate {
+                summary,
+                deleted: self.deleted.contains(&summary.id),
+            })
+        };
+        let entry = &self.messages[i];
+        if matches(entry) {
+            return Some(entry.id.clone());
+        }
+        if self.thread_of(&entry.id).is_none_or(|t| t.folded == 0) {
+            return None;
+        }
+        self.folded
+            .iter()
+            .filter(|m| self.thread_of(&m.id).is_some_and(|t| t.root == entry.id))
+            .find(|m| matches(m))
+            .map(|m| m.id.clone())
     }
 
     /// Limits the index to the messages matching `text`, or shows them all

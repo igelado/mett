@@ -300,7 +300,14 @@ fn threads(
     };
     let representative: Vec<usize> = trees
         .iter()
-        .map(|tree| if aux.last { latest(tree) } else { tree.0 })
+        .map(|tree| {
+            // `last-threads` or `sort_aux=last-...`.
+            if aux.last || sort.last {
+                latest(tree)
+            } else {
+                tree.0
+            }
+        })
         .collect();
     let mut order: Vec<usize> = (0..trees.len()).collect();
     order.sort_by(|&a, &b| {
@@ -476,6 +483,8 @@ mod tests {
             ["root".to_owned(), "|->lost".to_owned()]
         );
         assert_eq!(arranged(&messages, "threads", "last-date")[0], "other");
+        // The same with `last-threads`.
+        assert_eq!(arranged(&messages, "last-threads", "date")[0], "other");
     }
 
     #[test]
