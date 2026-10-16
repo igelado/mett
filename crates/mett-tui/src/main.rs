@@ -584,6 +584,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     Some(received) => received,
                     None => {
                         if std::mem::take(&mut stale) {
+                            app.before_draw();
                             draw(&mut terminal, &app)?;
                         }
                         next.await
@@ -674,6 +675,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             }
             // What was ignored changed nothing to draw.
             if std::mem::take(&mut stale) {
+                app.before_draw();
                 draw(&mut terminal, &app)?;
             }
             let msg = tokio::select! {

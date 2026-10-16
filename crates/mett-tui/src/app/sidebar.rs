@@ -298,14 +298,16 @@ impl App {
         self.sidebar.entries = entries;
     }
 
-    /// Orders the sidebar again when it is ordered by counts and the open
-    /// folder's have changed (mail was read, moved or listed).
-    pub(super) fn follow_open_counts(&mut self) {
+    /// Brings the sidebar up to date before the screen is drawn: ordered
+    /// by counts, it follows the open folder's as the index has them (mail
+    /// was read, moved or listed). They are counted once a frame, as the
+    /// status bar counts them, and only then.
+    pub fn before_draw(&mut self) {
         let by_counts = matches!(
             self.sidebar.settings.sort.method,
             SortMethod::Count | SortMethod::Unread
         );
-        let counts = (by_counts && self.folder.is_some()).then(|| {
+        let counts = (by_counts && self.sidebar_shown() && self.folder.is_some()).then(|| {
             let unread = self.folder_messages().filter(|m| !m.flags.read).count();
             (unread, self.total_messages())
         });
@@ -686,6 +688,12 @@ mod tests {
         // The open folder stays the open one.
         assert!(app.sidebar.entries[0].open);
         assert!(app.status.is_empty(), "{}", app.status);
+        // Text is read in the pager, which has them too.
+        let text = crate::app::TextView::new("notes.txt".into(), vec!["a".into()], 50);
+        app.screens.push(crate::app::Screen::Text(text));
+        act(&mut app, Action::SidebarFirst);
+        assert_eq!(app.sidebar.highlight, 0);
+        assert!(matches!(app.screen(), crate::app::Screen::Text(_)));
     }
 
     #[test]
@@ -766,7 +774,8 @@ mod tests {
 
     #[test]
     fn ordered_by_counts_follows_the_open_folder_s() {
-        let settings = with_mailboxes(sorted_by("unread"));
+        let mut settings = with_mailboxes(sorted_by("unread"));
+        settings.sidebar.visible = true;
         let (mut app, effects) = App::open(80, 24, inbox(), settings);
         let open = first_request(&effects);
         let folder = mett_core::mock::folder("inbox", "Inbox", None);
@@ -779,11 +788,13 @@ mod tests {
             .collect();
         listed(&mut app, sent[0].0, unread, None);
         mailboxes_checked(&mut app, sent[1].0, &[("Work", 3, 3, false)]);
+        app.before_draw();
         assert_eq!(shown(&app), ["*Inbox", "Work", "Lists"]);
         for _ in 0..3 {
             act(&mut app, Action::ToggleNew);
             act(&mut app, Action::NextEntry);
         }
+        app.before_draw();
         assert_eq!(shown(&app), ["Work", "*Inbox", "Lists"]);
     }
 }

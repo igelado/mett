@@ -909,8 +909,6 @@ impl App {
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         let mut effects = self.handle(msg);
-        // Ordered by counts, the sidebar follows the open folder's.
-        self.follow_open_counts();
         // A search given up on (the user moved on, or left the message it
         // waited for) stops saying it is searching.
         let searching = self.pending_search.is_some()
@@ -1035,7 +1033,10 @@ impl App {
         }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
-            Menu::Pager if matches!(self.screen(), Screen::Text(_)) => self.on_text_action(action),
+            // Text is read in the pager, beside the sidebar too.
+            Menu::Pager if matches!(self.screen(), Screen::Text(_)) => self
+                .on_sidebar_action(action)
+                .unwrap_or_else(|| self.on_text_action(action)),
             Menu::Pager => self.on_pager_action(action),
             Menu::Attach => self.on_attach_action(action),
             Menu::Query => self.on_query_action(action),
