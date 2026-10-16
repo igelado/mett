@@ -624,6 +624,9 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
     let width = usize::from(area.width);
     let colors = &app.display.colors;
     let total = app.total_messages();
+    // The threads with unread mail folded into them, found once for the
+    // page, and only if a collapsed thread on it needs them.
+    let unread_roots = std::cell::OnceCell::new();
     render_page(
         &app.messages,
         app.selected,
@@ -635,7 +638,12 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
             // unread.
             let thread = app.thread_of(&message.id);
             let folded_unread;
-            let message = if message.flags.read && app.folded_unread(&message.id) {
+            let message = if message.flags.read
+                && thread.is_some_and(|t| t.folded > 0)
+                && unread_roots
+                    .get_or_init(|| app.roots_with_folded_unread())
+                    .contains(&message.id)
+            {
                 let mut shown = message.clone();
                 shown.flags.read = false;
                 folded_unread = shown;
@@ -679,14 +687,21 @@ fn index_status(app: &App, height: usize, width: usize) -> String {
     let first = app.selected / height * height;
     let position = expando::position(first, height, app.messages.len());
     let (sort, aux) = (app.ordering.sort.name(), app.ordering.aux.name());
+    // The whole folder, as in mutt, whatever the limit shows: counted in
+    // one pass.
+    let (new, flagged) = app.folder_messages().fold((0, 0), |(new, flagged), m| {
+        (
+            new + usize::from(!m.flags.read),
+            flagged + usize::from(m.flags.flagged),
+        )
+    });
     let status = Status {
         folder: app.folder.as_ref().map_or("", |f| f.name.as_str()),
         total: app.total_messages(),
         shown: app.limit.as_ref().map(|_| app.shown_count()),
-        // The whole folder, as in mutt, whatever the limit shows.
-        new: app.folder_messages().filter(|m| !m.flags.read).count(),
+        new,
         deleted: app.deleted_count(),
-        flagged: app.folder_messages().filter(|m| m.flags.flagged).count(),
+        flagged,
         incoming: app.mailboxes_with_new_mail(),
         limit: app.limit.as_ref().map(|limit| limit.text.as_str()),
         incomplete: app.incomplete(),
@@ -819,7 +834,16 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     let position = expando::position(top, height, total);
     // The message as the index currently shows it, as in mutt's `%Z`: its
     // flags may have changed since it was fetched.
-    let index = app.messages.iter().position(|m| m.id == pager.id);
+    // Usually the selected one; IDs are unique, so it is the only one.
+    let index = if app
+        .messages
+        .get(app.selected)
+        .is_some_and(|m| m.id == pager.id)
+    {
+        Some(app.selected)
+    } else {
+        app.messages.iter().position(|m| m.id == pager.id)
+    };
     let summary = index.map_or(&message.summary, |i| &app.messages[i]);
     let entry = Entry {
         number: index.unwrap_or(app.selected) + 1,
@@ -1127,6 +1151,42 @@ mod tests {
         let lines = screen(&app);
         assert!(lines[1].starts_with("   6 "), "{lines:#?}");
         assert!(lines[2].starts_with("   7 "), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_collapsed_thread_with_unread_mail_folded_in_shows_as_unread() {
+        // Threads "a" (a0, a1) and "b" (b0, b1): only a1 is unread.
+        let messages = [
+            ("b1", "b", 1),
+            ("a1", "a", 1),
+            ("b0", "b", 0),
+            ("a0", "a", 0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, conversation, depth))| {
+            let mut m = mock::message(id, "in", "Plans", received(-(i as i64))).summary;
+            m.flags.read = id != "a1";
+            m.thread = Some(mett_core::ThreadPosition {
+                conversation: conversation.into(),
+                path: (0..=depth).map(|step| vec![step]).collect(),
+            });
+            m
+        })
+        .collect();
+        let (mut app, _) = opened(sorted("threads"), HEIGHT, messages, None);
+        act(&mut app, Action::CollapseAll);
+        let lines = sized_screen(&app, WIDTH, HEIGHT);
+        let row = |id: &str| {
+            let i = app
+                .messages
+                .iter()
+                .position(|m| m.id.as_str() == id)
+                .unwrap();
+            lines[i + 1].clone()
+        };
+        assert!(row("a0").starts_with("   1 N"), "{lines:#?}");
+        assert!(row("b0").starts_with("   2  "), "{lines:#?}");
     }
 
     #[test]
