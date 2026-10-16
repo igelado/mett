@@ -424,4 +424,66 @@ mod tests {
         });
         assert_eq!(app.width, 120);
     }
+
+    /// Opens the selected message, `words` words long.
+    fn read(app: &mut App, words: usize) {
+        let fetch = first_request(&act(app, crate::action::Action::DisplayMessage));
+        let id = app.messages[app.selected].id.as_str().to_owned();
+        let mut message = mock::message(&id, "in", "Subject", chrono::DateTime::UNIX_EPOCH);
+        message.body.content = "word ".repeat(words);
+        respond(app, fetch, Event::MessageFetched(Ok(message)));
+    }
+
+    fn rows_width(app: &App) -> Option<usize> {
+        match app.screen() {
+            crate::app::Screen::Pager(pager) => pager.rows_width,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn wrap_counts_from_the_width_beside_it() {
+        let mut app = app(visible(), 1);
+        read(&mut app, 40);
+        for (wrap, width) in [(0, 70), (50, 50), (90, 70), (-10, 60)] {
+            app.display.wrap = wrap;
+            app.update(Msg::Resize {
+                width: WIDTH,
+                height: HEIGHT,
+            });
+            assert_eq!(rows_width(&app), Some(width), "wrap={wrap}");
+        }
+        let lines = screen(&app);
+        assert!(
+            lines[5].starts_with("                             |word"),
+            "{lines:#?}"
+        );
+        assert!(lines[5].chars().count() <= 90, "{lines:#?}");
+    }
+
+    #[test]
+    fn the_mini_index_is_beside_it_too() {
+        let mut app = app(visible(), 3);
+        app.display.pager_index_lines = 4;
+        let height = 16;
+        app.update(Msg::Resize {
+            width: WIDTH,
+            height,
+        });
+        read(&mut app, 5);
+        let lines = lines(&drawn(&app, WIDTH, height));
+        let side = |row: usize| lines[row].chars().take(30).collect::<String>();
+        let menu = |row: usize| lines[row].chars().skip(30).collect::<String>();
+        assert_eq!(side(1), format!("Inbox{}|", " ".repeat(24)), "{lines:#?}");
+        assert!(menu(1).starts_with("   1 "), "{lines:#?}");
+        // The mini-index's status bar is in the pager's window, beside the
+        // sidebar, as in mutt; the pager's own spans the screen.
+        assert!(side(4).ends_with('|'), "{lines:#?}");
+        assert!(menu(4).contains("mett: Inbox"), "{lines:#?}");
+        assert_eq!(menu(4).chars().count(), 70, "{lines:#?}");
+        assert!(menu(5).starts_with("Date:"), "{lines:#?}");
+        let status = &lines[usize::from(height) - 2];
+        assert!(status.starts_with("-"), "{lines:#?}");
+        assert_eq!(status.chars().count(), usize::from(WIDTH), "{lines:#?}");
+    }
 }
