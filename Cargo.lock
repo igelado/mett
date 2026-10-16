@@ -1718,10 +1718,12 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest",
+ "serde_json",
  "tokio",
  "unicode-segmentation",
  "unicode-width",
  "url",
+ "wiremock",
 ]
 
 [[package]]

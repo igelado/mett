@@ -168,6 +168,13 @@ Commands typed at the `:` prompt, which may `source` files or run
 backticks, likewise run on a thread of their own, one at a time, and
 report back to the main loop.
 
+A request that takes many Graph requests (moving many messages, checking
+the `mailboxes`) makes a few at a time, keeping the order of its results.
+A folder path is resolved one level at a time (`MailStore::child_folders`),
+listing only the folders below each name on it rather than the whole tree,
+and checking the `mailboxes` looks up each parent, well-known folder and
+listing once for all of them.
+
 - **Pros:**
   - The UI never blocks on I/O.
   - Each resource has a single owner, which fits Rust's ownership model.
