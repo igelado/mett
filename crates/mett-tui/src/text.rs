@@ -4,6 +4,8 @@
 //! `docs/DESIGN.md` §5.7 (for example, an external mailcap command) will
 //! replace it.
 
+use std::borrow::Cow;
+
 use chrono::Local;
 use mett_core::{Address, Body, BodyKind, Message};
 use unicode_segmentation::UnicodeSegmentation;
@@ -146,6 +148,9 @@ pub fn body_lines(body: &Body) -> Vec<String> {
 /// Replaces tabs with spaces up to the next 8-column tab stop, counting
 /// columns in display cells.
 fn expand_tabs(line: &str) -> String {
+    if !line.contains('\t') {
+        return line.to_owned();
+    }
     let mut out = String::with_capacity(line.len());
     let mut column = 0;
     for g in line.graphemes(true) {
@@ -236,11 +241,21 @@ fn tag_end(html: &str) -> Option<usize> {
     None
 }
 
+/// Where `needle` (in lowercase ASCII) first is in `haystack`, in any
+/// case, without lowercasing the rest of the document each time.
 fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
-    haystack.to_ascii_lowercase().find(needle)
+    let needle = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
 }
 
-fn decode_entities(text: &str) -> String {
+fn decode_entities(text: &str) -> Cow<'_, str> {
+    // Most text between tags has no entities at all.
+    if !text.contains('&') {
+        return Cow::Borrowed(text);
+    }
     text.replace("&nbsp;", " ")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -248,6 +263,7 @@ fn decode_entities(text: &str) -> String {
         .replace("&#39;", "'")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+        .into()
 }
 
 /// Trims each line and keeps at most one blank line in a row.
@@ -357,6 +373,8 @@ mod tests {
             html("<style>p { color: red }</style><!-- hidden --><p>shown</p><SCRIPT>x()</SCRIPT>"),
             ["shown"]
         );
+        // Found in any case, after text that isn't ASCII.
+        assert_eq!(html("<script>é()</ScRiPt><p>ünï</p>"), ["ünï"]);
     }
 
     #[test]
