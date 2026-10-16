@@ -136,6 +136,9 @@ pub struct Config {
     colors: crate::color::Palette,
     /// `alias`, in the order given.
     aliases: Vec<crate::alias::Alias>,
+    /// Where each alias is in `aliases`, by its name ignoring case (see
+    /// [`crate::alias::folded_key`]).
+    alias_places: HashMap<String, usize>,
     /// `mailboxes`, in the order given.
     mailboxes: Vec<Mailbox>,
     /// `bind` and `macro` commands not yet taken by the key bindings.
@@ -177,6 +180,7 @@ impl Config {
             alternates: Vec::new(),
             colors: crate::color::Palette::default(),
             aliases: Vec::new(),
+            alias_places: HashMap::new(),
             mailboxes: Vec::new(),
             key_commands: Vec::new(),
             pushed: Vec::new(),
@@ -488,8 +492,9 @@ impl Config {
                 "unalias" => self.each(args, |c, key| {
                     if key == "*" {
                         c.aliases.clear();
+                        c.alias_places.clear();
                     } else {
-                        c.aliases.retain(|a| !crate::alias::same_key(&a.key, key));
+                        c.remove_alias(key);
                     }
                     Ok(())
                 }),
@@ -604,10 +609,22 @@ impl Config {
         if value.trim().is_empty() {
             return Err(format!("alias {key}: expected addresses"));
         }
-        self.aliases
-            .retain(|a| !crate::alias::same_key(&a.key, &key));
+        self.remove_alias(&key);
+        self.alias_places
+            .insert(crate::alias::folded_key(&key), self.aliases.len());
         self.aliases.push(crate::alias::Alias { key, value });
         Ok(())
+    }
+
+    /// Forgets the alias called `key`, ignoring case, if there is one.
+    fn remove_alias(&mut self, key: &str) {
+        let Some(place) = self.alias_places.remove(&crate::alias::folded_key(key)) else {
+            return;
+        };
+        self.aliases.remove(place);
+        for later in self.alias_places.values_mut().filter(|p| **p > place) {
+            *later -= 1;
+        }
     }
 
     /// `mailboxes [-label NAME | -nolabel] [-notify | -nonotify] [-poll |
@@ -1384,6 +1401,61 @@ mod tests {
         assert_eq!(config.aliases().len(), 6);
         config.run_line("unalias *").unwrap();
         assert!(config.aliases().is_empty());
+    }
+
+    #[test]
+    fn aliases_given_again_go_last() {
+        let mut config = load(
+            "alias a a@x.org\nalias b b@x.org\nalias c c@x.org\nalias d d@x.org\n\
+             alias B b2@x.org\nalias a a2@x.org\n",
+        );
+        let keys = |config: &Config| {
+            config
+                .aliases()
+                .iter()
+                .map(|a| format!("{}={}", a.key, a.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(&config),
+            ["c=c@x.org", "d=d@x.org", "B=b2@x.org", "a=a2@x.org"]
+        );
+        config.run_line("unalias C").unwrap();
+        config.run_line("unalias nobody").unwrap();
+        config.run_line("alias e e@x.org").unwrap();
+        config.run_line("alias D d2@x.org").unwrap();
+        assert_eq!(
+            keys(&config),
+            ["B=b2@x.org", "a=a2@x.org", "e=e@x.org", "D=d2@x.org"]
+        );
+        // Case is ignored in any script, as Rust lowers whole names: the
+        // Kelvin sign is a `k`, and a final capital sigma a final `ς`.
+        config.run_line("unalias *").unwrap();
+        config.run_line("alias \u{212a}im k@x.org").unwrap();
+        config.run_line("alias kim k2@x.org").unwrap();
+        config.run_line("alias ΟΔΟΣ o@x.org").unwrap();
+        config.run_line("alias οδος o2@x.org").unwrap();
+        config.run_line("alias οδοσ o3@x.org").unwrap();
+        assert_eq!(
+            keys(&config),
+            ["kim=k2@x.org", "οδος=o2@x.org", "οδοσ=o3@x.org"]
+        );
+        assert_eq!(
+            crate::alias::find(config.aliases(), "KIM").unwrap().value,
+            "k2@x.org"
+        );
+        assert_eq!(
+            crate::alias::find(config.aliases(), "\u{212a}IM")
+                .unwrap()
+                .value,
+            "k2@x.org"
+        );
+        assert_eq!(
+            crate::alias::find(config.aliases(), "ΟΔΟΣ").unwrap().value,
+            "o2@x.org"
+        );
+        config.run_line("unalias ΟΔΟΣ").unwrap();
+        assert_eq!(keys(&config), ["kim=k2@x.org", "οδοσ=o3@x.org"]);
     }
 
     #[test]
