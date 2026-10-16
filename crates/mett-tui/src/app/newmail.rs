@@ -1319,13 +1319,7 @@ mod tests {
     fn flags_saved_meanwhile_are_kept() {
         let (mut app, _) = app();
         let id = poll(&mut app);
-        let effects = app.update_flags(
-            MessageId::new("m2"),
-            FlagsUpdate {
-                read: None,
-                flagged: Some(true),
-            },
-        );
+        let effects = app.update_flags(MessageId::new("m2"), FlagsUpdate::flagged(true));
         let (write, _) = requests(&effects)[0].clone();
         respond(&mut app, write, Event::FlagsUpdated(Ok(())));
         polled(
@@ -1438,13 +1432,7 @@ mod tests {
         );
         // m0 is read in the Inbox; then the user leaves for Work, before
         // the change is saved.
-        let effects = app.update_flags(
-            MessageId::new("m0"),
-            FlagsUpdate {
-                read: Some(true),
-                flagged: None,
-            },
-        );
+        let effects = app.update_flags(MessageId::new("m0"), FlagsUpdate::read(true));
         let (write, _) = requests(&effects)[0].clone();
         let effects = switch_to(&mut app, work(), folder("work", "Work", 0));
         respond(&mut app, write, Event::FlagsUpdated(Ok(())));
@@ -1680,13 +1668,7 @@ mod tests {
             checked("work", "Work", 0, None),
         );
         // m1 is flagged: Graph says it changed (at 30).
-        let effects = app.update_flags(
-            MessageId::new("m1"),
-            FlagsUpdate {
-                read: None,
-                flagged: Some(true),
-            },
-        );
+        let effects = app.update_flags(MessageId::new("m1"), FlagsUpdate::flagged(true));
         let (write, _) = requests(&effects)[0].clone();
         respond(&mut app, write, Event::FlagsUpdated(Ok(())));
         leave_and_check(&mut app, vec![("m1", 30), ("m2", 2)]);

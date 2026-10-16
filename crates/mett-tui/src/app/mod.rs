@@ -1747,10 +1747,7 @@ impl App {
 
     /// Marks a message read, updating the index straight away.
     fn mark_read(&mut self, message_id: MessageId) -> Vec<Effect> {
-        let update = FlagsUpdate {
-            read: Some(true),
-            flagged: None,
-        };
+        let update = FlagsUpdate::read(true);
         self.update_flags(message_id, update)
     }
 
