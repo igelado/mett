@@ -206,10 +206,7 @@ impl App {
                     return Some(Vec::new());
                 };
                 let update = if action == Action::FlagMessage {
-                    FlagsUpdate {
-                        flagged: Some(!flags.flagged),
-                        ..Default::default()
-                    }
+                    FlagsUpdate::flagged(!flags.flagged)
                 } else {
                     // Chosen while the message loads: showing it won't
                     // undo it.
@@ -219,10 +216,7 @@ impl App {
                     {
                         pager.read_chosen = true;
                     }
-                    FlagsUpdate {
-                        read: Some(!flags.read),
-                        ..Default::default()
-                    }
+                    FlagsUpdate::read(!flags.read)
                 };
                 self.update_flags(id, update)
             }
@@ -1441,13 +1435,7 @@ mod tests {
         let (id, request) = sent(&act(&mut app, Action::FlagMessage));
         assert!(matches!(
             request,
-            Request::UpdateFlags(
-                _,
-                FlagsUpdate {
-                    flagged: Some(true),
-                    read: None
-                }
-            )
+            Request::UpdateFlags(_, update) if update == FlagsUpdate::flagged(true)
         ));
         assert!(app.messages[0].flags.flagged);
         respond(&mut app, id, Event::FlagsUpdated(Err(offline())));
@@ -1456,13 +1444,7 @@ mod tests {
         let (_, request) = sent(&act(&mut app, Action::ToggleNew));
         assert!(matches!(
             request,
-            Request::UpdateFlags(
-                _,
-                FlagsUpdate {
-                    read: Some(true),
-                    flagged: None
-                }
-            )
+            Request::UpdateFlags(_, update) if update == FlagsUpdate::read(true)
         ));
         assert!(app.messages[0].flags.read);
     }
@@ -1657,13 +1639,7 @@ mod tests {
         let effects = respond(&mut app, first, Event::FlagsUpdated(Err(offline())));
         assert!(matches!(
             sent(&effects).1,
-            Request::UpdateFlags(
-                _,
-                FlagsUpdate {
-                    read: Some(true),
-                    flagged: None
-                }
-            )
+            Request::UpdateFlags(_, update) if update == FlagsUpdate::read(true)
         ));
     }
 
@@ -2266,13 +2242,7 @@ mod tests {
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
         let (_, failed) = &app.save_failures[&MessageId::new("m0")];
-        assert_eq!(
-            *failed,
-            FlagsUpdate {
-                read: Some(true),
-                flagged: None,
-            }
-        );
+        assert_eq!(*failed, FlagsUpdate::read(true));
     }
 
     #[test]
