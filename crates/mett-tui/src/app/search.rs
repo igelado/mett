@@ -248,7 +248,7 @@ impl App {
                 return;
             }
         };
-        let (width, height) = (self.width, self.body_height);
+        let (width, height) = (self.wrap_width(), self.body_height);
         let Some(Screen::Pager(pager)) = self.screens.get_mut(position) else {
             return;
         };
@@ -967,6 +967,78 @@ mod tests {
         act(&mut app, Action::Search);
         answer(&mut app, "row 4[0-9]");
         assert_eq!(app.status, "", "found below, without wrapping");
+    }
+
+    /// Sets `wrap`, as `:set wrap=…` does.
+    fn wrap_at(app: &mut App, wrap: i64) {
+        let mut settings = Settings::default();
+        settings.display.wrap = wrap;
+        app.update(configured(settings));
+    }
+
+    #[test]
+    fn the_pager_wraps_where_wrap_says() {
+        use unicode_width::UnicodeWidthStr;
+        let mut app = app();
+        show(&mut app, format!("{}\n", "word ".repeat(40)));
+        assert_eq!(pager(&app).rows_width, Some(80), "the terminal's width");
+        // At most the terminal's width; a negative one leaves room on the
+        // right, unless that leaves nothing.
+        for (wrap, width) in [
+            (30, 30),
+            (200, 80),
+            (-20, 60),
+            (-80, 80),
+            (-100, 80),
+            (0, 80),
+        ] {
+            wrap_at(&mut app, wrap);
+            let view = pager(&app);
+            assert_eq!(view.rows_width, Some(width), "wrap={wrap}");
+            assert!(
+                (0..view.row_count()).all(|row| view.row(row).width() <= width),
+                "wrap={wrap}"
+            );
+        }
+    }
+
+    #[test]
+    fn setting_wrap_wraps_a_covered_pager_again() {
+        let mut app = app();
+        show(&mut app, format!("{} needle\n", "word ".repeat(40)));
+        act(&mut app, Action::Search);
+        answer(&mut app, "needle");
+        act(&mut app, Action::BrowseMailboxes);
+        wrap_at(&mut app, 25);
+        let pager = app
+            .screens
+            .iter()
+            .find_map(|s| match s {
+                Screen::Pager(p) => Some(p),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pager.rows_width, Some(25));
+        let found = highlighted(pager);
+        assert_eq!(&pager.row(found[0].0)[found[0].1.clone()], "needle");
+    }
+
+    #[test]
+    fn a_narrower_wrap_is_searched_as_shown() {
+        let mut app = app();
+        wrap_at(&mut app, 20);
+        show(
+            &mut app,
+            format!("{} needle\n{}", "word ".repeat(80), "more\n".repeat(40)),
+        );
+        assert_eq!(pager(&app).rows_width, Some(20));
+        act(&mut app, Action::Search);
+        answer(&mut app, "needle");
+        let view = pager(&app);
+        assert!(view.row(view.scroll).contains("needle"));
+        let found = highlighted(view);
+        assert_eq!(found.len(), 1);
+        assert_eq!(&view.row(found[0].0)[found[0].1.clone()], "needle");
     }
 
     #[test]

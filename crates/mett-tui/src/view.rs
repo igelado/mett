@@ -160,7 +160,7 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         Screen::Browser(browser) => render_browser(browser, colors, frame, body),
         Screen::Help(help) => render_help(app, help, frame, body),
         Screen::Attachments(menu) => render_attachments(menu, colors, frame, body),
-        Screen::Text(view) => render_text(view, frame, body),
+        Screen::Text(view) => render_text(view, &app.display, frame, body),
         Screen::Query(menu) => render_query(menu, colors, frame, body),
         Screen::Postponed(menu) => render_postponed(menu, colors, frame, body),
     };
@@ -475,11 +475,11 @@ fn render_postponed(
 }
 
 /// Draws text on its own screen and returns its status line.
-fn render_text(view: &TextView, frame: &mut Frame, area: Rect) -> String {
-    let width = usize::from(area.width);
+fn render_text(view: &TextView, display: &Display, frame: &mut Frame, area: Rect) -> String {
+    let width = display.wrap_width(usize::from(area.width));
     let height = usize::from(area.height);
-    // Wrapped by the app to the terminal's width; here only if the
-    // drawing area differs.
+    // Wrapped by the app as `wrap` says for the terminal's width; here only
+    // if the drawing area differs.
     let rewrapped;
     let rows = if view.rows_width == Some(width.max(1)) {
         &view.rows
@@ -717,9 +717,10 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         frame.render_widget(Paragraph::new("Loading message..."), area);
         return "---mett: loading---".into();
     };
-    // The app keeps the message wrapped to the terminal width; wrap here
-    // only if the drawing area differs, so no text is clipped.
-    let width = usize::from(area.width);
+    // The app keeps the message wrapped as `wrap` says for the terminal's
+    // width; wrap here only if the drawing area differs, so no text is
+    // clipped.
+    let width = app.display.wrap_width(usize::from(area.width));
     let cached = pager.rows_width == Some(width);
     let rewrapped: Vec<(usize, Range<usize>)> = if cached {
         Vec::new()
@@ -853,7 +854,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         position: Some(&position),
         thread: None,
     };
-    format::expand(&app.display.pager_format, &entry, width)
+    format::expand(&app.display.pager_format, &entry, usize::from(area.width))
 }
 
 /// How a line of the message in the pager is drawn, and whether it is in
@@ -1225,6 +1226,32 @@ mod tests {
         // Marked for deletion from the pager (the only message, so it stays).
         act(&mut app, Action::DeleteMessage);
         assert_eq!(screen(&app)[6], pager_status("D  "));
+    }
+
+    #[test]
+    fn the_pager_wraps_where_wrap_says_under_a_full_status_bar() {
+        let mut app = app(1);
+        let mut settings = crate::app::Settings::default();
+        settings.display.wrap = 20;
+        app.update(configured(settings));
+        app.update(Msg::Resize {
+            width: WIDTH,
+            height: 16,
+        });
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
+        let mut message = mock::message("m0", "in", "Subject 0", received(0));
+        message.body.content = "alpha beta gamma delta epsilon zeta eta theta".into();
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        let lines = sized_screen(&app, WIDTH, 16);
+        let body = lines.iter().position(|l| l.starts_with("alpha")).unwrap();
+        assert_eq!(
+            lines[body..body + 3],
+            ["alpha beta gamma", "delta epsilon zeta", "eta theta"],
+            "{lines:#?}"
+        );
+        assert!(lines[1..14].iter().all(|l| l.width() <= 20), "{lines:#?}");
+        assert_eq!(lines[14].width(), usize::from(WIDTH), "{lines:#?}");
+        assert!(lines[14].ends_with("-- (all)"), "{lines:#?}");
     }
 
     #[test]

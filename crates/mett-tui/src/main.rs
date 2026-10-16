@@ -324,6 +324,10 @@ fn settings_keeping(
             .colors()
             .active(color::mono_terminal(&|name| std::env::var(name).ok()))
             .clone(),
+        wrap: match config.get("wrap") {
+            Some(config::Value::Number(n)) => *n,
+            _ => 0,
+        },
     };
     let ordering = app::Ordering {
         sort: sort::Sort::parse(config.string("sort"), true).map_err(|e| format!("sort: {e}"))?,
@@ -1449,6 +1453,14 @@ mod tests {
         // The next command works on what was there before.
         let next = demo.run("set resolve=no");
         assert!(!next.settings.unwrap().resolve);
+    }
+
+    #[test]
+    fn wrap_takes_negative_numbers() {
+        let mut demo = Commanded::demo("/home/alice");
+        assert_eq!(demo.settings.display.wrap, 0, "the default");
+        let set = demo.run("set wrap=-10");
+        assert_eq!(set.settings.unwrap().display.wrap, -10);
     }
 
     #[test]

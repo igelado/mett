@@ -331,7 +331,7 @@ impl App {
                     self.screens.push(Screen::Text(TextView::new(
                         format!("{} [{}]", attachment.name, attachment.content_type),
                         lines,
-                        self.width,
+                        self.wrap_width(),
                     )));
                     Vec::new()
                 }
@@ -389,7 +389,7 @@ impl App {
 
     pub(super) fn on_text_action(&mut self, action: Action) -> Vec<Effect> {
         let page = self.body_height.max(1);
-        let width = self.width;
+        let width = self.wrap_width();
         let height = self.body_height;
         let Some(Screen::Text(view)) = self.screens.last_mut() else {
             return Vec::new();
@@ -710,6 +710,28 @@ mod tests {
         let (_, request) = sent(&act(&mut app, Action::Retry));
         assert!(
             matches!(request, Request::FetchAttachment(m, a) if m.as_str() == "m0" && a.as_str() == "a0")
+        );
+    }
+
+    #[test]
+    fn a_text_attachment_wraps_where_wrap_says() {
+        let mut app = menu();
+        app.screens.push(Screen::Text(TextView::new(
+            "notes".into(),
+            vec!["word ".repeat(30)],
+            80,
+        )));
+        let mut settings = crate::app::Settings::default();
+        settings.display.wrap = 20;
+        app.update(configured(settings));
+        let Screen::Text(view) = app.screen() else {
+            panic!("expected the text");
+        };
+        assert_eq!(view.rows_width, Some(20));
+        assert!(
+            view.rows.iter().all(|row| row.len() <= 20),
+            "{:?}",
+            view.rows
         );
     }
 

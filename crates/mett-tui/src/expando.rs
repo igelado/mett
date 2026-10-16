@@ -22,6 +22,25 @@ pub struct Display {
     pub quote: Regex,
     /// `color` and `mono`.
     pub colors: Colors,
+    /// `wrap`: where the pager wraps text (see [`Display::wrap_width`]).
+    pub wrap: i64,
+}
+
+impl Display {
+    /// The width the pager wraps text at on a screen `width` columns wide,
+    /// as mutt reads `wrap`: at the screen's width when it is 0, at `wrap`
+    /// columns when it is positive (or the width, if narrower), and `-wrap`
+    /// columns short of the width when it is negative (or at the width, if
+    /// that leaves nothing).
+    pub fn wrap_width(&self, width: usize) -> usize {
+        let wrap = usize::try_from(self.wrap.unsigned_abs()).unwrap_or(usize::MAX);
+        match self.wrap {
+            0 => width,
+            1.. => wrap.min(width),
+            _ if width > wrap => width - wrap,
+            _ => width,
+        }
+    }
 }
 
 impl PartialEq for Display {
@@ -32,6 +51,7 @@ impl PartialEq for Display {
             && self.date_format == other.date_format
             && self.quote.as_str() == other.quote.as_str()
             && self.colors == other.colors
+            && self.wrap == other.wrap
     }
 }
 
@@ -54,6 +74,7 @@ impl Default for Display {
             date_format: var("date_format"),
             quote: Regex::new(&var("quote_regex")).expect("the default is valid"),
             colors: Colors::default(),
+            wrap: 0,
         }
     }
 }

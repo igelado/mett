@@ -1438,6 +1438,12 @@ impl App {
         Vec::new()
     }
 
+    /// The width the pager and text views wrap their text at: `wrap`
+    /// applied to the terminal's width.
+    pub(super) fn wrap_width(&self) -> usize {
+        self.display.wrap_width(self.width)
+    }
+
     /// Scrolls the pager by `rows`, within the message.
     fn scroll_by(&mut self, rows: isize) {
         if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
@@ -1449,7 +1455,7 @@ impl App {
     /// Keeps the pager's scroll position within the wrapped message, so that
     /// the last page stays full and scrolling back responds at once.
     fn clamp_scroll(&mut self) {
-        let (width, height) = (self.width, self.body_height);
+        let (width, height) = (self.wrap_width(), self.body_height);
         // Pagers under other screens too: their rows (and search
         // highlights) must match the width they will be drawn at.
         for screen in &mut self.screens {
@@ -1759,7 +1765,7 @@ impl App {
             .position(|line| line == "-- ")
             .map(|at| pager.body_start + at);
         pager.rows_width = None;
-        pager.layout(self.width);
+        pager.layout(self.display.wrap_width(self.width));
         let message_id = message.summary.id.clone();
         let chosen = pager.read_chosen;
         pager.message = Some(message);
@@ -2076,6 +2082,8 @@ impl App {
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
         self.display = settings.display;
+        // `wrap` may have changed: the pager and text views wrap again.
+        self.clamp_scroll();
         self.apply_ordering(settings.ordering);
         self.apply_mailboxes(settings.mailboxes, settings.sync_interval);
     }
