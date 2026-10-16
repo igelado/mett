@@ -7,8 +7,9 @@ against Microsoft Graph:
   (authorization code with PKCE, or device code). It stores refresh tokens,
   and checks that the signed-in user is the configured account.
 - **`GraphMailStore`** implements the `MailStore` port on the signed-in
-  user's mailbox (`/me`). It lists folders and messages (newest first, paged
-  by Graph's `@odata.nextLink`), fetches messages (with Graph converting
+  user's mailbox (`/me`). It lists folders (the whole tree a level at a
+  time, a few listings at once, or just the folders below one) and messages
+  (newest first, paged by Graph's `@odata.nextLink`), fetches messages (with Graph converting
   HTML bodies to text), updates read and flagged state, moves messages, and
   deletes them permanently. It also implements `MailSender`: new mail goes
   out with `sendMail`, while replies and forwards are created with
