@@ -230,14 +230,25 @@ impl App {
         if selected < self.messages.len() {
             self.selected += places.partition_point(|&place| place <= selected);
         }
-        // The listed messages go at the end, then from the last, each
-        // moves with those listed before it to where it goes, moving the
-        // messages it skips once.
+        // Room at the end for the listed messages (copies of the first, for
+        // now). From the last listed, the messages after where each goes
+        // move down past the room left, which moves up, and it takes the
+        // room's last place: each message moves once.
         let mut end = self.messages.len();
-        self.messages.extend(listed.into_iter().map(|(_, m)| m));
-        for (k, &place) in places.iter().enumerate().rev() {
-            self.messages[place..end + k + 1].rotate_right(k + 1);
-            end = place;
+        if let Some((_, first)) = listed.first() {
+            let room = std::iter::repeat_n(first.clone(), listed.len());
+            self.messages.extend(room);
+        }
+        for (k, (&place, (_, message))) in places.iter().zip(listed).enumerate().rev() {
+            // The room is end..end + k + 1.
+            let room = k + 1;
+            while end > place {
+                let step = room.min(end - place);
+                let (before, after) = self.messages.split_at_mut(end);
+                before[end - step..].swap_with_slice(&mut after[room - step..room]);
+                end -= step;
+            }
+            self.messages[place + k] = message;
         }
         if let Some(at) = selected_id.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
             self.selected = at;
