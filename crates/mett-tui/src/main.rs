@@ -456,18 +456,24 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     app.push_after_load(pushed);
     let mut deferred = carry_out(&mut app, effects);
 
+    // Whether the screen may differ from what was drawn last: it is drawn
+    // only before waiting, once everything ready has been taken in.
+    let mut stale = true;
     while !app.quit {
         // What effects done at once answered goes to the app first.
         while !deferred.msgs.is_empty() {
             for msg in std::mem::take(&mut deferred.msgs) {
                 let effects = app.update(msg);
                 deferred.absorb(carry_out(&mut app, effects));
+                stale = true;
             }
         }
         // The editor runs between messages, with the terminal handed over.
         commands.queue.extend(deferred.commands.drain(..));
         while let Some(text) = deferred.edit.take() {
             let result = input.suspended(&mut terminal, &mut input_rx, || editor.edit(&text))?;
+            // The terminal was cleared: all of it is drawn again.
+            stale = true;
             // The terminal may have been resized meanwhile.
             let size = terminal.size()?;
             app.update(Msg::Resize {
@@ -496,49 +502,72 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 let _ = done.send((configuration, reconfigured));
             });
         }
-        draw(&mut terminal, &app)?;
         // Keys a macro or `push` queued come before new input, once the
-        // last action has what it was waiting for.
+        // last action has what it was waiting for. They are played without
+        // drawing the screen between them.
         let stroke = app.next_stroke();
-        if stroke.is_none() && app.take_redraw() {
-            continue;
-        }
-        let msg = match stroke {
-            Some(msg) => msg,
-            None => tokio::select! {
-                // Without input mett can't be used or quit, so a terminal
-                // read error ends it (and the terminal is restored).
-                event = input_rx.recv() => match event.transpose()? {
-                    None => return Err(std::io::Error::other("terminal input closed")),
-                    Some(event) => match event {
-                        // Repeats too, so holding a key keeps moving.
-                        TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
-                            app.typed();
-                            Msg::Key(key)
+        stale |= app.take_redraw();
+        let received = match stroke {
+            Some(msg) => Received::Msg(msg),
+            None => {
+                let mut next = std::pin::pin!(async {
+                    tokio::select! {
+                        event = input_rx.recv() => Received::Input(event),
+                        Some(response) = response_rx.recv() => Received::Msg(Msg::Response(response)),
+                        Some(event) = sign_in_rx.recv() => Received::Msg(Msg::SignIn(event)),
+                        Some(timer) = timer_rx.recv() => Received::Msg(Msg::Timer(timer)),
+                        Some(msg) = file_rx.recv() => Received::Msg(msg),
+                        done = async { running.as_mut().expect("checked").await }, if running.is_some() => {
+                            Received::Configured(done)
                         }
-                        TermEvent::Resize(width, height) => Msg::Resize { width, height },
-                        _ => continue,
-                    },
-                },
-                Some(response) = response_rx.recv() => Msg::Response(response),
-                Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
-                Some(timer) = timer_rx.recv() => Msg::Timer(timer),
-                Some(msg) = file_rx.recv() => msg,
-                done = async { running.as_mut().expect("checked").await }, if running.is_some() => {
-                    running = None;
-                    let (configuration, reconfigured) =
-                        done.map_err(|_| std::io::Error::other("a : command stopped"))?;
-                    // `editor` and `tmpdir` may have changed.
-                    let config = &configuration.config;
-                    editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
-                    commands.finish(configuration);
-                    Msg::Configured(reconfigured)
+                        else => Received::Closed,
+                    }
+                });
+                // What is ready already is taken in first; the screen is
+                // drawn only before waiting for more.
+                match ready(next.as_mut()).await {
+                    Some(received) => received,
+                    None => {
+                        if std::mem::take(&mut stale) {
+                            draw(&mut terminal, &app)?;
+                        }
+                        next.await
+                    }
                 }
-                else => break,
+            }
+        };
+        let msg = match received {
+            Received::Msg(msg) => msg,
+            // Without input mett can't be used or quit, so a terminal read
+            // error ends it (and the terminal is restored).
+            Received::Input(event) => match event.transpose()? {
+                None => return Err(std::io::Error::other("terminal input closed")),
+                Some(event) => match event {
+                    // Repeats too, so holding a key keeps moving.
+                    TermEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                        app.typed();
+                        Msg::Key(key)
+                    }
+                    TermEvent::Resize(width, height) => Msg::Resize { width, height },
+                    // Nothing changed: nothing to draw again.
+                    _ => continue,
+                },
             },
+            Received::Configured(done) => {
+                running = None;
+                let (configuration, reconfigured) =
+                    done.map_err(|_| std::io::Error::other("a : command stopped"))?;
+                // `editor` and `tmpdir` may have changed.
+                let config = &configuration.config;
+                editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
+                commands.finish(configuration);
+                Msg::Configured(reconfigured)
+            }
+            Received::Closed => break,
         };
         let effects = app.update(msg);
         deferred.absorb(carry_out(&mut app, effects));
+        stale = true;
     }
 
     // Give pending changes (such as marking a message read) a moment to
@@ -562,6 +591,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     let unsaved = !app.save_failures().is_empty();
     if app.saving() || (unsaved && app.sign_in.is_some()) {
         app.status = "Saving changes...".into();
+        stale = true;
         let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
         loop {
             // A failed save's sign-in failure is sent before the save's own
@@ -570,12 +600,15 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             while let Ok(event) = sign_in_rx.try_recv() {
                 let effects = app.update(Msg::SignIn(event));
                 carry_out(&mut app, effects);
+                stale = true;
             }
             // A macro run in the sign-in window plays there.
             while let Some(msg) = app.next_sign_in_stroke() {
                 let effects = app.update(msg);
                 carry_out(&mut app, effects);
+                stale = true;
             }
+            stale |= app.take_redraw();
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
             // sign-ins don't matter any more.
@@ -584,7 +617,10 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             if !waiting {
                 break;
             }
-            draw(&mut terminal, &app)?;
+            // What was ignored changed nothing to draw.
+            if std::mem::take(&mut stale) {
+                draw(&mut terminal, &app)?;
+            }
             let msg = tokio::select! {
                 // Saving may need the user to sign in: the sign-in window
                 // still works, and only it takes keys.
@@ -625,6 +661,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             };
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
+            stale = true;
             // Nothing is edited, nor configured, any more.
             let _ = carry_out(&mut app, effects);
             // The wait starts again once the user is done signing in.
@@ -646,6 +683,31 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         )));
     }
     Ok(())
+}
+
+/// What the main loop takes in next. Each is handled at once, so the
+/// size of the large ones doesn't matter.
+#[allow(clippy::large_enum_variant)]
+enum Received {
+    /// A message for the app.
+    Msg(Msg),
+    /// A terminal event, a read error, or `None` once input closed.
+    Input(Option<std::io::Result<TermEvent>>),
+    /// A `:` command finished running, with the configuration it leaves.
+    Configured(Result<(Configuration, app::Reconfigured), oneshot::error::RecvError>),
+    /// Nothing more can come.
+    Closed,
+}
+
+/// What `future` gives if it is ready now, without waiting for it.
+async fn ready<F: Future + Unpin>(mut future: F) -> Option<F::Output> {
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(match std::pin::Pin::new(&mut future).poll(cx) {
+            std::task::Poll::Ready(output) => Some(output),
+            std::task::Poll::Pending => None,
+        })
+    })
+    .await
 }
 
 /// Draws the screen, then prints the view's overlay, if any, as plain text
