@@ -120,6 +120,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `timeout` | number | Seconds to wait for input before checking mail. |
 | | `sort`, `sort_aux` | sort order | Index sorting. |
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |
+| | `wrap` | number | Where the pager wraps text (also text attachments viewed in it, but not the help screen, as in mutt). `0` (the default) wraps at the terminal's width; a positive number wraps at that many columns, or at the terminal's width if it is narrower; a negative number leaves that many columns empty on the right, or wraps at the terminal's width if that leaves no room. Changing it with `:set` wraps an open message again. |
 | | `mailcap_path` | string | mailcap files used to view MIME parts. |
 | | `query_command` | path | External address-book query. |
 | | `alias_file` | path | Where aliases created with `a` (`<create-alias>`) are saved. Defaults to the user's own mettrc (`~/.config/mett/mettrc` for a user who has none yet). |

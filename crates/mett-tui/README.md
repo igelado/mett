@@ -92,6 +92,11 @@ time; `date_format` is used by `%d` and `%D`). The expandos mett knows:
 Expandos mett can't fill yet (such as sizes and line counts) are empty, so
 `%?l?...?` conditionals take their `else` part.
 
+The pager wraps text at the terminal's width, or where `wrap` says, as in
+mutt: at `wrap` columns when it is positive (and the terminal is wider),
+or `-wrap` columns short of the terminal's width when it is negative. Text
+attachments viewed in the pager wrap the same way; the help screen doesn't.
+
 `color OBJECT [ATTRIBUTE ...] FOREGROUND BACKGROUND [EXPRESSION]` (an
 expression with spaces quoted, as in mutt) sets the
 colors of `normal`, `indicator`, `status` (and the help line), `error`,

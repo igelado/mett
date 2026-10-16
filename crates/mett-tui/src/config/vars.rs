@@ -188,6 +188,7 @@ pub const VARS: &[Var] = &[
     var("tmpdir", Kind::Path, ""),
     var("trash", Kind::Path, ""),
     var("use_from", Kind::Bool, "yes"),
+    var("wrap", Kind::Number, "0"),
 ];
 
 /// Looks up a known variable.
