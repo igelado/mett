@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use mett_core::{
     Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
     Message, MessageId, MessagePage, Page, Result, WellKnownFolder, join_bounded,
+    join_bounded_until,
 };
 use tokio::sync::mpsc;
 
@@ -287,14 +288,20 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         }
         Request::StillThere { folder, ids } => {
             // Where each is, a few at a time; the first failure (in the
-            // order of `ids`) is the answer.
-            let found = join_bounded(
+            // order of `ids`) is the answer, as soon as those before it are
+            // known.
+            let failed = |found: &Option<Result<FolderId>>| matches!(found, Some(Err(e)) if !matches!(e, Error::NotFound { .. }));
+            let found = join_bounded_until(
                 ids.iter().map(|id| store.message_folder(id)).collect(),
                 CHECKS_AT_ONCE,
+                |found| found.iter().take_while(|f| f.is_some()).any(failed),
             )
             .await;
             let mut gone = Vec::new();
             for (id, found) in ids.into_iter().zip(found) {
+                let Some(found) = found else {
+                    unreachable!("a failure before it is the answer");
+                };
                 match found {
                     Err(Error::NotFound { .. }) => gone.push(id),
                     Ok(at) if at != folder => gone.push(id),
@@ -1399,6 +1406,31 @@ mod tests {
                 matches!(event, Event::StillThere(Err(Error::Auth(_)))),
                 "{event:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn the_first_failure_is_not_held_up_by_later_messages() {
+            let stalled = Duration::from_secs(5);
+            let mut paths = mailbox();
+            let at = ok(json!({ "id": "x", "parentFolderId": "inbox-id" }));
+            paths.insert("/me/messages/m1".into(), at.clone());
+            paths.insert("/me/messages/m2".into(), ResponseTemplate::new(503));
+            paths.insert("/me/messages/m3".into(), at.set_delay(stalled));
+            let server = serve_paths(paths).await;
+            let started = Instant::now();
+            let event = serve(
+                &store(&server),
+                Request::StillThere {
+                    folder: FolderId::new("inbox-id"),
+                    ids: ["m1", "m2", "m3"].map(MessageId::new).to_vec(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(event, Event::StillThere(Err(Error::Network(_)))),
+                "{event:?}"
+            );
+            assert!(started.elapsed() < stalled / 2, "{:?}", started.elapsed());
         }
 
         /// [`mailbox`], with `List 0` to `List 19` (`l0`, ...) in the

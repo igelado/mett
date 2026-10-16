@@ -549,6 +549,65 @@ async fn a_failed_folder_listing_is_the_one_a_walk_would_stop_at() {
     assert!(matches!(listed, Err(Error::Auth(_))), "{listed:?}");
 }
 
+/// Longer than any test should take: a request answered this late is
+/// never waited for.
+const STALLED: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn a_decisive_folder_listing_error_is_not_held_up_by_others() {
+    let server = MockServer::start().await;
+    mount_roles(&server).await;
+    server
+        .on(
+            "GET",
+            "/me/mailFolders",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "value": [child("a", "A", "root-id", 1), child("b", "B", "root-id", 1)],
+            })),
+        )
+        .await;
+    // A walk lists B (the last) first, and stops at its failure.
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/a/childFolders",
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "value": [] }))
+                .set_delay(STALLED),
+        )
+        .await;
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/b/childFolders",
+            ResponseTemplate::new(503),
+        )
+        .await;
+    let started = std::time::Instant::now();
+    let listed = store(&server).list_folders().await;
+    assert!(matches!(listed, Err(Error::Network(_))), "{listed:?}");
+    assert!(started.elapsed() < STALLED / 2, "{:?}", started.elapsed());
+
+    // Nor are the roles' by the listing.
+    server.reset().await;
+    mount_roles_with(&server, 403).await;
+    route("GET", "/me/mailFolders")
+        .respond_with(ResponseTemplate::new(503).set_delay(STALLED))
+        .mount(&server)
+        .await;
+    route("GET", "/me/mailFolders/a/childFolders")
+        .respond_with(ResponseTemplate::new(503).set_delay(STALLED))
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    let store = store(&server);
+    let listed = store.list_folders().await;
+    assert!(matches!(listed, Err(Error::Auth(_))), "{listed:?}");
+    let below = store.child_folders(Some(&FolderId::new("a"))).await;
+    assert!(matches!(below, Err(Error::Auth(_))), "{below:?}");
+    assert!(started.elapsed() < STALLED / 2, "{:?}", started.elapsed());
+}
+
 #[tokio::test]
 async fn lists_a_few_folders_at_once() {
     let server = MockServer::start().await;
@@ -2209,6 +2268,27 @@ async fn searches_people_and_the_directory_at_once() {
             other => panic!("{people} {users}: {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn a_failed_people_search_is_not_held_up_by_the_directory() {
+    let server = MockServer::start().await;
+    server
+        .on("GET", "/me/people", ResponseTemplate::new(400))
+        .await;
+    server
+        .on(
+            "GET",
+            "/users",
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "value": [] }))
+                .set_delay(STALLED),
+        )
+        .await;
+    let started = std::time::Instant::now();
+    let found = store(&server).search_people("car").await;
+    assert!(matches!(found, Err(Error::Backend(_))), "{found:?}");
+    assert!(started.elapsed() < STALLED / 2, "{:?}", started.elapsed());
 }
 
 /// A recalled postponed message, `d1`.

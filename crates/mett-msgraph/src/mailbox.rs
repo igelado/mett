@@ -13,7 +13,7 @@ use mett_core::{
     AccessToken, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body, BodyKind,
     Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
     Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor,
-    RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder, join_bounded,
+    RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder, join_bounded_until,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -441,6 +441,20 @@ impl<A: Authenticator> GraphMailStore<A> {
     }
 }
 
+/// `first` and `second` at once, as if `first` came first: its error is
+/// the answer as soon as it is known, without waiting for `second`.
+async fn first_then<T, U>(
+    first: impl Future<Output = Result<T>>,
+    second: impl Future<Output = U>,
+) -> Result<(T, U)> {
+    tokio::pin!(first, second);
+    tokio::select! {
+        biased;
+        first = &mut first => Ok((first?, second.await)),
+        second = &mut second => Ok((first.await?, second)),
+    }
+}
+
 /// The folders of a successful `listing` that have folders below them.
 fn with_children(listing: Option<&Result<Vec<GraphFolder>>>) -> Vec<String> {
     match listing {
@@ -472,11 +486,12 @@ enum Walk<'a> {
 /// `listings`: it lists the top level, then each time the folders below the
 /// last folder found (and not listed yet) that has any. This is the order
 /// [`MailStore::list_folders`] gives the folders in.
-fn walk(listings: &Listings) -> Walk<'_> {
+/// `listed` gives each listing made so far.
+fn walk<'a>(listed: impl Fn(&Option<String>) -> Option<&'a Result<Vec<GraphFolder>>>) -> Walk<'a> {
     let mut pending = vec![None];
     let mut order = Vec::new();
     while let Some(parent) = pending.pop() {
-        match listings.get(&parent) {
+        match listed(&parent) {
             None => return Walk::Unlisted,
             Some(Err(e)) => return Walk::Failed(e),
             Some(listing) => pending.extend(with_children(Some(listing)).into_iter().map(Some)),
@@ -562,12 +577,19 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .request(Method::GET, url)
             .header("ConsistencyLevel", "eventual");
         let users = self.json::<Collection<User>>(request, About::MAILBOX);
-        // Both at once; their results are taken in turn, as if one came
-        // after the other.
-        let (people, users) = tokio::join!(people, users);
         // Either search may be refused (the app may not have its
         // permission): the other's results are what there is.
         let refused = |e: &Error| matches!(e, Error::Auth(_));
+        // Both at once; their results are taken in turn, as if one came
+        // after the other: the people's failure (but a refusal) is the
+        // answer as soon as it is known.
+        let people = async {
+            match people.await {
+                Err(e) if !refused(&e) => Err(e),
+                people => Ok(people),
+            }
+        };
+        let (people, users) = first_then(people, users).await?;
         let people_refused = match people {
             Ok(people) => {
                 for person in people.value {
@@ -604,35 +626,51 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         // `childFolders` for the rest, a level at a time, a few listings at
         // once. The roles are looked up meanwhile; failing, they are what
         // is reported, as if looked up first.
-        let (roles, top) = tokio::join!(self.roles(), self.subfolders(None));
-        let roles = roles?;
-        let mut listings = HashMap::from([(None, Ok(top?))]);
+        let (roles, top) = first_then(self.roles(), self.subfolders(None)).await?;
+        let mut listings: Listings = HashMap::from([(None, Ok(top?))]);
         let mut level = with_children(listings.get(&None));
         let mut failed = false;
         while !level.is_empty() {
-            let listed = join_bounded(
+            // The error a walk one listing at a time would stop at comes
+            // back once it is known that none comes before it, without
+            // waiting for the other listings.
+            let listed = join_bounded_until(
                 level
                     .iter()
                     .map(|id| self.subfolders(Some(id.as_str())))
                     .collect(),
                 LISTINGS_AT_ONCE,
+                |listed| {
+                    failed |= listed.iter().flatten().any(Result::is_err);
+                    failed
+                        && matches!(
+                            walk(|parent| match parent {
+                                Some(id) => match level.iter().position(|l| l == id) {
+                                    Some(at) => listed[at].as_ref(),
+                                    None => listings.get(parent),
+                                },
+                                None => listings.get(parent),
+                            }),
+                            Walk::Failed(_)
+                        )
+                },
             )
             .await;
             let mut next = Vec::new();
-            for (id, listing) in level.into_iter().zip(listed) {
-                failed |= listing.is_err();
-                let key = Some(id);
+            for (id, listing) in level.iter().zip(listed) {
+                let Some(listing) = listing else {
+                    continue;
+                };
+                let key = Some(id.clone());
                 listings.insert(key.clone(), listing);
                 next.extend(with_children(listings.get(&key)));
             }
             level = next;
-            // The error a walk one listing at a time would stop at, once
-            // it is known that none comes before it.
-            if failed && let Walk::Failed(e) = walk(&listings) {
+            if failed && let Walk::Failed(e) = walk(|parent| listings.get(parent)) {
                 return Err(e.clone());
             }
         }
-        let order = match walk(&listings) {
+        let order = match walk(|parent| listings.get(parent)) {
             Walk::Listed(order) => order,
             Walk::Failed(e) => return Err(e.clone()),
             Walk::Unlisted => unreachable!("the folders below every one listed were listed"),
@@ -649,8 +687,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
         // The roles label the folders as in a listing of them all.
         let (roles, listing) =
-            tokio::join!(self.roles(), self.subfolders(parent.map(FolderId::as_str)));
-        let roles = roles?;
+            first_then(self.roles(), self.subfolders(parent.map(FolderId::as_str))).await?;
         Ok(listing?.into_iter().map(|f| roles.folder(f)).collect())
     }
 
