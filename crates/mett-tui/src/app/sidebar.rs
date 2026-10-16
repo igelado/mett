@@ -263,11 +263,16 @@ impl App {
                 if !shown {
                     return None;
                 }
-                let expanded =
-                    crate::config::mailbox::expand_shortcut(&mailbox.text, &self.mailbox_root);
-                let key = match settings.sort.method {
-                    SortMethod::Alpha => mailbox.label.clone().unwrap_or(expanded),
-                    _ => expanded,
+                // `alpha` by the label, or the path as `%B` shows it
+                // (relative to `folder`); `path` by the whole path.
+                let key = match (settings.sort.method, &mailbox.label) {
+                    (SortMethod::Alpha, Some(label)) => label.clone(),
+                    (SortMethod::Alpha, None) => mailbox
+                        .text
+                        .strip_prefix('=')
+                        .unwrap_or(&mailbox.text)
+                        .to_owned(),
+                    _ => crate::config::mailbox::expand_shortcut(&mailbox.text, &self.mailbox_root),
                 }
                 .to_lowercase();
                 // The open folder's as the index has them, if they are
@@ -592,6 +597,12 @@ mod tests {
         assert_eq!(order("unread"), ["Work", "*Inbox", "Lists"]);
         // By label, or path: `Inbox` before `Lists`.
         assert_eq!(order("alpha"), ["*Inbox", "Lists", "Work"]);
+        // As shown: `Apple` before a label (`Banana`) after it.
+        let mut settings = with_mailboxes(sorted_by("alpha"));
+        settings.mailboxes[0].label = Some("Banana".into());
+        settings.mailboxes[2].text = "=Apple".into();
+        let (app, _) = mailboxes_app(settings, 80, 24);
+        assert_eq!(shown(&app), ["Apple", "*Banana", "Work"]);
         // By path: `=@inbox` comes first.
         assert_eq!(order("path"), ["*Inbox", "Lists", "Work"]);
         assert_eq!(order("reverse-path"), ["Work", "Lists", "*Inbox"]);
