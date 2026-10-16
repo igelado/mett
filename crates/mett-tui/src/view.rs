@@ -195,10 +195,9 @@ fn render_help(app: &App, help: &Help, frame: &mut Frame, area: Rect) -> String 
     let width = usize::from(area.width);
     let lines: Vec<Line> = app
         .help_lines(help.menu)
-        .iter()
         .skip(help.scroll)
         .take(usize::from(area.height))
-        .map(|line| Line::raw(truncate(line, width)))
+        .map(|line| Line::raw(truncate(&line, width)))
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
     format!("---mett: Help for {}---", help.menu.name())

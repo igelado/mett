@@ -1445,7 +1445,7 @@ impl App {
         }
         // A taller help screen shows more lines, not empty space.
         if let Some(Screen::Help(help)) = self.screens.last() {
-            let last = self.help_lines(help.menu).len().saturating_sub(height);
+            let last = self.help_count(help.menu).saturating_sub(height);
             if let Some(Screen::Help(help)) = self.screens.last_mut() {
                 help.scroll = help.scroll.min(last);
             }
