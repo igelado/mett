@@ -226,10 +226,6 @@ mod tests {
     /// (Work has unread mail), and the Inbox listing `messages`.
     fn app(sidebar: SidebarSettings, messages: usize) -> crate::app::App {
         let settings = with_mailboxes(sidebar);
-        let (mut app, effects) = App::open(WIDTH, HEIGHT, inbox(), settings);
-        let open = first_request(&effects);
-        let folder = mock::folder("inbox", "Inbox", None);
-        let sent = requests(&respond(&mut app, open, Event::FolderOpened(Ok(folder))));
         let summaries = (0..messages)
             .map(|i| {
                 let date = chrono::DateTime::UNIX_EPOCH + chrono::TimeDelta::days(i as i64);
@@ -238,8 +234,7 @@ mod tests {
                 m.summary
             })
             .collect();
-        listed(&mut app, sent[0].0, summaries, None);
-        let check = sent[1].0;
+        let (mut app, check) = mailboxes_listed(settings, WIDTH, HEIGHT, summaries);
         mailboxes_checked(
             &mut app,
             check,

@@ -874,18 +874,14 @@ mod tests {
     fn ordered_by_counts_follows_the_open_folder_s() {
         let mut settings = with_mailboxes(sorted_by("unread"));
         settings.sidebar.visible = true;
-        let (mut app, effects) = App::open(120, 24, inbox(), settings);
-        let open = first_request(&effects);
-        let folder = mett_core::mock::folder("inbox", "Inbox", None);
-        let sent = requests(&respond(&mut app, open, Event::FolderOpened(Ok(folder))));
         let unread = (0..5)
             .map(|i| {
                 let date = chrono::DateTime::UNIX_EPOCH + chrono::TimeDelta::minutes(i);
                 mett_core::mock::message(&format!("m{i}"), "in", "s", date).summary
             })
             .collect();
-        listed(&mut app, sent[0].0, unread, None);
-        mailboxes_checked(&mut app, sent[1].0, &[("Work", 3, 3, false)]);
+        let (mut app, check) = mailboxes_listed(settings, 120, 24, unread);
+        mailboxes_checked(&mut app, check, &[("Work", 3, 3, false)]);
         app.before_draw();
         assert_eq!(shown(&app), ["*Inbox", "Work", "Lists"]);
         for _ in 0..3 {

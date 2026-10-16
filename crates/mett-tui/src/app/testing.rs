@@ -250,17 +250,26 @@ pub(crate) fn mailbox_path(name: &str) -> FolderPath {
 /// A `width`×`height` app with `settings` that has opened the Inbox, and
 /// listed it empty; returns it and the check of the mailboxes it started.
 pub(crate) fn mailboxes_app(settings: Settings, width: u16, height: u16) -> (App, RequestId) {
+    mailboxes_listed(settings, width, height, Vec::new())
+}
+
+/// Like [`mailboxes_app`], with the Inbox listing `messages`.
+pub(crate) fn mailboxes_listed(
+    settings: Settings,
+    width: u16,
+    height: u16,
+    messages: Vec<MessageSummary>,
+) -> (App, RequestId) {
     let (mut app, effects) = App::open(width, height, inbox(), settings);
     let open = first_request(&effects);
     let folder = mock::folder("inbox", "Inbox", Some(WellKnownFolder::Inbox));
     let effects = respond(&mut app, open, Event::FolderOpened(Ok(folder)));
     let sent = requests(&effects);
-    let check = sent
-        .iter()
-        .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-        .expect("the mailboxes are checked")
-        .0;
-    listed(&mut app, sent[0].0, Vec::new(), None);
+    let find =
+        |wanted: fn(&Request) -> bool| sent.iter().find(|(_, r)| wanted(r)).expect("requested").0;
+    let check = find(|r| matches!(r, Request::CheckMailboxes(_)));
+    let list = find(|r| matches!(r, Request::ListMessages { .. }));
+    listed(&mut app, list, messages, None);
     (app, check)
 }
 
