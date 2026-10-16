@@ -35,6 +35,9 @@ pub(super) enum Write {
     Transfer(Transfer, Request),
 }
 
+/// A move, copy or purge of a message that failed, and where to.
+type TransferFailure = (MessageId, Transfer, Option<FolderPath>);
+
 /// How each message of a move, copy or purge fared.
 pub(super) type Outcomes = Vec<(MessageId, mett_core::Result<()>)>;
 
@@ -440,13 +443,15 @@ impl App {
         if let Write::Transfer(transfer, request) = &write {
             let (ids, to) = (transfer_ids(request), destination(request));
             let folder_ids = &self.folder_ids;
+            let mut again: Option<HashSet<&MessageId>> = None;
             for (failed, retry) in &mut self.failed_transfers {
                 // Moved again, anywhere (or purged again): the earlier one
                 // is moot.
                 let same = *transfer != Transfer::Copy
                     || same_destination(folder_ids, destination(retry), to);
                 if failed == transfer && same {
-                    transfer_ids_mut(retry).retain(|id| !ids.contains(id));
+                    let again = again.get_or_insert_with(|| ids.iter().collect());
+                    transfer_ids_mut(retry).retain(|id| !again.contains(id));
                 }
             }
             self.prune_retries();
@@ -713,22 +718,27 @@ impl App {
             follow(*transfer, request);
         }
         self.prune_retries();
+        // The failures of the messages that moved, found in one pass.
+        let mut failures: HashMap<MessageId, Vec<TransferFailure>> = HashMap::new();
+        for key in self.transfer_failures.keys() {
+            if renamed.contains_key(&key.0) {
+                failures.entry(key.0.clone()).or_default().push(key.clone());
+            }
+        }
         for (old, new) in moved {
             rekey(&mut self.save_failures, old, new);
             // Moved away, it is no longer to be purged from here.
             self.transfer_failures
                 .remove(&(old.clone(), Transfer::Purge, None));
-            let followed: Vec<_> = self
-                .transfer_failures
-                .keys()
-                .filter(|(id, _, _)| id == old)
-                .cloned()
-                .collect();
-            for key in followed {
+            for key in failures.remove(old).unwrap_or_default() {
                 if let Some(failure) = self.transfer_failures.remove(&key) {
                     let (_, transfer, to) = key;
-                    self.transfer_failures
-                        .insert((new.clone(), transfer, to), failure);
+                    let key = (new.clone(), transfer, to);
+                    // Moved on again, it takes them along.
+                    if renamed.contains_key(new) {
+                        failures.entry(new.clone()).or_default().push(key.clone());
+                    }
+                    self.transfer_failures.insert(key, failure);
                 }
             }
             rekey(&mut self.mailbox_flags, old, new);
@@ -870,6 +880,7 @@ impl App {
         // moved or copied, by the same to the same place. Neither is what
         // fails for want of a sign-in once more, which is retried now.
         let folder_ids = &self.folder_ids;
+        let unauthorized_ids: HashSet<&MessageId> = unauthorized.iter().collect();
         for (failed, retry) in &mut self.failed_transfers {
             if transfer == Transfer::Purge {
                 transfer_ids_mut(retry).retain(|id| !done.contains(id));
@@ -878,7 +889,7 @@ impl App {
                 let again = same_destination(folder_ids, place, to.as_ref());
                 let done_there = same_place(place);
                 transfer_ids_mut(retry).retain(|id| {
-                    !((again && unauthorized.contains(id)) || (done_there && done.contains(id)))
+                    !((again && unauthorized_ids.contains(id)) || (done_there && done.contains(id)))
                 });
             }
         }
@@ -1257,7 +1268,7 @@ fn tree(folders: Vec<Folder>) -> Vec<BrowserEntry> {
         children.entry(parent).or_default().push(folder);
     }
     for list in children.values_mut() {
-        list.sort_by_key(|f| f.name.to_lowercase());
+        list.sort_by_cached_key(|f| f.name.to_lowercase());
     }
     let mut entries = Vec::new();
     let mut stack: Vec<(Vec<String>, Folder)> = children
@@ -1704,6 +1715,48 @@ mod tests {
         let (id, _) = sent(&answer(&mut app, "=@inbox"));
         let effects = transferred(&mut app, id, "in", "m0", Ok("c0"));
         assert!(matches!(sent(&effects).1, Request::ListMessages { .. }));
+    }
+
+    #[test]
+    fn failures_follow_messages_moved_on_again() {
+        let mut app = app(settings());
+        let archive = Some(FolderPath::Named(vec!["Archive".into()]));
+        let other = Some(FolderPath::Named(vec!["Other".into()]));
+        let failure = |id: &str, transfer, to: &Option<FolderPath>| {
+            (
+                (MessageId::new(id), transfer, to.clone()),
+                format!("{id} failed"),
+            )
+        };
+        app.transfer_failures = HashMap::from([
+            failure("a", Transfer::Save, &archive),
+            failure("a", Transfer::Purge, &None),
+            failure("b", Transfer::Copy, &other),
+            failure("b", Transfer::Purge, &None),
+            failure("z", Transfer::Save, &archive),
+        ]);
+        let unsaved = ("offline".to_owned(), FlagsUpdate::read(true));
+        app.save_failures.insert("a".into(), unsaved.clone());
+        // a became b, and b (another message) became c: what failed for
+        // a goes along to c, as what failed for b does.
+        app.follow_moves(&[("a".into(), "b".into()), ("b".into(), "c".into())]);
+        let mut failures: Vec<_> = app
+            .transfer_failures
+            .iter()
+            .map(|((id, transfer, to), e)| format!("{id:?} {transfer:?} {to:?}: {e}"))
+            .collect();
+        failures.sort();
+        let expected = [
+            (failure("c", Transfer::Copy, &other).0, "b failed".into()),
+            (failure("c", Transfer::Save, &archive).0, "a failed".into()),
+            failure("z", Transfer::Save, &archive),
+        ]
+        .map(|((id, transfer, to), e)| format!("{id:?} {transfer:?} {to:?}: {e}"));
+        assert_eq!(failures, expected);
+        assert_eq!(
+            app.save_failures,
+            HashMap::from([(MessageId::new("c"), unsaved)])
+        );
     }
 
     #[test]
