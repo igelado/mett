@@ -9,7 +9,9 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
+use chrono::{DateTime, Utc};
 use mett_core::{MessageId, MessageSummary};
 
 /// What messages are ordered by.
@@ -92,16 +94,11 @@ impl Sort {
         format!("{reverse}{last}{method}")
     }
 
-    /// Compares two messages, `position` being where each was listed (the
-    /// tie-breaker, and the order for `unsorted`).
-    fn compare(
-        self,
-        a: &MessageSummary,
-        b: &MessageSummary,
-        position: &dyn Fn(&MessageId) -> usize,
-    ) -> Ordering {
-        let order = primary(self.method, a, b).then_with(|| position(&a.id).cmp(&position(&b.id)));
-        self.directed(order)
+    /// Compares two messages by what this orders by (`a` and `b`, their
+    /// [`Value`]s for it), with ties going to where each was listed (the
+    /// order for `unsorted`).
+    fn compare(self, a: &Value, b: &Value, a_at: usize, b_at: usize) -> Ordering {
+        self.directed(a.cmp(b).then(a_at.cmp(&b_at)))
     }
 
     /// `order`, the other way round for `reverse-`.
@@ -110,20 +107,30 @@ impl Sort {
     }
 }
 
-/// How `method` alone orders two messages.
-fn primary(method: Method, a: &MessageSummary, b: &MessageSummary) -> Ordering {
-    match method {
-        Method::Date | Method::Threads => a.received.cmp(&b.received),
-        Method::Received => {
-            let at = |m: &MessageSummary| m.delivered.unwrap_or(m.received);
-            at(a).cmp(&at(b))
+/// What a method orders a message by, worked out once rather than at
+/// every comparison. Two messages ordered by one method have the same
+/// kind of value.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Value {
+    /// When it was sent or received.
+    Date(DateTime<Utc>),
+    /// A name or subject, lower-cased.
+    Text(String),
+    /// Nothing: `unsorted` goes by where messages were listed alone.
+    Nothing,
+}
+
+impl Value {
+    /// What `method` alone orders `message` by.
+    fn of(method: Method, message: &MessageSummary) -> Self {
+        match method {
+            Method::Date | Method::Threads => Value::Date(message.received),
+            Method::Received => Value::Date(message.delivered.unwrap_or(message.received)),
+            Method::From => Value::Text(key(message.from.as_ref())),
+            Method::Subject => Value::Text(base_subject(&message.subject).to_lowercase()),
+            Method::To => Value::Text(key(message.to.first())),
+            Method::Unsorted => Value::Nothing,
         }
-        Method::From => key(a.from.as_ref()).cmp(&key(b.from.as_ref())),
-        Method::Subject => base_subject(&a.subject)
-            .to_lowercase()
-            .cmp(&base_subject(&b.subject).to_lowercase()),
-        Method::To => key(a.to.first()).cmp(&key(b.to.first())),
-        Method::Unsorted => Ordering::Equal,
     }
 }
 
@@ -139,14 +146,38 @@ fn key(address: Option<&mett_core::Address>) -> String {
 pub fn base_subject(subject: &str) -> &str {
     let mut subject = subject.trim_start();
     loop {
-        let lower = subject.to_ascii_lowercase();
-        let stripped = ["re:", "fwd:", "fw:", "aw:", "sv:"]
-            .iter()
-            .find(|prefix| lower.starts_with(*prefix))
-            .map(|prefix| subject[prefix.len()..].trim_start());
+        let stripped = ["re:", "fwd:", "fw:", "aw:", "sv:"].iter().find(|prefix| {
+            subject
+                .as_bytes()
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
+        });
         match stripped {
-            Some(rest) => subject = rest,
+            Some(prefix) => subject = subject[prefix.len()..].trim_start(),
             None => return subject,
+        }
+    }
+}
+
+/// What a message is ordered by, for [`compare`]: worked out once, so
+/// that sorting doesn't work it out again at every comparison.
+#[derive(Clone, Debug)]
+pub struct Key {
+    /// What `sort` orders it by.
+    sort: Value,
+    /// What `sort_aux` orders it by.
+    aux: Value,
+    /// Where it was listed.
+    position: usize,
+}
+
+impl Key {
+    /// `message`'s key for `sort` and `aux`, listed at `position`.
+    pub fn new(message: &MessageSummary, sort: Sort, aux: Sort, position: usize) -> Self {
+        Self {
+            sort: Value::of(sort.method, message),
+            aux: Value::of(aux.method, message),
+            position,
         }
     }
 }
@@ -166,6 +197,18 @@ pub struct Node {
     pub root: usize,
 }
 
+/// The ordered index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arranged {
+    /// Each message's place, in order.
+    pub nodes: Vec<Node>,
+    /// Whether the order, and the threads, depend only on the messages,
+    /// not on the order they were given in: no two were listed at one
+    /// position, and no two of a conversation have one path. Arranging
+    /// the messages again in another order then gives the same.
+    pub settled: bool,
+}
+
 /// Orders `messages` by `sort` (with `aux` breaking ties, or ordering
 /// each thread's messages); `position` says where each was listed.
 pub fn arrange(
@@ -174,11 +217,19 @@ pub fn arrange(
     aux: Sort,
     position: &dyn Fn(&MessageId) -> usize,
     ascii: bool,
-) -> Vec<Node> {
+) -> Arranged {
+    // Where each was listed, looked up once.
+    let at: Vec<usize> = messages.iter().map(|m| position(&m.id)).collect();
+    let distinct = distinct(&at);
     if sort.method != Method::Threads {
+        let keys: Vec<Key> = messages
+            .iter()
+            .zip(&at)
+            .map(|(m, &at)| Key::new(m, sort, aux, at))
+            .collect();
         let mut order: Vec<usize> = (0..messages.len()).collect();
-        order.sort_by(|&a, &b| compare(messages[a], messages[b], sort, aux, position));
-        return order
+        order.sort_by(|&a, &b| compare(&keys[a], &keys[b], sort, aux));
+        let nodes = order
             .into_iter()
             .map(|index| Node {
                 index,
@@ -188,36 +239,59 @@ pub fn arrange(
                 root: index,
             })
             .collect();
+        return Arranged {
+            nodes,
+            settled: distinct,
+        };
     }
-    threads(messages, sort, aux, position, ascii)
+    let (nodes, single_paths) = threads(messages, &at, sort, aux, ascii);
+    Arranged {
+        nodes,
+        settled: distinct && single_paths,
+    }
 }
 
-/// How [`arrange`] orders two messages, when not by threads: by `sort`,
-/// with ties going to `sort_aux`, then to where they were listed (with
-/// `unsorted`, only where they were listed counts). No two messages are
-/// equal, so merging sorted lists gives what sorting them all would.
-pub fn compare(
-    a: &MessageSummary,
-    b: &MessageSummary,
-    sort: Sort,
-    aux: Sort,
-    position: &dyn Fn(&MessageId) -> usize,
-) -> Ordering {
+/// Whether no two of `positions` are the same.
+fn distinct(positions: &[usize]) -> bool {
+    // Positions count from 0, so they usually fit a table as long as
+    // there are messages; otherwise they are sorted.
+    let mut seen = vec![false; positions.len()];
+    for &at in positions {
+        match seen.get_mut(at) {
+            Some(true) => return false,
+            Some(slot) => *slot = true,
+            None => {
+                let mut sorted = positions.to_vec();
+                sorted.sort_unstable();
+                return sorted.windows(2).all(|pair| pair[0] != pair[1]);
+            }
+        }
+    }
+    true
+}
+
+/// How [`arrange`] orders two messages, by their [`Key`]s for `sort` and
+/// `aux`, when not by threads: by `sort`, with ties going to `sort_aux`,
+/// then to where they were listed (with `unsorted`, only where they were
+/// listed counts). No two messages are equal, so merging sorted lists
+/// gives what sorting them all would.
+pub fn compare(a: &Key, b: &Key, sort: Sort, aux: Sort) -> Ordering {
     if sort.method == Method::Unsorted {
-        return sort.compare(a, b, position);
+        return sort.compare(&a.sort, &b.sort, a.position, b.position);
     }
-    let first = sort.directed(primary(sort.method, a, b));
-    first.then_with(|| aux.compare(a, b, position))
+    let first = sort.directed(a.sort.cmp(&b.sort));
+    first.then_with(|| aux.compare(&a.aux, &b.aux, a.position, b.position))
 }
 
-/// [`arrange`] by threads.
+/// [`arrange`] by threads, with `at` where each message was listed; also
+/// says whether no two messages of a conversation have one path.
 fn threads(
     messages: &[&MessageSummary],
+    at: &[usize],
     sort: Sort,
     aux: Sort,
-    position: &dyn Fn(&MessageId) -> usize,
     ascii: bool,
-) -> Vec<Node> {
+) -> (Vec<Node>, bool) {
     // The conversations, in the order first seen.
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut by_conversation: HashMap<&str, usize> = HashMap::new();
@@ -235,40 +309,72 @@ fn threads(
             None => groups.push(vec![i]),
         }
     }
-    let compare = |a: &usize, b: &usize| {
-        let children = Sort { last: false, ..aux };
-        children.compare(messages[*a], messages[*b], position)
+    // A thread's messages, and threads, go by `sort_aux`.
+    let children_sort = Sort { last: false, ..aux };
+    let values: Vec<Value> = messages
+        .iter()
+        .map(|m| Value::of(children_sort.method, m))
+        .collect();
+    let compare =
+        |a: &usize, b: &usize| children_sort.compare(&values[*a], &values[*b], at[*a], at[*b]);
+    let path = |i: usize| {
+        messages[i]
+            .thread
+            .as_ref()
+            .map_or(&[][..], |t| t.path.as_slice())
     };
-    // Each conversation's tree: children of each message, and its root.
-    let mut trees: Vec<(usize, HashMap<usize, Vec<usize>>)> = Vec::new();
+    let mut single_paths = true;
+    // Each conversation's first message, and the children of each
+    // message.
+    let mut roots: Vec<usize> = Vec::with_capacity(groups.len());
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); messages.len()];
     for group in &groups {
-        let path = |i: usize| {
-            messages[i]
-                .thread
-                .as_ref()
-                .map_or(&[][..], |t| t.path.as_slice())
-        };
+        // Two messages with one path: the first listed stands for it. A
+        // small conversation is looked through rather than indexed.
+        let small = group.len() <= 8;
         let mut by_path: HashMap<&[Vec<u8>], usize> = HashMap::new();
-        for &i in group {
-            if !path(i).is_empty() {
-                // Two messages with one path: the first listed stands for
-                // it.
-                by_path.entry(path(i)).or_insert(i);
+        for (k, &i) in group.iter().enumerate() {
+            if path(i).is_empty() {
+                continue;
             }
+            let repeated = if small {
+                group[..k].iter().any(|&j| path(j) == path(i))
+            } else {
+                match by_path.entry(path(i)) {
+                    Entry::Occupied(_) => true,
+                    Entry::Vacant(entry) => {
+                        entry.insert(i);
+                        false
+                    }
+                }
+            };
+            single_paths &= !repeated;
         }
-        // Each message's nearest ancestor in the folder, if any.
-        let parent_of = |i: usize| {
-            let path = path(i);
-            (1..path.len())
-                .rev()
-                .find_map(|len| by_path.get(&path[..len]).copied())
-                .filter(|&p| p != i)
+        let stands_for = |prefix: &[Vec<u8>]| {
+            if small {
+                group.iter().copied().find(|&j| path(j) == prefix)
+            } else {
+                by_path.get(prefix).copied()
+            }
         };
-        let orphans: Vec<usize> = group
+        // Each message's nearest ancestor in the folder, if any.
+        let parents: Vec<Option<usize>> = group
             .iter()
-            .copied()
-            .filter(|&i| parent_of(i).is_none())
+            .map(|&i| {
+                let path = path(i);
+                (1..path.len())
+                    .rev()
+                    .find_map(|len| stands_for(&path[..len]))
+                    .filter(|&p| p != i)
+            })
             .collect();
+        let orphans = || {
+            group
+                .iter()
+                .zip(&parents)
+                .filter(|(_, parent)| parent.is_none())
+                .map(|(&i, _)| i)
+        };
         // The thread starts at the orphan nearest the conversation's start,
         // or else the earliest. One without a place in the conversation
         // (no conversation index) goes by its date: it starts the thread
@@ -277,21 +383,15 @@ fn threads(
             messages[a]
                 .received
                 .cmp(&messages[b].received)
-                .then_with(|| position(&messages[a].id).cmp(&position(&messages[b].id)))
+                .then_with(|| at[a].cmp(&at[b]))
         };
-        let placed = orphans
-            .iter()
-            .copied()
-            .filter(|&i| !path(i).is_empty())
-            .min_by(|&a, &b| {
-                path(a)
-                    .len()
-                    .cmp(&path(b).len())
-                    .then_with(|| earlier(a, b))
-            });
-        let unplaced = orphans
-            .iter()
-            .copied()
+        let placed = orphans().filter(|&i| !path(i).is_empty()).min_by(|&a, &b| {
+            path(a)
+                .len()
+                .cmp(&path(b).len())
+                .then_with(|| earlier(a, b))
+        });
+        let unplaced = orphans()
             .filter(|&i| path(i).is_empty())
             .min_by(|&a, &b| earlier(a, b));
         let root = match (placed, unplaced) {
@@ -301,49 +401,46 @@ fn threads(
                 unreachable!("a conversation has a message without a parent among its own")
             }
         };
-        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &i in group {
-            if i == root {
-                continue;
+        for (&i, parent) in group.iter().zip(&parents) {
+            if i != root {
+                children[parent.unwrap_or(root)].push(i);
             }
-            let parent = parent_of(i).unwrap_or(root);
-            children.entry(parent).or_default().push(i);
         }
-        for list in children.values_mut() {
-            list.sort_by(compare);
+        for &i in group {
+            children[i].sort_by(compare);
         }
-        trees.push((root, children));
+        roots.push(root);
     }
     // Threads in order: by their first message, or with `last-`, their
     // latest.
     // The latest by date, whichever way the threads are then ordered.
-    let latest = |tree: &(usize, HashMap<usize, Vec<usize>>)| {
-        std::iter::once(tree.0)
-            .chain(tree.1.values().flatten().copied())
+    let latest = |t: usize| {
+        let root = roots[t];
+        std::iter::once(root)
+            .chain(groups[t].iter().copied().filter(|&i| i != root))
             .max_by(|a, b| {
                 // By the date `sort_aux` goes by.
-                let at = |m: &MessageSummary| match aux.method {
+                let date = |m: &MessageSummary| match aux.method {
                     Method::Received => m.delivered.unwrap_or(m.received),
                     _ => m.received,
                 };
-                at(messages[*a])
-                    .cmp(&at(messages[*b]))
-                    .then_with(|| position(&messages[*a].id).cmp(&position(&messages[*b].id)))
+                date(messages[*a])
+                    .cmp(&date(messages[*b]))
+                    .then_with(|| at[*a].cmp(&at[*b]))
             })
             .expect("a thread has a message")
     };
-    let representative: Vec<usize> = trees
-        .iter()
-        .map(|tree| {
+    let representative: Vec<usize> = (0..roots.len())
+        .map(|t| {
             // `last-threads` or `sort_aux=last-...`.
             if aux.last || sort.last {
-                latest(tree)
+                latest(t)
             } else {
-                tree.0
+                roots[t]
             }
         })
         .collect();
-    let mut order: Vec<usize> = (0..trees.len()).collect();
+    let mut order: Vec<usize> = (0..roots.len()).collect();
     order.sort_by(|&a, &b| sort.directed(compare(&representative[a], &representative[b])));
     let (branch, last, line, arrow) = if ascii {
         ("|-", "`-", "| ", ">")
@@ -352,12 +449,12 @@ fn threads(
     };
     let mut nodes = Vec::with_capacity(messages.len());
     for t in order {
-        let (root, children) = &trees[t];
+        let root = roots[t];
         // Depth first: the message, whether each ancestor (below the root)
         // has more children after this branch, and whether it is the last
         // of its siblings.
         let mut stack: Vec<(usize, Vec<bool>, bool, Option<usize>)> =
-            vec![(*root, Vec::new(), true, None)];
+            vec![(root, Vec::new(), true, None)];
         while let Some((i, more, is_last, parent)) = stack.pop() {
             let depth = more.len() + usize::from(parent.is_some());
             let mut tree = String::new();
@@ -377,9 +474,10 @@ fn threads(
                 depth,
                 tree,
                 same_subject,
-                root: *root,
+                root,
             });
-            if let Some(kids) = children.get(&i) {
+            let kids = &children[i];
+            if !kids.is_empty() {
                 let mut below = more.clone();
                 if parent.is_some() {
                     below.push(!is_last);
@@ -390,7 +488,7 @@ fn threads(
             }
         }
     }
-    nodes
+    (nodes, single_paths)
 }
 
 #[cfg(test)]
@@ -430,6 +528,7 @@ mod tests {
             &|id| listed[id],
             true,
         )
+        .nodes
         .into_iter()
         .map(|node| format!("{}{}", node.tree, messages[node.index].id))
         .collect()
@@ -551,7 +650,8 @@ mod tests {
             Sort::parse("date", false).unwrap(),
             &|_| 0,
             false,
-        );
+        )
+        .nodes;
         assert!(!nodes[0].same_subject);
         assert!(nodes[1].same_subject);
         assert_eq!(nodes[1].tree, "└─>");

@@ -535,6 +535,9 @@ pub struct App {
     /// How many messages the threads were last built from: while a large
     /// folder is listed, they are built again only as it doubles.
     threaded_count: usize,
+    /// Whether building the threads again would give what they were last
+    /// built as (see [`crate::sort::Arranged::settled`]).
+    settled: bool,
     /// The threads (by key) collapsed, or with `collapse_all`, opened:
     /// those that differ from the rest.
     collapsed: HashSet<String>,
@@ -546,6 +549,9 @@ pub struct App {
     /// Where each message was in the folder's listing, to restore the
     /// order when the limit is lifted.
     positions: HashMap<MessageId, usize>,
+    /// A message was listed twice since the index was last empty: it may
+    /// show it twice.
+    listed_twice: bool,
     /// The last search (`/`), which `n` repeats.
     last_search: Option<String>,
     /// The last search in the pager, which `n` there repeats.
@@ -773,10 +779,12 @@ impl App {
             ordering: settings.ordering,
             threads: HashMap::new(),
             threaded_count: 0,
+            settled: false,
             collapsed: HashSet::new(),
             collapse_all: false,
             limited: HashMap::new(),
             positions: HashMap::new(),
+            listed_twice: false,
             last_search: None,
             last_pager_search: None,
             pending_search: None,

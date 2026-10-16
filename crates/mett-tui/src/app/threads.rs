@@ -1,7 +1,7 @@
 //! Ordering the index (`sort`, `sort_aux`) and threads: collapsing them
 //! and moving between them, as in mutt.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use mett_core::{MessageId, MessageSummary};
 
@@ -95,7 +95,7 @@ impl App {
         let selected = self.messages.get(self.selected).map(|m| m.id.clone());
         let mut all = std::mem::take(&mut self.messages);
         all.append(&mut self.folded);
-        let nodes = {
+        let arranged = {
             let refs: Vec<&MessageSummary> = all.iter().collect();
             let positions = &self.positions;
             sort::arrange(
@@ -108,39 +108,45 @@ impl App {
         };
         let threaded = self.threaded();
         self.threaded_count = all.len();
-        let ids: Vec<MessageId> = all.iter().map(|m| m.id.clone()).collect();
+        self.settled = arranged.settled;
         let mut slots: Vec<Option<MessageSummary>> = all.into_iter().map(Some).collect();
-        let mut folded_under: HashMap<MessageId, usize> = HashMap::new();
         self.threads.clear();
-        for node in nodes {
+        // The thread being taken in: its first message, its key, whether
+        // it is collapsed, and how many messages are folded under it. A
+        // thread's messages come together, its first message first.
+        let mut thread: Option<(MessageId, String, bool, usize)> = None;
+        for node in arranged.nodes {
             let message = slots[node.index].take().expect("each message once");
-            let root = ids[node.root].clone();
-            let key = thread_key(&message, &root);
-            let fold = threaded && node.depth > 0 && self.is_collapsed(&key);
-            if threaded {
-                self.threads.insert(
-                    message.id.clone(),
-                    Threaded {
-                        tree: node.tree,
-                        same_subject: node.same_subject,
-                        root: root.clone(),
-                        key,
-                        folded: 0,
-                    },
-                );
+            if !threaded {
+                self.messages.push(message);
+                continue;
             }
-            if fold {
-                *folded_under.entry(root).or_default() += 1;
+            if node.index == node.root {
+                self.fold_count(thread.take());
+                let root = message.id.clone();
+                let key = thread_key(&message, &root);
+                let collapsed = self.is_collapsed(&key);
+                thread = Some((root, key, collapsed, 0));
+            }
+            let (root, key, collapsed, folded) = thread.as_mut().expect("the root comes first");
+            self.threads.insert(
+                message.id.clone(),
+                Threaded {
+                    tree: node.tree,
+                    same_subject: node.same_subject,
+                    root: root.clone(),
+                    key: key.clone(),
+                    folded: 0,
+                },
+            );
+            if *collapsed && node.depth > 0 {
+                *folded += 1;
                 self.folded.push(message);
             } else {
                 self.messages.push(message);
             }
         }
-        for (root, count) in folded_under {
-            if let Some(threaded) = self.threads.get_mut(&root) {
-                threaded.folded = count;
-            }
-        }
+        self.fold_count(thread);
         // (Collapsed threads hidden by a limit stay collapsed; the folder's
         // are forgotten when it is left or listed again.)
         let Some(selected) = selected else {
@@ -149,6 +155,18 @@ impl App {
         };
         if let Some(at) = self.entry_of(&selected) {
             self.selected = at;
+        }
+    }
+
+    /// Says how many messages are folded under a thread [`Self::arrange`]
+    /// took in, given as its first message, key, whether it is collapsed
+    /// and that count.
+    fn fold_count(&mut self, thread: Option<(MessageId, String, bool, usize)>) {
+        if let Some((root, _, _, folded)) = thread
+            && folded > 0
+            && let Some(threaded) = self.threads.get_mut(&root)
+        {
+            threaded.folded = folded;
         }
     }
 
@@ -165,7 +183,7 @@ impl App {
     /// built again: once the index has doubled since they last were, and
     /// once the folder is listed (`last`), so that a large folder isn't
     /// threaded again at every page.
-    pub(super) fn arrange_listed(&mut self, mut listed: Vec<MessageSummary>, last: bool) {
+    pub(super) fn arrange_listed(&mut self, listed: Vec<MessageSummary>, last: bool) {
         if self.threaded() {
             self.messages.extend(listed);
             let count = self.shown_count();
@@ -178,27 +196,60 @@ impl App {
         }
         let (sort, aux) = (self.ordering.sort, self.ordering.aux);
         let positions = &self.positions;
-        let position = |id: &MessageId| positions.get(id).copied().unwrap_or(usize::MAX);
-        let compare =
-            |a: &MessageSummary, b: &MessageSummary| sort::compare(a, b, sort, aux, &position);
-        listed.sort_by(compare);
-        let selected = self.messages.get(self.selected).map(|m| m.id.clone());
-        let old = std::mem::take(&mut self.messages);
-        let mut merged = Vec::with_capacity(old.len() + listed.len());
-        let (mut old, mut listed) = (old.into_iter().peekable(), listed.into_iter().peekable());
+        let key = |m: &MessageSummary| {
+            let at = positions.get(&m.id).copied().unwrap_or(usize::MAX);
+            sort::Key::new(m, sort, aux, at)
+        };
+        let compare = |a: &sort::Key, b: &sort::Key| sort::compare(a, b, sort, aux);
+        let mut listed: Vec<(sort::Key, MessageSummary)> =
+            listed.into_iter().map(|m| (key(&m), m)).collect();
+        listed.sort_by(|(a, _), (b, _)| compare(a, b));
+        // The messages that go before the first listed stay where they
+        // are (with pages coming in the index's order, all of them): only
+        // those after it are merged.
+        let cut = match listed.first() {
+            Some((first, _)) => self
+                .messages
+                .partition_point(|m| !compare(first, &key(m)).is_lt()),
+            None => self.messages.len(),
+        };
+        let selected = self.selected;
+        // A message listed twice may be shown twice: the selection goes to
+        // the first, as when it is looked for.
+        let twice = self.listed_twice
+            || self
+                .messages
+                .get(selected)
+                .is_some_and(|s| listed.iter().any(|(_, m)| m.id == s.id));
+        let selected_id = self
+            .messages
+            .get(selected)
+            .filter(|_| twice)
+            .map(|m| m.id.clone());
+        let tail = self.messages.split_off(cut);
+        let mut tail = tail
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| (cut + i, key(&m), m))
+            .peekable();
+        let mut listed = listed.into_iter().peekable();
         loop {
-            let next = match (old.peek(), listed.peek()) {
-                (Some(a), Some(b)) if compare(b, a).is_lt() => listed.next(),
-                (Some(_), _) => old.next(),
+            let next = match (tail.peek(), listed.peek()) {
+                (Some((_, a, _)), Some((b, _))) if compare(b, a).is_lt() => listed.next(),
+                (Some(_), _) => tail.next().map(|(at, key, message)| {
+                    if at == selected {
+                        self.selected = self.messages.len();
+                    }
+                    (key, message)
+                }),
                 (None, _) => listed.next(),
             };
             match next {
-                Some(message) => merged.push(message),
+                Some((_, message)) => self.messages.push(message),
                 None => break,
             }
         }
-        self.messages = merged;
-        if let Some(at) = selected.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
+        if let Some(at) = selected_id.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
             self.selected = at;
         }
     }

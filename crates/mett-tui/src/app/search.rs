@@ -2,6 +2,7 @@
 //! and searching the text in the pager.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ops::Range;
 
 use mett_core::{MessageId, MessageSummary};
@@ -411,13 +412,21 @@ impl App {
     /// Adds newly listed messages to the index, or aside if the index is
     /// limited and they don't match.
     pub(super) fn add_listed(&mut self, messages: Vec<MessageSummary>, last: bool) {
-        for message in &messages {
-            let next = self.positions.len();
-            self.positions.entry(message.id.clone()).or_insert(next);
-        }
         // The first page starts at the top, wherever its first message
         // goes.
         let first = self.messages.is_empty() && self.hidden.is_empty() && self.folded.is_empty();
+        if first {
+            self.listed_twice = false;
+        }
+        for message in &messages {
+            let next = self.positions.len();
+            match self.positions.entry(message.id.clone()) {
+                Entry::Occupied(_) => self.listed_twice = true,
+                Entry::Vacant(entry) => {
+                    entry.insert(next);
+                }
+            }
+        }
         let limited = self.limit.is_some();
         let mut shown = Vec::with_capacity(messages.len());
         for message in messages {
