@@ -388,6 +388,12 @@ mod tests {
         let lines = screen(&app);
         assert!(lines[6].contains("-- ("), "{lines:#?}");
         assert_eq!(lines[6].chars().count(), usize::from(WIDTH));
+        // The sidebar's keys work in the pager too: the cursor underlined.
+        act(&mut app, crate::action::Action::SidebarNext);
+        let buffer = drawn(&app, WIDTH, HEIGHT);
+        assert!(buffer[(0, 2)].modifier.contains(Modifier::UNDERLINED));
+        assert!(!buffer[(0, 3)].modifier.contains(Modifier::UNDERLINED));
+        assert!(matches!(app.screen(), crate::app::Screen::Pager(_)));
         // Shown again at its full width once hidden.
         let mut hidden = with_mailboxes(SidebarSettings::default());
         hidden.sidebar.visible = false;

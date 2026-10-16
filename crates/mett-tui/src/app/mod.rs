@@ -909,6 +909,8 @@ impl App {
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
         let mut effects = self.handle(msg);
+        // Ordered by counts, the sidebar follows the open folder's.
+        self.follow_open_counts();
         // A search given up on (the user moved on, or left the message it
         // waited for) stops saying it is searching.
         let searching = self.pending_search.is_some()
@@ -1342,6 +1344,7 @@ impl App {
             .on_mailbox_action(action)
             .or_else(|| self.on_thread_action(action))
             .or_else(|| self.on_search_action(action))
+            .or_else(|| self.on_sidebar_action(action))
         {
             return Some(effects);
         }
