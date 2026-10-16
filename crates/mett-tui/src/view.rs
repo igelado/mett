@@ -152,8 +152,14 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
     );
     let status_line = match app.screen() {
         Screen::Index => {
-            render_index(app, frame, body);
-            index_status(app, usize::from(body.height), usize::from(body.width))
+            let first = page_start(app.selected, usize::from(body.height));
+            render_index(app, first, app.selected, frame, body);
+            index_status(
+                app,
+                first,
+                usize::from(body.height),
+                usize::from(body.width),
+            )
         }
         Screen::Pager(pager) => render_pager(app, pager, frame, body),
         Screen::Compose(compose) => render_compose(compose, colors, frame, body),
@@ -258,8 +264,28 @@ fn render_page<T>(
     area: Rect,
     line: impl Fn(usize, &T) -> Line<'static>,
 ) {
+    let first = page_start(selected, usize::from(area.height));
+    render_rows(entries, first, selected, indicator, frame, area, line);
+}
+
+/// The first entry of the page of `height` entries with `selected` on it.
+fn page_start(selected: usize, height: usize) -> usize {
+    let height = height.max(1);
+    selected / height * height
+}
+
+/// Draws `entries` from `first` on, as many as fit, as [`render_page`]
+/// does.
+fn render_rows<T>(
+    entries: &[T],
+    first: usize,
+    selected: usize,
+    indicator: Style,
+    frame: &mut Frame,
+    area: Rect,
+    line: impl Fn(usize, &T) -> Line<'static>,
+) {
     let height = usize::from(area.height).max(1);
-    let first = selected / height * height;
     let lines: Vec<Line> = entries
         .iter()
         .enumerate()
@@ -619,16 +645,19 @@ fn help_line(app: &App, keymap: &Keymap, menu: Menu) -> String {
         .join("  ")
 }
 
-fn render_index(app: &App, frame: &mut Frame, area: Rect) {
+/// Draws the index from entry `first` on, with entry `current` in the
+/// indicator's colors.
+fn render_index(app: &App, first: usize, current: usize, frame: &mut Frame, area: Rect) {
     let width = usize::from(area.width);
     let colors = &app.display.colors;
     let total = app.total_messages();
     // The threads with unread mail folded into them, found once for the
     // page, and only if a collapsed thread on it needs them.
     let unread_roots = std::cell::OnceCell::new();
-    render_page(
+    render_rows(
         &app.messages,
-        app.selected,
+        first,
+        current,
         colors.indicator,
         frame,
         area,
@@ -667,7 +696,7 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
             text.push_str(&" ".repeat(width.saturating_sub(used)));
             let line = Line::raw(text);
             // The selected one is in the indicator's colors instead.
-            if i == app.selected {
+            if i == current {
                 return line;
             }
             line.style(colors.index_style(|pattern| {
@@ -680,10 +709,10 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
-/// The status bar under the index, from `status_format`.
-fn index_status(app: &App, height: usize, width: usize) -> String {
+/// The status bar under the index, from `status_format`, with the index
+/// shown from entry `first` in `height` rows.
+fn index_status(app: &App, first: usize, height: usize, width: usize) -> String {
     let height = height.max(1);
-    let first = app.selected / height * height;
     let position = expando::position(first, height, app.messages.len());
     let (sort, aux) = (app.ordering.sort.name(), app.ordering.aux.name());
     // The whole folder, as in mutt, whatever the limit shows: counted in
@@ -711,8 +740,21 @@ fn index_status(app: &App, height: usize, width: usize) -> String {
     format::expand(&app.display.status_format, &status, width)
 }
 
-/// Draws the pager body and returns its status line.
+/// Draws the pager body, under the mini-index if there is one, and returns
+/// its status line.
 fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> String {
+    // The message as the index shows it: usually the selected one. IDs
+    // are unique, so it is the only one.
+    let index = if app
+        .messages
+        .get(app.selected)
+        .is_some_and(|m| m.id == pager.id)
+    {
+        Some(app.selected)
+    } else {
+        app.messages.iter().position(|m| m.id == pager.id)
+    };
+    let area = render_mini_index(app, index.unwrap_or(app.selected), frame, area);
     let Some(message) = &pager.message else {
         frame.render_widget(Paragraph::new("Loading message..."), area);
         return "---mett: loading---".into();
@@ -833,16 +875,6 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     let position = expando::position(top, height, total);
     // The message as the index currently shows it, as in mutt's `%Z`: its
     // flags may have changed since it was fetched.
-    // Usually the selected one; IDs are unique, so it is the only one.
-    let index = if app
-        .messages
-        .get(app.selected)
-        .is_some_and(|m| m.id == pager.id)
-    {
-        Some(app.selected)
-    } else {
-        app.messages.iter().position(|m| m.id == pager.id)
-    };
     let summary = index.map_or(&message.summary, |i| &app.messages[i]);
     let entry = Entry {
         number: index.unwrap_or(app.selected) + 1,
@@ -855,6 +887,49 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         thread: None,
     };
     format::expand(&app.display.pager_format, &entry, usize::from(area.width))
+}
+
+/// Draws the mini-index (`pager_index_lines`) at the top of `area`, as
+/// mutt does: the index with entry `current` highlighted, about a third of
+/// the way down when there are entries before and after it, and the
+/// index's status bar under it. Returns the rest of `area`, for the
+/// message.
+fn render_mini_index(app: &App, current: usize, frame: &mut Frame, area: Rect) -> Rect {
+    let rows = app
+        .display
+        .mini_index_rows(app.messages.len(), usize::from(area.height));
+    if rows == 0 {
+        return area;
+    }
+    let rows = u16::try_from(rows).unwrap_or(area.height);
+    let [index, status, rest] = Layout::vertical([
+        Constraint::Length(rows - 1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let height = usize::from(index.height);
+    let first = mini_index_top(current, app.messages.len(), height, usize::from(rows) / 3);
+    render_index(app, first, current, frame, index);
+    let line = index_status(app, first, height, usize::from(status.width));
+    frame.render_widget(
+        Paragraph::new(line).style(app.display.colors.status),
+        status,
+    );
+    rest
+}
+
+/// The first entry of a mini-index `height` rows tall over `count`
+/// entries, so that entry `current` is on row `indicator`, unless that
+/// would leave rows empty at the top or bottom (as mutt places it).
+fn mini_index_top(current: usize, count: usize, height: usize, indicator: usize) -> usize {
+    if current < indicator {
+        0
+    } else if count.saturating_sub(current) < height.saturating_sub(indicator) {
+        count.saturating_sub(height)
+    } else {
+        current - indicator
+    }
 }
 
 /// How a line of the message in the pager is drawn, and whether it is in
@@ -1252,6 +1327,97 @@ mod tests {
         assert!(lines[1..14].iter().all(|l| l.width() <= 20), "{lines:#?}");
         assert_eq!(lines[14].width(), usize::from(WIDTH), "{lines:#?}");
         assert!(lines[14].ends_with("-- (all)"), "{lines:#?}");
+    }
+
+    /// `app` with `pager_index_lines` set to `lines`, on a `height`-row
+    /// terminal.
+    fn with_mini_index(app: &mut App, lines: usize, height: u16) {
+        let mut settings = crate::app::Settings::default();
+        settings.display.pager_index_lines = lines;
+        app.update(configured(settings));
+        app.update(Msg::Resize {
+            width: WIDTH,
+            height,
+        });
+    }
+
+    /// Opens the selected message, as m0 with `body`.
+    fn read(app: &mut App, action: Action, body: &str) {
+        let fetch = first_request(&act(app, action));
+        let mut message = mock::message("m0", "in", "Subject 0", received(0));
+        message.body.content = body.into();
+        respond(app, fetch, Event::MessageFetched(Ok(message)));
+    }
+
+    /// The numbers of the index entries on `lines`, in order.
+    fn numbers(lines: &[String]) -> Vec<usize> {
+        lines
+            .iter()
+            .map(|l| l[..4].trim().parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_pager_shows_a_mini_index_above_the_message() {
+        use ratatui::style::Color;
+        let mut app = app(10);
+        with_mini_index(&mut app, 4, 16);
+        colored(&mut app, &["color indicator black yellow"]);
+        read(&mut app, Action::DisplayMessage, "Body");
+        let lines = sized_screen(&app, WIDTH, 16);
+        // 3 entries, then the index's status bar, then the message.
+        assert_eq!(numbers(&lines[1..4]), [1, 2, 3], "{lines:#?}");
+        assert!(lines[4].contains("-mett: Inbox [Msgs:10"), "{lines:#?}");
+        assert!(lines[5].starts_with("Date: "), "{lines:#?}");
+        assert!(lines[14].starts_with("-   - 1/10: "), "{lines:#?}");
+        let buffer = drawn(&app, WIDTH, 16);
+        assert_eq!(buffer[(5, 1)].bg, Color::Yellow, "the open message");
+        assert_eq!(buffer[(5, 2)].bg, Color::Reset);
+
+        // The next message, as mutt places it: a third of the way down.
+        for _ in 0..5 {
+            read(&mut app, Action::NextEntry, "Body");
+        }
+        let lines = sized_screen(&app, WIDTH, 16);
+        assert_eq!(numbers(&lines[1..4]), [5, 6, 7], "{lines:#?}");
+        assert_eq!(drawn(&app, WIDTH, 16)[(5, 2)].bg, Color::Yellow);
+        // Near the end, the index stays full.
+        for _ in 0..4 {
+            read(&mut app, Action::NextEntry, "Body");
+        }
+        let lines = sized_screen(&app, WIDTH, 16);
+        assert_eq!(numbers(&lines[1..4]), [8, 9, 10], "{lines:#?}");
+        assert_eq!(drawn(&app, WIDTH, 16)[(5, 3)].bg, Color::Yellow);
+    }
+
+    #[test]
+    fn the_mini_index_takes_only_the_rows_it_needs() {
+        let mut app = app(2);
+        with_mini_index(&mut app, 10, 16);
+        read(&mut app, Action::DisplayMessage, "Body");
+        let lines = sized_screen(&app, WIDTH, 16);
+        assert_eq!(numbers(&lines[1..3]), [1, 2], "{lines:#?}");
+        assert!(lines[3].contains("-mett: Inbox"), "{lines:#?}");
+        assert!(lines[4].starts_with("Date: "), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_small_terminal_shrinks_the_mini_index_then_leaves_it_out() {
+        let mut app = app(10);
+        with_mini_index(&mut app, 6, HEIGHT);
+        read(&mut app, Action::DisplayMessage, "Body");
+        // 5 rows: one entry and the status bar, and 3 for the message.
+        let lines = screen(&app);
+        assert_eq!(numbers(&lines[1..2]), [1], "{lines:#?}");
+        assert!(lines[2].contains("-mett: Inbox"), "{lines:#?}");
+        assert!(lines[3].starts_with("Date: "), "{lines:#?}");
+        // 4 rows: only the message.
+        app.update(Msg::Resize {
+            width: WIDTH,
+            height: 7,
+        });
+        let lines = sized_screen(&app, WIDTH, 7);
+        assert!(lines[1].starts_with("Date: "), "{lines:#?}");
     }
 
     #[test]

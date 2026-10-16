@@ -97,6 +97,13 @@ mutt: at `wrap` columns when it is positive (and the terminal is wider),
 or `-wrap` columns short of the terminal's width when it is negative. Text
 attachments viewed in the pager wrap the same way; the help screen doesn't.
 
+With `pager_index_lines` set, the pager shows that many rows of the index
+above the message, as mutt does: the entries around the open message (a
+third of the way down), then the index's status bar. Moving to another
+message from the pager moves it along. On a small terminal it shrinks so
+that the message keeps at least 3 rows, and is left out when there is no
+room for an entry.
+
 `color OBJECT [ATTRIBUTE ...] FOREGROUND BACKGROUND [EXPRESSION]` (an
 expression with spaces quoted, as in mutt) sets the
 colors of `normal`, `indicator`, `status` (and the help line), `error`,
