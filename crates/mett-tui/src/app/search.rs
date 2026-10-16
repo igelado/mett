@@ -248,7 +248,7 @@ impl App {
                 return;
             }
         };
-        let (width, height) = (self.wrap_width(), self.body_height);
+        let (width, height) = (self.wrap_width(), self.pager_height());
         let Some(Screen::Pager(pager)) = self.screens.get_mut(position) else {
             return;
         };
@@ -1039,6 +1039,32 @@ mod tests {
         let found = highlighted(view);
         assert_eq!(found.len(), 1);
         assert_eq!(&view.row(found[0].0)[found[0].1.clone()], "needle");
+    }
+
+    #[test]
+    fn the_pager_pages_and_searches_in_the_rows_the_mini_index_leaves() {
+        let mut app = app();
+        let mut settings = Settings::default();
+        settings.display.pager_index_lines = 6;
+        app.update(configured(settings));
+        show(&mut app, (0..60).map(|i| format!("line {i}\n")).collect());
+        let height = app.body_height - 6;
+        assert_eq!(app.pager_height(), height);
+        act(&mut app, Action::NextPage);
+        assert_eq!(pager(&app).scroll, height);
+        // The last page is full, in the rows left.
+        let last = pager(&app).row_count() - height;
+        act(&mut app, Action::Search);
+        answer(&mut app, "line 59");
+        assert_eq!(pager(&app).scroll, last);
+        for _ in 0..10 {
+            act(&mut app, Action::NextPage);
+        }
+        assert_eq!(pager(&app).scroll, last);
+        // Without it, the pager has the rows back.
+        app.update(configured(Settings::default()));
+        assert_eq!(app.pager_height(), app.body_height);
+        assert_eq!(pager(&app).scroll, last - 6);
     }
 
     #[test]

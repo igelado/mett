@@ -24,7 +24,14 @@ pub struct Display {
     pub colors: Colors,
     /// `wrap`: where the pager wraps text (see [`Display::wrap_width`]).
     pub wrap: i64,
+    /// `pager_index_lines`: the rows of the index shown above the pager
+    /// (see [`Display::mini_index_rows`]).
+    pub pager_index_lines: usize,
 }
+
+/// The fewest rows the pager keeps for the message when the mini-index
+/// (`pager_index_lines`) is shrunk to fit a small terminal.
+const MIN_PAGER_ROWS: usize = 3;
 
 impl Display {
     /// The width the pager wraps text at on a screen `width` columns wide,
@@ -41,6 +48,25 @@ impl Display {
             _ => width,
         }
     }
+
+    /// How many of the pager's `height` rows the mini-index takes, its
+    /// status bar included, with `messages` in the index. As in mutt, it
+    /// is `pager_index_lines`, or only as many as the index needs (its
+    /// messages and the status bar). On a terminal too small for that and
+    /// a few rows of the message, it shrinks, and is left out when it
+    /// would have no room for an entry.
+    pub fn mini_index_rows(&self, messages: usize, height: usize) -> usize {
+        // As in mutt, 1 (or an empty index) leaves only the status bar.
+        let wanted = self.pager_index_lines.min(messages.saturating_add(1));
+        let room = height.saturating_sub(MIN_PAGER_ROWS);
+        if wanted <= room {
+            wanted
+        } else if room >= 2 {
+            room
+        } else {
+            0
+        }
+    }
 }
 
 impl PartialEq for Display {
@@ -52,6 +78,7 @@ impl PartialEq for Display {
             && self.quote.as_str() == other.quote.as_str()
             && self.colors == other.colors
             && self.wrap == other.wrap
+            && self.pager_index_lines == other.pager_index_lines
     }
 }
 
@@ -75,6 +102,7 @@ impl Default for Display {
             quote: Regex::new(&var("quote_regex")).expect("the default is valid"),
             colors: Colors::default(),
             wrap: 0,
+            pager_index_lines: 0,
         }
     }
 }

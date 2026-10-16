@@ -328,6 +328,11 @@ fn settings_keeping(
             Some(config::Value::Number(n)) => *n,
             _ => 0,
         },
+        pager_index_lines: match config.get("pager_index_lines") {
+            Some(config::Value::Number(n)) => usize::try_from(*n)
+                .map_err(|_| "pager_index_lines must be 0 (off) or a number of lines")?,
+            _ => 0,
+        },
     };
     let ordering = app::Ordering {
         sort: sort::Sort::parse(config.string("sort"), true).map_err(|e| format!("sort: {e}"))?,
@@ -1461,6 +1466,14 @@ mod tests {
         assert_eq!(demo.settings.display.wrap, 0, "the default");
         let set = demo.run("set wrap=-10");
         assert_eq!(set.settings.unwrap().display.wrap, -10);
+    }
+
+    #[test]
+    fn pager_index_lines_takes_no_negative_numbers() {
+        let mut demo = Commanded::demo("/home/alice");
+        let set = demo.run("set pager_index_lines=5");
+        assert_eq!(set.settings.unwrap().display.pager_index_lines, 5);
+        assert!(demo.run("set pager_index_lines=-1").settings.is_err());
     }
 
     #[test]

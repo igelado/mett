@@ -1404,7 +1404,7 @@ impl App {
         if let Some(effects) = self.on_message_action(action) {
             return effects;
         }
-        let page = self.body_height.max(1);
+        let page = self.pager_height().max(1);
         match action {
             Action::Exit => {
                 self.screens.pop();
@@ -1444,6 +1444,16 @@ impl App {
         self.display.wrap_width(self.width)
     }
 
+    /// The rows the pager shows the message in: those under the help line
+    /// and above the status bar, but for the mini-index's
+    /// (`pager_index_lines`).
+    pub(super) fn pager_height(&self) -> usize {
+        let index = self
+            .display
+            .mini_index_rows(self.messages.len(), self.body_height);
+        self.body_height - index
+    }
+
     /// Scrolls the pager by `rows`, within the message.
     fn scroll_by(&mut self, rows: isize) {
         if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
@@ -1456,11 +1466,12 @@ impl App {
     /// the last page stays full and scrolling back responds at once.
     fn clamp_scroll(&mut self) {
         let (width, height) = (self.wrap_width(), self.body_height);
+        let pager_height = self.pager_height();
         // Pagers under other screens too: their rows (and search
         // highlights) must match the width they will be drawn at.
         for screen in &mut self.screens {
             match screen {
-                Screen::Pager(pager) => pager.fit(width, height),
+                Screen::Pager(pager) => pager.fit(width, pager_height),
                 Screen::Text(view) => {
                     view.layout(width);
                     view.scroll = view.scroll.min(view.rows.len().saturating_sub(height));

@@ -120,6 +120,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `timeout` | number | Seconds to wait for input before checking mail. |
 | | `sort`, `sort_aux` | sort order | Index sorting. |
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |
+| | `pager_index_lines` | number | Rows of a mini-index shown above the pager, one of them the index's status bar (default `0`, none). As in mutt, the open message is about a third of the way down it, and it takes only the rows the index needs. On a terminal too small for it and a few rows of the message, it shrinks, or is left out. |
 | | `wrap` | number | Where the pager wraps text (also text attachments viewed in it, but not the help screen, as in mutt). `0` (the default) wraps at the terminal's width; a positive number wraps at that many columns, or at the terminal's width if it is narrower; a negative number leaves that many columns empty on the right, or wraps at the terminal's width if that leaves no room. Changing it with `:set` wraps an open message again. |
 | | `mailcap_path` | string | mailcap files used to view MIME parts. |
 | | `query_command` | path | External address-book query. |

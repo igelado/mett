@@ -166,6 +166,7 @@ pub const VARS: &[Var] = &[
         Kind::String,
         "-%Z- %C/%m: %-20.20n   %s%*  -- (%P)",
     ),
+    var("pager_index_lines", Kind::Number, "0"),
     var("postpone", Kind::Quad, "ask-yes"),
     var("postponed", Kind::Path, "~/postponed"),
     var("query_command", Kind::Path, ""),
