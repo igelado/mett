@@ -64,6 +64,8 @@ pub(super) struct Polling {
 pub struct MailboxEntry {
     /// How it is shown: its label, or its path with `=` for `folder`.
     pub name: String,
+    /// Its label (`-label`), if it has one.
+    pub label: Option<String>,
     /// What the user would type for it at a mailbox prompt.
     pub text: String,
     /// The folder.
@@ -713,6 +715,7 @@ impl App {
             }
         }
         self.refresh_mailbox_browser();
+        self.rebuild_sidebar(false);
         Vec::new()
     }
 
@@ -726,7 +729,7 @@ impl App {
 
     /// Whether the mailbox at `path` (found to be `found`, if it was) is
     /// the open folder.
-    fn is_open(&self, path: &FolderPath, found: Option<&Folder>) -> bool {
+    pub(super) fn is_open(&self, path: &FolderPath, found: Option<&Folder>) -> bool {
         match (&self.folder, found) {
             (Some(open), Some(found)) => open.id == found.id,
             (Some(_), None) => *path == self.path,
@@ -747,6 +750,7 @@ impl App {
                 state.folder = Some(open.clone());
             }
         }
+        self.rebuild_sidebar(true);
     }
 
     /// The mailboxes with new mail, other than the open folder.
@@ -760,7 +764,7 @@ impl App {
     /// Whether `mailbox` has new mail. One that isn't checked (`-nopoll`)
     /// can't tell, even if the folder is listed again under another name
     /// that is.
-    fn has_new_mail(&self, mailbox: &MailboxEntry) -> bool {
+    pub(super) fn has_new_mail(&self, mailbox: &MailboxEntry) -> bool {
         mailbox.poll && self.mailbox_state.get(&mailbox.path).is_some_and(|s| s.new)
     }
 
@@ -846,6 +850,7 @@ impl App {
             self.poll_armed = false;
         }
         self.refresh_mailbox_browser();
+        self.rebuild_sidebar(false);
     }
 }
 
@@ -886,6 +891,7 @@ mod tests {
     fn settings() -> Settings {
         let entry = |name: &str, path| MailboxEntry {
             name: name.into(),
+            label: None,
             text: name.into(),
             path,
             notify: true,
@@ -2019,6 +2025,7 @@ mod tests {
         lists.id = FolderId::new("lists");
         app.mailboxes.push(MailboxEntry {
             name: "=Lists".into(),
+            label: None,
             text: "=Lists".into(),
             path: FolderPath::Named(vec!["Lists".into()]),
             notify: true,

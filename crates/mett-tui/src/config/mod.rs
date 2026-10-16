@@ -59,7 +59,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "send-hook",
     "send2-hook",
     "setenv",
-    "sidebar_whitelist",
     "spam",
     "subjectrx",
     "subscribe",
@@ -75,7 +74,6 @@ const NOT_YET_SUPPORTED: &[&str] = &[
     "unmy_hdr",
     "unscore",
     "unsetenv",
-    "unsidebar_whitelist",
     "unsubjectrx",
     "unsubscribe",
 ];
@@ -141,6 +139,9 @@ pub struct Config {
     alias_places: HashMap<String, usize>,
     /// `mailboxes`, in the order given.
     mailboxes: Vec<Mailbox>,
+    /// `sidebar_whitelist`: mailboxes the sidebar shows even with
+    /// `sidebar_new_mail_only`, expanded as `mailboxes` expands them.
+    sidebar_whitelist: Vec<String>,
     /// `bind` and `macro` commands not yet taken by the key bindings.
     key_commands: Vec<KeyCommand>,
     /// Keys to play, from `push` and `exec`, in mutt's notation.
@@ -182,6 +183,7 @@ impl Config {
             aliases: Vec::new(),
             alias_places: HashMap::new(),
             mailboxes: Vec::new(),
+            sidebar_whitelist: Vec::new(),
             key_commands: Vec::new(),
             pushed: Vec::new(),
             warnings: Vec::new(),
@@ -276,6 +278,11 @@ impl Config {
     /// The mailboxes to check for new mail (`mailboxes`).
     pub fn mailboxes(&self) -> &[Mailbox] {
         &self.mailboxes
+    }
+
+    /// The mailboxes the sidebar always shows (`sidebar_whitelist`).
+    pub fn sidebar_whitelist(&self) -> &[String] {
+        &self.sidebar_whitelist
     }
 
     /// The `bind` and `macro` commands read since the last call.
@@ -374,6 +381,11 @@ impl Config {
             }
             format!("{line} {}", Value::Str(mailbox.path.clone()))
         }));
+        lines.extend(
+            self.sidebar_whitelist
+                .iter()
+                .map(|path| format!("sidebar_whitelist {}", Value::Str(path.clone()))),
+        );
         lines
     }
 
@@ -505,6 +517,22 @@ impl Config {
                     } else {
                         let path = c.expand_mailbox(path);
                         c.mailboxes.retain(|m| m.path != path);
+                    }
+                    Ok(())
+                }),
+                "sidebar_whitelist" => self.each(args, |c, path| {
+                    let path = c.expand_mailbox(path);
+                    if !c.sidebar_whitelist.contains(&path) {
+                        c.sidebar_whitelist.push(path);
+                    }
+                    Ok(())
+                }),
+                "unsidebar_whitelist" => self.each(args, |c, path| {
+                    if path == "*" {
+                        c.sidebar_whitelist.clear();
+                    } else {
+                        let path = c.expand_mailbox(path);
+                        c.sidebar_whitelist.retain(|m| *m != path);
                     }
                     Ok(())
                 }),
@@ -1319,7 +1347,7 @@ mod tests {
         let marker = std::env::temp_dir().join(format!("mett-color-{}", std::process::id()));
         let _ = fs::remove_file(&marker);
         let config = load(&format!(
-            "color sidebar_new red `touch {}`\n",
+            "color progress red `touch {}`\n",
             marker.display()
         ));
         assert!(config.errors.is_empty(), "{:?}", config.errors);
@@ -1489,6 +1517,22 @@ mod tests {
         assert!(config.run_line("mailboxes -label x").is_err());
         assert_eq!(config.run_line("unmailboxes *"), Ok(vec![]));
         assert!(config.mailboxes().is_empty());
+    }
+
+    #[test]
+    fn keeps_the_sidebar_whitelist() {
+        let mut config = load(
+            "set folder=msgraph://a@b.c/\n\
+             sidebar_whitelist =Work =Lists =Work\n\
+             unsidebar_whitelist =Lists\n",
+        );
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert_eq!(config.sidebar_whitelist(), ["msgraph://a@b.c/Work"]);
+        let again = load(&config.dump().join("\n"));
+        assert_eq!(again.sidebar_whitelist(), config.sidebar_whitelist());
+        assert_eq!(config.run_line("unsidebar_whitelist *"), Ok(vec![]));
+        assert!(config.sidebar_whitelist().is_empty());
     }
 
     #[test]

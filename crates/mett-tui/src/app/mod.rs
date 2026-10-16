@@ -13,6 +13,7 @@ mod newmail;
 mod query;
 mod recall;
 mod search;
+mod sidebar;
 #[cfg(test)]
 pub(crate) mod testing;
 mod threads;
@@ -33,6 +34,7 @@ pub use self::newmail::MailboxEntry;
 pub use self::query::{QueryMenu, QuerySettings};
 pub use self::recall::PostponedMenu;
 pub use self::search::{Limit, highlighted};
+pub use self::sidebar::{Sidebar, SidebarSettings, SidebarSort};
 pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
 use crate::compose::Kind;
@@ -102,6 +104,8 @@ pub struct Settings {
     pub alias_file: Option<std::path::PathBuf>,
     /// How to find addresses.
     pub query: QuerySettings,
+    /// The sidebar's settings.
+    pub sidebar: SidebarSettings,
 }
 
 /// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
@@ -135,6 +139,7 @@ impl Default for Settings {
             aliases: Vec::new(),
             alias_file: None,
             query: QuerySettings::default(),
+            sidebar: SidebarSettings::default(),
         }
     }
 }
@@ -718,6 +723,8 @@ pub struct App {
     poll_epoch: u64,
     /// When the folder was last listed from the start.
     listed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The sidebar.
+    sidebar: Sidebar,
 }
 
 impl App {
@@ -854,7 +861,9 @@ impl App {
             seen: HashMap::new(),
             poll_epoch: 0,
             listed_at: None,
+            sidebar: Sidebar::default(),
         };
+        app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();
         (app, effects)
     }
@@ -2093,6 +2102,7 @@ impl App {
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
         self.display = settings.display;
+        self.apply_sidebar(settings.sidebar);
         // `wrap` may have changed: the pager and text views wrap again.
         self.clamp_scroll();
         self.apply_ordering(settings.ordering);
