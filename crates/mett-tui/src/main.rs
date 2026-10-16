@@ -305,6 +305,7 @@ fn settings_keeping(
             };
             Ok(app::MailboxEntry {
                 name: mailbox.label.clone().unwrap_or_else(|| text.clone()),
+                label: mailbox.label.clone(),
                 text,
                 path,
                 notify: mailbox.notify,
@@ -340,6 +341,7 @@ fn settings_keeping(
             .map_err(|e| format!("sort_aux: {e}"))?,
         ascii: config.flag("ascii_chars"),
     };
+    let sidebar = sidebar_settings(config, account)?;
     let alias_file = match config.string("alias_file") {
         "" => config.user_file().map(std::path::Path::to_path_buf),
         file => Some(std::path::PathBuf::from(file)),
@@ -354,6 +356,7 @@ fn settings_keeping(
         home: config.home().map(str::to_owned),
         page_size,
         mailboxes,
+        sidebar,
         display,
         ordering,
         sync_interval,
@@ -368,6 +371,46 @@ fn settings_keeping(
             mbox: config.string("mbox").to_owned(),
             record: config.string("record").to_owned(),
         },
+    })
+}
+
+/// The sidebar's settings from the configuration, for `account`.
+fn sidebar_settings(
+    config: &config::Config,
+    account: &mett_core::AccountId,
+) -> Result<app::SidebarSettings, String> {
+    let number = |name: &str| match config.get(name) {
+        Some(config::Value::Number(n)) if *n >= 0 => {
+            usize::try_from(*n).map_err(|_| format!("{name} {n} is too large"))
+        }
+        _ => Err(format!("{name} must be 0 or more")),
+    };
+    let folder = config.string("folder");
+    // Those that name no folder of the account can't match a mailbox.
+    let path = |text: &str| config::mailbox::folder_path(text, folder, account).ok();
+    Ok(app::SidebarSettings {
+        visible: config.flag("sidebar_visible"),
+        width: number("sidebar_width")?,
+        min_width: number("sidebar_min_width")?,
+        format: config.string("sidebar_format").to_owned(),
+        short_path: config.flag("sidebar_short_path"),
+        folder_indent: config.flag("sidebar_folder_indent"),
+        indent_string: config.string("sidebar_indent_string").to_owned(),
+        delim_chars: config.string("sidebar_delim_chars").to_owned(),
+        divider_char: config.string("sidebar_divider_char").to_owned(),
+        sort: app::SidebarSort::parse(config.string("sidebar_sort_method"))
+            .map_err(|e| format!("sidebar_sort_method: {e}"))?,
+        new_mail_only: config.flag("sidebar_new_mail_only"),
+        next_new_wrap: config.flag("sidebar_next_new_wrap"),
+        on_right: config.flag("sidebar_on_right"),
+        whitelist: config
+            .sidebar_whitelist()
+            .iter()
+            .filter_map(|text| path(text))
+            .collect(),
+        spoolfile: Some(config.string("spoolfile"))
+            .filter(|spoolfile| !spoolfile.is_empty())
+            .and_then(path),
     })
 }
 
@@ -542,6 +585,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     Some(received) => received,
                     None => {
                         if std::mem::take(&mut stale) {
+                            app.before_draw();
                             draw(&mut terminal, &app)?;
                         }
                         next.await
@@ -632,6 +676,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             }
             // What was ignored changed nothing to draw.
             if std::mem::take(&mut stale) {
+                app.before_draw();
                 draw(&mut terminal, &app)?;
             }
             let msg = tokio::select! {
@@ -1606,6 +1651,21 @@ mod tests {
             "still the demo user"
         );
         assert_eq!(after.compose.signature, None, "not the user's signature");
+    }
+
+    #[test]
+    fn the_sidebar_is_set_at_the_prompt() {
+        let mut demo = Commanded::demo("/home/alice");
+        let done =
+            demo.run("set sidebar_visible sidebar_width=25 sidebar_sort_method=reverse-alpha");
+        let sidebar = done.settings.unwrap().sidebar;
+        assert!(sidebar.visible);
+        assert_eq!(sidebar.width, 25);
+        assert!(sidebar.sort.reverse);
+        assert!(demo.run("set sidebar_sort_method=size").settings.is_err());
+        assert!(demo.run("set sidebar_min_width=-1").settings.is_err());
+        let done = demo.run("toggle sidebar_visible");
+        assert!(!done.settings.unwrap().sidebar.visible);
     }
 
     #[test]

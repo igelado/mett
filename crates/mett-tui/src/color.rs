@@ -43,6 +43,20 @@ pub enum Object {
     Header,
     /// Text in the body matching a regular expression.
     Body,
+    /// The line between the sidebar and the rest of the screen.
+    SidebarDivider,
+    /// Sidebar mailboxes with flagged mail.
+    SidebarFlagged,
+    /// The sidebar's cursor (`sidebar-next` and the like move it).
+    SidebarHighlight,
+    /// The open mailbox in the sidebar (`indicator` until set).
+    SidebarIndicator,
+    /// Sidebar mailboxes with new or unread mail.
+    SidebarNew,
+    /// Other sidebar mailboxes (neomutt's; `normal` until set).
+    SidebarOrdinary,
+    /// The `spoolfile` mailbox in the sidebar, if set.
+    SidebarSpoolfile,
 }
 
 /// How many `quoted` levels there are (`quoted` to `quoted9`).
@@ -54,7 +68,7 @@ pub enum ColorError {
     /// It is wrong: a bad color, a bad regular expression, missing words.
     Bad(String),
     /// It is mutt's, but mett doesn't do it yet (an object such as
-    /// `sidebar_new`, or a pattern mett doesn't know): it is ignored.
+    /// `progress`, or a pattern mett doesn't know): it is ignored.
     Unsupported(String),
 }
 
@@ -98,6 +112,13 @@ impl Object {
             "index" => Self::Index,
             "header" => Self::Header,
             "body" => Self::Body,
+            "sidebar_divider" => Self::SidebarDivider,
+            "sidebar_flagged" => Self::SidebarFlagged,
+            "sidebar_highlight" => Self::SidebarHighlight,
+            "sidebar_indicator" => Self::SidebarIndicator,
+            "sidebar_new" => Self::SidebarNew,
+            "sidebar_ordinary" => Self::SidebarOrdinary,
+            "sidebar_spoolfile" => Self::SidebarSpoolfile,
             "quoted" => Self::Quoted(0),
             _ => match name.strip_prefix("quoted").and_then(|n| n.parse().ok()) {
                 Some(level) if level < QUOTED_LEVELS => Self::Quoted(level),
@@ -155,6 +176,10 @@ pub struct Colors {
     pub tilde: Style,
     pub markers: Style,
     pub attachment: Style,
+    /// The sidebar's objects (`sidebar_*`). `sidebar_indicator` and
+    /// `sidebar_spoolfile` count only once set (to anything but the empty
+    /// style they start with).
+    pub sidebar: SidebarColors,
     /// `color index`, in the order given: the last that matches counts.
     pub index: Vec<IndexRule>,
     /// `color header`: the last that matches counts.
@@ -164,6 +189,33 @@ pub struct Colors {
 }
 
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
+
+/// How the sidebar is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarColors {
+    pub divider: Style,
+    pub flagged: Style,
+    pub highlight: Style,
+    pub indicator: Style,
+    pub new: Style,
+    pub ordinary: Style,
+    pub spoolfile: Style,
+}
+
+impl Default for SidebarColors {
+    /// mutt's: the cursor underlined, the rest unset.
+    fn default() -> Self {
+        Self {
+            divider: Style::new(),
+            flagged: Style::new(),
+            highlight: Style::new().add_modifier(Modifier::UNDERLINED),
+            indicator: Style::new(),
+            new: Style::new(),
+            ordinary: Style::new(),
+            spoolfile: Style::new(),
+        }
+    }
+}
 
 impl Default for Colors {
     /// mutt's defaults on a terminal without colors.
@@ -183,6 +235,7 @@ impl Default for Colors {
             tilde: Style::new(),
             markers: Style::new(),
             attachment: Style::new(),
+            sidebar: SidebarColors::default(),
             index: Vec::new(),
             header: Vec::new(),
             body: Vec::new(),
@@ -225,6 +278,13 @@ impl Colors {
             self.tilde,
             self.markers,
             self.attachment,
+            self.sidebar.divider,
+            self.sidebar.flagged,
+            self.sidebar.highlight,
+            self.sidebar.indicator,
+            self.sidebar.new,
+            self.sidebar.ordinary,
+            self.sidebar.spoolfile,
         ];
         styles.extend(self.quoted);
         styles
@@ -247,6 +307,13 @@ impl Colors {
             Object::Tilde => &mut self.tilde,
             Object::Markers => &mut self.markers,
             Object::Attachment => &mut self.attachment,
+            Object::SidebarDivider => &mut self.sidebar.divider,
+            Object::SidebarFlagged => &mut self.sidebar.flagged,
+            Object::SidebarHighlight => &mut self.sidebar.highlight,
+            Object::SidebarIndicator => &mut self.sidebar.indicator,
+            Object::SidebarNew => &mut self.sidebar.new,
+            Object::SidebarOrdinary => &mut self.sidebar.ordinary,
+            Object::SidebarSpoolfile => &mut self.sidebar.spoolfile,
             Object::Index | Object::Header | Object::Body => {
                 unreachable!("objects with rules have no style of their own")
             }
@@ -603,10 +670,32 @@ mod tests {
     }
 
     #[test]
+    fn colors_the_sidebar() {
+        let mut colors = Colors::default();
+        assert_eq!(
+            colors.sidebar.highlight,
+            Style::new().add_modifier(Modifier::UNDERLINED),
+            "mutt's default"
+        );
+        colors.color(&words("sidebar_new yellow default")).unwrap();
+        colors
+            .color(&words("sidebar_highlight black cyan"))
+            .unwrap();
+        colors.mono(&words("sidebar_divider bold")).unwrap();
+        assert_eq!(colors.sidebar.new.fg, Some(Color::Yellow));
+        assert_eq!(colors.sidebar.highlight.bg, Some(Color::Cyan));
+        assert!(colors.sidebar.divider.add_modifier.contains(Modifier::BOLD));
+        colors.uncolor(&words("sidebar_highlight")).unwrap();
+        colors.uncolor(&words("sidebar_new")).unwrap();
+        colors.uncolor(&words("sidebar_divider")).unwrap();
+        assert_eq!(colors, Colors::default());
+    }
+
+    #[test]
     fn rejects_mistakes() {
         let mut colors = Colors::default();
         assert!(matches!(
-            colors.color(&words("sidebar_new red blue")),
+            colors.color(&words("progress red blue")),
             Err(ColorError::Unsupported(_))
         ));
         assert!(matches!(

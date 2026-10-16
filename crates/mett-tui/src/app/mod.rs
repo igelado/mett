@@ -13,6 +13,7 @@ mod newmail;
 mod query;
 mod recall;
 mod search;
+mod sidebar;
 #[cfg(test)]
 pub(crate) mod testing;
 mod threads;
@@ -33,6 +34,7 @@ pub use self::newmail::MailboxEntry;
 pub use self::query::{QueryMenu, QuerySettings};
 pub use self::recall::PostponedMenu;
 pub use self::search::{Limit, highlighted};
+pub use self::sidebar::{Sidebar, SidebarEntry, SidebarSettings, SidebarSort};
 pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
 use crate::compose::Kind;
@@ -102,6 +104,8 @@ pub struct Settings {
     pub alias_file: Option<std::path::PathBuf>,
     /// How to find addresses.
     pub query: QuerySettings,
+    /// The sidebar's settings.
+    pub sidebar: SidebarSettings,
 }
 
 /// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
@@ -135,6 +139,7 @@ impl Default for Settings {
             aliases: Vec::new(),
             alias_file: None,
             query: QuerySettings::default(),
+            sidebar: SidebarSettings::default(),
         }
     }
 }
@@ -607,8 +612,11 @@ pub struct App {
     path: FolderPath,
     /// The request opening the folder, while it is pending.
     opening: Option<RequestId>,
-    /// Terminal width, in cells.
+    /// The width of the menus, in cells: the terminal's, but for the
+    /// sidebar's.
     pub width: usize,
+    /// Terminal width, in cells.
+    terminal_width: usize,
     /// Rows available for the index or pager body.
     pub body_height: usize,
     /// The request whose messages the index is waiting for, if any.
@@ -718,6 +726,8 @@ pub struct App {
     poll_epoch: u64,
     /// When the folder was last listed from the start.
     listed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The sidebar.
+    sidebar: Sidebar,
 }
 
 impl App {
@@ -810,6 +820,7 @@ impl App {
             path,
             opening: None,
             width: usize::from(width),
+            terminal_width: usize::from(width),
             body_height: body_height(height),
             listing: None,
             listing_page: None,
@@ -854,7 +865,9 @@ impl App {
             seen: HashMap::new(),
             poll_epoch: 0,
             listed_at: None,
+            sidebar: Sidebar::default(),
         };
+        app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();
         (app, effects)
     }
@@ -946,10 +959,9 @@ impl App {
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
             Msg::Resize { width, height } => {
-                self.width = usize::from(width);
+                self.terminal_width = usize::from(width);
                 self.body_height = body_height(height);
-                self.clamp_scroll();
-                self.clamp_sign_in_scroll();
+                self.relayout();
                 Vec::new()
             }
         }
@@ -1021,7 +1033,10 @@ impl App {
         }
         match self.menu() {
             Menu::Index => self.on_index_action(action),
-            Menu::Pager if matches!(self.screen(), Screen::Text(_)) => self.on_text_action(action),
+            // Text is read in the pager, beside the sidebar too.
+            Menu::Pager if matches!(self.screen(), Screen::Text(_)) => self
+                .on_sidebar_action(action)
+                .unwrap_or_else(|| self.on_text_action(action)),
             Menu::Pager => self.on_pager_action(action),
             Menu::Attach => self.on_attach_action(action),
             Menu::Query => self.on_query_action(action),
@@ -1216,7 +1231,8 @@ impl App {
         // The window covers all but the help line, and has a border above
         // and below its text.
         let room = (self.body_height + CHROME_ROWS).saturating_sub(3);
-        let width = self.width;
+        // Across the whole terminal, over the sidebar too.
+        let width = self.terminal_width;
         if let Some(window) = &mut self.sign_in {
             let last = window.rows(width).len().saturating_sub(room);
             window.scroll = window.scroll.min(last);
@@ -1329,6 +1345,7 @@ impl App {
             .on_mailbox_action(action)
             .or_else(|| self.on_thread_action(action))
             .or_else(|| self.on_search_action(action))
+            .or_else(|| self.on_sidebar_action(action))
         {
             return Some(effects);
         }
@@ -2093,6 +2110,7 @@ impl App {
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
         self.display = settings.display;
+        self.apply_sidebar(settings.sidebar);
         // `wrap` may have changed: the pager and text views wrap again.
         self.clamp_scroll();
         self.apply_ordering(settings.ordering);

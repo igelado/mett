@@ -121,7 +121,8 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `sort`, `sort_aux` | sort order | Index sorting. |
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |
 | | `pager_index_lines` | number | Rows of a mini-index shown above the pager, one of them the index's status bar (default `0`, none). As in mutt, the open message is about a third of the way down it, and it takes only the rows the index needs. On a terminal too small for it and a few rows of the message, it shrinks, or is left out. |
-| | `wrap` | number | Where the pager wraps text (also text attachments viewed in it, but not the help screen, as in mutt). `0` (the default) wraps at the terminal's width; a positive number wraps at that many columns, or at the terminal's width if it is narrower; a negative number leaves that many columns empty on the right, or wraps at the terminal's width if that leaves no room. Changing it with `:set` wraps an open message again. |
+| | `wrap` | number | Where the pager wraps text (also text attachments viewed in it, but not the help screen, as in mutt). `0` (the default) wraps at the pager's width (the terminal's, less the sidebar's, if shown); a positive number wraps at that many columns, or at the terminal's width if it is narrower; a negative number leaves that many columns empty on the right, or wraps at the terminal's width if that leaves no room. Changing it with `:set` wraps an open message again. |
+| | `sidebar_visible`, `sidebar_width`, `sidebar_format` | boolean, number, string | The sidebar (§4.10). |
 | | `mailcap_path` | string | mailcap files used to view MIME parts. |
 | | `query_command` | path | External address-book query. |
 | | `alias_file` | path | Where aliases created with `a` (`<create-alias>`) are saved. Defaults to the user's own mettrc (`~/.config/mett/mettrc` for a user who has none yet). |
@@ -155,6 +156,9 @@ unlists       regexp [ ... ]
 sidebar_whitelist   mailbox [ ... ]
 unsidebar_whitelist [ * | mailbox ... ]
 ```
+
+`sidebar_whitelist` names mailboxes that the sidebar shows even with
+`sidebar_new_mail_only` (§4.10); `unsidebar_whitelist` forgets them.
 
 ### 4.3 Addresses and identities
 
@@ -253,6 +257,46 @@ unscore       [ * | pattern ... ]
 spam          pattern format
 nospam        pattern
 ```
+
+### 4.10 The sidebar
+
+mutt's sidebar lists the `mailboxes` in a column beside the menus, with
+their counts. mett supports it as below; neomutt's additions are marked,
+and so is mett's own.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `sidebar_visible` | `no` | Show the sidebar. |
+| `sidebar_width` | `30` | Its width in columns, the divider included. |
+| `sidebar_format` | `%B%*  %n` | Each entry: `%B` name, `%N` unread, `%S` messages, `%n` `N` with new mail, `%F` flagged, `%!` `!`, `!!` or `N!` for the flagged, and for the open folder `%d` deleted, `%L` shown by the limit, `%t` tagged; `%?X?…&…?`, `%>X`, `%*X` and `%\|X` as in other formats. |
+| `sidebar_short_path` | `no` | Show only the last part of each path (after `sidebar_delim_chars`). |
+| `sidebar_folder_indent` | `no` | Indent mailboxes below `folder` by their depth, with `sidebar_indent_string` (`"  "`). |
+| `sidebar_delim_chars` | `/.` | What separates the parts of a path. |
+| `sidebar_divider_char` | `\|` | The line between the sidebar and the menus. |
+| `sidebar_sort_method` | `unsorted` | `unsorted` (`mailbox-order`), `path`, `alpha` (`name`: the label, or the path), `count`, `unread` (`new`) or `flagged`, most first for counts; with `reverse-`. |
+| `sidebar_new_mail_only` | `no` | Show only mailboxes with new, unread or flagged mail, the open one and those in `sidebar_whitelist`. |
+| `sidebar_next_new_wrap` | `no` | `<sidebar-next-new>` and `<sidebar-prev-new>` go round the list. |
+| `sidebar_on_right` | `no` | (neomutt) The sidebar on the right. |
+| `sidebar_min_width` | `100` | (mett) On a terminal narrower than this, or one that would leave the menus fewer than 40 columns, the sidebar hides even if visible, and comes back once the terminal widens. `0` turns this off, as in mutt. |
+
+The functions, unbound by default, work in the index and the pager:
+`<sidebar-next>`, `<sidebar-prev>`, `<sidebar-first>`, `<sidebar-last>`,
+`<sidebar-next-new>`, `<sidebar-prev-new>` (a mailbox with new or unread
+mail), `<sidebar-page-down>`, `<sidebar-page-up>` move the sidebar's
+highlight; `<sidebar-open>` opens its mailbox; and
+`<sidebar-toggle-visible>` toggles `sidebar_visible`. For example:
+
+```muttrc
+bind index,pager \CP sidebar-prev
+bind index,pager \CN sidebar-next
+bind index,pager \CO sidebar-open
+```
+
+Its `color` objects are `sidebar_new` (new or unread mail),
+`sidebar_flagged`, `sidebar_spoolfile` (if set), `sidebar_indicator` (the
+open mailbox; `indicator` until set), `sidebar_highlight` (the highlight;
+underlined by default), `sidebar_divider` and, from neomutt,
+`sidebar_ordinary` (the others; `normal` until set).
 
 ## 5. Mailbox shortcuts
 

@@ -95,6 +95,16 @@ actions! {
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";
+    SidebarFirst => "sidebar-first", "Move the sidebar's highlight to the first mailbox";
+    SidebarLast => "sidebar-last", "Move the sidebar's highlight to the last mailbox";
+    SidebarNext => "sidebar-next", "Move the sidebar's highlight to the next mailbox";
+    SidebarNextNew => "sidebar-next-new", "Move the sidebar's highlight to the next mailbox with new mail";
+    SidebarOpen => "sidebar-open", "Open the mailbox highlighted in the sidebar";
+    SidebarPageDown => "sidebar-page-down", "Scroll the sidebar down a page";
+    SidebarPageUp => "sidebar-page-up", "Scroll the sidebar up a page";
+    SidebarPrev => "sidebar-prev", "Move the sidebar's highlight to the previous mailbox";
+    SidebarPrevNew => "sidebar-prev-new", "Move the sidebar's highlight to the previous mailbox with new mail";
+    SidebarToggleVisible => "sidebar-toggle-visible", "Show or hide the sidebar";
     Help => "help", "Show the key bindings";
     EnterCommand => "enter-command", "Run a mettrc command";
     Noop => "noop", "Do nothing (unbinds a key)";

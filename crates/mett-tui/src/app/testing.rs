@@ -213,3 +213,89 @@ pub(crate) fn request_for(
         _ => None,
     })
 }
+
+/// Settings with the mailboxes `=@inbox` (labelled `Inbox`), `=Work` and
+/// `=Lists`, checked every minute, and `sidebar`.
+pub(crate) fn with_mailboxes(sidebar: SidebarSettings) -> Settings {
+    let entry = |text: &str, label: Option<&str>, path| MailboxEntry {
+        name: label.unwrap_or(text).into(),
+        label: label.map(str::to_owned),
+        text: text.into(),
+        path,
+        notify: true,
+        poll: true,
+    };
+    Settings {
+        account: mett_core::AccountId::new("alice@contoso.com"),
+        folder: "msgraph://alice@contoso.com/".into(),
+        sync_interval: Some(std::time::Duration::from_secs(60)),
+        mailboxes: vec![
+            entry("=@inbox", Some("Inbox"), inbox()),
+            entry("=Work", None, mailbox_path("Work")),
+            entry("=Lists", None, mailbox_path("Lists")),
+        ],
+        sidebar,
+        ..Settings::default()
+    }
+}
+
+/// The path of one of [`with_mailboxes`]'s mailboxes, by its name.
+pub(crate) fn mailbox_path(name: &str) -> FolderPath {
+    match name {
+        "Inbox" => inbox(),
+        _ => FolderPath::Named(vec![name.into()]),
+    }
+}
+
+/// A `width`×`height` app with `settings` that has opened the Inbox, and
+/// listed it empty; returns it and the check of the mailboxes it started.
+pub(crate) fn mailboxes_app(settings: Settings, width: u16, height: u16) -> (App, RequestId) {
+    mailboxes_listed(settings, width, height, Vec::new())
+}
+
+/// Like [`mailboxes_app`], with the Inbox listing `messages`.
+pub(crate) fn mailboxes_listed(
+    settings: Settings,
+    width: u16,
+    height: u16,
+    messages: Vec<MessageSummary>,
+) -> (App, RequestId) {
+    let (mut app, effects) = App::open(width, height, inbox(), settings);
+    let open = first_request(&effects);
+    let folder = mock::folder("inbox", "Inbox", Some(WellKnownFolder::Inbox));
+    let effects = respond(&mut app, open, Event::FolderOpened(Ok(folder)));
+    let sent = requests(&effects);
+    let find =
+        |wanted: fn(&Request) -> bool| sent.iter().find(|(_, r)| wanted(r)).expect("requested").0;
+    let check = find(|r| matches!(r, Request::CheckMailboxes(_)));
+    let list = find(|r| matches!(r, Request::ListMessages { .. }));
+    listed(&mut app, list, messages, None);
+    (app, check)
+}
+
+/// Answers the check `id` of [`with_mailboxes`]'s mailboxes: each by its
+/// name, with its unread and total counts, and whether mail arrived in it.
+pub(crate) fn mailboxes_checked(
+    app: &mut App,
+    id: RequestId,
+    counts: &[(&str, u32, u32, bool)],
+) -> Vec<Effect> {
+    let checked = counts
+        .iter()
+        .map(|&(name, unread, total, arrived)| {
+            let folder = Folder {
+                unread_count: unread,
+                total_count: total,
+                ..mock::folder(&name.to_lowercase(), name, None)
+            };
+            let recent = if arrived {
+                vec![(MessageId::new(format!("{name}-new")), chrono::Utc::now())]
+            } else {
+                Vec::new()
+            };
+            let checked = crate::worker::Checked { folder, recent };
+            (mailbox_path(name), Ok(checked))
+        })
+        .collect();
+    respond(app, id, Event::MailboxesChecked(checked))
+}
