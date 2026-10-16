@@ -126,6 +126,29 @@ impl State {
         }
     }
 
+    /// The folders `which` picks, in order, with their counts (see
+    /// [`State::with_counts`]), counting the messages once for them all.
+    fn counted(&self, which: impl Fn(&Folder) -> bool) -> Vec<Folder> {
+        let mut counts: HashMap<&FolderId, (u32, u32)> = HashMap::new();
+        for m in &self.messages {
+            let (total, unread) = counts.entry(&m.summary.folder).or_default();
+            *total += 1;
+            *unread += u32::from(!m.summary.flags.read);
+        }
+        self.folders
+            .iter()
+            .filter(|f| which(f))
+            .map(|f| {
+                let (total, unread) = counts.get(&f.id).copied().unwrap_or_default();
+                Folder {
+                    total_count: total,
+                    unread_count: unread,
+                    ..f.clone()
+                }
+            })
+            .collect()
+    }
+
     /// Fails if `draft` recalls a draft that is gone (sent or deleted), as
     /// Office365 does.
     fn check_recalled(&self, draft: &Draft) -> Result<()> {
@@ -245,8 +268,11 @@ impl State {
 
 impl MailStore for MemoryStore {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
-        let state = self.state();
-        Ok(state.folders.iter().map(|f| state.with_counts(f)).collect())
+        Ok(self.state().counted(|_| true))
+    }
+
+    async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
+        Ok(self.state().counted(|f| f.parent.as_ref() == parent))
     }
 
     /// The senders and recipients of the stored mail.
@@ -320,7 +346,7 @@ impl MailStore for MemoryStore {
             .messages
             .iter()
             .filter(|m| &m.summary.folder == folder)
-            .map(|m| m.summary.clone())
+            .map(|m| &m.summary)
             .collect();
         messages.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
 
@@ -339,9 +365,14 @@ impl MailStore for MemoryStore {
             .saturating_add(page.size() as usize)
             .min(messages.len());
         let next = (end < messages.len())
-            .then(|| messages.get(end - 1).map(encode_cursor))
+            .then(|| messages.get(end - 1).map(|m| encode_cursor(m)))
             .flatten();
-        let messages = messages.get(start..end).unwrap_or_default().to_vec();
+        let messages = messages
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .map(|m| (*m).clone())
+            .collect();
 
         Ok(MessagePage { messages, next })
     }
@@ -831,6 +862,26 @@ mod tests {
         let folders = store.list_folders().await.unwrap();
         let totals: Vec<_> = folders.into_iter().map(counts).collect();
         assert_eq!(totals, [(1, 0), (1, 1)]);
+    }
+
+    #[tokio::test]
+    async fn lists_the_folders_below_one_as_the_whole_tree_does() {
+        let mut sub = folder("sub", "Sub", None);
+        sub.parent = Some(FolderId::new("in"));
+        let store = store()
+            .with_folder(sub)
+            .with_message(message("s1", "sub", "below", at(4)));
+        let all = store.list_folders().await.unwrap();
+        for parent in [None, Some(FolderId::new("in")), Some(FolderId::new("sub"))] {
+            let below: Vec<_> = all.iter().filter(|f| f.parent == parent).cloned().collect();
+            assert_eq!(
+                store.child_folders(parent.as_ref()).await.unwrap(),
+                below,
+                "below {parent:?}"
+            );
+        }
+        let message_folder = store.message_folder(&MessageId::new("s1")).await;
+        assert_eq!(message_folder.unwrap(), FolderId::new("sub"));
     }
 
     #[tokio::test]

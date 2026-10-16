@@ -10,6 +10,7 @@ mod draft;
 mod error;
 mod folder;
 mod ids;
+mod join;
 mod message;
 mod ports;
 
@@ -21,6 +22,7 @@ pub use draft::{Draft, DraftOrigin};
 pub use error::{Error, Result};
 pub use folder::{Folder, UnknownWellKnownFolder, WellKnownFolder};
 pub use ids::{AccountId, AttachmentId, FolderId, MessageId, PageCursor};
+pub use join::join_bounded;
 pub use message::{
     Address, AddressError, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary,
     ThreadPosition,
