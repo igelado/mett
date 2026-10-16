@@ -996,8 +996,13 @@ impl App {
             _ => self.selected.saturating_sub(before),
         }
         .min(self.messages.len().saturating_sub(1));
-        // Their threads change.
-        self.arrange();
+        // Their threads change. Without threads, what is left is still in
+        // order.
+        if self.threaded() {
+            self.arrange();
+        } else {
+            debug_assert!(self.in_order(), "the index is in order");
+        }
         if let Some(member) = left_of_thread {
             let root = self.thread_of(&member).map_or(member, |t| t.root.clone());
             if let Some(at) = self.messages.iter().position(|m| m.id == root) {

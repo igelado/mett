@@ -20,6 +20,32 @@ pub(super) type SeenByFolder = HashMap<mett_core::FolderId, Seen>;
 /// enough for the clocks of mett's computer and the server to differ.
 const OVERLAP: TimeDelta = TimeDelta::minutes(15);
 
+/// Where the open folder's messages were listed (their positions, if
+/// any), kept up to date as mail that arrived is placed among them.
+pub(super) struct Placing {
+    /// Each message's position, whether it is a draft and its date, in
+    /// the order listed.
+    order: Vec<(Option<usize>, bool, DateTime<Utc>)>,
+    /// The positions of the messages in the index, entry by entry.
+    shown: Vec<Option<usize>>,
+    /// Those of the messages the limit hides.
+    hidden: Vec<Option<usize>>,
+}
+
+impl Placing {
+    /// The messages from position `at` on moved down one.
+    fn shift(&mut self, at: usize) {
+        let moved = self.order.iter_mut().map(|(listed, _, _)| listed);
+        for listed in moved.chain(&mut self.shown).chain(&mut self.hidden) {
+            if let Some(listed) = listed
+                && *listed >= at
+            {
+                *listed += 1;
+            }
+        }
+    }
+}
+
 /// The open folder's check for new mail, on its way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Polling {
@@ -96,18 +122,20 @@ impl App {
         let Some(open) = &self.folder else {
             return;
         };
-        let unread: Vec<&MessageSummary> = self
+        let seen = self.seen.entry(open.id.clone()).or_default();
+        let unread = self
             .messages
             .iter()
             .chain(&self.hidden)
             .chain(&self.folded)
-            .filter(|m| !m.flags.read)
-            .collect();
-        let seen = self.seen.entry(open.id.clone()).or_default();
-        seen.until = seen
-            .until
-            .max(unread.iter().filter_map(|m| m.modified).max());
-        seen.messages.extend(unread.iter().map(|m| m.id.clone()));
+            .filter(|m| !m.flags.read);
+        for message in unread {
+            seen.until = seen.until.max(message.modified);
+            // Most were seen at the last page or check.
+            if !seen.messages.contains(&message.id) {
+                seen.messages.insert(message.id.clone());
+            }
+        }
     }
 
     /// A change the user made to an unread message in the open folder was
@@ -312,7 +340,7 @@ impl App {
         self.overlay_wanted_flags(&mut fresh);
         self.overlay_wanted_flags(&mut changes);
         let complete = newest.next.is_none();
-        let known: HashSet<MessageId> = self.folder_messages().map(|m| m.id.clone()).collect();
+        let known: HashSet<&MessageId> = self.folder_messages().map(|m| &m.id).collect();
         // A message in both lists comes as it was last changed.
         let mut arrived: Vec<MessageSummary> = Vec::new();
         for message in fresh.iter().chain(&changes) {
@@ -339,6 +367,7 @@ impl App {
             .zip(self.listed_at)
             .is_some_and(|(oldest, listed)| oldest < listed - OVERLAP);
         if (!complete && all_new) || (changed.next.is_some() && !listed_before) {
+            let known = known.into_iter().cloned().collect();
             if unread {
                 self.announce(NEW_MAIL);
             }
@@ -435,8 +464,11 @@ impl App {
             }
         }
         reorder |= !arrived.is_empty();
-        for message in arrived {
-            self.insert_arrived(message);
+        if !arrived.is_empty() {
+            let mut placing = self.placing();
+            for message in arrived {
+                self.insert_arrived(message, &mut placing);
+            }
         }
         // In order, and in their threads (only if anything changed: a
         // large folder takes a while).
@@ -482,27 +514,51 @@ impl App {
         Vec::new()
     }
 
+    /// Where the folder's messages were listed, for placing those that
+    /// arrive.
+    fn placing(&self) -> Placing {
+        let at: Vec<Option<usize>> = self
+            .folder_messages()
+            .map(|m| self.positions.get(&m.id).copied())
+            .collect();
+        let mut order: Vec<(Option<usize>, bool, DateTime<Utc>)> = self
+            .folder_messages()
+            .zip(&at)
+            .map(|(m, at)| (*at, m.draft, m.received))
+            .collect();
+        order.sort_by_key(|(at, _, _)| at.unwrap_or(usize::MAX));
+        let (shown, rest) = at.split_at(self.messages.len());
+        Placing {
+            order,
+            shown: shown.to_vec(),
+            hidden: rest[..self.hidden.len()].to_vec(),
+        }
+    }
+
     /// Adds a message that arrived to the index, where its date puts it
     /// in the folder's order, or aside if the index is limited and it
-    /// doesn't match.
-    fn insert_arrived(&mut self, message: MessageSummary) {
-        let position =
-            |m: &MessageSummary| self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
-        let mut order: Vec<&MessageSummary> = self.folder_messages().collect();
-        order.sort_by_key(|m| position(m));
+    /// doesn't match. `placing` is where the folder's messages are,
+    /// including those that arrived before it.
+    fn insert_arrived(&mut self, message: MessageSummary, placing: &mut Placing) {
+        let position = |at: &Option<usize>| at.unwrap_or(usize::MAX);
+        let order = &placing.order;
         // Among the messages like it (drafts are a group of their own):
         // before the first older one, or after the last of them.
-        let alike: Vec<&&MessageSummary> =
-            order.iter().filter(|m| m.draft == message.draft).collect();
+        let alike = || order.iter().filter(|(_, draft, _)| *draft == message.draft);
         // Graph lists unsent drafts after the rest.
-        let at = alike
-            .iter()
-            .find(|m| m.received < message.received)
-            .map(|m| position(m))
-            .or_else(|| alike.last().map(|m| position(m).saturating_add(1)))
+        let at = alike()
+            .find(|(_, _, received)| *received < message.received)
+            .map(|(at, _, _)| position(at))
             .or_else(|| {
-                let first_draft = order.iter().find(|m| m.draft).map(|m| position(m));
-                first_draft.filter(|_| !message.draft)
+                alike()
+                    .next_back()
+                    .map(|(at, _, _)| position(at).saturating_add(1))
+            })
+            .or_else(|| {
+                let first_draft = order.iter().find(|(_, draft, _)| *draft);
+                first_draft
+                    .map(|(at, _, _)| position(at))
+                    .filter(|_| !message.draft)
             });
         let at = match at {
             Some(at) => {
@@ -510,22 +566,28 @@ impl App {
                 for later in self.positions.values_mut().filter(|p| **p >= at) {
                     *later += 1;
                 }
+                placing.shift(at);
                 at
             }
             None => self.positions.values().max().map_or(0, |last| last + 1),
         };
         self.positions.insert(message.id.clone(), at);
-        let list = if self.limit_shows(&message) {
-            &mut self.messages
+        let entry = (Some(at), message.draft, message.received);
+        let index = placing
+            .order
+            .partition_point(|(listed, _, _)| position(listed) < at);
+        placing.order.insert(index, entry);
+        let (list, positions) = if self.limit_shows(&message) {
+            (&mut self.messages, &mut placing.shown)
         } else {
-            &mut self.hidden
+            (&mut self.hidden, &mut placing.hidden)
         };
-        let positions = &self.positions;
-        let index = list
+        let index = positions
             .iter()
-            .filter(|m| positions.get(&m.id).is_some_and(|p| *p < at))
+            .filter(|p| p.is_some_and(|p| p < at))
             .count();
         list.insert(index, message);
+        positions.insert(index, Some(at));
     }
 
     /// The folder was listed again because a check found more than it
@@ -557,7 +619,7 @@ impl App {
         for (path, result) in checked {
             let found = result.as_ref().ok().map(|c| &c.folder);
             let open = self.is_open(&path, found);
-            let seen = found.and_then(|f| self.seen.get(&f.id)).cloned();
+            let seen = found.and_then(|f| self.seen.get(&f.id));
             let state = self.mailbox_state.entry(path.clone()).or_default();
             match result {
                 Ok(Checked { folder, recent }) => {

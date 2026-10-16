@@ -535,6 +535,9 @@ pub struct App {
     /// How many messages the threads were last built from: while a large
     /// folder is listed, they are built again only as it doubles.
     threaded_count: usize,
+    /// Whether building the threads again would give what they were last
+    /// built as (see [`crate::sort::Arranged::settled`]).
+    settled: bool,
     /// The threads (by key) collapsed, or with `collapse_all`, opened:
     /// those that differ from the rest.
     collapsed: HashSet<String>,
@@ -546,12 +549,16 @@ pub struct App {
     /// Where each message was in the folder's listing, to restore the
     /// order when the limit is lifted.
     positions: HashMap<MessageId, usize>,
+    /// A message was listed twice since the index was last empty: it may
+    /// show it twice.
+    listed_twice: bool,
     /// The last search (`/`), which `n` repeats.
     last_search: Option<String>,
     /// The last search in the pager, which `n` there repeats.
     last_pager_search: Option<String>,
-    /// A search that found nothing yet, waiting for more of the folder.
-    pending_search: Option<String>,
+    /// A search that found nothing yet, waiting for more of the folder,
+    /// and its pattern.
+    pending_search: Option<(String, crate::pattern::Pattern)>,
     /// The search began with nothing in the index: it starts at the
     /// first message, not after the selected one.
     search_from_top: bool,
@@ -773,10 +780,12 @@ impl App {
             ordering: settings.ordering,
             threads: HashMap::new(),
             threaded_count: 0,
+            settled: false,
             collapsed: HashSet::new(),
             collapse_all: false,
             limited: HashMap::new(),
             positions: HashMap::new(),
+            listed_twice: false,
             last_search: None,
             last_pager_search: None,
             pending_search: None,
@@ -2101,8 +2110,10 @@ impl App {
         let Some((id, at)) = &self.reselect else {
             return;
         };
-        // Shown, or folded into a collapsed thread that is.
-        if let Some(found) = self.entry_of(id) {
+        // Shown, or folded into a collapsed thread that is (once listed:
+        // looking through the index for it at every page would be slow).
+        let listed = self.positions.contains_key(id);
+        if let Some(found) = listed.then(|| self.entry_of(id)).flatten() {
             self.selected = found;
         } else if done {
             self.selected = (*at).min(self.messages.len().saturating_sub(1));
@@ -2183,8 +2194,6 @@ impl App {
                 }
             }
             Target::After(message, steps) => {
-                // Folded into a collapsed thread since: from the thread.
-                let from = self.entry_of(&message);
                 // While the folder loads, a later page may put a message
                 // in between (mail from the same time, a draft by its own
                 // date, a reply's start): wait for all of it, as mutt
@@ -2195,6 +2204,8 @@ impl App {
                 if loading && !in_page_order {
                     return Vec::new();
                 }
+                // Folded into a collapsed thread since: from the thread.
+                let from = self.entry_of(&message);
                 match from.map(|from| from + steps) {
                     Some(entry) if entry < self.messages.len() => entry,
                     _ if loading => return Vec::new(),

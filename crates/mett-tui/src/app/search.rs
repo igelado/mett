@@ -2,6 +2,7 @@
 //! and searching the text in the pager.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ops::Range;
 
 use mett_core::{MessageId, MessageSummary};
@@ -148,13 +149,18 @@ impl App {
             self.search_pager(position, text);
             return Vec::new();
         }
-        let pattern = match Pattern::parse(text) {
-            Ok(pattern) => pattern,
+        match Pattern::parse(text) {
+            Ok(pattern) => self.search_index(text, pattern),
             Err(e) => {
                 self.fail(e.to_string());
-                return Vec::new();
+                Vec::new()
             }
-        };
+        }
+    }
+
+    /// Finds the next message of the index matching `pattern`, parsed
+    /// from `text`.
+    fn search_index(&mut self, text: &str, pattern: Pattern) -> Vec<Effect> {
         // Replies folded under the selected (collapsed) thread come before
         // the next row.
         let folded = self.folded_matches(&pattern);
@@ -206,7 +212,7 @@ impl App {
             }
             // More of the folder is on its way: look again when it comes.
             None if more => {
-                self.pending_search = Some(text.to_owned());
+                self.pending_search = Some((text.to_owned(), pattern));
                 self.search_from_top = from_top;
                 let effects = self.retry_listing();
                 self.status = "Searching...".into();
@@ -225,7 +231,7 @@ impl App {
             return Vec::new();
         }
         match self.pending_search.take() {
-            Some(text) => self.search(&text),
+            Some((text, pattern)) => self.search_index(&text, pattern),
             None => Vec::new(),
         }
     }
@@ -306,7 +312,7 @@ impl App {
     fn matches(&self, pattern: &Pattern, message: &MessageSummary) -> bool {
         pattern.matches(&Candidate {
             summary: message,
-            deleted: self.deleted.contains(&message.id),
+            deleted: pattern.asks_deleted() && self.deleted.contains(&message.id),
         })
     }
 
@@ -366,7 +372,7 @@ impl App {
         let mut all = std::mem::take(&mut self.messages);
         all.append(&mut self.hidden);
         all.append(&mut self.folded);
-        all.sort_by_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
+        all.sort_by_cached_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
         self.messages = all;
         self.limit = None;
         self.limited.clear();
@@ -411,13 +417,21 @@ impl App {
     /// Adds newly listed messages to the index, or aside if the index is
     /// limited and they don't match.
     pub(super) fn add_listed(&mut self, messages: Vec<MessageSummary>, last: bool) {
-        for message in &messages {
-            let next = self.positions.len();
-            self.positions.entry(message.id.clone()).or_insert(next);
-        }
         // The first page starts at the top, wherever its first message
         // goes.
         let first = self.messages.is_empty() && self.hidden.is_empty() && self.folded.is_empty();
+        if first {
+            self.listed_twice = false;
+        }
+        for message in &messages {
+            let next = self.positions.len();
+            match self.positions.entry(message.id.clone()) {
+                Entry::Occupied(_) => self.listed_twice = true,
+                Entry::Vacant(entry) => {
+                    entry.insert(next);
+                }
+            }
+        }
         let limited = self.limit.is_some();
         let mut shown = Vec::with_capacity(messages.len());
         for message in messages {
