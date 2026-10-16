@@ -737,7 +737,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
             .collect()
     };
     let total = if cached {
-        pager.rows.len()
+        pager.row_count()
     } else {
         rewrapped.len()
     };
@@ -749,8 +749,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     let rows: Vec<(usize, (usize, Range<usize>))> = (top..end)
         .map(|row| {
             let part = if cached {
-                let line = pager.line_rows.partition_point(|&first| first <= row) - 1;
-                (line, pager.row_ranges[row].clone())
+                (pager.line_of(row), pager.row_ranges[row].clone())
             } else {
                 rewrapped[row].clone()
             };
