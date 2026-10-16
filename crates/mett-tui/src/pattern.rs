@@ -29,6 +29,8 @@ use regex::{Regex, RegexBuilder};
 #[derive(Clone, Debug)]
 pub struct Pattern {
     expr: Expr,
+    /// Whether it asks if messages are marked for deletion (`~D`).
+    deleted: bool,
 }
 
 /// Why a pattern couldn't be parsed.
@@ -97,6 +99,7 @@ impl Pattern {
             let regex = regex(text)?;
             return Ok(Self {
                 expr: Expr::Or(vec![Expr::From(regex.clone()), Expr::Subject(regex)]),
+                deleted: false,
             });
         }
         let mut parser = Parser { text, position: 0 };
@@ -108,7 +111,14 @@ impl Pattern {
                 &text[parser.position..]
             )));
         }
-        Ok(Self { expr })
+        let deleted = expr.asks_deleted();
+        Ok(Self { expr, deleted })
+    }
+
+    /// Whether matching needs to know if a message is marked for
+    /// deletion ([`Candidate::deleted`]); otherwise it isn't asked.
+    pub fn asks_deleted(&self) -> bool {
+        self.deleted
     }
 
     /// Whether the message matches.
@@ -118,6 +128,16 @@ impl Pattern {
 }
 
 impl Expr {
+    /// Whether it is or has `~D`.
+    fn asks_deleted(&self) -> bool {
+        match self {
+            Expr::And(all) | Expr::Or(all) => all.iter().any(Expr::asks_deleted),
+            Expr::Not(e) => e.asks_deleted(),
+            Expr::Deleted => true,
+            _ => false,
+        }
+    }
+
     fn matches(&self, c: &Candidate<'_>) -> bool {
         let summary = c.summary;
         match self {
@@ -139,7 +159,17 @@ impl Expr {
 /// Whether the address matches, as shown (`Name <email>`), so that an
 /// expression can span the name and the address.
 fn address_matches(address: &Address, regex: &Regex) -> bool {
-    regex.is_match(&address.to_string())
+    thread_local! {
+        /// The address as shown, written again for each address rather
+        /// than allocated.
+        static SHOWN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    SHOWN.with_borrow_mut(|shown| {
+        use std::fmt::Write;
+        shown.clear();
+        write!(shown, "{address}").expect("writing to a String");
+        regex.is_match(shown)
+    })
 }
 
 /// A regular expression with mutt's case rule: it ignores case unless it

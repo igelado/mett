@@ -149,13 +149,18 @@ impl App {
             self.search_pager(position, text);
             return Vec::new();
         }
-        let pattern = match Pattern::parse(text) {
-            Ok(pattern) => pattern,
+        match Pattern::parse(text) {
+            Ok(pattern) => self.search_index(text, pattern),
             Err(e) => {
                 self.fail(e.to_string());
-                return Vec::new();
+                Vec::new()
             }
-        };
+        }
+    }
+
+    /// Finds the next message of the index matching `pattern`, parsed
+    /// from `text`.
+    fn search_index(&mut self, text: &str, pattern: Pattern) -> Vec<Effect> {
         // Replies folded under the selected (collapsed) thread come before
         // the next row.
         let folded = self.folded_matches(&pattern);
@@ -207,7 +212,7 @@ impl App {
             }
             // More of the folder is on its way: look again when it comes.
             None if more => {
-                self.pending_search = Some(text.to_owned());
+                self.pending_search = Some((text.to_owned(), pattern));
                 self.search_from_top = from_top;
                 let effects = self.retry_listing();
                 self.status = "Searching...".into();
@@ -226,7 +231,7 @@ impl App {
             return Vec::new();
         }
         match self.pending_search.take() {
-            Some(text) => self.search(&text),
+            Some((text, pattern)) => self.search_index(&text, pattern),
             None => Vec::new(),
         }
     }
@@ -307,7 +312,7 @@ impl App {
     fn matches(&self, pattern: &Pattern, message: &MessageSummary) -> bool {
         pattern.matches(&Candidate {
             summary: message,
-            deleted: self.deleted.contains(&message.id),
+            deleted: pattern.asks_deleted() && self.deleted.contains(&message.id),
         })
     }
 
@@ -367,7 +372,7 @@ impl App {
         let mut all = std::mem::take(&mut self.messages);
         all.append(&mut self.hidden);
         all.append(&mut self.folded);
-        all.sort_by_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
+        all.sort_by_cached_key(|m| self.positions.get(&m.id).copied().unwrap_or(usize::MAX));
         self.messages = all;
         self.limit = None;
         self.limited.clear();

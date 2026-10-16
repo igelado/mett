@@ -556,8 +556,9 @@ pub struct App {
     last_search: Option<String>,
     /// The last search in the pager, which `n` there repeats.
     last_pager_search: Option<String>,
-    /// A search that found nothing yet, waiting for more of the folder.
-    pending_search: Option<String>,
+    /// A search that found nothing yet, waiting for more of the folder,
+    /// and its pattern.
+    pending_search: Option<(String, crate::pattern::Pattern)>,
     /// The search began with nothing in the index: it starts at the
     /// first message, not after the selected one.
     search_from_top: bool,
