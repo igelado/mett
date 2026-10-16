@@ -274,10 +274,9 @@ pub struct Pager {
     pub message: Option<Message>,
     /// The message laid out as lines (headers and body), not yet wrapped.
     pub lines: Vec<String>,
-    /// `lines` wrapped to [`Pager::rows_width`]. Cached, so redrawing and
-    /// scrolling don't re-wrap the whole message.
-    pub rows: Vec<String>,
-    /// The width `rows` were wrapped to, if they have been.
+    /// The width `lines` were wrapped to, if they have been, in
+    /// [`Pager::line_rows`] and [`Pager::row_ranges`]. Kept, so redrawing
+    /// and scrolling don't re-wrap the whole message.
     pub rows_width: Option<usize>,
     /// The request fetching it.
     pub request: RequestId,
@@ -286,9 +285,9 @@ pub struct Pager {
     /// The user set the message read or unread while it was loading:
     /// showing it doesn't mark it read.
     pub read_chosen: bool,
-    /// For each of `lines`, its first row in `rows`.
+    /// For each of `lines`, its first row, wrapped.
     pub line_rows: Vec<usize>,
-    /// For each of `rows`, the bytes of its line it shows.
+    /// For each row, wrapped, the bytes of its line it shows.
     pub row_ranges: Vec<std::ops::Range<usize>>,
     /// Where the last search match ended, as a line and a byte offset in
     /// it: the next search starts there. (The match may be shown lower
@@ -309,15 +308,11 @@ impl Pager {
     /// Re-wraps the message if the width changed.
     fn layout(&mut self, width: usize) {
         if self.rows_width != Some(width) {
-            self.rows.clear();
             self.line_rows.clear();
             self.row_ranges.clear();
             for line in &self.lines {
-                self.line_rows.push(self.rows.len());
-                for range in text::wrap_ranges(line, width) {
-                    self.rows.push(line[range.clone()].to_owned());
-                    self.row_ranges.push(range);
-                }
+                self.line_rows.push(self.row_ranges.len());
+                self.row_ranges.extend(text::wrap_ranges(line, width));
             }
             self.rows_width = Some(width);
         }
@@ -327,7 +322,23 @@ impl Pager {
     /// it for a screen `height` rows tall.
     fn fit(&mut self, width: usize, height: usize) {
         self.layout(width);
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(height));
+        self.scroll = self.scroll.min(self.row_count().saturating_sub(height));
+    }
+
+    /// How many rows the message takes, wrapped.
+    pub fn row_count(&self) -> usize {
+        self.row_ranges.len()
+    }
+
+    /// The line that wrapped row `row` is part of.
+    pub fn line_of(&self, row: usize) -> usize {
+        self.line_rows.partition_point(|&first| first <= row) - 1
+    }
+
+    /// The text of wrapped row `row`.
+    #[cfg(test)]
+    pub fn row(&self, row: usize) -> &str {
+        &self.lines[self.line_of(row)][self.row_ranges[row].clone()]
     }
 }
 
@@ -1434,7 +1445,7 @@ impl App {
         }
         // A taller help screen shows more lines, not empty space.
         if let Some(Screen::Help(help)) = self.screens.last() {
-            let last = self.help_lines(help.menu).len().saturating_sub(height);
+            let last = self.help_count(help.menu).saturating_sub(height);
             if let Some(Screen::Help(help)) = self.screens.last_mut() {
                 help.scroll = help.scroll.min(last);
             }
@@ -1455,7 +1466,6 @@ impl App {
             id,
             message: None,
             lines: Vec::new(),
-            rows: Vec::new(),
             rows_width: None,
             request: effect_id(&fetch),
             scroll: 0,
@@ -2729,7 +2739,7 @@ mod tests {
         let mut app = loaded(1);
         // 4 header lines and a blank line, 40 body lines; 20 visible rows.
         open(&mut app, 40);
-        let rows = pager(&app).rows.len();
+        let rows = pager(&app).row_count();
         assert_eq!(rows, text::wrap_all(&pager(&app).lines, 80).len());
         act(&mut app, Action::NextLine);
         act(&mut app, Action::NextPage);
@@ -2764,7 +2774,7 @@ mod tests {
         let mut message = message("m0", 0);
         message.body.content = "x".repeat(100);
         respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
-        let rows = pager(&app).rows.len();
+        let rows = pager(&app).row_count();
         assert_eq!(rows, text::wrap_all(&pager(&app).lines, 10).len());
         assert!(rows > 10);
         for _ in 0..rows {

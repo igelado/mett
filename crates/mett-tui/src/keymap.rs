@@ -506,11 +506,22 @@ impl Keymap {
     }
 
     /// The first key bound to `action` in `menu`, if any.
+    /// The first key bound to `action` in `menu`, if any: the first of
+    /// [`Keymap::entries`] that does it, found without listing them all
+    /// (the help line asks for several each time it is drawn).
     pub fn key_for(&self, menu: Menu, action: Action) -> Option<Key> {
-        self.entries(menu)
-            .into_iter()
-            .find(|(_, binding)| *binding == &Binding::Action(action))
-            .map(|(key, _)| key)
+        let wanted = Binding::Action(action);
+        let keys = |menu| self.order.get(&menu).into_iter().flatten();
+        // The menu's own keys come first; a generic key counts only where
+        // the menu doesn't bind it itself.
+        let own = keys(menu).find(|key| self.bindings.get(&(menu, **key)) == Some(&wanted));
+        own.or_else(|| {
+            keys(Menu::Generic)
+                .filter(|_| menu.uses_generic())
+                .filter(|key| !self.bindings.contains_key(&(menu, **key)))
+                .find(|key| self.bindings.get(&(Menu::Generic, **key)) == Some(&wanted))
+        })
+        .copied()
     }
 
     /// Every key that does something in `menu`, in binding order: the
@@ -647,6 +658,32 @@ mod tests {
         assert_eq!(
             keymap.key_for(Menu::Index, Action::DisplayMessage),
             Some(Key::new(KeyCode::Enter))
+        );
+    }
+
+    #[test]
+    fn the_key_for_an_action_is_the_first_entry_for_it() {
+        let mut keymap = Keymap::mutt_defaults();
+        // A generic key the index takes over, and one more for an action.
+        keymap.bind_action(Menu::Index, Key::char(':'), Action::Quit);
+        keymap.bind_action(Menu::Generic, Key::char('x'), Action::EnterCommand);
+        for name in [
+            "generic", "index", "pager", "signin", "compose", "browser", "help", "attach", "query",
+            "postpone",
+        ] {
+            let menu = Menu::from_name(name).unwrap();
+            for &action in Action::ALL {
+                let first = keymap
+                    .entries(menu)
+                    .into_iter()
+                    .find(|(_, binding)| *binding == &Binding::Action(action))
+                    .map(|(key, _)| key);
+                assert_eq!(keymap.key_for(menu, action), first, "{name}: {action:?}");
+            }
+        }
+        assert_eq!(
+            keymap.key_for(Menu::Index, Action::EnterCommand),
+            Some(Key::char('x'))
         );
     }
 

@@ -21,7 +21,7 @@ fn rows_of(pager: &crate::app::Pager, line: usize) -> Range<usize> {
         .line_rows
         .get(line + 1)
         .copied()
-        .unwrap_or(pager.rows.len());
+        .unwrap_or(pager.row_count());
     first..last
 }
 
@@ -294,7 +294,7 @@ impl App {
                 // Show the row with the match at the top, unless that would
                 // scroll past the end.
                 let row = match_row(pager, line, start);
-                pager.scroll = row.min(pager.rows.len().saturating_sub(height));
+                pager.scroll = row.min(pager.row_count().saturating_sub(height));
                 pager.search_match = Some((line, next));
                 pager.highlight = Some((line, start..end));
             }
@@ -577,10 +577,10 @@ mod tests {
         act(&mut app, Action::Search);
         answer(&mut app, "line 1[0-9]");
         let view = pager(&app);
-        assert_eq!(view.rows[view.scroll], "line 10");
+        assert_eq!(view.row(view.scroll), "line 10");
         act(&mut app, Action::SearchNext);
         let view = pager(&app);
-        assert_eq!(view.rows[view.scroll], "line 11");
+        assert_eq!(view.row(view.scroll), "line 11");
     }
 
     #[test]
@@ -711,10 +711,9 @@ mod tests {
         answer(&mut app, "needle");
         let shown = |app: &App| {
             let view = pager(app);
-            view.rows[view.scroll..]
-                .iter()
+            (view.scroll..view.row_count())
                 .take(app.body_height)
-                .cloned()
+                .map(|row| view.row(row))
                 .collect::<Vec<_>>()
                 .join("|")
         };
@@ -839,7 +838,7 @@ mod tests {
             (0..60).map(|i| format!("line {i}\n")).collect(),
         );
         let view = pager(&app);
-        assert_eq!(view.rows[view.scroll], "line 10");
+        assert_eq!(view.row(view.scroll), "line 10");
         assert_eq!(app.status, "");
     }
 
@@ -853,7 +852,7 @@ mod tests {
         let found = highlighted(view);
         assert_eq!(found.len(), 1);
         let (row, range) = &found[0];
-        assert_eq!(&view.rows[*row][range.clone()], "one");
+        assert_eq!(&view.row(*row)[range.clone()], "one");
         let first = range.start;
         act(&mut app, Action::SearchNext);
         let view = pager(&app);
@@ -874,7 +873,7 @@ mod tests {
         answer(&mut app, "needle");
         let view = pager(&app);
         assert_eq!(view.rows_width, Some(40));
-        assert!(view.rows[view.scroll].contains("needle"));
+        assert!(view.row(view.scroll).contains("needle"));
     }
 
     #[test]
@@ -949,7 +948,7 @@ mod tests {
             panic!("not in the pager");
         };
         // At the end, then widened while another screen covered it.
-        pager.scroll = pager.rows.len() - app.body_height;
+        pager.scroll = pager.row_count() - app.body_height;
         app.width = 200;
         act(&mut app, Action::Search);
         answer(&mut app, "row 4[0-9]");
@@ -1013,7 +1012,7 @@ mod tests {
             (0..60).map(|i| format!("line {i}\n")).collect(),
         );
         let view = pager(&app);
-        assert_eq!(view.rows[view.scroll], "line 10");
+        assert_eq!(view.row(view.scroll), "line 10");
     }
 
     #[test]
@@ -1050,7 +1049,7 @@ mod tests {
             .unwrap();
         assert_eq!(pager.rows_width, Some(50));
         let found = highlighted(pager);
-        assert_eq!(&pager.rows[found[0].0][found[0].1.clone()], "needle");
+        assert_eq!(&pager.row(found[0].0)[found[0].1.clone()], "needle");
     }
 
     #[test]
@@ -1065,7 +1064,7 @@ mod tests {
         let found = highlighted(view);
         assert_eq!(found.len(), 1, "{found:?}");
         let (row, range) = &found[0];
-        assert_eq!(&view.rows[*row][range.clone()], " y");
+        assert_eq!(&view.row(*row)[range.clone()], " y");
     }
 
     #[test]

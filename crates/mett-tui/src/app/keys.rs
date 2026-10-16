@@ -280,27 +280,29 @@ impl App {
         Vec::new()
     }
 
+    /// How many lines the help screen has: one for each key.
+    pub fn help_count(&self, menu: Menu) -> usize {
+        self.keymap.entries(menu).len()
+    }
+
     /// The help screen's lines: each key, its function and what it does.
-    pub fn help_lines(&self, menu: Menu) -> Vec<String> {
-        self.keymap
-            .entries(menu)
-            .into_iter()
-            .map(|(key, binding)| {
-                let (name, what): (_, Cow<str>) = match binding {
-                    Binding::Action(action) => (action.name(), action.description().into()),
-                    Binding::Macro {
-                        strokes,
-                        description,
-                    } => (
-                        "macro",
-                        description
-                            .as_deref()
-                            .map_or_else(|| macro_text(strokes).into(), Cow::from),
-                    ),
-                };
-                format!("{:<12} {:<20} {what}", key.to_string(), name)
-            })
-            .collect()
+    /// Made as they are taken, so that drawing a page makes only its own.
+    pub fn help_lines(&self, menu: Menu) -> impl Iterator<Item = String> {
+        self.keymap.entries(menu).into_iter().map(|(key, binding)| {
+            let (name, what): (_, Cow<str>) = match binding {
+                Binding::Action(action) => (action.name(), action.description().into()),
+                Binding::Macro {
+                    strokes,
+                    description,
+                } => (
+                    "macro",
+                    description
+                        .as_deref()
+                        .map_or_else(|| macro_text(strokes).into(), Cow::from),
+                ),
+            };
+            format!("{:<12} {:<20} {what}", key.to_string(), name)
+        })
     }
 
     pub(super) fn on_help_action(&mut self, action: Action) -> Vec<Effect> {
@@ -308,10 +310,7 @@ impl App {
         let Some(Screen::Help(help)) = self.screens.last() else {
             return Vec::new();
         };
-        let last = self
-            .help_lines(help.menu)
-            .len()
-            .saturating_sub(self.body_height);
+        let last = self.help_count(help.menu).saturating_sub(self.body_height);
         let Some(Screen::Help(help)) = self.screens.last_mut() else {
             return Vec::new();
         };
@@ -489,7 +488,7 @@ mod tests {
         let mut app = app();
         press(&mut app, Key::char('?'));
         assert_eq!(app.menu(), Menu::Help);
-        let lines = app.help_lines(Menu::Index);
+        let lines: Vec<String> = app.help_lines(Menu::Index).collect();
         assert!(lines[0].starts_with("q            quit"), "{lines:#?}");
         assert!(
             lines.iter().any(|l| l.contains("enter-command")),

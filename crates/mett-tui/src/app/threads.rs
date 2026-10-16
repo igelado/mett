@@ -1,7 +1,7 @@
 //! Ordering the index (`sort`, `sort_aux`) and threads: collapsing them
 //! and moving between them, as in mutt.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mett_core::{MessageId, MessageSummary};
 
@@ -65,14 +65,18 @@ impl App {
         self.ordering.sort.method == Method::Threads
     }
 
-    /// Whether unread mail is folded under `root` (into its collapsed
-    /// thread), as its flags are now.
-    pub fn folded_unread(&self, root: &MessageId) -> bool {
-        self.thread_of(root).is_some_and(|t| t.folded > 0)
-            && self
-                .folded
-                .iter()
-                .any(|m| !m.flags.read && self.thread_of(&m.id).is_some_and(|t| &t.root == root))
+    /// The first messages of the collapsed threads with unread mail folded
+    /// under them, as their flags are now. Found for all of them at once,
+    /// so that a page of collapsed threads looks through the folded mail
+    /// only once.
+    pub fn roots_with_folded_unread(&self) -> HashSet<&MessageId> {
+        self.folded
+            .iter()
+            .filter(|m| !m.flags.read)
+            .filter_map(|m| self.thread_of(&m.id))
+            .map(|t| &t.root)
+            .filter(|root| self.thread_of(root).is_some_and(|t| t.folded > 0))
+            .collect()
     }
 
     /// How many messages the index shows, folded ones too.
@@ -627,8 +631,8 @@ mod tests {
             m.flags.read = m.id.as_str() != "a2";
         }
         act(&mut app, Action::CollapseThread);
-        assert!(app.folded_unread(&MessageId::new("a0")));
-        assert!(!app.folded_unread(&MessageId::new("b0")));
+        let a0 = MessageId::new("a0");
+        assert_eq!(app.roots_with_folded_unread(), HashSet::from([&a0]));
         // As the flags are now.
         let a2 = app
             .folded
@@ -636,7 +640,7 @@ mod tests {
             .find(|m| m.id.as_str() == "a2")
             .unwrap();
         a2.flags.read = true;
-        assert!(!app.folded_unread(&MessageId::new("a0")));
+        assert!(app.roots_with_folded_unread().is_empty());
     }
 
     #[test]
