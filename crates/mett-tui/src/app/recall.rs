@@ -157,14 +157,10 @@ impl App {
         let Some(Screen::Postponed(menu)) = self.screens.last_mut() else {
             return Vec::new();
         };
-        let last = menu.entries.len().saturating_sub(1);
+        if super::navigate(&mut menu.selected, action, menu.entries.len(), page) {
+            return Vec::new();
+        }
         match action {
-            Action::NextEntry => menu.selected = (menu.selected + 1).min(last),
-            Action::PreviousEntry => menu.selected = menu.selected.saturating_sub(1),
-            Action::FirstEntry => menu.selected = 0,
-            Action::LastEntry => menu.selected = last,
-            Action::NextPage => menu.selected = (menu.selected + page).min(last),
-            Action::PreviousPage => menu.selected = menu.selected.saturating_sub(page),
             Action::Exit | Action::Quit => {
                 self.screens.pop();
             }
@@ -283,12 +279,10 @@ impl App {
     }
 
     fn clear_recall_status(&mut self) {
-        if matches!(
-            self.status.as_str(),
-            "Looking for postponed messages..." | "Fetching postponed message..."
-        ) {
-            self.status.clear();
-        }
+        self.clear_status_if(&[
+            "Looking for postponed messages...",
+            "Fetching postponed message...",
+        ]);
     }
 }
 

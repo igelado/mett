@@ -17,8 +17,6 @@ macro_rules! actions {
             )*
         }
 
-        // The names are for `bind` and `macro` in mettrc, which comes next.
-        #[allow(dead_code)]
         impl Action {
             /// Every action.
             pub const ALL: &[Action] = &[$(Action::$variant),*];

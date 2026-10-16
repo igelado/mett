@@ -143,17 +143,16 @@ impl App {
             self.selected = self.selected.min(self.messages.len().saturating_sub(1));
             return;
         };
-        let shown = self
-            .messages
-            .iter()
-            .position(|m| m.id == selected)
-            .or_else(|| {
-                let root = &self.threads.get(&selected)?.root;
-                self.messages.iter().position(|m| &m.id == root)
-            });
-        if let Some(at) = shown {
+        if let Some(at) = self.entry_of(&selected) {
             self.selected = at;
         }
+    }
+
+    /// Where the index shows `id`: its entry, or that of the collapsed
+    /// thread it is folded into.
+    pub(super) fn entry_of(&self, id: &MessageId) -> Option<usize> {
+        let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+        shown(id).or_else(|| shown(&self.thread_of(id)?.root))
     }
 
     /// Puts newly listed messages in the index. Without threads, they are
@@ -165,7 +164,7 @@ impl App {
     pub(super) fn arrange_listed(&mut self, mut listed: Vec<MessageSummary>, last: bool) {
         if self.threaded() {
             self.messages.extend(listed);
-            let count = self.messages.len() + self.folded.len();
+            let count = self.shown_count();
             // Collapsed threads fold their replies as they come.
             let folding = self.collapse_all || !self.collapsed.is_empty();
             if last || folding || count >= self.threaded_count.saturating_mul(2) {
@@ -202,7 +201,7 @@ impl App {
 
     /// Threads the messages listed so far, if some aren't yet.
     pub(super) fn thread_listed(&mut self) {
-        if self.threaded() && self.messages.len() + self.folded.len() != self.threaded_count {
+        if self.threaded() && self.shown_count() != self.threaded_count {
             self.arrange();
         }
     }
@@ -245,27 +244,38 @@ impl App {
         }
     }
 
-    /// Where the thread after the selected message starts, if it is
-    /// listed.
-    pub(super) fn next_thread_root(&self) -> Option<usize> {
-        (self.selected + 1..self.messages.len()).find(|&i| {
-            let id = &self.messages[i].id;
-            self.threads.get(id).is_none_or(|t| &t.root == id)
-        })
+    /// Whether the entry `at` starts a thread.
+    fn is_root(&self, at: usize) -> bool {
+        let id = &self.messages[at].id;
+        self.threads.get(id).is_none_or(|t| &t.root == id)
     }
 
-    /// Where the thread before the selected message's starts, if any.
-    pub(super) fn previous_thread_root(&self) -> Option<usize> {
-        let selected = &self.messages.get(self.selected)?.id;
-        let start = self
-            .threads
-            .get(selected)
+    /// Where the thread of `id`, the selected message, starts.
+    fn thread_start(&self, id: &MessageId) -> usize {
+        self.threads
+            .get(id)
             .and_then(|t| self.messages.iter().position(|m| m.id == t.root))
-            .unwrap_or(self.selected);
-        (0..start).rev().find(|&i| {
-            let id = &self.messages[i].id;
-            self.threads.get(id).is_none_or(|t| &t.root == id)
-        })
+            .unwrap_or(self.selected)
+    }
+
+    /// Where the thread after the selected message (if it is listed), or
+    /// the one before the selected message's (`next` false), starts; or
+    /// why there is none.
+    pub(super) fn thread_root_toward(&self, next: bool) -> Result<usize, &'static str> {
+        if next {
+            (self.selected + 1..self.messages.len())
+                .find(|&i| self.is_root(i))
+                .ok_or("You are on the last thread.")
+        } else {
+            self.messages
+                .get(self.selected)
+                .and_then(|m| {
+                    (0..self.thread_start(&m.id))
+                        .rev()
+                        .find(|&i| self.is_root(i))
+                })
+                .ok_or("You are on the first thread.")
+        }
     }
 
     /// Handles the thread actions of the index and the pager. Returns
@@ -288,10 +298,7 @@ impl App {
         // listed again meanwhile).
         // Folded into a collapsed thread since, from the thread.
         if let Some(Screen::Pager(pager)) = self.screens.last() {
-            let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
-            let at =
-                shown(&pager.id).or_else(|| self.thread_of(&pager.id).and_then(|t| shown(&t.root)));
-            match at {
+            match self.entry_of(&pager.id) {
                 Some(at) => self.selected = at,
                 None => {
                     self.fail("The folder is being listed again; wait a moment.");
@@ -305,35 +312,25 @@ impl App {
             return Some(Vec::new());
         };
         // The start of the selected message's thread.
-        let start = self
-            .threads
-            .get(&selected)
-            .and_then(|t| self.messages.iter().position(|m| m.id == t.root))
-            .unwrap_or(self.selected);
+        let start = self.thread_start(&selected);
         match action {
-            Action::NextThread => {
+            Action::NextThread | Action::PreviousThread => {
+                let next = action == Action::NextThread;
                 // While pages come, a thread's start (and with it, where
-                // the thread goes) may still be on its way: wait for them.
+                // the thread goes) may still be on its way, and an older
+                // page may bring a thread that goes before it: wait for
+                // them.
                 if self.more_to_list() {
-                    return Some(self.wait_for(super::Target::NextThread));
+                    return Some(self.wait_for(if next {
+                        super::Target::NextThread
+                    } else {
+                        super::Target::PreviousThread
+                    }));
                 }
-                match self.next_thread_root() {
-                    Some(next) => self.selected = next,
-                    None => {
-                        self.fail("You are on the last thread.");
-                        return Some(Vec::new());
-                    }
-                }
-            }
-            Action::PreviousThread => {
-                // An older page may bring a thread that goes before it.
-                if self.more_to_list() {
-                    return Some(self.wait_for(super::Target::PreviousThread));
-                }
-                match self.previous_thread_root() {
-                    Some(previous) => self.selected = previous,
-                    None => {
-                        self.fail("You are on the first thread.");
+                match self.thread_root_toward(next) {
+                    Ok(at) => self.selected = at,
+                    Err(reason) => {
+                        self.fail(reason);
                         return Some(Vec::new());
                     }
                 }

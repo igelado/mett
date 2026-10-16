@@ -26,26 +26,27 @@ pub enum AnyStore {
     File(FileStore),
 }
 
+impl AnyStore {
+    /// The store chosen.
+    fn inner(&self) -> &dyn TokenStore {
+        match self {
+            Self::Keyring(s) => s,
+            Self::File(s) => s,
+        }
+    }
+}
+
 impl TokenStore for AnyStore {
     fn load(&self, account: &mett_core::AccountId) -> Result<Option<String>, TokenStoreError> {
-        match self {
-            Self::Keyring(s) => s.load(account),
-            Self::File(s) => s.load(account),
-        }
+        self.inner().load(account)
     }
 
     fn save(&self, account: &mett_core::AccountId, token: &str) -> Result<(), TokenStoreError> {
-        match self {
-            Self::Keyring(s) => s.save(account, token),
-            Self::File(s) => s.save(account, token),
-        }
+        self.inner().save(account, token)
     }
 
     fn clear(&self, account: &mett_core::AccountId) -> Result<(), TokenStoreError> {
-        match self {
-            Self::Keyring(s) => s.clear(account),
-            Self::File(s) => s.clear(account),
-        }
+        self.inner().clear(account)
     }
 
     fn clear_if(
@@ -53,10 +54,7 @@ impl TokenStore for AnyStore {
         account: &mett_core::AccountId,
         token: &str,
     ) -> Result<Option<String>, TokenStoreError> {
-        match self {
-            Self::Keyring(s) => s.clear_if(account, token),
-            Self::File(s) => s.clear_if(account, token),
-        }
+        self.inner().clear_if(account, token)
     }
 }
 

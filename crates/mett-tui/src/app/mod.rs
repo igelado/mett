@@ -320,6 +320,13 @@ impl Pager {
             self.rows_width = Some(width);
         }
     }
+
+    /// Wraps the message to `width`, and keeps the scroll position within
+    /// it for a screen `height` rows tall.
+    fn fit(&mut self, width: usize, height: usize) {
+        self.layout(width);
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(height));
+    }
 }
 
 /// The sign-in window, shown over the current screen while the user has
@@ -1283,20 +1290,41 @@ impl App {
             .collect()
     }
 
+    /// Handles the actions the index and the pager share. Returns `None`
+    /// for others.
+    fn on_message_action(&mut self, action: Action) -> Option<Vec<Effect>> {
+        if let Some(effects) = self
+            .on_mailbox_action(action)
+            .or_else(|| self.on_thread_action(action))
+            .or_else(|| self.on_search_action(action))
+        {
+            return Some(effects);
+        }
+        let effects = match action {
+            Action::Quit => self.leave_folder(AfterPurge::Quit),
+            Action::Mail => self.start_compose(Kind::New),
+            Action::Reply => self.start_compose(Kind::Reply),
+            Action::GroupReply => self.start_compose(Kind::GroupReply),
+            Action::Forward => self.start_compose(Kind::Forward),
+            Action::ViewAttachments => self.view_attachments(),
+            Action::Query => {
+                self.ask_query();
+                Vec::new()
+            }
+            Action::CreateAlias => self.create_alias(),
+            Action::RecallMessage => self.recall_message(),
+            _ => return None,
+        };
+        Some(effects)
+    }
+
     fn on_index_action(&mut self, action: Action) -> Vec<Effect> {
-        if let Some(effects) = self.on_mailbox_action(action) {
-            return effects;
-        }
-        if let Some(effects) = self.on_thread_action(action) {
-            return effects;
-        }
-        if let Some(effects) = self.on_search_action(action) {
+        if let Some(effects) = self.on_message_action(action) {
             return effects;
         }
         let last = self.messages.len().saturating_sub(1);
         let page = self.body_height.max(1);
         match action {
-            Action::Quit => return self.quit(),
             Action::NextEntry if self.selected < last => self.selected += 1,
             Action::NextEntry if self.more_to_list() => {
                 return self.wait_for(self.next_entry());
@@ -1335,32 +1363,17 @@ impl App {
                 self.status = "Opening folder...".into();
             }
             Action::DisplayMessage => return self.open_selected(),
-            Action::Mail => return self.start_compose(Kind::New),
-            Action::Reply => return self.start_compose(Kind::Reply),
-            Action::GroupReply => return self.start_compose(Kind::GroupReply),
-            Action::Forward => return self.start_compose(Kind::Forward),
-            Action::ViewAttachments => return self.view_attachments(),
-            Action::Query => self.ask_query(),
-            Action::CreateAlias => return self.create_alias(),
-            Action::RecallMessage => return self.recall_message(),
             _ => {}
         }
         Vec::new()
     }
 
     fn on_pager_action(&mut self, action: Action) -> Vec<Effect> {
-        if let Some(effects) = self.on_mailbox_action(action) {
-            return effects;
-        }
-        if let Some(effects) = self.on_thread_action(action) {
-            return effects;
-        }
-        if let Some(effects) = self.on_search_action(action) {
+        if let Some(effects) = self.on_message_action(action) {
             return effects;
         }
         let page = self.body_height.max(1);
         match action {
-            Action::Quit => return self.quit(),
             Action::Exit => {
                 self.screens.pop();
             }
@@ -1388,14 +1401,6 @@ impl App {
             Action::PreviousLine => self.scroll_by(-1),
             Action::NextPage => self.scroll_by(page as isize),
             Action::PreviousPage => self.scroll_by(-(page as isize)),
-            Action::Mail => return self.start_compose(Kind::New),
-            Action::Reply => return self.start_compose(Kind::Reply),
-            Action::GroupReply => return self.start_compose(Kind::GroupReply),
-            Action::Forward => return self.start_compose(Kind::Forward),
-            Action::ViewAttachments => return self.view_attachments(),
-            Action::Query => self.ask_query(),
-            Action::CreateAlias => return self.create_alias(),
-            Action::RecallMessage => return self.recall_message(),
             _ => {}
         }
         Vec::new()
@@ -1417,10 +1422,7 @@ impl App {
         // highlights) must match the width they will be drawn at.
         for screen in &mut self.screens {
             match screen {
-                Screen::Pager(pager) => {
-                    pager.layout(width);
-                    pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
-                }
+                Screen::Pager(pager) => pager.fit(width, height),
                 Screen::Text(view) => {
                     view.layout(width);
                     view.scroll = view.scroll.min(view.rows.len().saturating_sub(height));
@@ -1566,17 +1568,7 @@ impl App {
                     // Pages asked for again come after the saves.
                     self.saved_flags.clear();
                     self.removed_while_listing.clear();
-                    // A search waiting for the page goes on once a sign-in
-                    // lets it load.
-                    if !matches!(e, Error::Auth(_)) {
-                        self.pending_search = None;
-                    }
-                    // Keys waiting for the folder play anyway, unless a
-                    // sign-in is to load it after all.
-                    if !matches!(e, Error::Auth(_)) {
-                        self.loaded();
-                    }
-                    self.report(e);
+                    self.load_failed(e);
                 }
             },
             Event::MessageFetched(result)
@@ -1688,17 +1680,7 @@ impl App {
             }
             Event::FolderOpened(Err(e)) => {
                 self.opening = None;
-                // A search waiting for the folder goes on once a sign-in
-                // lets it open.
-                if !matches!(e, Error::Auth(_)) {
-                    self.pending_search = None;
-                }
-                // Keys waiting for the folder play anyway, unless a sign-in
-                // is to open it after all.
-                if !matches!(e, Error::Auth(_)) {
-                    self.loaded();
-                }
-                self.report(e);
+                self.load_failed(e);
             }
             Event::MessagesListed(_) => {}
         }
@@ -1875,17 +1857,7 @@ impl App {
                     self.saved_flags
                         .insert(message.clone(), merged(saved, update));
                 }
-                if let Some((_, failed)) = self.save_failures.get_mut(&message) {
-                    if update.read.is_some() {
-                        failed.read = None;
-                    }
-                    if update.flagged.is_some() {
-                        failed.flagged = None;
-                    }
-                    if *failed == FlagsUpdate::default() {
-                        self.save_failures.remove(&message);
-                    }
-                }
+                self.forget_saved(&message, update);
             }
             Err(e) => {
                 let failed = self
@@ -1897,6 +1869,22 @@ impl App {
             }
         }
         Vec::new()
+    }
+
+    /// Forgets that saving what `update` has saved now failed before for
+    /// `message`.
+    fn forget_saved(&mut self, message: &MessageId, update: FlagsUpdate) {
+        if let Some((_, failed)) = self.save_failures.get_mut(message) {
+            if update.read.is_some() {
+                failed.read = None;
+            }
+            if update.flagged.is_some() {
+                failed.flagged = None;
+            }
+            if *failed == FlagsUpdate::default() {
+                self.save_failures.remove(message);
+            }
+        }
     }
 
     /// Handles the outcome of a flag change.
@@ -1919,17 +1907,7 @@ impl App {
             Ok(()) => {
                 update.apply(&mut mailbox);
                 // Whatever failed before of what was saved now is done.
-                if let Some((_, failed)) = self.save_failures.get_mut(&message) {
-                    if update.read.is_some() {
-                        failed.read = None;
-                    }
-                    if update.flagged.is_some() {
-                        failed.flagged = None;
-                    }
-                    if *failed == FlagsUpdate::default() {
-                        self.save_failures.remove(&message);
-                    }
-                }
+                self.forget_saved(&message, update);
             }
             Err(e) => {
                 // What the user has changed back meanwhile isn't wanted any
@@ -2009,11 +1987,7 @@ impl App {
     /// The summary of a message in the folder, shown or hidden by the
     /// limit.
     fn summary(&self, id: &MessageId) -> Option<&MessageSummary> {
-        self.messages
-            .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
-            .find(|s| &s.id == id)
+        self.folder_messages().find(|s| &s.id == id)
     }
 
     /// The summary of a message in the folder, to change.
@@ -2119,9 +2093,7 @@ impl App {
             return;
         };
         // Shown, or folded into a collapsed thread that is.
-        let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
-        let found = shown(id).or_else(|| self.thread_of(id).and_then(|t| shown(&t.root)));
-        if let Some(found) = found {
+        if let Some(found) = self.entry_of(id) {
             self.selected = found;
         } else if done {
             self.selected = (*at).min(self.messages.len().saturating_sub(1));
@@ -2191,27 +2163,19 @@ impl App {
         let selected = match target {
             // A later page may bring a thread that goes in between.
             Target::NextThread | Target::PreviousThread if loading => return Vec::new(),
-            Target::PreviousThread => match self.previous_thread_root() {
-                Some(previous) => previous,
-                None => {
-                    self.pending = None;
-                    self.fail("You are on the first thread.");
-                    return Vec::new();
+            Target::NextThread | Target::PreviousThread => {
+                match self.thread_root_toward(matches!(target, Target::NextThread)) {
+                    Ok(at) => at,
+                    Err(reason) => {
+                        self.pending = None;
+                        self.fail(reason);
+                        return Vec::new();
+                    }
                 }
-            },
-            Target::NextThread => match self.next_thread_root() {
-                Some(next) => next,
-                None => {
-                    self.pending = None;
-                    self.fail("You are on the last thread.");
-                    return Vec::new();
-                }
-            },
+            }
             Target::After(message, steps) => {
                 // Folded into a collapsed thread since: from the thread.
-                let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
-                let from = shown(&message)
-                    .or_else(|| self.thread_of(&message).and_then(|t| shown(&t.root)));
+                let from = self.entry_of(&message);
                 // While the folder loads, a later page may put a message
                 // in between (mail from the same time, a draft by its own
                 // date, a reply's start): wait for all of it, as mutt
@@ -2311,6 +2275,17 @@ impl App {
             || !self.discarding.is_empty()
     }
 
+    /// The folder failed to open or load. A search waiting for it goes on,
+    /// and the keys waiting for it play, once a sign-in lets it load;
+    /// otherwise, the keys play anyway.
+    fn load_failed(&mut self, e: Error) {
+        if !matches!(e, Error::Auth(_)) {
+            self.pending_search = None;
+            self.loaded();
+        }
+        self.report(e);
+    }
+
     fn report(&mut self, error: Error) {
         // A request the user's cancelled sign-in held up: they know.
         if matches!(&error, Error::Auth(m) if m == "sign-in cancelled") {
@@ -2321,6 +2296,13 @@ impl App {
     }
 
     /// Shows an error on the message line, in the `error` color.
+    /// Clears the status if it is one of `statuses`, which no longer hold.
+    pub(super) fn clear_status_if(&mut self, statuses: &[&str]) {
+        if statuses.contains(&self.status.as_str()) {
+            self.status.clear();
+        }
+    }
+
     pub(super) fn fail(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.error = Some(self.status.clone());
@@ -2356,6 +2338,23 @@ fn merged(earlier: FlagsUpdate, later: FlagsUpdate) -> FlagsUpdate {
         read: later.read.or(earlier.read),
         flagged: later.flagged.or(earlier.flagged),
     }
+}
+
+/// Moves the selection `selected` of a list menu of `count` entries as
+/// `action` says, by `page` entries a page. Returns whether `action` moves
+/// it.
+fn navigate(selected: &mut usize, action: Action, count: usize, page: usize) -> bool {
+    let last = count.saturating_sub(1);
+    *selected = match action {
+        Action::NextEntry => (*selected + 1).min(last),
+        Action::PreviousEntry => selected.saturating_sub(1),
+        Action::FirstEntry => 0,
+        Action::LastEntry => last,
+        Action::NextPage => (*selected + page).min(last),
+        Action::PreviousPage => selected.saturating_sub(page),
+        _ => return false,
+    };
+    true
 }
 
 /// The ID of a request effect.

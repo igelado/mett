@@ -27,24 +27,10 @@ pub enum FolderPath {
     Named(Vec<String>),
 }
 
-impl FolderPath {
-    /// Whether a folder called `name` may be the one at this path: its
-    /// last name matches, ignoring case as Office365 does. (Well-known
-    /// folders may be called anything.)
-    pub fn names(&self, name: &str) -> bool {
-        let last = match self {
-            FolderPath::Root => return true,
-            FolderPath::WellKnown(_, rest) => match rest.last() {
-                Some(last) => last,
-                None => return true,
-            },
-            FolderPath::Named(names) => match names.last() {
-                Some(last) => last,
-                None => return true,
-            },
-        };
-        last == name || last.to_lowercase() == name.to_lowercase()
-    }
+/// Whether two folder names are the same, ignoring case as Office365
+/// does.
+pub fn same_name(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
 }
 
 /// Why a mailbox path is not usable.

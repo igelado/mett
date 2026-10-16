@@ -6,10 +6,9 @@ use std::ops::Range;
 
 use mett_core::{MessageId, MessageSummary};
 
-use super::composing::{Input, Question};
+use super::composing::Question;
 use super::{App, Effect, Screen};
 use crate::action::Action;
-use crate::lineedit::LineEditor;
 use crate::pattern::{self, Candidate, Pattern};
 
 /// What the index says when a limit leaves it empty.
@@ -96,14 +95,6 @@ impl App {
             _ => return None,
         }
         Some(Vec::new())
-    }
-
-    fn ask(&mut self, question: Question, prompt: &str, current: &str) {
-        self.input = Some(Input::Line {
-            prompt: prompt.to_owned(),
-            editor: LineEditor::new(current),
-            question,
-        });
     }
 
     /// Acts on a search or limit pattern the user typed.
@@ -257,8 +248,7 @@ impl App {
         };
         // The terminal may have been resized while another screen covered
         // the pager: search the rows it will show.
-        pager.layout(width);
-        pager.scroll = pager.scroll.min(pager.rows.len().saturating_sub(height));
+        pager.fit(width, height);
         let count = pager.lines.len();
         if count == 0 {
             self.fail("Not found.");
@@ -312,6 +302,14 @@ impl App {
         }
     }
 
+    /// Whether `message` matches `pattern`.
+    fn matches(&self, pattern: &Pattern, message: &MessageSummary) -> bool {
+        pattern.matches(&Candidate {
+            summary: message,
+            deleted: self.deleted.contains(&message.id),
+        })
+    }
+
     /// What matches `pattern` at entry `i` of the index: the message, or
     /// one folded under it into its collapsed thread.
     fn search_match(
@@ -320,14 +318,8 @@ impl App {
         folded: &HashMap<MessageId, MessageId>,
         i: usize,
     ) -> Option<MessageId> {
-        let matches = |summary: &MessageSummary| {
-            pattern.matches(&Candidate {
-                summary,
-                deleted: self.deleted.contains(&summary.id),
-            })
-        };
         let entry = &self.messages[i];
-        if matches(entry) {
+        if self.matches(pattern, entry) {
             return Some(entry.id.clone());
         }
         folded.get(&entry.id).cloned()
@@ -345,10 +337,7 @@ impl App {
             if found.contains_key(&thread.root) {
                 continue;
             }
-            if pattern.matches(&Candidate {
-                summary: message,
-                deleted: self.deleted.contains(&message.id),
-            }) {
+            if self.matches(pattern, message) {
                 found.insert(thread.root.clone(), message.id.clone());
             }
         }
@@ -407,12 +396,7 @@ impl App {
         let (shown, hidden): (Vec<MessageSummary>, Vec<MessageSummary>) =
             std::mem::take(&mut self.messages)
                 .into_iter()
-                .partition(|m| {
-                    limit.pattern.matches(&Candidate {
-                        summary: m,
-                        deleted: self.deleted.contains(&m.id),
-                    })
-                });
+                .partition(|m| self.matches(&limit.pattern, m));
         self.messages = shown;
         self.hidden = hidden;
         self.limit = Some(limit);
@@ -421,10 +405,7 @@ impl App {
     /// Selects the message `id` if it is shown (or the collapsed thread
     /// it is in), or the first one.
     fn limit_index_to(&mut self, id: Option<&mett_core::MessageId>) {
-        let shown = |id: &mett_core::MessageId| self.messages.iter().position(|m| &m.id == id);
-        self.selected = id
-            .and_then(|id| shown(id).or_else(|| self.thread_of(id).and_then(|t| shown(&t.root))))
-            .unwrap_or(0);
+        self.selected = id.and_then(|id| self.entry_of(id)).unwrap_or(0);
     }
 
     /// Adds newly listed messages to the index, or aside if the index is
@@ -462,12 +443,10 @@ impl App {
         let Some(limit) = &self.limit else {
             return true;
         };
-        self.limited.get(&message.id).copied().unwrap_or_else(|| {
-            limit.pattern.matches(&Candidate {
-                summary: message,
-                deleted: self.deleted.contains(&message.id),
-            })
-        })
+        self.limited
+            .get(&message.id)
+            .copied()
+            .unwrap_or_else(|| self.matches(&limit.pattern, message))
     }
 
     /// The number of messages in the folder, shown or not.
@@ -483,8 +462,10 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     use super::*;
+    use crate::app::composing::Input;
     use crate::app::{Msg, Settings};
     use crate::config::mailbox::FolderPath;
+    use crate::lineedit::LineEditor;
     use crate::worker::{Event, Response};
 
     /// Messages from alternating senders, newest first: m0 from Alice

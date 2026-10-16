@@ -227,7 +227,7 @@ pub fn parse(var: &Var, text: &str, home: Option<&str>) -> Result<Value, String>
 }
 
 /// Expands a leading `~` or `~/` to `home`.
-fn expand_home(path: &str, home: Option<&str>) -> String {
+pub fn expand_home(path: &str, home: Option<&str>) -> String {
     match (path.strip_prefix('~'), home) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
             format!("{home}{rest}")

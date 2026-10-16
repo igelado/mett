@@ -140,41 +140,10 @@ impl Word {
         }
         Ok(out)
     }
-}
 
-/// `parts`, with variables replaced and backtick commands run.
-fn expand_parts(parts: &[Part], expander: &dyn Expander) -> Result<String, String> {
-    {
-        let mut out = String::new();
-        for part in parts {
-            match part {
-                Part::Literal(text) => out.push_str(text),
-                Part::Variable(name) => {
-                    out.push_str(&expander.variable(name).unwrap_or_default());
-                }
-                Part::Command(command) => {
-                    let output = expander
-                        .command(command)
-                        .map_err(|e| format!("`{command}` failed: {e}"))?;
-                    out.push_str(output.trim_end_matches(['\n', '\r']));
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
-impl Word {
     /// The word's text if it has no variables or commands.
     pub fn literal(&self) -> Option<String> {
-        let mut out = String::new();
-        for part in &self.parts {
-            match part {
-                Part::Literal(text) => out.push_str(text),
-                _ => return None,
-            }
-        }
-        Some(out)
+        literal_text(&self.parts)
     }
 
     /// For a word starting with `=` (as in `set var =value`), the rest of
@@ -183,47 +152,67 @@ impl Word {
         let Some(Part::Literal(text)) = self.parts.first() else {
             return None;
         };
-        let rest = text.strip_prefix('=')?;
-        let mut word = Word::default();
-        if !rest.is_empty() {
-            word.parts.push(Part::Literal(rest.to_owned()));
-        }
-        word.parts.extend(self.parts[1..].iter().cloned());
-        Some(word)
+        Some(rest_word(text.strip_prefix('=')?, &self.parts[1..]))
     }
 
     /// Splits `name=value` at the first literal `=`, if the name before it
     /// is literal text. The value is `None` for a bare `name=` (nothing
     /// after the `=`, not even `""`).
     pub fn split_assignment(&self) -> Option<(String, Option<Word>)> {
-        let (index, offset) = self
-            .parts
-            .iter()
-            .enumerate()
-            .find_map(|(i, part)| match part {
-                Part::Literal(text) => text.find('=').map(|offset| (i, offset)),
-                _ => None,
-            })?;
-        let mut name = String::new();
-        for part in &self.parts[..index] {
-            match part {
-                Part::Literal(text) => name.push_str(text),
-                _ => return None,
-            }
-        }
-        let Part::Literal(text) = &self.parts[index] else {
-            unreachable!("found in a literal");
-        };
-        name.push_str(&text[..offset]);
-        let mut value = Word::default();
-        let rest = &text[offset + 1..];
-        if !rest.is_empty() {
-            value.parts.push(Part::Literal(rest.to_owned()));
-        }
-        value.parts.extend(self.parts[index + 1..].iter().cloned());
+        let (index, text, offset) =
+            self.parts
+                .iter()
+                .enumerate()
+                .find_map(|(i, part)| match part {
+                    Part::Literal(text) => text.find('=').map(|offset| (i, text, offset)),
+                    _ => None,
+                })?;
+        let name = literal_text(&self.parts[..index])? + &text[..offset];
+        let value = rest_word(&text[offset + 1..], &self.parts[index + 1..]);
         let value = (!value.parts.is_empty()).then_some(value);
         Some((name, value))
     }
+}
+
+/// The text of `parts`, if they are all literal.
+fn literal_text(parts: &[Part]) -> Option<String> {
+    parts
+        .iter()
+        .map(|part| match part {
+            Part::Literal(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A word of the literal `rest`, if any, then `after`.
+fn rest_word(rest: &str, after: &[Part]) -> Word {
+    let mut word = Word::default();
+    if !rest.is_empty() {
+        word.parts.push(Part::Literal(rest.to_owned()));
+    }
+    word.parts.extend(after.iter().cloned());
+    word
+}
+
+/// `parts`, with variables replaced and backtick commands run.
+fn expand_parts(parts: &[Part], expander: &dyn Expander) -> Result<String, String> {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            Part::Literal(text) => out.push_str(text),
+            Part::Variable(name) => {
+                out.push_str(&expander.variable(name).unwrap_or_default());
+            }
+            Part::Command(command) => {
+                let output = expander
+                    .command(command)
+                    .map_err(|e| format!("`{command}` failed: {e}"))?;
+                out.push_str(output.trim_end_matches(['\n', '\r']));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Reads commands from a mettrc source.

@@ -222,16 +222,15 @@ fn render_browser(browser: &Browser, colors: &Colors, frame: &mut Frame, area: R
     } else {
         "Folders"
     };
-    let height = usize::from(area.height).max(1);
-    let first = browser.selected / height * height;
     let width = usize::from(area.width);
-    let lines: Vec<Line> = browser
-        .entries
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(height)
-        .map(|(i, entry)| {
+    let (entries, selected) = (&browser.entries, browser.selected);
+    render_page(
+        entries,
+        selected,
+        colors.indicator,
+        frame,
+        area,
+        |i, entry| {
             let new = if entry.new { 'N' } else { ' ' };
             let counts = match entry.counts {
                 Some((unread, total)) => format!("{unread:>5}/{total:<6}"),
@@ -243,16 +242,40 @@ fn render_browser(browser: &Browser, colors: &Colors, frame: &mut Frame, area: R
                 "  ".repeat(entry.depth),
                 entry.name
             );
-            let line = Line::raw(truncate(&line, width));
-            if i == browser.selected {
-                line.style(colors.indicator)
+            Line::raw(truncate(&line, width))
+        },
+    );
+    format!("---mett: {title} [{}]---", browser.entries.len())
+}
+
+/// Draws the page of `entries` with the selected one on it (a page at a
+/// time, as mutt scrolls), each as `line` makes it from its position, and
+/// the selected one in `indicator`.
+fn render_page<T>(
+    entries: &[T],
+    selected: usize,
+    indicator: Style,
+    frame: &mut Frame,
+    area: Rect,
+    line: impl Fn(usize, &T) -> Line<'static>,
+) {
+    let height = usize::from(area.height).max(1);
+    let first = selected / height * height;
+    let lines: Vec<Line> = entries
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, entry)| {
+            let line = line(i, entry);
+            if i == selected {
+                line.style(indicator)
             } else {
                 line
             }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
-    format!("---mett: {title} [{}]---", browser.entries.len())
 }
 
 /// Draws a question on the message line, with the cursor where the answer
@@ -319,23 +342,18 @@ fn render_compose(compose: &Compose, colors: &Colors, frame: &mut Frame, area: R
             parts.len() + 1
         ));
     }
-    // A recalled message's own.
-    for kept in &compose.kept {
+    // A recalled message's own, then the attached files.
+    let kept = compose.kept.iter().map(|kept| {
+        let size = usize::try_from(kept.size).unwrap_or(usize::MAX);
+        (&kept.name, &kept.content_type, size)
+    });
+    let files = draft.attachments.iter();
+    let files = files.map(|f| (&f.name, &f.content_type, f.data.len()));
+    for (name, content_type, size) in kept.chain(files) {
         parts.push(format!(
-            "- A     {} {}  [{}, {}]",
+            "- A     {} {name}  [{content_type}, {}]",
             parts.len() + 1,
-            kept.name,
-            kept.content_type,
-            format_size(usize::try_from(kept.size).unwrap_or(usize::MAX))
-        ));
-    }
-    for file in &draft.attachments {
-        parts.push(format!(
-            "- A     {} {}  [{}, {}]",
-            parts.len() + 1,
-            file.name,
-            file.content_type,
-            format_size(file.data.len())
+            format_size(size)
         ));
     }
     let count = parts.len();
@@ -378,16 +396,15 @@ fn render_attachments(menu: &AttachMenu, colors: &Colors, frame: &mut Frame, are
         frame.render_widget(Paragraph::new(text), area);
         return "---mett: Attachments---".into();
     }
-    let height = usize::from(area.height).max(1);
-    let first = menu.selected / height * height;
     let width = usize::from(area.width);
-    let lines: Vec<Line> = menu
-        .entries
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(height)
-        .map(|(i, attachment)| {
+    let (entries, selected) = (&menu.entries, menu.selected);
+    render_page(
+        entries,
+        selected,
+        colors.indicator,
+        frame,
+        area,
+        |i, attachment| {
             let size = usize::try_from(attachment.size).unwrap_or(usize::MAX);
             let kind = match attachment.kind {
                 mett_core::AttachmentKind::Link => " (link)",
@@ -400,15 +417,9 @@ fn render_attachments(menu: &AttachMenu, colors: &Colors, frame: &mut Frame, are
                 format_size(size),
                 attachment.name
             );
-            let line = Line::raw(truncate(&line, width));
-            if i == menu.selected {
-                line.style(colors.indicator)
-            } else {
-                line.style(colors.attachment)
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+            Line::raw(truncate(&line, width)).style(colors.attachment)
+        },
+    );
     format!("---mett: Attachments [{}]---", menu.entries.len())
 }
 
@@ -418,25 +429,16 @@ fn render_query(menu: &QueryMenu, colors: &Colors, frame: &mut Frame, area: Rect
         frame.render_widget(Paragraph::new("Searching..."), area);
         return format!("---mett: {}---", menu.title);
     }
-    let height = usize::from(area.height).max(1);
-    let first = menu.selected / height * height;
     let width = usize::from(area.width);
-    let lines: Vec<Line> = menu
-        .entries
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(height)
-        .map(|(i, entry)| {
-            let line = Line::raw(truncate(&format!("{:>4} {}", i + 1, entry.label), width));
-            if i == menu.selected {
-                line.style(colors.indicator)
-            } else {
-                line
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+    let (entries, selected) = (&menu.entries, menu.selected);
+    render_page(
+        entries,
+        selected,
+        colors.indicator,
+        frame,
+        area,
+        |i, entry| Line::raw(truncate(&format!("{:>4} {}", i + 1, entry.label), width)),
+    );
     format!("---mett: {} [{}]---", menu.title, menu.entries.len())
 }
 
@@ -448,16 +450,15 @@ fn render_postponed(
     frame: &mut Frame,
     area: Rect,
 ) -> String {
-    let height = usize::from(area.height).max(1);
-    let first = menu.selected / height * height;
     let width = usize::from(area.width);
-    let lines: Vec<Line> = menu
-        .entries
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(height)
-        .map(|(i, message)| {
+    let (entries, selected) = (&menu.entries, menu.selected);
+    render_page(
+        entries,
+        selected,
+        colors.indicator,
+        frame,
+        area,
+        |i, message| {
             let to = message.to.first().map_or_else(String::new, |a| {
                 a.name.clone().unwrap_or_else(|| a.email.clone())
             });
@@ -465,18 +466,12 @@ fn render_postponed(
                 .received
                 .with_timezone(&chrono::Local)
                 .format("%b %d");
-            let line = Line::raw(truncate(
+            Line::raw(truncate(
                 &format!("{:>4} {when} {:<20.20} {}", i + 1, to, message.subject),
                 width,
-            ));
-            if i == menu.selected {
-                line.style(colors.indicator)
-            } else {
-                line
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+            ))
+        },
+    );
     format!("---mett: Postponed Messages [{}]---", menu.entries.len())
 }
 
@@ -626,19 +621,16 @@ fn help_line(app: &App, keymap: &Keymap, menu: Menu) -> String {
 }
 
 fn render_index(app: &App, frame: &mut Frame, area: Rect) {
-    let height = usize::from(area.height).max(1);
-    // Like mutt, scroll a page at a time.
-    let first = app.selected / height * height;
     let width = usize::from(area.width);
     let colors = &app.display.colors;
     let total = app.total_messages();
-    let lines: Vec<Line> = app
-        .messages
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(height)
-        .map(|(i, message)| {
+    render_page(
+        &app.messages,
+        app.selected,
+        colors.indicator,
+        frame,
+        area,
+        |i, message| {
             // A collapsed thread with unread mail folded into it shows as
             // unread.
             let thread = app.thread_of(&message.id);
@@ -667,19 +659,18 @@ fn render_index(app: &App, frame: &mut Frame, area: Rect) {
             let used = text.width();
             text.push_str(&" ".repeat(width.saturating_sub(used)));
             let line = Line::raw(text);
+            // The selected one is in the indicator's colors instead.
             if i == app.selected {
-                line.style(colors.indicator)
-            } else {
-                line.style(colors.index_style(|pattern| {
-                    pattern.matches(&Candidate {
-                        summary: message,
-                        deleted,
-                    })
-                }))
+                return line;
             }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+            line.style(colors.index_style(|pattern| {
+                pattern.matches(&Candidate {
+                    summary: message,
+                    deleted,
+                })
+            }))
+        },
+    );
 }
 
 /// The status bar under the index, from `status_format`.

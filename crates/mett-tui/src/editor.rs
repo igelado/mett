@@ -35,6 +35,11 @@ impl Editor {
         Self { command, tmpdir }
     }
 
+    /// [`Editor::new`], with mett's own environment.
+    pub fn from_env(editor: &str, tmpdir: &str) -> Self {
+        Self::new(editor, tmpdir, &|name| std::env::var(name).ok())
+    }
+
     /// Lets the user edit `text` and returns the result. The caller hands
     /// the terminal over first.
     ///

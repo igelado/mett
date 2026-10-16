@@ -140,13 +140,7 @@ impl Key {
                         None => return Err(format!("{text}: \\C needs a key")),
                     },
                     // Escape then a character is Meta-character.
-                    Some('e' | 'E') => match chars.peek() {
-                        Some(&c) if is_meta_char(c) => {
-                            chars.next();
-                            Key::alt(c)
-                        }
-                        _ => Key::new(KeyCode::Esc),
-                    },
+                    Some('e' | 'E') => escape(&mut chars),
                     Some('t') => Key::new(KeyCode::Tab),
                     Some('n') => Key::ctrl('j'),
                     Some('r') => Key::new(KeyCode::Enter),
@@ -171,13 +165,7 @@ impl Key {
                 }
                 // What the mettrc lexer made of `\e`, `\t`, `\Cx` and
                 // friends.
-                '\u{1b}' => match chars.peek() {
-                    Some(&c) if is_meta_char(c) => {
-                        chars.next();
-                        Key::alt(c)
-                    }
-                    _ => Key::new(KeyCode::Esc),
-                },
+                '\u{1b}' => escape(&mut chars),
                 '\t' => Key::new(KeyCode::Tab),
                 '\n' => Key::ctrl('j'),
                 '\r' => Key::new(KeyCode::Enter),
@@ -194,14 +182,16 @@ impl Key {
     }
 }
 
-/// Control-`x`, as the terminal reports it: `^M` is Enter, `^I`
-/// is Tab, `^[` is Esc and `^?` is Backspace.
-/// Whether Escape followed by `c` stands for Meta-`c`: a printable
-/// character, not the start of other notation.
-fn is_meta_char(c: char) -> bool {
-    c.is_ascii_graphic() && !matches!(c, '\\' | '<' | '^')
+/// Escape, or with the character after it (taken), Meta and that
+/// character: a printable one, not the start of other notation.
+fn escape(chars: &mut std::iter::Peekable<std::str::Chars>) -> Key {
+    chars
+        .next_if(|c| c.is_ascii_graphic() && !matches!(c, '\\' | '<' | '^'))
+        .map_or(Key::new(KeyCode::Esc), Key::alt)
 }
 
+/// Control-`x`, as the terminal reports it: `^M` is Enter, `^I`
+/// is Tab, `^[` is Esc and `^?` is Backspace.
 fn control(x: char) -> Key {
     match x.to_ascii_lowercase() {
         'm' => Key::new(KeyCode::Enter),
@@ -281,20 +271,8 @@ impl fmt::Display for Key {
             }
             KeyCode::Char(c) if control => write!(f, "{}", c.to_ascii_uppercase()),
             KeyCode::Char(c) => write!(f, "{c}"),
-            KeyCode::Enter => f.write_str("<Enter>"),
-            KeyCode::Esc => f.write_str("<Esc>"),
-            KeyCode::Tab => f.write_str("<Tab>"),
-            KeyCode::Backspace => f.write_str("<Backspace>"),
-            KeyCode::Delete => f.write_str("<Delete>"),
-            KeyCode::Up => f.write_str("<Up>"),
-            KeyCode::Down => f.write_str("<Down>"),
-            KeyCode::Left => f.write_str("<Left>"),
-            KeyCode::Right => f.write_str("<Right>"),
-            KeyCode::Home => f.write_str("<Home>"),
-            KeyCode::End => f.write_str("<End>"),
-            KeyCode::PageUp => f.write_str("<PageUp>"),
-            KeyCode::PageDown => f.write_str("<PageDown>"),
             KeyCode::F(n) => write!(f, "<F{n}>"),
+            // The others by their names: `<Enter>`, `<PageDown>`.
             other => write!(f, "<{other:?}>"),
         }
     }
@@ -363,9 +341,6 @@ impl Keymap {
         // mutt's generic menu: keys that work in every menu but the pager,
         // unless the menu binds them itself.
         let generic: &[(Key, Action)] = &[(Key::char('?'), Help), (Key::char(':'), EnterCommand)];
-        for (key, action) in generic {
-            keymap.bind_action(Menu::Generic, *key, *action);
-        }
 
         let index: &[(Key, Action)] = &[
             (Key::char('q'), Quit),
@@ -393,9 +368,6 @@ impl Keymap {
             (Key::alt('v'), CollapseThread),
             (Key::alt('V'), CollapseAll),
         ];
-        for (key, action) in index.iter().chain(mailbox) {
-            keymap.bind_action(Menu::Index, *key, *action);
-        }
 
         let pager: &[(Key, Action)] = &[
             (Key::char('i'), Exit),
@@ -417,9 +389,6 @@ impl Keymap {
             (Key::char('g'), GroupReply),
             (Key::char('f'), Forward),
         ];
-        for (key, action) in pager.iter().chain(mailbox) {
-            keymap.bind_action(Menu::Pager, *key, *action);
-        }
 
         let sign_in: &[(Key, Action)] = &[
             (Key::char('q'), Exit),
@@ -432,9 +401,6 @@ impl Keymap {
             (Key::char('k'), PreviousLine),
             (Key::new(Up), PreviousLine),
         ];
-        for (key, action) in sign_in {
-            keymap.bind_action(Menu::SignIn, *key, *action);
-        }
 
         let compose: &[(Key, Action)] = &[
             (Key::char('y'), SendMessage),
@@ -452,9 +418,6 @@ impl Keymap {
             (Key::char('k'), PreviousEntry),
             (Key::new(Up), PreviousEntry),
         ];
-        for (key, action) in compose {
-            keymap.bind_action(Menu::Compose, *key, *action);
-        }
 
         let help: &[(Key, Action)] = &[
             (Key::char('q'), Exit),
@@ -469,11 +432,9 @@ impl Keymap {
             (Key::char('-'), PreviousPage),
             (Key::new(PageUp), PreviousPage),
         ];
-        for (key, action) in help {
-            keymap.bind_action(Menu::Help, *key, *action);
-        }
 
-        let browser: &[(Key, Action)] = &[
+        // The list menus' keys for moving about, and for choosing an entry.
+        let list: &[(Key, Action)] = &[
             (Key::char('q'), Exit),
             (Key::new(Esc), Exit),
             (Key::char('j'), NextEntry),
@@ -488,80 +449,36 @@ impl Keymap {
             (Key::new(PageDown), NextPage),
             (Key::char('Z'), PreviousPage),
             (Key::new(PageUp), PreviousPage),
+        ];
+        let choose: &[(Key, Action)] = &[
             (Key::new(Enter), DisplayMessage),
             (Key::char(' '), DisplayMessage),
-            (Key::new(KeyCode::Tab), ToggleMailboxes),
         ];
-        for (key, action) in browser {
-            keymap.bind_action(Menu::Browser, *key, *action);
-        }
-
+        let browser: &[(Key, Action)] = &[(Key::new(KeyCode::Tab), ToggleMailboxes)];
         let attach: &[(Key, Action)] = &[
-            (Key::char('q'), Exit),
-            (Key::new(Esc), Exit),
-            (Key::char('j'), NextEntry),
-            (Key::new(Down), NextEntry),
-            (Key::char('k'), PreviousEntry),
-            (Key::new(Up), PreviousEntry),
-            (Key::char('='), FirstEntry),
-            (Key::new(Home), FirstEntry),
-            (Key::char('*'), LastEntry),
-            (Key::new(End), LastEntry),
-            (Key::char('z'), NextPage),
-            (Key::new(PageDown), NextPage),
-            (Key::char('Z'), PreviousPage),
-            (Key::new(PageUp), PreviousPage),
             (Key::new(Enter), ViewAttach),
             (Key::char('m'), ViewAttach),
             (Key::char('s'), SaveEntry),
         ];
-        for (key, action) in attach {
-            keymap.bind_action(Menu::Attach, *key, *action);
-        }
+        let query: &[(Key, Action)] = &[(Key::char('m'), Mail)];
 
-        let query: &[(Key, Action)] = &[
-            (Key::char('q'), Exit),
-            (Key::new(Esc), Exit),
-            (Key::char('j'), NextEntry),
-            (Key::new(Down), NextEntry),
-            (Key::char('k'), PreviousEntry),
-            (Key::new(Up), PreviousEntry),
-            (Key::char('='), FirstEntry),
-            (Key::new(Home), FirstEntry),
-            (Key::char('*'), LastEntry),
-            (Key::new(End), LastEntry),
-            (Key::char('z'), NextPage),
-            (Key::new(PageDown), NextPage),
-            (Key::char('Z'), PreviousPage),
-            (Key::new(PageUp), PreviousPage),
-            (Key::new(Enter), DisplayMessage),
-            (Key::char(' '), DisplayMessage),
-            (Key::char('m'), Mail),
+        type Table = [(Key, Action)];
+        let menus: [(Menu, &[&Table]); 10] = [
+            (Menu::Generic, &[generic]),
+            (Menu::Index, &[index, mailbox]),
+            (Menu::Pager, &[pager, mailbox]),
+            (Menu::SignIn, &[sign_in]),
+            (Menu::Compose, &[compose]),
+            (Menu::Help, &[help]),
+            (Menu::Browser, &[list, choose, browser]),
+            (Menu::Attach, &[list, attach]),
+            (Menu::Query, &[list, choose, query]),
+            (Menu::Postpone, &[list, choose]),
         ];
-        for (key, action) in query {
-            keymap.bind_action(Menu::Query, *key, *action);
-        }
-
-        let postpone: &[(Key, Action)] = &[
-            (Key::char('q'), Exit),
-            (Key::new(Esc), Exit),
-            (Key::char('j'), NextEntry),
-            (Key::new(Down), NextEntry),
-            (Key::char('k'), PreviousEntry),
-            (Key::new(Up), PreviousEntry),
-            (Key::char('='), FirstEntry),
-            (Key::new(Home), FirstEntry),
-            (Key::char('*'), LastEntry),
-            (Key::new(End), LastEntry),
-            (Key::char('z'), NextPage),
-            (Key::new(PageDown), NextPage),
-            (Key::char('Z'), PreviousPage),
-            (Key::new(PageUp), PreviousPage),
-            (Key::new(Enter), DisplayMessage),
-            (Key::char(' '), DisplayMessage),
-        ];
-        for (key, action) in postpone {
-            keymap.bind_action(Menu::Postpone, *key, *action);
+        for (menu, tables) in menus {
+            for (key, action) in tables.iter().copied().flatten() {
+                keymap.bind_action(menu, *key, *action);
+            }
         }
 
         keymap
