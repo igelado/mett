@@ -391,6 +391,7 @@ fn sidebar_settings(
     Ok(app::SidebarSettings {
         visible: config.flag("sidebar_visible"),
         width: number("sidebar_width")?,
+        min_width: number("sidebar_min_width")?,
         format: config.string("sidebar_format").to_owned(),
         short_path: config.flag("sidebar_short_path"),
         folder_indent: config.flag("sidebar_folder_indent"),
@@ -1650,6 +1651,21 @@ mod tests {
             "still the demo user"
         );
         assert_eq!(after.compose.signature, None, "not the user's signature");
+    }
+
+    #[test]
+    fn the_sidebar_is_set_at_the_prompt() {
+        let mut demo = Commanded::demo("/home/alice");
+        let done =
+            demo.run("set sidebar_visible sidebar_width=25 sidebar_sort_method=reverse-alpha");
+        let sidebar = done.settings.unwrap().sidebar;
+        assert!(sidebar.visible);
+        assert_eq!(sidebar.width, 25);
+        assert!(sidebar.sort.reverse);
+        assert!(demo.run("set sidebar_sort_method=size").settings.is_err());
+        assert!(demo.run("set sidebar_min_width=-1").settings.is_err());
+        let done = demo.run("toggle sidebar_visible");
+        assert!(!done.settings.unwrap().sidebar.visible);
     }
 
     #[test]

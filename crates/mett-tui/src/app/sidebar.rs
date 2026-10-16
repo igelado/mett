@@ -71,6 +71,9 @@ pub struct SidebarSettings {
     pub visible: bool,
     /// `sidebar_width`, the divider included, as in mutt.
     pub width: usize,
+    /// mett's `sidebar_min_width`: on a terminal narrower than this, the
+    /// sidebar hides (or 0 not to).
+    pub min_width: usize,
     /// `sidebar_format`.
     pub format: String,
     /// `sidebar_short_path`.
@@ -110,6 +113,7 @@ impl Default for SidebarSettings {
         Self {
             visible: false,
             width: number("sidebar_width"),
+            min_width: number("sidebar_min_width"),
             format: var("sidebar_format").to_owned(),
             short_path: false,
             folder_indent: false,
@@ -167,15 +171,30 @@ pub struct Sidebar {
     open_counts: Option<(usize, usize)>,
 }
 
+/// The fewest columns the sidebar leaves the menus, unless
+/// `sidebar_min_width` is 0: fewer would cut the index's columns short.
+pub const MIN_MENU_WIDTH: usize = 40;
+
 impl SidebarSettings {
     /// How many columns the sidebar takes, its divider included, on a
-    /// terminal `total` columns wide: none while it is hidden; otherwise
+    /// terminal `total` columns wide: none while it is hidden, or while
+    /// the terminal is narrower than `sidebar_min_width` or would leave
+    /// the menus fewer than [`MIN_MENU_WIDTH`] columns (mett's); otherwise
     /// `sidebar_width`, leaving the menus at least a column, as in mutt.
     pub fn columns(&self, total: usize) -> usize {
         if !self.visible {
             return 0;
         }
+        if self.min_width > 0 && (total < self.min_width || total < self.width + MIN_MENU_WIDTH) {
+            return 0;
+        }
         self.width.min(total.saturating_sub(1))
+    }
+
+    /// Whether the sidebar is set visible but the terminal is too narrow
+    /// for it.
+    pub fn too_narrow(&self, total: usize) -> bool {
+        self.visible && self.width > 0 && self.columns(total) == 0
     }
 }
 
@@ -351,6 +370,9 @@ impl App {
             | Action::SidebarPageUp
             | Action::SidebarOpen => {
                 // As in mutt, they do nothing while it is hidden.
+                if self.sidebar.settings.too_narrow(self.terminal_width) {
+                    self.status = self.narrow_note();
+                }
                 if !self.sidebar_shown() || count == 0 {
                     return Some(Vec::new());
                 }
@@ -390,12 +412,22 @@ impl App {
         Some(Vec::new())
     }
 
+    /// Says how wide the terminal has to be for the sidebar.
+    fn narrow_note(&self) -> String {
+        let settings = &self.sidebar.settings;
+        let wide = settings.min_width.max(settings.width + MIN_MENU_WIDTH);
+        format!("The sidebar shows once the terminal is {wide} columns wide.")
+    }
+
     /// `sidebar-toggle-visible`: shows or hides the sidebar at once, and
     /// toggles `sidebar_visible` in the configuration, which the next
     /// settings take.
     fn toggle_sidebar(&mut self) -> Vec<Effect> {
         self.sidebar.settings.visible = !self.sidebar.settings.visible;
         self.relayout();
+        if self.sidebar.settings.too_narrow(self.terminal_width) {
+            self.after_configured = Some(self.narrow_note());
+        }
         // Like a command typed at `:`: keys after it wait for it.
         self.answer_command("toggle sidebar_visible".into())
     }
@@ -683,7 +715,7 @@ mod tests {
             visible: true,
             ..sidebar
         };
-        let (mut app, check) = mailboxes_app(with_mailboxes(sidebar), 80, height);
+        let (mut app, check) = mailboxes_app(with_mailboxes(sidebar), 120, height);
         mailboxes_checked(&mut app, check, counts);
         app
     }
@@ -776,24 +808,62 @@ mod tests {
     #[test]
     fn toggles_the_sidebar_and_sidebar_visible() {
         let mut app = shown_app(SidebarSettings::default(), 24, &[]);
-        assert_eq!(app.width, 50);
+        assert_eq!(app.width, 90);
         let effects = act(&mut app, Action::SidebarToggleVisible);
         assert_eq!(effects, [Effect::Command("toggle sidebar_visible".into())]);
-        assert_eq!(app.width, 80, "hidden at once");
+        assert_eq!(app.width, 120, "hidden at once");
         assert!(app.waiting(), "keys wait for the command");
         // The configuration agrees.
         app.update(configured(with_mailboxes(SidebarSettings::default())));
-        assert_eq!(app.width, 80);
+        assert_eq!(app.width, 120);
         assert!(!app.waiting());
         act(&mut app, Action::SidebarToggleVisible);
-        assert_eq!(app.width, 50);
+        assert_eq!(app.width, 90);
+    }
+
+    #[test]
+    fn hides_on_a_narrow_terminal() {
+        let mut app = shown_app(SidebarSettings::default(), 24, &[]);
+        let resize = |app: &mut App, width| {
+            app.update(crate::app::Msg::Resize { width, height: 24 });
+        };
+        resize(&mut app, 99);
+        assert_eq!(app.width, 99, "narrower than sidebar_min_width");
+        act(&mut app, Action::SidebarNext);
+        assert_eq!(app.sidebar.highlight, 0);
+        assert_eq!(
+            app.status,
+            "The sidebar shows once the terminal is 100 columns wide."
+        );
+        resize(&mut app, 100);
+        assert_eq!(app.width, 70, "back");
+        // Nor does it leave the menus fewer than 40 columns.
+        let wide = with_mailboxes(SidebarSettings {
+            visible: true,
+            width: 70,
+            ..SidebarSettings::default()
+        });
+        app.update(configured(wide));
+        assert_eq!(app.width, 100);
+        resize(&mut app, 110);
+        assert_eq!(app.width, 40);
+        // Without sidebar_min_width, as in mutt: a column at least.
+        let mutt = with_mailboxes(SidebarSettings {
+            visible: true,
+            width: 70,
+            min_width: 0,
+            ..SidebarSettings::default()
+        });
+        app.update(configured(mutt));
+        resize(&mut app, 50);
+        assert_eq!(app.width, 1);
     }
 
     #[test]
     fn ordered_by_counts_follows_the_open_folder_s() {
         let mut settings = with_mailboxes(sorted_by("unread"));
         settings.sidebar.visible = true;
-        let (mut app, effects) = App::open(80, 24, inbox(), settings);
+        let (mut app, effects) = App::open(120, 24, inbox(), settings);
         let open = first_request(&effects);
         let folder = mett_core::mock::folder("inbox", "Inbox", None);
         let sent = requests(&respond(&mut app, open, Event::FolderOpened(Ok(folder))));

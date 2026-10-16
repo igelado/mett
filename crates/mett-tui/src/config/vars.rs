@@ -180,6 +180,7 @@ pub const VARS: &[Var] = &[
     var("sidebar_folder_indent", Kind::Bool, "no"),
     var("sidebar_format", Kind::String, "%B%*  %n"),
     var("sidebar_indent_string", Kind::String, "  "),
+    var("sidebar_min_width", Kind::Number, "100"),
     var("sidebar_new_mail_only", Kind::Bool, "no"),
     var("sidebar_next_new_wrap", Kind::Bool, "no"),
     var("sidebar_on_right", Kind::Bool, "no"),

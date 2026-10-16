@@ -309,6 +309,22 @@ mod tests {
     }
 
     #[test]
+    fn hides_on_a_narrow_terminal_and_comes_back() {
+        let mut app = app(visible(), 2);
+        app.update(Msg::Resize {
+            width: 80,
+            height: HEIGHT,
+        });
+        let lines = lines(&drawn(&app, 80, HEIGHT));
+        assert!(lines[2].starts_with("   2 N!"), "{lines:#?}");
+        app.update(Msg::Resize {
+            width: WIDTH,
+            height: HEIGHT,
+        });
+        assert!(screen(&app)[2].starts_with("Work"));
+    }
+
+    #[test]
     fn may_be_on_the_right() {
         let app = app(
             SidebarSettings {
