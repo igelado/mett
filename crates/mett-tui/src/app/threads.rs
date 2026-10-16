@@ -205,15 +205,15 @@ impl App {
         let mut listed: Vec<(sort::Key, MessageSummary)> =
             listed.into_iter().map(|m| (key(&m), m)).collect();
         listed.sort_by(|(a, _), (b, _)| compare(a, b));
-        // The messages that go before the first listed stay where they
-        // are (with pages coming in the index's order, all of them): only
-        // those after it are merged.
-        let cut = match listed.first() {
-            Some((first, _)) => self
-                .messages
-                .partition_point(|m| !compare(first, &key(m)).is_lt()),
-            None => self.messages.len(),
-        };
+        // Each listed message goes before the first message after it in
+        // the index, found by bisecting what follows the one listed before
+        // it (with pages coming in the index's order, that is the end).
+        let mut places = Vec::with_capacity(listed.len());
+        let mut from = 0;
+        for (listed, _) in &listed {
+            from += self.messages[from..].partition_point(|m| !compare(listed, &key(m)).is_lt());
+            places.push(from);
+        }
         let selected = self.selected;
         // A message listed twice may be shown twice: the selection goes to
         // the first, as when it is looked for.
@@ -227,28 +227,17 @@ impl App {
             .get(selected)
             .filter(|_| twice)
             .map(|m| m.id.clone());
-        let tail = self.messages.split_off(cut);
-        let mut tail = tail
-            .into_iter()
-            .enumerate()
-            .map(|(i, m)| (cut + i, key(&m), m))
-            .peekable();
-        let mut listed = listed.into_iter().peekable();
-        loop {
-            let next = match (tail.peek(), listed.peek()) {
-                (Some((_, a, _)), Some((b, _))) if compare(b, a).is_lt() => listed.next(),
-                (Some(_), _) => tail.next().map(|(at, key, message)| {
-                    if at == selected {
-                        self.selected = self.messages.len();
-                    }
-                    (key, message)
-                }),
-                (None, _) => listed.next(),
-            };
-            match next {
-                Some((_, message)) => self.messages.push(message),
-                None => break,
-            }
+        if selected < self.messages.len() {
+            self.selected += places.partition_point(|&place| place <= selected);
+        }
+        // The listed messages go at the end, then from the last, each
+        // moves with those listed before it to where it goes, moving the
+        // messages it skips once.
+        let mut end = self.messages.len();
+        self.messages.extend(listed.into_iter().map(|(_, m)| m));
+        for (k, &place) in places.iter().enumerate().rev() {
+            self.messages[place..end + k + 1].rotate_right(k + 1);
+            end = place;
         }
         if let Some(at) = selected_id.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
             self.selected = at;

@@ -2110,8 +2110,10 @@ impl App {
         let Some((id, at)) = &self.reselect else {
             return;
         };
-        // Shown, or folded into a collapsed thread that is.
-        if let Some(found) = self.entry_of(id) {
+        // Shown, or folded into a collapsed thread that is (once listed:
+        // looking through the index for it at every page would be slow).
+        let listed = self.positions.contains_key(id);
+        if let Some(found) = listed.then(|| self.entry_of(id)).flatten() {
             self.selected = found;
         } else if done {
             self.selected = (*at).min(self.messages.len().saturating_sub(1));
@@ -2192,8 +2194,6 @@ impl App {
                 }
             }
             Target::After(message, steps) => {
-                // Folded into a collapsed thread since: from the thread.
-                let from = self.entry_of(&message);
                 // While the folder loads, a later page may put a message
                 // in between (mail from the same time, a draft by its own
                 // date, a reply's start): wait for all of it, as mutt
@@ -2204,6 +2204,8 @@ impl App {
                 if loading && !in_page_order {
                     return Vec::new();
                 }
+                // Folded into a collapsed thread since: from the thread.
+                let from = self.entry_of(&message);
                 match from.map(|from| from + steps) {
                     Some(entry) if entry < self.messages.len() => entry,
                     _ if loading => return Vec::new(),
