@@ -6,12 +6,15 @@
 //! worker is generic over the [`MailStore`] and [`MailSender`] ports, so
 //! the UI is tested against the in-memory store.
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
     Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
-    Message, MessageId, MessagePage, Page, Result,
+    Message, MessageId, MessagePage, Page, Result, WellKnownFolder, join_bounded,
+    join_bounded_until,
 };
 use tokio::sync::mpsc;
 
@@ -284,20 +287,29 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             Event::Queried(run_query(&command, &text).await)
         }
         Request::StillThere { folder, ids } => {
+            // Where each is, a few at a time; the first failure (in the
+            // order of `ids`) is the answer, as soon as those before it are
+            // known.
+            let failed = |found: &Option<Result<FolderId>>| matches!(found, Some(Err(e)) if !matches!(e, Error::NotFound { .. }));
+            let found = join_bounded_until(
+                ids.iter().map(|id| store.message_folder(id)).collect(),
+                CHECKS_AT_ONCE,
+                |found| found.iter().take_while(|f| f.is_some()).any(failed),
+            )
+            .await;
             let mut gone = Vec::new();
-            let mut failed = None;
-            for id in ids {
-                match store.fetch_message(&id).await {
+            for (id, found) in ids.into_iter().zip(found) {
+                let Some(found) = found else {
+                    unreachable!("a failure before it is the answer");
+                };
+                match found {
                     Err(Error::NotFound { .. }) => gone.push(id),
-                    Ok(message) if message.summary.folder != folder => gone.push(id),
+                    Ok(at) if at != folder => gone.push(id),
                     Ok(_) => {}
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
+                    Err(e) => return Event::StillThere(Err(e)),
                 }
             }
-            Event::StillThere(failed.map_or(Ok(gone), Err))
+            Event::StillThere(Ok(gone))
         }
         Request::CheckMailboxes(mailboxes) => {
             Event::MailboxesChecked(check_mailboxes(store, mailboxes).await)
@@ -314,94 +326,136 @@ async fn check_mailboxes<S: MailStore>(
     store: &S,
     mailboxes: Vec<(FolderPath, Option<FolderId>, Option<DateTime<Utc>>)>,
 ) -> Vec<(FolderPath, Result<Checked>)> {
-    // The folders, by the IDs known. A folder deleted (or moved away)
-    // since is looked for by its path again; so is one renamed or moved
-    // since (another may be at its path now).
+    // Parents, well-known folders and the folders below each are looked up
+    // once for all.
+    let lookups = &Lookups::default();
+    // The folders, by the IDs known, each checked once found. A folder
+    // deleted (or moved away) since is looked for by its path again; so is
+    // one renamed or moved since (another may be at its path now).
     let known = join_bounded(
         mailboxes
             .iter()
-            .map(|(path, id, _)| async move {
+            .map(|(path, id, since)| async move {
                 let id = id.as_ref()?;
-                match store.folder(id).await {
-                    Err(Error::NotFound { .. }) => None,
-                    Ok(folder) => match at_path(store, path, &folder).await {
-                        Ok(true) => Some(Ok(folder)),
-                        Ok(false) => None,
-                        Err(e) => Some(Err(e)),
+                let found = match lookups.folder(store, id).await {
+                    Err(Error::NotFound { .. }) => return None,
+                    Ok(folder) => match at_path(store, lookups, path, &folder).await {
+                        Ok(true) => Ok(folder),
+                        Ok(false) => return None,
+                        Err(e) => Err(e),
                     },
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .collect(),
-        CHECKS_AT_ONCE,
-    )
-    .await;
-    // The others, by their paths: the folder tree is listed once for all.
-    let mut listed = None;
-    let mut found = Vec::new();
-    for ((path, _, _), known) in mailboxes.iter().zip(known) {
-        found.push(match known {
-            Some(found) => found,
-            None => resolve_listed(store, path, &mut listed).await,
-        });
-    }
-    join_bounded(
-        mailboxes
-            .into_iter()
-            .zip(found)
-            .map(|((path, id, since), found)| async move {
-                let checked = match found {
-                    Ok(folder) => {
-                        // Changes since what was seen of the folder asked
-                        // about, not of another now at its path.
-                        let since = since.filter(|_| id.as_ref() == Some(&folder.id));
-                        store
-                            .recent_unread(&folder.id, since)
-                            .await
-                            .map(|recent| Checked { folder, recent })
-                    }
                     Err(e) => Err(e),
                 };
-                (path, checked)
+                Some(check(store, found, Some(id), *since).await)
             })
             .collect(),
         CHECKS_AT_ONCE,
     )
-    .await
+    .await;
+    // The others, by their paths.
+    let by_path = join_bounded(
+        mailboxes
+            .iter()
+            .zip(&known)
+            .filter(|(_, known)| known.is_none())
+            .map(|((path, id, since), _)| async move {
+                let found = resolve_with(store, lookups, path).await;
+                check(store, found, id.as_ref(), *since).await
+            })
+            .collect(),
+        CHECKS_AT_ONCE,
+    )
+    .await;
+    let mut by_path = by_path.into_iter();
+    mailboxes
+        .into_iter()
+        .zip(known)
+        .map(|((path, _, _), known)| {
+            let checked = known.unwrap_or_else(|| by_path.next().expect("checked by its path"));
+            (path, checked)
+        })
+        .collect()
 }
 
-/// Runs `futures`, at most `limit` at a time, and gives their outputs in
-/// order.
-async fn join_bounded<F: std::future::Future>(futures: Vec<F>, limit: usize) -> Vec<F::Output> {
-    let mut futures: Vec<std::pin::Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
-    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        // Futures do nothing until polled: polling the first `limit`
-        // unfinished ones runs only those.
-        let mut running = 0;
-        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
-            if output.is_some() {
-                continue;
-            }
-            if running == limit {
-                break;
-            }
-            match future.as_mut().poll(cx) {
-                std::task::Poll::Ready(done) => *output = Some(done),
-                std::task::Poll::Pending => running += 1,
-            }
-        }
-        if running == 0 {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-    outputs
-        .into_iter()
-        .map(|output| output.expect("every future finished"))
-        .collect()
+/// Checks the folder `found` for a mailbox last seen with `id` (if it was
+/// found): reads its unread mail that changed `since`.
+async fn check<S: MailStore>(
+    store: &S,
+    found: Result<Folder>,
+    id: Option<&FolderId>,
+    since: Option<DateTime<Utc>>,
+) -> Result<Checked> {
+    let folder = found?;
+    // Changes since what was seen of the folder asked about, not of
+    // another now at its path.
+    let since = since.filter(|_| id == Some(&folder.id));
+    store
+        .recent_unread(&folder.id, since)
+        .await
+        .map(|recent| Checked { folder, recent })
+}
+
+/// What the lookups for one request found, so that each is made once:
+/// checking many mailboxes looks up their common parents, and lists the
+/// folders below each, once for all. A lookup that fails isn't kept: the
+/// next one is made again.
+#[derive(Default)]
+struct Lookups {
+    /// Folders by ID.
+    folders: Memo<FolderId, Folder>,
+    /// Well-known folders.
+    well_known: Memo<WellKnownFolder, Folder>,
+    /// The folders below each folder (`None`: the top-level ones).
+    children: Memo<Option<FolderId>, Arc<Vec<Folder>>>,
+}
+
+impl Lookups {
+    /// The folder `id` (see [`MailStore::folder`]).
+    async fn folder<S: MailStore>(&self, store: &S, id: &FolderId) -> Result<Folder> {
+        self.folders.get(id, || store.folder(id)).await
+    }
+
+    /// The well-known folder `which` (see [`MailStore::well_known_folder`]).
+    async fn well_known<S: MailStore>(&self, store: &S, which: WellKnownFolder) -> Result<Folder> {
+        self.well_known
+            .get(&which, || store.well_known_folder(which))
+            .await
+    }
+
+    /// The folders below `parent` (see [`MailStore::child_folders`]).
+    async fn children<S: MailStore>(
+        &self,
+        store: &S,
+        parent: Option<&FolderId>,
+    ) -> Result<Arc<Vec<Folder>>> {
+        self.children
+            .get(&parent.cloned(), || async move {
+                store.child_folders(parent).await.map(Arc::new)
+            })
+            .await
+    }
+}
+
+/// Values looked up by key, each once (while one lookup runs, others for
+/// the same key wait for it), unless it fails.
+struct Memo<K, V>(std::sync::Mutex<HashMap<K, Arc<tokio::sync::OnceCell<V>>>>);
+
+impl<K, V> Default for Memo<K, V> {
+    fn default() -> Self {
+        Self(std::sync::Mutex::default())
+    }
+}
+
+impl<K: Clone + Eq + Hash, V: Clone> Memo<K, V> {
+    /// The value for `key`, looked up with `look_up` if it isn't known.
+    async fn get<F: Future<Output = Result<V>>>(
+        &self,
+        key: &K,
+        look_up: impl FnOnce() -> F,
+    ) -> Result<V> {
+        let cell = Arc::clone(self.0.lock().expect("lock").entry(key.clone()).or_default());
+        cell.get_or_try_init(look_up).await.cloned()
+    }
 }
 
 /// How many pages of changes a check reads before listing the whole
@@ -591,8 +645,12 @@ fn query_script(command: &str) -> String {
     script
 }
 
-/// Purges `ids` from the folder `from` (see [`Request::Purge`]), one at a
-/// time, so that a failure only affects its own message.
+/// How many messages are moved, copied or deleted at once.
+const MOVES_AT_ONCE: usize = 4;
+
+/// Purges `ids` from the folder `from` (see [`Request::Purge`]), a few at
+/// a time, each on its own, so that a failure only affects its own
+/// message.
 async fn purge<S: MailStore>(
     store: &S,
     ids: &[MessageId],
@@ -605,19 +663,25 @@ async fn purge<S: MailStore>(
         Some(path) => Some(resolve(store, path).await?).filter(|t| &t.id != from),
         None => None,
     };
-    let mut results = Vec::new();
-    for id in ids {
-        let result = match &trash {
-            Some(trash) => store.move_message(id, &trash.id).await.map(drop),
-            None => store.delete_message(id).await,
-        };
-        results.push((id.clone(), result));
-    }
+    let trash = trash.as_ref();
+    let results = join_bounded(
+        ids.iter()
+            .map(|id| async move {
+                let result = match trash {
+                    Some(trash) => store.move_message(id, &trash.id).await.map(drop),
+                    None => store.delete_message(id).await,
+                };
+                (id.clone(), result)
+            })
+            .collect(),
+        MOVES_AT_ONCE,
+    )
+    .await;
     Ok(results)
 }
 
-/// Moves or copies `ids` to the folder at `to`, one at a time, so that a
-/// failure only affects its own message.
+/// Moves or copies `ids` to the folder at `to`, a few at a time, each on
+/// its own, so that a failure only affects its own message.
 async fn transfer<S: MailStore>(
     store: &S,
     ids: &[MessageId],
@@ -625,22 +689,33 @@ async fn transfer<S: MailStore>(
     copy: bool,
 ) -> Result<(FolderId, Moved)> {
     let folder = resolve(store, to).await?;
-    let mut results = Vec::new();
-    for id in ids {
-        let result = if copy {
-            store.copy_message(id, &folder.id).await
-        } else {
-            store.move_message(id, &folder.id).await
-        };
-        results.push((id.clone(), result));
-    }
+    let to = &folder.id;
+    let results = join_bounded(
+        ids.iter()
+            .map(|id| async move {
+                let result = if copy {
+                    store.copy_message(id, to).await
+                } else {
+                    store.move_message(id, to).await
+                };
+                (id.clone(), result)
+            })
+            .collect(),
+        MOVES_AT_ONCE,
+    )
+    .await;
     Ok((folder.id, results))
 }
 
 /// Whether `folder` is still at `path`: its name and its parents' match
 /// the path's, up to the top of the mailbox or the well-known folder the
 /// path starts from.
-async fn at_path<S: MailStore>(store: &S, path: &FolderPath, folder: &Folder) -> Result<bool> {
+async fn at_path<S: MailStore>(
+    store: &S,
+    lookups: &Lookups,
+    path: &FolderPath,
+    folder: &Folder,
+) -> Result<bool> {
     let (names, start) = match path {
         FolderPath::Root => return Ok(true),
         FolderPath::WellKnown(which, rest) => (rest.as_slice(), Some(*which)),
@@ -655,14 +730,14 @@ async fn at_path<S: MailStore>(store: &S, path: &FolderPath, folder: &Folder) ->
             let Some(parent) = current.parent.clone() else {
                 return Ok(false);
             };
-            current = store.folder(&parent).await?;
+            current = lookups.folder(store, &parent).await?;
         }
     }
     match start {
         // A well-known folder keeps its ID.
         Some(_) if names.is_empty() => Ok(true),
         Some(which) => {
-            let start = store.well_known_folder(which).await?;
+            let start = lookups.well_known(store, which).await?;
             Ok(current.parent.as_ref() == Some(&start.id))
         }
         None => Ok(current.parent.is_none()),
@@ -672,47 +747,44 @@ async fn at_path<S: MailStore>(store: &S, path: &FolderPath, folder: &Folder) ->
 /// Finds the folder at `path`: a well-known folder, possibly followed by
 /// names of folders below it, or names from the top of the mailbox.
 async fn resolve<S: MailStore>(store: &S, path: &FolderPath) -> Result<Folder> {
-    resolve_listed(store, path, &mut None).await
+    resolve_with(store, &Lookups::default(), path).await
 }
 
-/// [`resolve`], listing the folders (if it must) into `listed`, or using
-/// those listed there already: checking several mailboxes lists them once.
-async fn resolve_listed<S: MailStore>(
+/// [`resolve`], with the `lookups` made for other paths: checking several
+/// mailboxes lists the folders below each parent once.
+async fn resolve_with<S: MailStore>(
     store: &S,
+    lookups: &Lookups,
     path: &FolderPath,
-    listed: &mut Option<Vec<Folder>>,
 ) -> Result<Folder> {
     match path {
         FolderPath::Root => Err(Error::Backend(
             "the mailbox itself isn't a folder; choose one, such as @inbox".into(),
         )),
         FolderPath::WellKnown(which, rest) => {
-            let start = store.well_known_folder(*which).await?;
+            let start = lookups.well_known(store, *which).await?;
             if rest.is_empty() {
                 return Ok(start);
             }
-            descend(store, Some(start), rest, listed).await
+            descend(store, lookups, Some(start), rest).await
         }
-        FolderPath::Named(names) => descend(store, None, names, listed).await,
+        FolderPath::Named(names) => descend(store, lookups, None, names).await,
     }
 }
 
-/// Walks down `names` from `start` (or the top of the mailbox). Names match
-/// exactly, or else ignoring case (in any script), as Office365 folder
-/// names do.
+/// Walks down `names` from `start` (or the top of the mailbox), listing
+/// the folders below each level only. Names match exactly, or else
+/// ignoring case (in any script), as Office365 folder names do.
 async fn descend<S: MailStore>(
     store: &S,
+    lookups: &Lookups,
     start: Option<Folder>,
     names: &[String],
-    listed: &mut Option<Vec<Folder>>,
 ) -> Result<Folder> {
-    if listed.is_none() {
-        *listed = Some(store.list_folders().await?);
-    }
-    let folders = listed.as_deref().unwrap_or_default();
     let mut current = start;
     for name in names {
         let parent = current.as_ref().map(|f| &f.id);
+        let folders = lookups.children(store, parent).await?;
         let children = || folders.iter().filter(|f| f.parent.as_ref() == parent);
         let found = children()
             .find(|f| &f.name == name)
@@ -769,27 +841,6 @@ mod tests {
         };
         assert_eq!(gone, [MessageId::new("m2")]);
     }
-    #[tokio::test]
-    async fn runs_a_few_at_a_time_in_order() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let futures = (0..10)
-            .map(|i| {
-                let (running, most) = (&running, &most);
-                async move {
-                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
-                    most.fetch_max(now, Ordering::SeqCst);
-                    tokio::task::yield_now().await;
-                    running.fetch_sub(1, Ordering::SeqCst);
-                    i
-                }
-            })
-            .collect();
-        let done = join_bounded(futures, 3).await;
-        assert_eq!(done, (0..10).collect::<Vec<_>>());
-        assert_eq!(most.load(Ordering::SeqCst), 3);
-    }
-
     #[tokio::test]
     async fn a_query_given_up_has_no_answer() {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
@@ -1079,5 +1130,394 @@ mod tests {
         assert!(
             matches!(response.event, Event::MessageFetched(Ok(m)) if m.summary.subject == "hello")
         );
+    }
+
+    /// The worker against a mock Microsoft Graph, counting the requests
+    /// it makes.
+    mod graph {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        use chrono::TimeDelta;
+        use mett_core::{AccessToken, Authenticator};
+        use mett_msgraph::{AuthSettings, GraphMailStore};
+        use serde_json::{Value, json};
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+        use super::*;
+
+        /// Hands out a fixed token.
+        struct StaticAuth;
+
+        impl Authenticator for StaticAuth {
+            async fn access_token(&self) -> Result<AccessToken> {
+                Ok(AccessToken::new("tok", Utc::now() + TimeDelta::hours(1)))
+            }
+        }
+
+        /// Answers each request by its path (whatever its method or
+        /// query), or else with a 404.
+        struct Paths(HashMap<String, ResponseTemplate>);
+
+        impl Respond for Paths {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let at = request.url.path().strip_prefix("/v1.0").unwrap_or_default();
+                self.0
+                    .get(at)
+                    .cloned()
+                    .unwrap_or_else(|| ResponseTemplate::new(404))
+            }
+        }
+
+        fn ok(body: Value) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(body)
+        }
+
+        fn folder(id: &str, name: &str, parent: &str, children: u32) -> Value {
+            json!({
+                "id": id,
+                "displayName": name,
+                "parentFolderId": parent,
+                "childFolderCount": children,
+                "unreadItemCount": 1,
+                "totalItemCount": 3,
+            })
+        }
+
+        /// A mailbox whose root is `root-id` and Inbox `inbox-id`, with no
+        /// other well-known folder, and nothing else yet.
+        fn mailbox() -> HashMap<String, ResponseTemplate> {
+            let roles: Vec<Value> = (0..8)
+                .map(|i| match i {
+                    0 => json!({ "id": "0", "status": 200, "body": { "id": "root-id" } }),
+                    1 => json!({ "id": "1", "status": 200, "body": { "id": "inbox-id" } }),
+                    _ => json!({ "id": i.to_string(), "status": 404 }),
+                })
+                .collect();
+            HashMap::from([
+                ("/$batch".into(), ok(json!({ "responses": roles }))),
+                (
+                    "/me/mailFolders/msgfolderroot".into(),
+                    ok(json!({ "id": "root-id" })),
+                ),
+                (
+                    "/me/mailFolders/inbox".into(),
+                    ok(folder("inbox-id", "Inbox", "root-id", 0)),
+                ),
+            ])
+        }
+
+        /// [`mailbox`], with 300 folders, 50 of them with folders below
+        /// them: Archive (`arc`) holds `2020` to `2024` (`arc-2020`, ...).
+        fn large_tree() -> HashMap<String, ResponseTemplate> {
+            let mut paths = mailbox();
+            let mut top = vec![folder("arc", "Archive", "root-id", 5)];
+            top.extend(
+                (1..50).map(|i| folder(&format!("t{i}"), &format!("Folder {i}"), "root-id", 5)),
+            );
+            paths.insert("/me/mailFolders".into(), ok(json!({ "value": top })));
+            paths.insert(
+                "/me/mailFolders/arc/childFolders".into(),
+                ok(json!({
+                    "value": (2020..2025)
+                        .map(|y| folder(&format!("arc-{y}"), &y.to_string(), "arc", 0))
+                        .collect::<Vec<_>>(),
+                })),
+            );
+            for i in 1..50 {
+                let parent = format!("t{i}");
+                paths.insert(
+                    format!("/me/mailFolders/{parent}/childFolders"),
+                    ok(json!({
+                        "value": (0..5)
+                            .map(|j| folder(&format!("{parent}-{j}"), &format!("Sub {j}"), &parent, 0))
+                            .collect::<Vec<_>>(),
+                    })),
+                );
+            }
+            paths
+        }
+
+        async fn serve_paths(paths: HashMap<String, ResponseTemplate>) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(Paths(paths))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn store(server: &MockServer) -> GraphMailStore<StaticAuth> {
+            let settings = AuthSettings {
+                graph_url: Some(url::Url::parse(&server.uri()).unwrap()),
+                ..AuthSettings::new("alice@contoso.com".into(), "client")
+            };
+            GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth))
+        }
+
+        /// The paths of the requests `server` received, below the Graph
+        /// root, and how many there were.
+        async fn requests(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.url.path().trim_start_matches("/v1.0").to_owned())
+                .collect()
+        }
+
+        /// The folder listings among `requests`.
+        fn listings(requests: &[String]) -> Vec<&str> {
+            requests
+                .iter()
+                .map(String::as_str)
+                .filter(|p| *p == "/me/mailFolders" || p.ends_with("/childFolders"))
+                .collect()
+        }
+
+        fn archive_2024() -> FolderPath {
+            FolderPath::Named(vec!["archive".into(), "2024".into()])
+        }
+
+        #[tokio::test]
+        async fn opening_a_path_lists_only_its_levels() {
+            let server = serve_paths(large_tree()).await;
+            let event = serve(&store(&server), Request::OpenFolder(archive_2024())).await;
+            let Event::FolderOpened(Ok(folder)) = event else {
+                panic!("expected the folder, got {event:?}");
+            };
+            assert_eq!(folder.id, FolderId::new("arc-2024"));
+            assert_eq!(folder.parent, Some(FolderId::new("arc")));
+            let requests = requests(&server).await;
+            assert_eq!(
+                listings(&requests),
+                ["/me/mailFolders", "/me/mailFolders/arc/childFolders"]
+            );
+            // The roles, which label well-known folders as a listing of
+            // them all does.
+            assert_eq!(requests.len(), 4, "{requests:?}");
+
+            // A name missing at any level, as before.
+            let missing = FolderPath::Named(vec!["Archive".into(), "1999".into()]);
+            let event = serve(&store(&server), Request::OpenFolder(missing)).await;
+            assert!(
+                matches!(&event, Event::FolderOpened(Err(Error::NotFound { kind: "folder", id })) if id == "Archive/1999"),
+                "{event:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_listing_on_the_way_is_the_answer() {
+            let mut paths = large_tree();
+            paths.insert(
+                "/me/mailFolders/arc/childFolders".into(),
+                ResponseTemplate::new(503),
+            );
+            let server = serve_paths(paths).await;
+            let event = serve(&store(&server), Request::OpenFolder(archive_2024())).await;
+            assert!(
+                matches!(event, Event::FolderOpened(Err(Error::Network(_)))),
+                "{event:?}"
+            );
+            // Elsewhere in the tree, it doesn't get in the way.
+            let mut paths = large_tree();
+            paths.insert(
+                "/me/mailFolders/t7/childFolders".into(),
+                ResponseTemplate::new(503),
+            );
+            let server = serve_paths(paths).await;
+            let event = serve(&store(&server), Request::OpenFolder(archive_2024())).await;
+            assert!(matches!(event, Event::FolderOpened(Ok(_))), "{event:?}");
+        }
+
+        #[tokio::test]
+        async fn moves_a_few_at_once_in_order() {
+            let mut paths = large_tree();
+            let delay = Duration::from_millis(300);
+            for i in 0..8 {
+                // The fourth is gone.
+                if i != 3 {
+                    paths.insert(
+                        format!("/me/messages/m{i}/move"),
+                        ok(json!({ "id": format!("n{i}") })).set_delay(delay),
+                    );
+                }
+            }
+            let server = serve_paths(paths).await;
+            let ids: Vec<_> = (0..8).map(|i| MessageId::new(format!("m{i}"))).collect();
+            let started = Instant::now();
+            let event = serve(
+                &store(&server),
+                Request::Transfer {
+                    ids: ids.clone(),
+                    to: archive_2024(),
+                    copy: false,
+                },
+            )
+            .await;
+            // One after the other, they would take 8 times the delay.
+            assert!(started.elapsed() < delay * 6, "{:?}", started.elapsed());
+            let Event::Transferred(Ok((to, moved))) = event else {
+                panic!("expected the messages moved, got {event:?}");
+            };
+            assert_eq!(to, FolderId::new("arc-2024"));
+            let got: Vec<_> = moved.iter().map(|(id, _)| id.clone()).collect();
+            assert_eq!(got, ids);
+            for (i, (_, result)) in moved.into_iter().enumerate() {
+                match result {
+                    Ok(new) => assert_eq!(new, MessageId::new(format!("n{i}"))),
+                    Err(e) => assert!(i == 3 && matches!(e, Error::NotFound { .. }), "{e}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn tells_which_messages_left_by_their_folder_alone() {
+            let mut paths = mailbox();
+            let at = |folder: &str| ok(json!({ "id": "x", "parentFolderId": folder }));
+            paths.insert("/me/messages/m1".into(), at("inbox-id"));
+            paths.insert("/me/messages/m2".into(), at("elsewhere"));
+            paths.insert("/me/messages/m4".into(), ResponseTemplate::new(503));
+            paths.insert("/me/messages/m5".into(), ResponseTemplate::new(403));
+            let server = serve_paths(paths).await;
+            let ids = |n: &[u8]| n.iter().map(|i| MessageId::new(format!("m{i}"))).collect();
+            let still_there = |ids| Request::StillThere {
+                folder: FolderId::new("inbox-id"),
+                ids,
+            };
+            let event = serve(&store(&server), still_there(ids(&[1, 2, 3]))).await;
+            let Event::StillThere(Ok(gone)) = event else {
+                panic!("expected the messages gone, got {event:?}");
+            };
+            assert_eq!(gone, [MessageId::new("m2"), MessageId::new("m3")]);
+            for request in server.received_requests().await.unwrap() {
+                let query = request.url.query().unwrap_or_default();
+                assert_eq!(query, "%24select=id%2CparentFolderId");
+            }
+            // The first failure, in order, is the answer.
+            let event = serve(&store(&server), still_there(ids(&[1, 4, 5]))).await;
+            assert!(
+                matches!(event, Event::StillThere(Err(Error::Network(_)))),
+                "{event:?}"
+            );
+            let event = serve(&store(&server), still_there(ids(&[5, 4]))).await;
+            assert!(
+                matches!(event, Event::StillThere(Err(Error::Auth(_)))),
+                "{event:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn the_first_failure_is_not_held_up_by_later_messages() {
+            let stalled = Duration::from_secs(5);
+            let mut paths = mailbox();
+            let at = ok(json!({ "id": "x", "parentFolderId": "inbox-id" }));
+            paths.insert("/me/messages/m1".into(), at.clone());
+            paths.insert("/me/messages/m2".into(), ResponseTemplate::new(503));
+            paths.insert("/me/messages/m3".into(), at.set_delay(stalled));
+            let server = serve_paths(paths).await;
+            let started = Instant::now();
+            let event = serve(
+                &store(&server),
+                Request::StillThere {
+                    folder: FolderId::new("inbox-id"),
+                    ids: ["m1", "m2", "m3"].map(MessageId::new).to_vec(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(event, Event::StillThere(Err(Error::Network(_)))),
+                "{event:?}"
+            );
+            assert!(started.elapsed() < stalled / 2, "{:?}", started.elapsed());
+        }
+
+        /// [`mailbox`], with `List 0` to `List 19` (`l0`, ...) in the
+        /// Inbox, each with no unread mail.
+        fn lists() -> HashMap<String, ResponseTemplate> {
+            let mut paths = mailbox();
+            for i in 0..20 {
+                let id = format!("l{i}");
+                paths.insert(
+                    format!("/me/mailFolders/{id}"),
+                    ok(folder(&id, &format!("List {i}"), "inbox-id", 0)),
+                );
+                paths.insert(
+                    format!("/me/mailFolders/{id}/messages"),
+                    ok(json!({ "value": [] })),
+                );
+            }
+            paths
+        }
+
+        fn list_path(i: usize) -> FolderPath {
+            FolderPath::WellKnown(WellKnownFolder::Inbox, vec![format!("List {i}")])
+        }
+
+        #[tokio::test]
+        async fn checking_mailboxes_looks_up_their_parents_once() {
+            let server = serve_paths(lists()).await;
+            let since = Some(DateTime::UNIX_EPOCH);
+            let mailboxes = (0..20)
+                .map(|i| (list_path(i), Some(FolderId::new(format!("l{i}"))), since))
+                .collect();
+            let event = serve(&store(&server), Request::CheckMailboxes(mailboxes)).await;
+            let Event::MailboxesChecked(checked) = event else {
+                panic!("expected the mailboxes checked, got {event:?}");
+            };
+            for (i, (path, checked)) in checked.into_iter().enumerate() {
+                assert_eq!(path, list_path(i));
+                assert_eq!(checked.unwrap().folder.id, FolderId::new(format!("l{i}")));
+            }
+            let requests = requests(&server).await;
+            let count = |at: &str| requests.iter().filter(|p| *p == at).count();
+            assert_eq!(count("/me/mailFolders/inbox"), 1, "{requests:?}");
+            for i in 0..20 {
+                assert_eq!(count(&format!("/me/mailFolders/l{i}")), 1);
+                assert_eq!(count(&format!("/me/mailFolders/l{i}/messages")), 1);
+            }
+            assert!(listings(&requests).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_mailbox_gone_is_looked_for_level_by_level() {
+            let mut paths = large_tree();
+            paths.extend(lists());
+            paths.insert(
+                "/me/mailFolders/arc-2024/messages".into(),
+                ok(json!({ "value": [] })),
+            );
+            let server = serve_paths(paths).await;
+            let mailboxes = vec![
+                (list_path(0), Some(FolderId::new("l0")), None),
+                // Deleted: looked for by its path.
+                (archive_2024(), Some(FolderId::new("gone")), None),
+                (
+                    FolderPath::Named(vec!["Archive".into(), "1999".into()]),
+                    Some(FolderId::new("gone too")),
+                    None,
+                ),
+            ];
+            let event = serve(&store(&server), Request::CheckMailboxes(mailboxes)).await;
+            let Event::MailboxesChecked(checked) = event else {
+                panic!("expected the mailboxes checked, got {event:?}");
+            };
+            assert_eq!(
+                checked[0].1.as_ref().unwrap().folder.id,
+                FolderId::new("l0")
+            );
+            assert_eq!(
+                checked[1].1.as_ref().unwrap().folder.id,
+                FolderId::new("arc-2024")
+            );
+            assert!(matches!(checked[2].1, Err(Error::NotFound { .. })));
+            // Each level listed once for both.
+            let requests = requests(&server).await;
+            assert_eq!(
+                listings(&requests),
+                ["/me/mailFolders", "/me/mailFolders/arc/childFolders"]
+            );
+        }
     }
 }

@@ -89,6 +89,21 @@ pub trait MailStore: Send + Sync {
     /// Lists all folders in the mailbox.
     fn list_folders(&self) -> impl Future<Output = Result<Vec<Folder>>> + Send;
 
+    /// Lists the folders directly below `parent` (without one, the
+    /// top-level folders), as [`MailStore::list_folders`] gives them and
+    /// in the same order. Finding a folder by its path takes one listing
+    /// per level, rather than the whole tree.
+    fn child_folders(
+        &self,
+        parent: Option<&FolderId>,
+    ) -> impl Future<Output = Result<Vec<Folder>>> + Send {
+        async move {
+            let mut folders = self.list_folders().await?;
+            folders.retain(|f| f.parent.as_ref() == parent);
+            Ok(folders)
+        }
+    }
+
     /// Returns a folder by its identifier, with fresh counts: polling for
     /// new mail reads these.
     fn folder(&self, id: &FolderId) -> impl Future<Output = Result<Folder>> + Send;
@@ -131,6 +146,12 @@ pub trait MailStore: Send + Sync {
 
     /// Fetches a full message, including its body.
     fn fetch_message(&self, id: &MessageId) -> impl Future<Output = Result<Message>> + Send;
+
+    /// The folder message `id` is in, which [`MailStore::fetch_message`]
+    /// tells too, without fetching the rest of the message.
+    fn message_folder(&self, id: &MessageId) -> impl Future<Output = Result<FolderId>> + Send {
+        async move { Ok(self.fetch_message(id).await?.summary.folder) }
+    }
 
     /// Lists a message's attachments.
     fn list_attachments(

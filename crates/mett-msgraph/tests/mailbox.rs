@@ -287,6 +287,56 @@ async fn finds_when_unread_mail_last_changed() {
 }
 
 #[tokio::test]
+async fn unread_mail_changed_since_a_time_comes_on_one_page() {
+    let server = MockServer::start().await;
+    let page = |from: usize, to: usize, next: Option<String>| {
+        let value: Vec<Value> = (from..to)
+            .map(|i| json!({ "id": format!("m{i}"), "lastModifiedDateTime": "2024-05-01T10:00:00Z" }))
+            .collect();
+        let mut body = json!({ "value": value });
+        if let Some(next) = next {
+            body["@odata.nextLink"] = json!(next);
+        }
+        ResponseTemplate::new(200).set_body_json(body)
+    };
+    route("GET", "/me/mailFolders/inbox-id/messages")
+        .and(query_param("$skip", "250"))
+        .respond_with(page(250, 300, None))
+        .with_priority(1)
+        .expect(0)
+        .mount(&server)
+        .await;
+    route("GET", "/me/mailFolders/inbox-id/messages")
+        .and(query_param(
+            "$filter",
+            "lastModifiedDateTime ge 2024-05-01T00:00:00Z and isRead eq false",
+        ))
+        .and(query_param("$top", "250"))
+        .respond_with(page(
+            0,
+            250,
+            Some(format!(
+                "{}/v1.0/me/mailFolders/inbox-id/messages?$skip=250",
+                server.uri()
+            )),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let since = DateTime::parse_from_rfc3339("2024-05-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let recent = store(&server)
+        .recent_unread(&FolderId::new("inbox-id"), Some(since))
+        .await
+        .unwrap();
+    // The most there are, newest first.
+    let ids: Vec<_> = recent.iter().map(|(id, _)| id.to_string()).collect();
+    let expected: Vec<_> = (0..250).map(|i| format!("m{i}")).collect();
+    assert_eq!(ids, expected);
+}
+
+#[tokio::test]
 async fn reads_where_messages_are_in_their_conversations() {
     use base64::Engine;
 
@@ -392,6 +442,296 @@ async fn lists_nested_folders() {
             ("mett", Some("projects-id")),
         ]
     );
+}
+
+/// Answers the listings of a tree, depth first:
+///
+/// ```text
+/// A ─ A1 ─ A1x
+///   ─ A2
+/// B
+/// C ─ C1 ─ C1x
+/// ```
+///
+/// with A's folders on two pages.
+async fn mount_tree(server: &MockServer) {
+    let listing =
+        |folders: Vec<Value>| ResponseTemplate::new(200).set_body_json(json!({ "value": folders }));
+    server
+        .on(
+            "GET",
+            "/me/mailFolders",
+            listing(vec![
+                child("a", "A", "root-id", 2),
+                child("b", "B", "root-id", 0),
+                child("c", "C", "root-id", 1),
+            ]),
+        )
+        .await;
+    route("GET", "/me/mailFolders/a/childFolders")
+        .and(query_param("$skip", "1"))
+        .respond_with(listing(vec![child("a2", "A2", "a", 0)]))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/a/childFolders",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "value": [child("a1", "A1", "a", 1)],
+                "@odata.nextLink": format!(
+                    "{}/v1.0/me/mailFolders/a/childFolders?$skip=1",
+                    server.uri()
+                ),
+            })),
+        )
+        .await;
+    for (parent, id, name) in [
+        ("a1", "a1x", "A1x"),
+        ("c", "c1", "C1"),
+        ("c1", "c1x", "C1x"),
+    ] {
+        let children = u32::from(id == "c1");
+        server
+            .on(
+                "GET",
+                &format!("/me/mailFolders/{parent}/childFolders"),
+                listing(vec![child(id, name, parent, children)]),
+            )
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn lists_the_tree_depth_first_as_one_listing_at_a_time_would() {
+    let server = MockServer::start().await;
+    mount_roles(&server).await;
+    mount_tree(&server).await;
+    let names: Vec<_> = store(&server)
+        .list_folders()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    // The top level, then always below the last folder found with
+    // folders below it.
+    assert_eq!(names, ["A", "B", "C", "C1", "C1x", "A1", "A2", "A1x"]);
+}
+
+#[tokio::test]
+async fn a_failed_folder_listing_is_the_one_a_walk_would_stop_at() {
+    let server = MockServer::start().await;
+    mount_roles(&server).await;
+    // A is listed before C1, but a walk lists C1 (below the last) first.
+    route("GET", "/me/mailFolders/a/childFolders")
+        .respond_with(ResponseTemplate::new(403))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    route("GET", "/me/mailFolders/c1/childFolders")
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mount_tree(&server).await;
+    let listed = store(&server).list_folders().await;
+    assert!(matches!(listed, Err(Error::Network(_))), "{listed:?}");
+
+    // The roles are looked up meanwhile; failing, they are the answer.
+    server.reset().await;
+    mount_roles_with(&server, 403).await;
+    server
+        .on("GET", "/me/mailFolders", ResponseTemplate::new(503))
+        .await;
+    let listed = store(&server).list_folders().await;
+    assert!(matches!(listed, Err(Error::Auth(_))), "{listed:?}");
+}
+
+/// Longer than any test should take: a request answered this late is
+/// never waited for.
+const STALLED: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn a_decisive_folder_listing_error_is_not_held_up_by_others() {
+    let server = MockServer::start().await;
+    mount_roles(&server).await;
+    server
+        .on(
+            "GET",
+            "/me/mailFolders",
+            ResponseTemplate::new(200).set_body_json(json!({
+                "value": [child("a", "A", "root-id", 1), child("b", "B", "root-id", 1)],
+            })),
+        )
+        .await;
+    // A walk lists B (the last) first, and stops at its failure.
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/a/childFolders",
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "value": [] }))
+                .set_delay(STALLED),
+        )
+        .await;
+    server
+        .on(
+            "GET",
+            "/me/mailFolders/b/childFolders",
+            ResponseTemplate::new(503),
+        )
+        .await;
+    let started = std::time::Instant::now();
+    let listed = store(&server).list_folders().await;
+    assert!(matches!(listed, Err(Error::Network(_))), "{listed:?}");
+    assert!(started.elapsed() < STALLED / 2, "{:?}", started.elapsed());
+
+    // Nor are the roles' by the listing.
+    server.reset().await;
+    mount_roles_with(&server, 403).await;
+    route("GET", "/me/mailFolders")
+        .respond_with(ResponseTemplate::new(503).set_delay(STALLED))
+        .mount(&server)
+        .await;
+    route("GET", "/me/mailFolders/a/childFolders")
+        .respond_with(ResponseTemplate::new(503).set_delay(STALLED))
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    let store = store(&server);
+    let listed = store.list_folders().await;
+    assert!(matches!(listed, Err(Error::Auth(_))), "{listed:?}");
+    let below = store.child_folders(Some(&FolderId::new("a"))).await;
+    assert!(matches!(below, Err(Error::Auth(_))), "{below:?}");
+    assert!(started.elapsed() < STALLED / 2, "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn lists_a_few_folders_at_once() {
+    let server = MockServer::start().await;
+    mount_roles(&server).await;
+    let top: Vec<Value> = (0..8)
+        .map(|i| child(&format!("f{i}"), &format!("F{i}"), "root-id", 1))
+        .collect();
+    server
+        .on(
+            "GET",
+            "/me/mailFolders",
+            ResponseTemplate::new(200).set_body_json(json!({ "value": top })),
+        )
+        .await;
+    let delay = Duration::from_millis(300);
+    for i in 0..8 {
+        server
+            .on(
+                "GET",
+                &format!("/me/mailFolders/f{i}/childFolders"),
+                ResponseTemplate::new(200)
+                    .set_body_json(
+                        json!({ "value": [child(&format!("s{i}"), "S", &format!("f{i}"), 0)] }),
+                    )
+                    .set_delay(delay),
+            )
+            .await;
+    }
+    let started = std::time::Instant::now();
+    let folders = store(&server).list_folders().await.unwrap();
+    // One after the other, the listings would take 8 times the delay.
+    assert!(started.elapsed() < delay * 6, "{:?}", started.elapsed());
+    assert_eq!(folders.len(), 16);
+    let below: Vec<_> = folders[8..].iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(below, ["s7", "s6", "s5", "s4", "s3", "s2", "s1", "s0"]);
+}
+
+#[tokio::test]
+async fn lists_the_folders_below_one_as_the_whole_tree_does() {
+    let server = MockServer::start().await;
+    mount_roles(&server).await;
+    mount_tree(&server).await;
+    let store = store(&server);
+    let all = store.list_folders().await.unwrap();
+    for parent in [None, Some("a"), Some("c1"), Some("a1")] {
+        let parent = parent.map(FolderId::new);
+        server.reset().await;
+        mount_roles(&server).await;
+        mount_tree(&server).await;
+        let below = store.child_folders(parent.as_ref()).await.unwrap();
+        let expected: Vec<_> = all.iter().filter(|f| f.parent == parent).cloned().collect();
+        assert_eq!(below, expected, "below {parent:?}");
+        // One listing (with its pages), and the roles.
+        let requests = server.received_requests().await.unwrap();
+        let listings: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "GET")
+            .map(|r| r.url.path().to_owned())
+            .collect();
+        let at = match &parent {
+            None => "/v1.0/me/mailFolders".to_owned(),
+            Some(id) => format!("/v1.0/me/mailFolders/{id}/childFolders"),
+        };
+        assert!(listings.iter().all(|l| *l == at), "{listings:?}");
+        let pages = if parent == Some(FolderId::new("a")) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(listings.len(), pages);
+        // The first page as a listing of the whole tree asks for it.
+        let first = requests
+            .iter()
+            .find(|r| r.method.as_str() == "GET")
+            .unwrap();
+        let query: Vec<_> = first.url.query_pairs().collect();
+        assert_eq!(
+            query,
+            [
+                ("$top".into(), "100".into()),
+                ("includeHiddenFolders".into(), "true".into())
+            ]
+        );
+    }
+    // The roles label well-known folders, and tell the top level.
+    let top = store.child_folders(None).await.unwrap();
+    assert!(top.iter().all(|f| f.parent.is_none()));
+
+    // Failing, the roles are the answer.
+    server.reset().await;
+    mount_roles_with(&server, 503).await;
+    mount_tree(&server).await;
+    assert!(matches!(
+        store.child_folders(None).await,
+        Err(Error::Network(_))
+    ));
+    server.reset().await;
+    mount_roles(&server).await;
+    assert!(matches!(
+        store.child_folders(Some(&FolderId::new("nope"))).await,
+        Err(Error::NotFound { kind: "folder", id }) if id == "nope"
+    ));
+}
+
+#[tokio::test]
+async fn finds_which_folder_a_message_is_in_without_its_body() {
+    let server = MockServer::start().await;
+    route("GET", "/me/messages/m1")
+        .and(query_param("$select", "id,parentFolderId"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "id": "m1", "parentFolderId": "inbox-id" })),
+        )
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    assert_eq!(
+        store.message_folder(&MessageId::new("m1")).await.unwrap(),
+        FolderId::new("inbox-id")
+    );
+    assert!(matches!(
+        store.message_folder(&MessageId::new("m2")).await,
+        Err(Error::NotFound { kind: "message", id }) if id == "m2"
+    ));
 }
 
 #[tokio::test]
@@ -1868,6 +2208,87 @@ async fn searches_people_and_the_directory() {
         .mount(&server)
         .await;
     assert!(store(&server).search_people("car").await.is_err());
+}
+
+#[tokio::test]
+async fn searches_people_and_the_directory_at_once() {
+    let server = MockServer::start().await;
+    let delay = Duration::from_millis(400);
+    route("GET", "/me/people")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "value": [{
+                        "displayName": "Carol",
+                        "scoredEmailAddresses": [{ "address": "carol@z.org" }],
+                    }],
+                }))
+                .set_delay(delay),
+        )
+        .mount(&server)
+        .await;
+    route("GET", "/users")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "value": [
+                        { "displayName": "Carlos", "mail": "carlos@z.org" },
+                        { "displayName": "Carol J", "mail": "CAROL@z.org" },
+                    ],
+                }))
+                .set_delay(delay),
+        )
+        .mount(&server)
+        .await;
+    let started = std::time::Instant::now();
+    let found: Vec<String> = store(&server)
+        .search_people("car")
+        .await
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(started.elapsed() < delay * 2, "{:?}", started.elapsed());
+    // The people the user works with first, as before.
+    assert_eq!(found, ["Carol <carol@z.org>", "Carlos <carlos@z.org>"]);
+
+    // Failing, the people the user works with are said first.
+    for (people, users, network) in [(503, 400, true), (403, 503, true), (400, 503, false)] {
+        server.reset().await;
+        server
+            .on("GET", "/me/people", ResponseTemplate::new(people))
+            .await;
+        server
+            .on("GET", "/users", ResponseTemplate::new(users))
+            .await;
+        let found = store(&server).search_people("car").await;
+        match found {
+            Err(Error::Network(_)) => assert!(network, "{people} {users}"),
+            Err(Error::Backend(_)) => assert!(!network, "{people} {users}"),
+            other => panic!("{people} {users}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_people_search_is_not_held_up_by_the_directory() {
+    let server = MockServer::start().await;
+    server
+        .on("GET", "/me/people", ResponseTemplate::new(400))
+        .await;
+    server
+        .on(
+            "GET",
+            "/users",
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "value": [] }))
+                .set_delay(STALLED),
+        )
+        .await;
+    let started = std::time::Instant::now();
+    let found = store(&server).search_people("car").await;
+    assert!(matches!(found, Err(Error::Backend(_))), "{found:?}");
+    assert!(started.elapsed() < STALLED / 2, "{:?}", started.elapsed());
 }
 
 /// A recalled postponed message, `d1`.

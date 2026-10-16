@@ -13,7 +13,7 @@ use mett_core::{
     AccessToken, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body, BodyKind,
     Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
     Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor,
-    RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder,
+    RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder, join_bounded_until,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -411,6 +411,96 @@ impl<A: Authenticator> GraphMailStore<A> {
 /// Graph's well-known name for the hidden root of the folder tree.
 const ROOT: &str = "msgfolderroot";
 
+/// How many folder listings [`MailStore::list_folders`] makes at once: a
+/// large tree is listed sooner, without flooding Graph.
+const LISTINGS_AT_ONCE: usize = 4;
+
+impl<A: Authenticator> GraphMailStore<A> {
+    /// The folders directly below `parent` (without one, the top-level
+    /// folders), every page of them, in Graph's order.
+    async fn subfolders(&self, parent: Option<&str>) -> Result<Vec<GraphFolder>> {
+        let (mut url, about) = match parent {
+            None => (self.url(&["me", "mailFolders"]), About::MAILBOX),
+            Some(id) => (
+                self.url(&["me", "mailFolders", id, "childFolders"]),
+                About::folder(id),
+            ),
+        };
+        url.query_pairs_mut()
+            .append_pair("$top", "100")
+            .append_pair("includeHiddenFolders", "true");
+        let mut folders = Vec::new();
+        loop {
+            let page: Collection<GraphFolder> = self.get(url, about).await?;
+            folders.extend(page.value);
+            match page.next_link {
+                Some(next) => url = self.next_page_url(&next)?,
+                None => return Ok(folders),
+            }
+        }
+    }
+}
+
+/// `first` and `second` at once, as if `first` came first: its error is
+/// the answer as soon as it is known, without waiting for `second`.
+async fn first_then<T, U>(
+    first: impl Future<Output = Result<T>>,
+    second: impl Future<Output = U>,
+) -> Result<(T, U)> {
+    tokio::pin!(first, second);
+    tokio::select! {
+        biased;
+        first = &mut first => Ok((first?, second.await)),
+        second = &mut second => Ok((first.await?, second)),
+    }
+}
+
+/// The folders of a successful `listing` that have folders below them.
+fn with_children(listing: Option<&Result<Vec<GraphFolder>>>) -> Vec<String> {
+    match listing {
+        Some(Ok(folders)) => folders
+            .iter()
+            .filter(|f| f.child_folder_count > 0)
+            .map(|f| f.id.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The folder listings made so far, by the folder they list (`None` for
+/// the top level).
+type Listings = HashMap<Option<String>, Result<Vec<GraphFolder>>>;
+
+/// How a walk down the folder tree, one listing at a time, would go with
+/// the listings made so far.
+enum Walk<'a> {
+    /// It lists every folder, from these listings, in this order.
+    Listed(Vec<Option<String>>),
+    /// It stops at this error.
+    Failed(&'a Error),
+    /// It needs a listing not made yet.
+    Unlisted,
+}
+
+/// How a depth-first walk down the tree, one listing at a time, goes with
+/// `listings`: it lists the top level, then each time the folders below the
+/// last folder found (and not listed yet) that has any. This is the order
+/// [`MailStore::list_folders`] gives the folders in.
+/// `listed` gives each listing made so far.
+fn walk<'a>(listed: impl Fn(&Option<String>) -> Option<&'a Result<Vec<GraphFolder>>>) -> Walk<'a> {
+    let mut pending = vec![None];
+    let mut order = Vec::new();
+    while let Some(parent) = pending.pop() {
+        match listed(&parent) {
+            None => return Walk::Unlisted,
+            Some(Err(e)) => return Walk::Failed(e),
+            Some(listing) => pending.extend(with_children(Some(listing)).into_iter().map(Some)),
+        }
+        order.push(parent);
+    }
+    Walk::Listed(order)
+}
+
 impl<A: Authenticator> MailStore for GraphMailStore<A> {
     async fn own_addresses(&self) -> Result<Vec<String>> {
         let mut url = self.url(&["me"]);
@@ -472,10 +562,34 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .append_pair("$search", &quoted)
             .append_pair("$top", "20")
             .append_pair("$select", "displayName,scoredEmailAddresses");
+        let people = self.get::<Collection<Person>>(url, About::MAILBOX);
+        // The whole directory (User.ReadBasic.All).
+        let mut url = self.url(&["users"]);
+        let term = text.replace(['"', '\\'], " ");
+        url.query_pairs_mut()
+            .append_pair(
+                "$search",
+                &format!("\"displayName:{term}\" OR \"mail:{term}\""),
+            )
+            .append_pair("$top", "20")
+            .append_pair("$select", "displayName,mail");
+        let request = self
+            .request(Method::GET, url)
+            .header("ConsistencyLevel", "eventual");
+        let users = self.json::<Collection<User>>(request, About::MAILBOX);
         // Either search may be refused (the app may not have its
         // permission): the other's results are what there is.
         let refused = |e: &Error| matches!(e, Error::Auth(_));
-        let people = self.get::<Collection<Person>>(url, About::MAILBOX).await;
+        // Both at once; their results are taken in turn, as if one came
+        // after the other: the people's failure (but a refusal) is the
+        // answer as soon as it is known.
+        let people = async {
+            match people.await {
+                Err(e) if !refused(&e) => Err(e),
+                people => Ok(people),
+            }
+        };
+        let (people, users) = first_then(people, users).await?;
         let people_refused = match people {
             Ok(people) => {
                 for person in people.value {
@@ -490,20 +604,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             Err(e) if refused(&e) => Some(e),
             Err(e) => return Err(e),
         };
-        // The whole directory (User.ReadBasic.All).
-        let mut url = self.url(&["users"]);
-        let term = text.replace(['"', '\\'], " ");
-        url.query_pairs_mut()
-            .append_pair(
-                "$search",
-                &format!("\"displayName:{term}\" OR \"mail:{term}\""),
-            )
-            .append_pair("$top", "20")
-            .append_pair("$select", "displayName,mail");
-        let request = self
-            .request(Method::GET, url)
-            .header("ConsistencyLevel", "eventual");
-        match self.json::<Collection<User>>(request, About::MAILBOX).await {
+        match users {
             Ok(users) => {
                 for user in users.value {
                     add(user.display_name, user.mail);
@@ -521,36 +622,73 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn list_folders(&self) -> Result<Vec<Folder>> {
-        let roles = self.roles().await?;
-        let top = |mut url: Url| {
-            url.query_pairs_mut()
-                .append_pair("$top", "100")
-                .append_pair("includeHiddenFolders", "true");
-            url
-        };
         // `/me/mailFolders` lists only top-level folders; walk down through
-        // `childFolders` for the rest.
-        let mut pending = vec![(top(self.url(&["me", "mailFolders"])), None)];
+        // `childFolders` for the rest, a level at a time, a few listings at
+        // once. The roles are looked up meanwhile; failing, they are what
+        // is reported, as if looked up first.
+        let (roles, top) = first_then(self.roles(), self.subfolders(None)).await?;
+        let mut listings: Listings = HashMap::from([(None, Ok(top?))]);
+        let mut level = with_children(listings.get(&None));
+        let mut failed = false;
+        while !level.is_empty() {
+            // The error a walk one listing at a time would stop at comes
+            // back once it is known that none comes before it, without
+            // waiting for the other listings.
+            let listed = join_bounded_until(
+                level
+                    .iter()
+                    .map(|id| self.subfolders(Some(id.as_str())))
+                    .collect(),
+                LISTINGS_AT_ONCE,
+                |listed| {
+                    failed |= listed.iter().flatten().any(Result::is_err);
+                    failed
+                        && matches!(
+                            walk(|parent| match parent {
+                                Some(id) => match level.iter().position(|l| l == id) {
+                                    Some(at) => listed[at].as_ref(),
+                                    None => listings.get(parent),
+                                },
+                                None => listings.get(parent),
+                            }),
+                            Walk::Failed(_)
+                        )
+                },
+            )
+            .await;
+            let mut next = Vec::new();
+            for (id, listing) in level.iter().zip(listed) {
+                let Some(listing) = listing else {
+                    continue;
+                };
+                let key = Some(id.clone());
+                listings.insert(key.clone(), listing);
+                next.extend(with_children(listings.get(&key)));
+            }
+            level = next;
+            if failed && let Walk::Failed(e) = walk(|parent| listings.get(parent)) {
+                return Err(e.clone());
+            }
+        }
+        let order = match walk(|parent| listings.get(parent)) {
+            Walk::Listed(order) => order,
+            Walk::Failed(e) => return Err(e.clone()),
+            Walk::Unlisted => unreachable!("the folders below every one listed were listed"),
+        };
         let mut folders = Vec::new();
-        while let Some((mut url, parent)) = pending.pop() {
-            loop {
-                let about = parent.as_deref().map_or(About::MAILBOX, About::folder);
-                let page: Collection<GraphFolder> = self.get(url, about).await?;
-                for folder in page.value {
-                    if folder.child_folder_count > 0 {
-                        let children =
-                            top(self.url(&["me", "mailFolders", &folder.id, "childFolders"]));
-                        pending.push((children, Some(folder.id.clone())));
-                    }
-                    folders.push(roles.folder(folder));
-                }
-                match page.next_link {
-                    Some(next) => url = self.next_page_url(&next)?,
-                    None => break,
-                }
+        for parent in order {
+            if let Some(Ok(listing)) = listings.remove(&parent) {
+                folders.extend(listing.into_iter().map(|f| roles.folder(f)));
             }
         }
         Ok(folders)
+    }
+
+    async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
+        // The roles label the folders as in a listing of them all.
+        let (roles, listing) =
+            first_then(self.roles(), self.subfolders(parent.map(FolderId::as_str))).await?;
+        Ok(listing?.into_iter().map(|f| roles.folder(f)).collect())
     }
 
     async fn folder(&self, id: &FolderId) -> Result<Folder> {
@@ -589,9 +727,15 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             // which was is told by its ID.
             |since| format!("ge {}", since.to_rfc3339_opts(SecondsFormat::Secs, true)),
         );
+        // Without `since`, the last few tell; with it, all of them, up to a
+        // limit, which one page holds.
+        let (top, wanted) = match since {
+            Some(_) => (RECENT_UNREAD, RECENT_UNREAD),
+            None => (50, 10),
+        };
         let mut url = self.url(&["me", "mailFolders", folder.as_str(), "messages"]);
         url.query_pairs_mut()
-            .append_pair("$top", "50")
+            .append_pair("$top", &top.to_string())
             .append_pair("$select", "id,lastModifiedDateTime")
             // Graph wants the sorted property filtered too, first.
             .append_pair(
@@ -607,9 +751,6 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
                     .map_err(|e| Error::Backend(format!("invalid lastModifiedDateTime: {e}")))?;
                 recent.push((MessageId::new(m.id), at.with_timezone(&Utc)));
             }
-            // Without `since`, the last few tell; with it, all of them, up
-            // to a limit.
-            let wanted = if since.is_some() { RECENT_UNREAD } else { 10 };
             match page.next_link {
                 Some(next) if recent.len() < wanted => url = self.next_page_url(&next)?,
                 _ => break,
@@ -668,6 +809,19 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .header("Prefer", "outlook.body-content-type=\"text\"");
         let message: GraphMessage = self.json(request, About::message(id.as_str())).await?;
         message.into_message()
+    }
+
+    async fn message_folder(&self, id: &MessageId) -> Result<FolderId> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Located {
+            parent_folder_id: String,
+        }
+        let mut url = self.url(&["me", "messages", id.as_str()]);
+        url.query_pairs_mut()
+            .append_pair("$select", "id,parentFolderId");
+        let located: Located = self.get(url, About::message(id.as_str())).await?;
+        Ok(FolderId::new(located.parent_folder_id))
     }
 
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
@@ -778,7 +932,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         response
             .bytes()
             .await
-            .map(|bytes| bytes.to_vec())
+            .map(Vec::from)
             .map_err(|e| Error::Network(e.to_string()))
     }
 }
@@ -1258,6 +1412,12 @@ impl<A: Authenticator> GraphMailStore<A> {
                 .iter()
                 .any(|u| u.id.as_deref() == Some(a.id.as_str()))
         };
+        // Each file's digest, worked out once, if any upload was lost.
+        let digests: Vec<[u8; 32]> = if uploads.iter().any(|u| u.id.is_none()) {
+            draft.attachments.iter().map(|f| digest(&f.data)).collect()
+        } else {
+            Vec::new()
+        };
         for upload in uploads.iter().filter(|u| u.id.is_none()) {
             // Taken off, or put in its place by a file of other contents
             // (or fewer of the same than lost uploads): the one uploaded
@@ -1270,7 +1430,8 @@ impl<A: Authenticator> GraphMailStore<A> {
             let wanted = draft
                 .attachments
                 .iter()
-                .filter(|f| same(&f.name, &f.content_type, &digest(&f.data)))
+                .zip(&digests)
+                .filter(|(f, digest)| same(&f.name, &f.content_type, digest))
                 .count();
             // (A copy may then go twice, as with any lost upload; more of
             // them lost than are wanted can't be told apart.)
@@ -1411,32 +1572,82 @@ pub fn needs_server_draft(draft: &Draft) -> bool {
     }
     // Otherwise, the request as sent: escaping may make the text much
     // larger.
-    serde_json::to_vec(&send_mail_json(draft)).map_or(true, |bytes| bytes.len() > INLINE_REQUEST)
+    send_mail_size(draft).map_or(true, |size| size > INLINE_REQUEST)
+}
+
+/// The size of the `sendMail` request for `draft` ([`send_mail_json`]),
+/// worked out without encoding its attachments: base64 needs no escaping
+/// in JSON, so the request is as long as one with every file's
+/// `contentBytes` empty, and their base64 besides.
+fn send_mail_size(draft: &Draft) -> serde_json::Result<usize> {
+    /// Counts what is written to it.
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, &send_mail_json_with(draft, |_| String::new()))?;
+    let encoded: usize = draft
+        .attachments
+        .iter()
+        .map(|a| a.data.len().div_ceil(3) * 4)
+        .sum();
+    Ok(counter.0 + encoded)
 }
 
 /// A `sendMail` request for `draft`, which goes with its attachments.
 fn send_mail_json(draft: &Draft) -> serde_json::Value {
+    send_mail_json_with(draft, in_base64)
+}
+
+/// [`send_mail_json`], with `content` for each file's `contentBytes`.
+fn send_mail_json_with(draft: &Draft, content: fn(&[u8]) -> String) -> serde_json::Value {
     json!({
-        "message": message_json(draft, true),
+        "message": message_json_with(draft, Some(content)),
         "saveToSentItems": draft.save_copy,
     })
 }
 
-/// A Graph `fileAttachment` resource for `file`.
-fn file_attachment_json(file: &OutgoingAttachment) -> serde_json::Value {
+/// `data` in base64, as Graph takes a file's content.
+fn in_base64(data: &[u8]) -> String {
     use base64::Engine;
 
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// A Graph `fileAttachment` resource for `file`.
+fn file_attachment_json(file: &OutgoingAttachment) -> serde_json::Value {
+    file_attachment_json_with(file, in_base64)
+}
+
+/// [`file_attachment_json`], with `content` for its `contentBytes`.
+fn file_attachment_json_with(
+    file: &OutgoingAttachment,
+    content: fn(&[u8]) -> String,
+) -> serde_json::Value {
     json!({
         "@odata.type": "#microsoft.graph.fileAttachment",
         "name": file.name,
         "contentType": file.content_type,
-        "contentBytes": base64::engine::general_purpose::STANDARD.encode(&file.data),
+        "contentBytes": content(&file.data),
     })
 }
 
 /// A Graph `message` resource with `draft`'s content, and its attachments
 /// if `attachments`.
 fn message_json(draft: &Draft, attachments: bool) -> serde_json::Value {
+    message_json_with(draft, attachments.then_some(in_base64))
+}
+
+/// [`message_json`], with its attachments if given `content` for their
+/// `contentBytes`.
+fn message_json_with(draft: &Draft, content: Option<fn(&[u8]) -> String>) -> serde_json::Value {
     let recipients = |list: &[Address]| -> Vec<serde_json::Value> {
         list.iter()
             .map(|a| {
@@ -1458,8 +1669,14 @@ fn message_json(draft: &Draft, attachments: bool) -> serde_json::Value {
     if let Some(from) = &draft.from {
         message["from"] = recipients(std::slice::from_ref(from)).remove(0);
     }
-    if attachments && !draft.attachments.is_empty() {
-        message["attachments"] = draft.attachments.iter().map(file_attachment_json).collect();
+    if let Some(content) = content
+        && !draft.attachments.is_empty()
+    {
+        message["attachments"] = draft
+            .attachments
+            .iter()
+            .map(|file| file_attachment_json_with(file, content))
+            .collect();
     }
     message
 }
@@ -1895,4 +2112,93 @@ struct Rest {
     reply_to: Vec<Recipient>,
     internet_message_id: Option<String>,
     body: Option<ItemBody>,
+}
+
+#[cfg(test)]
+mod tests {
+    use mett_core::{AccessToken, Address};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    /// Drafts of every shape the size of a request depends on.
+    fn drafts() -> Vec<Draft> {
+        let file = |name: &str, size: usize| OutgoingAttachment {
+            name: name.into(),
+            content_type: "application/octet-stream".into(),
+            data: (0..size).map(|i| (i * 7) as u8).collect(),
+        };
+        let plain = Draft {
+            to: vec![Address::new("bob@fabrikam.com").with_name("Bob \"B\" Smith")],
+            subject: "Héllo\t\u{1}".into(),
+            body: "Line \\ one\nlíne \"two\" \u{7f}\u{2028}".into(),
+            save_copy: true,
+            ..Draft::default()
+        };
+        let mut drafts = vec![plain.clone()];
+        for sizes in [
+            vec![0],
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![4, 5, 6],
+            vec![1000, 99_999],
+        ] {
+            let mut draft = plain.clone();
+            draft.attachments = sizes
+                .iter()
+                .enumerate()
+                .map(|(i, size)| file(&format!("f\"{i}\\é.bin"), *size))
+                .collect();
+            draft.from = (sizes.len() > 1).then(|| Address::new("me@contoso.com"));
+            draft.cc = vec![Address::new("c@z.org"); sizes.len()];
+            draft.save_copy = sizes.len() % 2 == 0;
+            drafts.push(draft);
+        }
+        drafts
+    }
+
+    #[test]
+    fn measures_the_send_mail_request_without_encoding_it() {
+        for draft in drafts() {
+            let sent = serde_json::to_vec(&send_mail_json(&draft)).unwrap();
+            assert_eq!(send_mail_size(&draft).unwrap(), sent.len(), "{draft:?}");
+        }
+    }
+
+    /// Hands out a fixed token.
+    struct StaticAuth;
+
+    impl Authenticator for StaticAuth {
+        async fn access_token(&self) -> Result<AccessToken> {
+            Ok(AccessToken::new(
+                "tok",
+                Utc::now() + chrono::TimeDelta::hours(1),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_the_request_measured() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let settings = AuthSettings {
+            graph_url: Some(Url::parse(&server.uri()).unwrap()),
+            ..AuthSettings::new("alice@contoso.com".into(), "client")
+        };
+        let store = GraphMailStore::new(reqwest::Client::new(), &settings, Arc::new(StaticAuth));
+        for draft in drafts() {
+            assert!(!needs_server_draft(&draft));
+            MailSender::send(&store, &draft).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let sent = &requests.last().unwrap().body;
+            assert_eq!(*sent, serde_json::to_vec(&send_mail_json(&draft)).unwrap());
+            assert_eq!(sent.len(), send_mail_size(&draft).unwrap());
+        }
+    }
 }
