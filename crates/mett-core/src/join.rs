@@ -6,8 +6,9 @@ use std::task::Poll;
 
 /// Runs `futures`, at most `limit` at a time, and gives their outputs in
 /// order: a slow one doesn't hold up the others, nor do many at once flood
-/// a backend.
+/// a backend. A `limit` of 0 runs them one at a time.
 pub async fn join_bounded<F: Future>(futures: Vec<F>, limit: usize) -> Vec<F::Output> {
+    let limit = limit.max(1);
     let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
     let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
     std::future::poll_fn(|cx| {
@@ -62,5 +63,11 @@ mod tests {
         let done = join_bounded(futures, 3).await;
         assert_eq!(done, (0..10).collect::<Vec<_>>());
         assert_eq!(most.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_limit_of_zero_runs_one_at_a_time() {
+        let futures = (0..3).map(|i| async move { i }).collect();
+        assert_eq!(join_bounded(futures, 0).await, [0, 1, 2]);
     }
 }
