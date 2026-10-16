@@ -34,7 +34,7 @@ pub use self::newmail::MailboxEntry;
 pub use self::query::{QueryMenu, QuerySettings};
 pub use self::recall::PostponedMenu;
 pub use self::search::{Limit, highlighted};
-pub use self::sidebar::{Sidebar, SidebarSettings, SidebarSort};
+pub use self::sidebar::{Sidebar, SidebarEntry, SidebarSettings, SidebarSort};
 pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
 use crate::compose::Kind;
@@ -612,8 +612,11 @@ pub struct App {
     path: FolderPath,
     /// The request opening the folder, while it is pending.
     opening: Option<RequestId>,
-    /// Terminal width, in cells.
+    /// The width of the menus, in cells: the terminal's, but for the
+    /// sidebar's.
     pub width: usize,
+    /// Terminal width, in cells.
+    terminal_width: usize,
     /// Rows available for the index or pager body.
     pub body_height: usize,
     /// The request whose messages the index is waiting for, if any.
@@ -817,6 +820,7 @@ impl App {
             path,
             opening: None,
             width: usize::from(width),
+            terminal_width: usize::from(width),
             body_height: body_height(height),
             listing: None,
             listing_page: None,
@@ -955,10 +959,9 @@ impl App {
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
             Msg::Resize { width, height } => {
-                self.width = usize::from(width);
+                self.terminal_width = usize::from(width);
                 self.body_height = body_height(height);
-                self.clamp_scroll();
-                self.clamp_sign_in_scroll();
+                self.relayout();
                 Vec::new()
             }
         }
@@ -1225,7 +1228,8 @@ impl App {
         // The window covers all but the help line, and has a border above
         // and below its text.
         let room = (self.body_height + CHROME_ROWS).saturating_sub(3);
-        let width = self.width;
+        // Across the whole terminal, over the sidebar too.
+        let width = self.terminal_width;
         if let Some(window) = &mut self.sign_in {
             let last = window.rows(width).len().saturating_sub(room);
             window.scroll = window.scroll.min(last);

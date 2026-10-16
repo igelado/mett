@@ -2,7 +2,10 @@
 //! model and never changes it.
 //!
 //! The layout follows mutt: a help line at the top, the index or pager in
-//! the middle, a status bar, and a message line at the bottom.
+//! the middle (with the sidebar beside it, when shown), a status bar, and
+//! a message line at the bottom.
+
+mod sidebar;
 
 use std::ops::Range;
 
@@ -145,6 +148,12 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
     let colors = &app.display.colors;
     // Text without colors of its own is `normal`.
     frame.render_widget(Block::new().style(colors.normal), frame.area());
+    // As in mutt, the sidebar is beside the menu only: the help line and
+    // the status bar span the screen.
+    let (body, side) = sidebar::split(app, body);
+    if let Some(side) = side {
+        sidebar::render(app, frame, side);
+    }
 
     frame.render_widget(
         Paragraph::new(help_line(app, keymap, app.menu())).style(colors.status),
@@ -158,10 +167,10 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
                 app,
                 first,
                 usize::from(body.height),
-                usize::from(body.width),
+                usize::from(status.width),
             )
         }
-        Screen::Pager(pager) => render_pager(app, pager, frame, body),
+        Screen::Pager(pager) => render_pager(app, pager, frame, body, status.width),
         Screen::Compose(compose) => render_compose(compose, colors, frame, body),
         Screen::Browser(browser) => render_browser(browser, colors, frame, body),
         Screen::Help(help) => render_help(app, help, frame, body),
@@ -741,8 +750,14 @@ fn index_status(app: &App, first: usize, height: usize, width: usize) -> String 
 }
 
 /// Draws the pager body, under the mini-index if there is one, and returns
-/// its status line.
-fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> String {
+/// its status line, `status_width` cells wide.
+fn render_pager(
+    app: &App,
+    pager: &Pager,
+    frame: &mut Frame,
+    area: Rect,
+    status_width: u16,
+) -> String {
     // The message as the index shows it: usually the selected one. IDs
     // are unique, so it is the only one.
     let index = if app
@@ -886,7 +901,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
         position: Some(&position),
         thread: None,
     };
-    format::expand(&app.display.pager_format, &entry, usize::from(area.width))
+    format::expand(&app.display.pager_format, &entry, usize::from(status_width))
 }
 
 /// Draws the mini-index (`pager_index_lines`) at the top of `area`, as

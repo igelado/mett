@@ -162,13 +162,40 @@ pub struct Sidebar {
     pub highlight: usize,
 }
 
+impl SidebarSettings {
+    /// How many columns the sidebar takes, its divider included, on a
+    /// terminal `total` columns wide: none while it is hidden; otherwise
+    /// `sidebar_width`, leaving the menus at least a column, as in mutt.
+    pub fn columns(&self, total: usize) -> usize {
+        if !self.visible {
+            return 0;
+        }
+        self.width.min(total.saturating_sub(1))
+    }
+}
+
 impl App {
+    /// The sidebar.
+    pub fn sidebar(&self) -> &Sidebar {
+        &self.sidebar
+    }
+
     /// Takes in the sidebar's settings. A new order puts the cursor back
     /// on the open folder, as in mutt.
     pub(super) fn apply_sidebar(&mut self, settings: SidebarSettings) {
         let resorted = settings.sort != self.sidebar.settings.sort;
         self.sidebar.settings = settings;
         self.rebuild_sidebar(resorted);
+        self.relayout();
+    }
+
+    /// Gives the menus the width the sidebar leaves them, and lays out
+    /// again what was laid out for another.
+    pub(super) fn relayout(&mut self) {
+        let sidebar = self.sidebar.settings.columns(self.terminal_width);
+        self.width = self.terminal_width - sidebar;
+        self.clamp_scroll();
+        self.clamp_sign_in_scroll();
     }
 
     /// Makes the sidebar's entries again from the mailboxes and what is
