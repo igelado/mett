@@ -181,17 +181,26 @@ impl App {
             .mailboxes
             .iter()
             .filter_map(|mailbox| {
+                let path = &mailbox.path;
+                let open = self
+                    .folder
+                    .as_ref()
+                    .filter(|open| self.folder_at(path) == Some(&open.id));
+                // A mailbox that isn't checked has the counts it had when
+                // it was opened.
                 let folder = self
                     .mailbox_state
-                    .get(&mailbox.path)
-                    .and_then(|state| state.folder.as_ref());
+                    .get(path)
+                    .and_then(|state| state.folder.as_ref())
+                    .or(open);
                 let entry = SidebarEntry {
-                    path: mailbox.path.clone(),
+                    path: path.clone(),
                     name: sidebar_name(mailbox, settings),
-                    open: self.is_open(&mailbox.path, folder),
+                    open: open.is_some(),
                     new: self.has_new_mail(mailbox),
                     counts: folder.map(|f| (f.unread_count, f.total_count)),
-                    spoolfile: settings.spoolfile.as_ref() == Some(&mailbox.path),
+                    spoolfile: (settings.spoolfile.as_ref())
+                        .is_some_and(|spoolfile| self.same_mailbox(spoolfile, path)),
                 };
                 // Office365 doesn't count flagged mail: with
                 // `sidebar_new_mail_only`, only new and unread mail shows
@@ -199,7 +208,7 @@ impl App {
                 let shown = !settings.new_mail_only
                     || entry.open
                     || entry.has_mail()
-                    || settings.whitelist.contains(&mailbox.path);
+                    || (settings.whitelist.iter()).any(|listed| self.same_mailbox(listed, path));
                 if !shown {
                     return None;
                 }
@@ -219,7 +228,11 @@ impl App {
             })
             .collect();
         let sort = settings.sort;
-        if sort.method != SortMethod::Unsorted {
+        if sort.method == SortMethod::Unsorted {
+            if sort.reverse {
+                entries.reverse();
+            }
+        } else {
             // Stable: mailboxes alike stay in their order.
             entries.sort_by(|(_, a_key, a_count), (_, b_key, b_count)| {
                 let order = match sort.method {
@@ -245,6 +258,33 @@ impl App {
         }
         .unwrap_or(0);
         self.sidebar.entries = entries;
+    }
+}
+
+impl App {
+    /// The folder at `path`, as far as known: as last checked, as found
+    /// when mail was moved there, or the open folder, if opened by it.
+    fn folder_at(&self, path: &FolderPath) -> Option<&mett_core::FolderId> {
+        let checked = self.mailbox_state.get(path).and_then(|s| s.folder.as_ref());
+        checked
+            .map(|folder| &folder.id)
+            .or_else(|| self.folder_ids.get(path))
+            .or_else(|| {
+                (*path == self.path)
+                    .then_some(self.folder.as_ref())
+                    .flatten()
+                    .map(|open| &open.id)
+            })
+    }
+
+    /// Whether `a` and `b` name the same mailbox: as written (`=@inbox`
+    /// and `=Inbox` are told apart until their folders are known), or as
+    /// found.
+    fn same_mailbox(&self, a: &FolderPath, b: &FolderPath) -> bool {
+        a == b
+            || self
+                .folder_at(a)
+                .is_some_and(|id| self.folder_at(b) == Some(id))
     }
 }
 
@@ -378,6 +418,29 @@ mod tests {
         let whitelisted = with_mailboxes(settings);
         app.update(configured(whitelisted));
         assert_eq!(shown(&app), ["*Inbox", "Work", "Lists"]);
+    }
+
+    #[test]
+    fn knows_the_open_folder_by_another_name() {
+        let mut settings = with_mailboxes(SidebarSettings {
+            new_mail_only: true,
+            sort: SidebarSort::parse("reverse-unsorted").unwrap(),
+            ..SidebarSettings::default()
+        });
+        // `=Inbox`, unchecked, is the Inbox opened as `=@inbox`.
+        settings.mailboxes[0].path = FolderPath::Named(vec!["Inbox".into()]);
+        settings.mailboxes[0].poll = false;
+        settings.sidebar.whitelist = vec![mailbox_path("Work"), mailbox_path("Lists")];
+        let (mut app, _) = mailboxes_app(settings, 80, 24);
+        app.folder_ids.insert(
+            FolderPath::Named(vec!["Inbox".into()]),
+            mett_core::FolderId::new("inbox"),
+        );
+        app.rebuild_sidebar(true);
+        assert_eq!(shown(&app), ["Lists", "Work", "*Inbox"], "reversed");
+        let inbox = &app.sidebar.entries[2];
+        assert!(inbox.open);
+        assert_eq!(inbox.counts, Some((0, 0)), "the open folder's");
     }
 
     #[test]

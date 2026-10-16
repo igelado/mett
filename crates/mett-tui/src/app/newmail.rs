@@ -729,7 +729,7 @@ impl App {
 
     /// Whether the mailbox at `path` (found to be `found`, if it was) is
     /// the open folder.
-    pub(super) fn is_open(&self, path: &FolderPath, found: Option<&Folder>) -> bool {
+    fn is_open(&self, path: &FolderPath, found: Option<&Folder>) -> bool {
         match (&self.folder, found) {
             (Some(open), Some(found)) => open.id == found.id,
             (Some(_), None) => *path == self.path,
