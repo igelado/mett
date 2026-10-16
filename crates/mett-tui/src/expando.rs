@@ -56,6 +56,7 @@ impl Display {
     /// a few rows of the message, it shrinks, and is left out when it
     /// would have no room for an entry.
     pub fn mini_index_rows(&self, messages: usize, height: usize) -> usize {
+        // As in mutt, 1 (or an empty index) leaves only the status bar.
         let wanted = self.pager_index_lines.min(messages.saturating_add(1));
         let room = height.saturating_sub(MIN_PAGER_ROWS);
         if wanted <= room {

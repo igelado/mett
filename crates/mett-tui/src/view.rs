@@ -153,7 +153,7 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
     let status_line = match app.screen() {
         Screen::Index => {
             let first = page_start(app.selected, usize::from(body.height));
-            render_index(app, first, app.selected, frame, body);
+            render_index(app, first, Some(app.selected), frame, body);
             index_status(
                 app,
                 first,
@@ -265,7 +265,7 @@ fn render_page<T>(
     line: impl Fn(usize, &T) -> Line<'static>,
 ) {
     let first = page_start(selected, usize::from(area.height));
-    render_rows(entries, first, selected, indicator, frame, area, line);
+    render_rows(entries, first, Some(selected), indicator, frame, area, line);
 }
 
 /// The first entry of the page of `height` entries with `selected` on it.
@@ -275,11 +275,11 @@ fn page_start(selected: usize, height: usize) -> usize {
 }
 
 /// Draws `entries` from `first` on, as many as fit, as [`render_page`]
-/// does.
+/// does (with no entry in `indicator` if none is `selected`).
 fn render_rows<T>(
     entries: &[T],
     first: usize,
-    selected: usize,
+    selected: Option<usize>,
     indicator: Style,
     frame: &mut Frame,
     area: Rect,
@@ -293,7 +293,7 @@ fn render_rows<T>(
         .take(height)
         .map(|(i, entry)| {
             let line = line(i, entry);
-            if i == selected {
+            if Some(i) == selected {
                 line.style(indicator)
             } else {
                 line
@@ -645,9 +645,9 @@ fn help_line(app: &App, keymap: &Keymap, menu: Menu) -> String {
         .join("  ")
 }
 
-/// Draws the index from entry `first` on, with entry `current` in the
-/// indicator's colors.
-fn render_index(app: &App, first: usize, current: usize, frame: &mut Frame, area: Rect) {
+/// Draws the index from entry `first` on, with entry `current`, if any, in
+/// the indicator's colors.
+fn render_index(app: &App, first: usize, current: Option<usize>, frame: &mut Frame, area: Rect) {
     let width = usize::from(area.width);
     let colors = &app.display.colors;
     let total = app.total_messages();
@@ -696,7 +696,7 @@ fn render_index(app: &App, first: usize, current: usize, frame: &mut Frame, area
             text.push_str(&" ".repeat(width.saturating_sub(used)));
             let line = Line::raw(text);
             // The selected one is in the indicator's colors instead.
-            if i == current {
+            if Some(i) == current {
                 return line;
             }
             line.style(colors.index_style(|pattern| {
@@ -754,7 +754,7 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
     } else {
         app.messages.iter().position(|m| m.id == pager.id)
     };
-    let area = render_mini_index(app, index.unwrap_or(app.selected), frame, area);
+    let area = render_mini_index(app, index, frame, area);
     let Some(message) = &pager.message else {
         frame.render_widget(Paragraph::new("Loading message..."), area);
         return "---mett: loading---".into();
@@ -890,11 +890,12 @@ fn render_pager(app: &App, pager: &Pager, frame: &mut Frame, area: Rect) -> Stri
 }
 
 /// Draws the mini-index (`pager_index_lines`) at the top of `area`, as
-/// mutt does: the index with entry `current` highlighted, about a third of
+/// mutt does: the index with entry `current` highlighted (the open
+/// message, if the index shows it), about a third of
 /// the way down when there are entries before and after it, and the
 /// index's status bar under it. Returns the rest of `area`, for the
 /// message.
-fn render_mini_index(app: &App, current: usize, frame: &mut Frame, area: Rect) -> Rect {
+fn render_mini_index(app: &App, current: Option<usize>, frame: &mut Frame, area: Rect) -> Rect {
     let rows = app
         .display
         .mini_index_rows(app.messages.len(), usize::from(area.height));
@@ -909,7 +910,10 @@ fn render_mini_index(app: &App, current: usize, frame: &mut Frame, area: Rect) -
     ])
     .areas(area);
     let height = usize::from(index.height);
-    let first = mini_index_top(current, app.messages.len(), height, usize::from(rows) / 3);
+    // Until the index lists the open message again (as a refresh does),
+    // around the selected entry, with none highlighted.
+    let around = current.unwrap_or(app.selected);
+    let first = mini_index_top(around, app.messages.len(), height, usize::from(rows) / 3);
     render_index(app, first, current, frame, index);
     let line = index_status(app, first, height, usize::from(status.width));
     frame.render_widget(
@@ -1388,6 +1392,21 @@ mod tests {
         let lines = sized_screen(&app, WIDTH, 16);
         assert_eq!(numbers(&lines[1..4]), [8, 9, 10], "{lines:#?}");
         assert_eq!(drawn(&app, WIDTH, 16)[(5, 3)].bg, Color::Yellow);
+    }
+
+    #[test]
+    fn the_mini_index_highlights_nothing_while_the_open_message_isnt_listed() {
+        use ratatui::style::Color;
+        let mut app = app(10);
+        with_mini_index(&mut app, 4, 16);
+        colored(&mut app, &["color indicator black yellow"]);
+        read(&mut app, Action::DisplayMessage, "Body");
+        // As while a refresh lists the folder again.
+        app.messages.retain(|m| m.id.as_str() != "m0");
+        let buffer = drawn(&app, WIDTH, 16);
+        for y in 1..4 {
+            assert_ne!(buffer[(5, y)].bg, Color::Yellow, "row {y}");
+        }
     }
 
     #[test]
