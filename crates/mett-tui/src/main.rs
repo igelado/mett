@@ -1257,6 +1257,35 @@ fn discard_pending_input() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The demo's configuration, as `:` commands change it.
+    struct Commanded {
+        config: config::Config,
+        settings: Settings,
+        signature: Option<String>,
+    }
+
+    impl Commanded {
+        /// With `home` as the home directory, and no signature read yet.
+        fn demo(home: &str) -> Self {
+            let (config, settings) = demo_config(Some(home.into()));
+            Self {
+                config,
+                settings,
+                signature: None,
+            }
+        }
+
+        fn run(&mut self, command: &str) -> app::Reconfigured {
+            run_command(
+                &mut self.config,
+                &self.settings.account,
+                &mut self.signature,
+                command,
+            )
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1335,26 +1364,14 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&new).unwrap(), "alias x x@y\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
-    use super::*;
 
     #[test]
     fn a_command_that_breaks_the_settings_is_undone() {
-        let (mut config, settings) = demo_config(Some("/home/alice".into()));
-        let mut signature = None;
-        let broken = run_command(
-            &mut config,
-            &settings.account,
-            &mut signature,
-            "set signature=/nonexistent/mett/signature",
-        );
+        let mut demo = Commanded::demo("/home/alice");
+        let broken = demo.run("set signature=/nonexistent/mett/signature");
         assert!(broken.settings.is_err());
         // The next command works on what was there before.
-        let next = run_command(
-            &mut config,
-            &settings.account,
-            &mut signature,
-            "set resolve=no",
-        );
+        let next = demo.run("set resolve=no");
         assert!(!next.settings.unwrap().resolve);
     }
 
@@ -1379,36 +1396,24 @@ mod tests {
     fn naming_the_default_signature_checks_it() {
         let home = std::env::temp_dir().join(format!("mett-home-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        let (mut config, settings) = demo_config(Some(home.display().to_string()));
-        let mut signature = None;
+        let mut demo = Commanded::demo(&home.display().to_string());
         // ~/.signature doesn't exist: fine as the default, not when named.
-        let named = run_command(
-            &mut config,
-            &settings.account,
-            &mut signature,
-            "set signature=~/.signature",
-        );
+        let named = demo.run("set signature=~/.signature");
         assert!(named.settings.is_err());
         std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
     fn mailbox_settings_wait_for_a_restart() {
-        let (mut config, settings) = demo_config(Some("/home/alice".into()));
-        let mut signature = None;
-        let done = run_command(
-            &mut config,
-            &settings.account,
-            &mut signature,
-            "set msgraph_client_id=abc msgraph_page_size=10",
-        );
+        let mut demo = Commanded::demo("/home/alice");
+        let done = demo.run("set msgraph_client_id=abc msgraph_page_size=10");
         assert_eq!(
             done.outcome,
             Ok(vec![
                 "msgraph_client_id: takes effect when mett starts again".to_owned()
             ])
         );
-        assert_eq!(config.string("msgraph_client_id"), "abc", "kept");
+        assert_eq!(demo.config.string("msgraph_client_id"), "abc", "kept");
     }
 
     #[test]
@@ -1417,32 +1422,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("signature");
         std::fs::write(&path, "-- \nAlice\n").unwrap();
-        let (mut config, settings) = demo_config(Some("/home/alice".into()));
-        let mut signature = None;
+        let mut demo = Commanded::demo("/home/alice");
         let set = format!("set signature={}", path.display());
-        let first = run_command(&mut config, &settings.account, &mut signature, &set);
+        let first = demo.run(&set);
         assert!(first.settings.is_ok());
-        assert_eq!(signature.as_deref(), Some("-- \nAlice\n"));
+        assert_eq!(demo.signature.as_deref(), Some("-- \nAlice\n"));
         // The file goes away; commands about other things still work.
         std::fs::remove_file(&path).unwrap();
-        let other = run_command(
-            &mut config,
-            &settings.account,
-            &mut signature,
-            "set resolve=no",
-        );
-        let other = other.settings.unwrap();
+        let other = demo.run("set resolve=no").settings.unwrap();
         assert!(!other.resolve);
         assert_eq!(other.compose.signature.as_deref(), Some("-- \nAlice\n"));
         // Setting it again reads it, and fails.
-        let again = run_command(&mut config, &settings.account, &mut signature, &set);
+        let again = demo.run(&set);
         assert!(again.settings.is_ok(), "unchanged value: not read again");
-        let reset = run_command(
-            &mut config,
-            &settings.account,
-            &mut signature,
-            "set signature=/nonexistent/mett/other",
-        );
+        let reset = demo.run("set signature=/nonexistent/mett/other");
         assert!(reset.settings.is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1516,17 +1509,12 @@ mod tests {
 
     #[test]
     fn a_failing_command_changes_nothing() {
-        let (mut config, settings) = demo_config(Some("/home/alice".into()));
-        let mut signature = settings.compose.signature.clone();
-        let before = config.clone();
+        let mut demo = Commanded::demo("/home/alice");
+        demo.signature = demo.settings.compose.signature.clone();
+        let before = demo.config.clone();
         // The first command works, the second doesn't: neither stays.
-        let done = run_command(
-            &mut config,
-            &settings.account,
-            &mut signature,
-            "set resolve=no; set timeout=soon",
-        );
+        let done = demo.run("set resolve=no; set timeout=soon");
         assert!(done.outcome.is_err());
-        assert!(config.changed_since(&before).is_empty());
+        assert!(demo.config.changed_since(&before).is_empty());
     }
 }

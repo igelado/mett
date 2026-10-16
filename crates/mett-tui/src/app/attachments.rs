@@ -615,6 +615,14 @@ fn file_name(attachment: &Attachment) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::DateTime;
+    use mett_core::{AttachmentId, mock};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+    use crate::app::testing::*;
+    use crate::app::{Msg, Settings};
+    use crate::worker::Event;
 
     #[test]
     fn text_is_decoded_in_its_charset() {
@@ -632,42 +640,15 @@ mod tests {
         );
         assert_eq!(decode("text/plain; charset=x-unknown", b"x"), None);
     }
-    use chrono::DateTime;
-    use mett_core::{AttachmentId, MessagePage, WellKnownFolder, mock};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    use super::*;
-    use crate::app::{Msg, Settings};
-    use crate::config::mailbox::FolderPath;
-    use crate::worker::{Event, Response};
 
     fn app() -> App {
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let settings = Settings {
             home: Some("/home/alice".into()),
             ..Settings::default()
         };
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
         let mut message = mock::message("m0", "in", "Files", DateTime::UNIX_EPOCH).summary;
         message.has_attachments = true;
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message],
-                next: None,
-            })),
-        }));
-        app
+        opened(settings, 24, vec![message], None).0
     }
 
     fn attachment(id: &str, name: &str, content_type: &str, kind: AttachmentKind) -> Attachment {
@@ -681,19 +662,8 @@ mod tests {
         }
     }
 
-    fn sent(effects: &[Effect]) -> (RequestId, Request) {
-        match effects {
-            [Effect::Request(id, request)] => (*id, request.clone()),
-            _ => panic!("expected one request, got {effects:?}"),
-        }
-    }
-
-    fn respond(app: &mut App, id: RequestId, event: Event) -> Vec<Effect> {
-        app.update(Msg::Response(Response { id, event }))
-    }
-
-    fn act(app: &mut App, action: Action) -> Vec<Effect> {
-        app.update(Msg::Action(action))
+    fn notes() -> Attachment {
+        attachment("a0", "notes.txt", "text/plain", AttachmentKind::File)
     }
 
     /// The attachment menu of m0, with a text file, a PDF and a link.
@@ -705,7 +675,7 @@ mod tests {
             &mut app,
             id,
             Event::AttachmentsListed(Ok(vec![
-                attachment("a0", "notes.txt", "text/plain", AttachmentKind::File),
+                notes(),
                 attachment("a1", "report.pdf", "application/pdf", AttachmentKind::File),
                 attachment(
                     "a2",
@@ -722,11 +692,7 @@ mod tests {
     fn attachments_are_listed_and_fetched_again_after_a_sign_in() {
         let mut app = app();
         let (id, _) = sent(&act(&mut app, Action::ViewAttachments));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentsListed(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::AttachmentsListed(Err(expired())));
         assert!(matches!(app.screen(), Screen::Attachments(_)));
         let failed = |app: &mut App| {
             app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
@@ -737,22 +703,9 @@ mod tests {
         failed(&mut app);
         let (id, request) = sent(&act(&mut app, Action::Retry));
         assert_eq!(request, Request::ListAttachments(MessageId::new("m0")));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentsListed(Ok(vec![attachment(
-                "a0",
-                "notes.txt",
-                "text/plain",
-                AttachmentKind::File,
-            )])),
-        );
+        respond(&mut app, id, Event::AttachmentsListed(Ok(vec![notes()])));
         let (id, _) = sent(&act(&mut app, Action::DisplayMessage));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentFetched(Err(mett_core::Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::AttachmentFetched(Err(expired())));
         failed(&mut app);
         let (_, request) = sent(&act(&mut app, Action::Retry));
         assert!(
@@ -883,7 +836,7 @@ mod tests {
             FileOp(1),
             FileOutcome::Exists(path.clone(), b"hello".to_vec()),
         ));
-        let effects = app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
+        let effects = key(&mut app, KeyCode::Char('y'));
         assert_eq!(
             effects,
             [Effect::SaveFile {
@@ -907,16 +860,7 @@ mod tests {
             menu: crate::keymap::Menu::Attach,
             scroll: 0,
         }));
-        respond(
-            &mut app,
-            id,
-            Event::AttachmentsListed(Ok(vec![attachment(
-                "a0",
-                "notes.txt",
-                "text/plain",
-                AttachmentKind::File,
-            )])),
-        );
+        respond(&mut app, id, Event::AttachmentsListed(Ok(vec![notes()])));
         assert!(!app.waiting());
         app.screens.pop();
         let Screen::Attachments(menu) = app.screen() else {
@@ -947,10 +891,7 @@ mod tests {
         let path = PathBuf::from("/home/alice/report.pdf");
         assert_eq!(effects, [Effect::ReadFile(FileOp(1), path.clone())]);
         // Keys wait for it.
-        assert!(
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Char('q'))))
-                .is_empty()
-        );
+        assert!(key(&mut app, KeyCode::Char('q')).is_empty());
         assert!(matches!(app.screen(), Screen::Compose(_)));
         assert!(app.status.starts_with("Waiting for /home/alice/report.pdf"));
         app.update(Msg::FileRead(FileOp(1), path, Ok(b"%PDF".to_vec())));

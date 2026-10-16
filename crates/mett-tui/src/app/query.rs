@@ -442,14 +442,15 @@ impl App {
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
-    use mett_core::{MessagePage, WellKnownFolder, mock};
+    use mett_core::mock;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
     use crate::alias::Alias;
+    use crate::app::testing::*;
     use crate::app::{Msg, Settings};
-    use crate::config::mailbox::FolderPath;
-    use crate::worker::{Event, Response};
+
+    use crate::worker::Event;
 
     fn settings(query: QuerySettings) -> Settings {
         let alias = |key: &str, value: &str| Alias {
@@ -469,39 +470,17 @@ mod tests {
     }
 
     fn app(query: QuerySettings) -> App {
-        let settings = settings(query);
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
         let mut message = mock::message("m0", "in", "Hi", DateTime::UNIX_EPOCH).summary;
         message.from = Some(Address::new("carol@z.org").with_name("Carol Jones"));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message],
-                next: None,
-            })),
-        }));
-        app
+        opened(settings(query), 24, vec![message], None).0
     }
 
-    fn key(app: &mut App, code: KeyCode) -> Vec<Effect> {
-        app.update(Msg::Key(KeyEvent::from(code)))
-    }
-
-    fn typed(app: &mut App, text: &str) {
-        for c in text.chars() {
-            key(app, KeyCode::Char(c));
-        }
+    /// Starts an alias named `name`, without the questions.
+    fn alias_named(app: &mut App, name: &str) {
+        act(app, Action::CreateAlias);
+        app.input = None;
+        app.answer_alias_name(name.into());
+        app.input = None;
     }
 
     fn answer_text(app: &App) -> String {
@@ -514,7 +493,7 @@ mod tests {
     #[test]
     fn aliases_complete_and_expand_in_address_questions() {
         let mut app = app(QuerySettings::default());
-        app.update(Msg::Action(Action::Mail));
+        act(&mut app, Action::Mail);
         typed(&mut app, "jane@x.org, te");
         key(&mut app, KeyCode::Tab);
         assert_eq!(answer_text(&app), "jane@x.org, team");
@@ -527,8 +506,8 @@ mod tests {
             panic!("expected the alias list");
         };
         assert_eq!(menu.entries.len(), 2);
-        app.update(Msg::Action(Action::NextEntry));
-        app.update(Msg::Action(Action::DisplayMessage));
+        act(&mut app, Action::NextEntry);
+        act(&mut app, Action::DisplayMessage);
         assert_eq!(answer_text(&app), "jane@x.org, team, bobby");
         key(&mut app, KeyCode::Enter);
         let to: Vec<String> = app
@@ -557,7 +536,7 @@ mod tests {
             command: String::new(),
             directory: true,
         });
-        app.update(Msg::Action(Action::Mail));
+        act(&mut app, Action::Mail);
         typed(&mut app, "car");
         let effects = app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('t'),
@@ -570,18 +549,19 @@ mod tests {
         };
         assert_eq!(text, "car");
         assert!(app.waiting());
-        app.update(Msg::Response(Response {
-            id: *id,
-            event: Event::Queried(Ok(vec![Address::new("carol@z.org").with_name("Carol")])),
-        }));
-        app.update(Msg::Action(Action::DisplayMessage));
+        respond(
+            &mut app,
+            *id,
+            Event::Queried(Ok(vec![Address::new("carol@z.org").with_name("Carol")])),
+        );
+        act(&mut app, Action::DisplayMessage);
         assert_eq!(answer_text(&app), "Carol <carol@z.org>");
     }
 
     #[test]
     fn a_query_with_nothing_found_goes_back_to_the_question() {
         let mut app = app(QuerySettings::default());
-        app.update(Msg::Action(Action::Mail));
+        act(&mut app, Action::Mail);
         typed(&mut app, "x");
         app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('t'),
@@ -598,7 +578,7 @@ mod tests {
             command: "lookup %s".into(),
             directory: false,
         });
-        app.update(Msg::Action(Action::Query));
+        act(&mut app, Action::Query);
         typed(&mut app, "carol");
         let effects = key(&mut app, KeyCode::Enter);
         let [Effect::Request(id, Request::Query(QuerySource::Command(command), _))] =
@@ -607,21 +587,20 @@ mod tests {
             panic!("expected a query, got {effects:?}");
         };
         assert_eq!(command, "lookup %s");
-        app.update(Msg::Response(Response {
-            id: *id,
-            event: Event::Queried(Ok(vec![Address::new("carol@z.org")])),
-        }));
-        app.update(Msg::Action(Action::Mail));
+        respond(
+            &mut app,
+            *id,
+            Event::Queried(Ok(vec![Address::new("carol@z.org")])),
+        );
+        act(&mut app, Action::Mail);
         assert_eq!(answer_text(&app), "carol@z.org");
     }
 
     #[test]
     fn completes_the_alias_at_the_cursor() {
         let mut app = app(QuerySettings::default());
-        app.update(Msg::Action(Action::Mail));
-        for c in "bo, x@y.org".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
+        act(&mut app, Action::Mail);
+        typed(&mut app, "bo, x@y.org");
         key(&mut app, KeyCode::Home);
         key(&mut app, KeyCode::Right);
         key(&mut app, KeyCode::Right);
@@ -637,7 +616,7 @@ mod tests {
         }
         key(&mut app, KeyCode::Tab);
         assert!(matches!(app.screen(), Screen::Query(_)));
-        app.update(Msg::Action(Action::Exit));
+        act(&mut app, Action::Exit);
         assert_eq!(answer_text(&app), "bobb, x@y.org");
         // The rest of the entry is replaced.
         key(&mut app, KeyCode::Home);
@@ -653,31 +632,24 @@ mod tests {
             command: "lookup %s".into(),
             directory: false,
         });
-        app.update(Msg::Action(Action::Query));
-        for c in "car".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
-        let effects = key(&mut app, KeyCode::Enter);
-        let [Effect::Request(query, _)] = effects.as_slice() else {
-            panic!("expected a query, got {effects:?}");
-        };
-        app.update(Msg::Action(Action::Help));
+        act(&mut app, Action::Query);
+        typed(&mut app, "car");
+        let (query, _) = sent(&key(&mut app, KeyCode::Enter));
+        act(&mut app, Action::Help);
         assert!(matches!(app.screen(), Screen::Query(_)));
-        let effects = app.update(Msg::Action(Action::Exit));
+        let effects = act(&mut app, Action::Exit);
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::Request(_, Request::CancelQuery(q)) if q == query))
+                .any(|e| matches!(e, Effect::Request(_, Request::CancelQuery(q)) if *q == query))
         );
     }
 
     #[test]
     fn a_failed_completion_shows_over_the_question() {
         let mut app = app(QuerySettings::default());
-        app.update(Msg::Action(Action::Mail));
-        for c in "zz".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
+        act(&mut app, Action::Mail);
+        typed(&mut app, "zz");
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.input_note.as_deref(), Some("No alias matches."));
         // The next key brings the question back.
@@ -690,16 +662,11 @@ mod tests {
     fn without_an_alias_file_says_the_alias_is_not_saved() {
         let mut app = app(QuerySettings::default());
         app.alias_file = None;
-        app.update(Msg::Action(Action::CreateAlias));
+        act(&mut app, Action::CreateAlias);
         key(&mut app, KeyCode::Enter);
         let effects = key(&mut app, KeyCode::Enter);
         assert_eq!(effects.len(), 1);
-        app.update(Msg::Configured(crate::app::Reconfigured {
-            outcome: Ok(Vec::new()),
-            settings: Ok(settings(QuerySettings::default())),
-            key_commands: Vec::new(),
-            pushed: Vec::new(),
-        }));
+        app.update(configured(settings(QuerySettings::default())));
         assert_eq!(
             app.status,
             "Alias carol added (no alias_file to save it in)."
@@ -709,7 +676,7 @@ mod tests {
     #[test]
     fn saves_the_sender_as_an_alias() {
         let mut app = app(QuerySettings::default());
-        app.update(Msg::Action(Action::CreateAlias));
+        act(&mut app, Action::CreateAlias);
         assert_eq!(answer_text(&app), "carol");
         let effects = key(&mut app, KeyCode::Enter);
         assert!(effects.is_empty());
@@ -728,23 +695,12 @@ mod tests {
         );
         app.update(Msg::Appended(Ok("/home/alice/.mettrc".into())));
         // Said once the command is done.
-        app.update(Msg::Configured(crate::app::Reconfigured {
-            outcome: Ok(Vec::new()),
-            settings: Ok(settings(QuerySettings::default())),
-            key_commands: Vec::new(),
-            pushed: Vec::new(),
-        }));
+        app.update(configured(settings(QuerySettings::default())));
         assert_eq!(app.status, "Alias added to /home/alice/.mettrc.");
         // An alias needs an address.
-        app.update(Msg::Action(Action::CreateAlias));
-        app.input = None;
-        app.answer_alias_name("dora".into());
-        app.input = None;
+        alias_named(&mut app, "dora");
         assert!(app.answer_alias_address("  ".into()).is_empty());
-        app.update(Msg::Action(Action::CreateAlias));
-        app.input = None;
-        app.answer_alias_name("dora".into());
-        app.input = None;
+        alias_named(&mut app, "dora");
         let effects = app.answer_alias_address(r#"A"B <a@b.org>"#.into());
         let Some(Effect::Command(line)) = effects.first() else {
             panic!("expected the alias command, got {effects:?}");
@@ -753,10 +709,7 @@ mod tests {
         config.run_line(line).unwrap();
         let expanded = crate::alias::expand("dora", config.aliases()).unwrap();
         assert_eq!(Address::parse_list(&expanded).unwrap()[0].email, "a@b.org");
-        app.update(Msg::Action(Action::CreateAlias));
-        app.input = None;
-        app.answer_alias_name("dora".into());
-        app.input = None;
+        alias_named(&mut app, "dora");
         assert!(
             app.answer_alias_address("\"x\nunalias *\" <d@x.org>".into())
                 .is_empty()
@@ -765,14 +718,11 @@ mod tests {
             app.status,
             "An alias's address can't have control characters."
         );
-        app.update(Msg::Action(Action::CreateAlias));
-        app.input = None;
-        app.answer_alias_name("dora".into());
-        app.input = None;
+        alias_named(&mut app, "dora");
         assert!(app.answer_alias_address("  ".into()).is_empty());
         assert_eq!(app.status, "No address: the alias wasn't added.");
         // An alias by that name already exists.
-        app.update(Msg::Action(Action::CreateAlias));
+        act(&mut app, Action::CreateAlias);
         app.input = None;
         app.answer_alias_name("bob".into());
         assert_eq!(

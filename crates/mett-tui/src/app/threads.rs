@@ -381,13 +381,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeDelta};
-    use mett_core::{MessagePage, ThreadPosition, WellKnownFolder, mock};
+    use mett_core::{ThreadPosition, mock};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
+    use crate::app::testing::*;
     use crate::app::{Msg, Settings};
-    use crate::config::mailbox::FolderPath;
-    use crate::worker::{Event, Response};
 
     fn message(id: &str, minutes: i64, conversation: &str, path: &[u8]) -> MessageSummary {
         let mut m = mock::message(
@@ -407,25 +406,6 @@ mod tests {
     /// An Inbox sorted by threads: a thread "a" (a0, with replies a1 and
     /// a2) and a thread "b" (b0 and b1), listed newest first.
     fn app() -> App {
-        let settings = Settings {
-            ordering: Ordering {
-                sort: Sort::parse("threads", true).unwrap(),
-                ..Ordering::default()
-            },
-            ..Settings::default()
-        };
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
         let messages = vec![
             message("b1", 5, "b", &[0, 1]),
             message("a2", 4, "a", &[0, 2]),
@@ -433,14 +413,7 @@ mod tests {
             message("a1", 2, "a", &[0, 1]),
             message("a0", 1, "a", &[0]),
         ];
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
-        app
+        opened(sorted("threads"), 24, messages, None).0
     }
 
     fn shown(app: &App) -> Vec<String> {
@@ -456,10 +429,6 @@ mod tests {
                 format!("{}{}{folded}", thread.tree, m.id)
             })
             .collect()
-    }
-
-    fn act(app: &mut App, action: Action) -> Vec<Effect> {
-        app.update(Msg::Action(action))
     }
 
     #[test]
@@ -535,21 +504,21 @@ mod tests {
     #[test]
     fn escape_then_v_collapses_too() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('v'))));
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('v'));
         assert_eq!(shown(&app)[0], "a0 (2)");
     }
 
     #[test]
     fn an_escape_long_ago_leaves_the_next_key_alone() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        key(&mut app, KeyCode::Esc);
         if let Some((_, when)) = &mut app.escape
             && let Some(earlier) = when.checked_sub(std::time::Duration::from_secs(5))
         {
             *when = earlier;
         }
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('v'))));
+        key(&mut app, KeyCode::Char('v'));
         // `v`, not `Esc v`: the thread isn't collapsed.
         assert_eq!(shown(&app)[0], "a0");
     }
@@ -557,7 +526,7 @@ mod tests {
     #[test]
     fn escape_then_control_n_is_control_n() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        key(&mut app, KeyCode::Esc);
         app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('n'),
             KeyModifiers::CONTROL,
@@ -569,11 +538,11 @@ mod tests {
     #[test]
     fn an_escape_is_forgotten_when_another_menu_takes_over() {
         let mut app = app();
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        key(&mut app, KeyCode::Esc);
         // The help screen opens before the next key (as the sign-in window
         // may): its `q` still leaves it.
         act(&mut app, Action::Help);
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('q'))));
+        key(&mut app, KeyCode::Char('q'));
         assert_eq!(app.screen(), &Screen::Index);
     }
 
@@ -588,39 +557,12 @@ mod tests {
 
     #[test]
     fn a_pending_page_down_counts_from_where_it_started() {
-        let settings = Settings {
-            ordering: Ordering {
-                sort: Sort::parse("subject", true).unwrap(),
-                ..Ordering::default()
-            },
-            ..Settings::default()
-        };
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 5, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(sorted("subject"), 5);
         let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
-        let effects = app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![named("a"), named("z")],
-                next: Some(mett_core::PageCursor::new("in next")),
-            })),
-        }));
-        let Effect::Request(next, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let next = page(&mut app, list, vec![named("a"), named("z")], "in next");
         // Two rows a page, from a.
         act(&mut app, Action::NextPage);
-        page(&mut app, next, vec![named("b"), named("zz")]);
+        listed(&mut app, next, vec![named("b"), named("zz")], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "z");
     }
 
@@ -634,18 +576,7 @@ mod tests {
             },
             ..Settings::default()
         };
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(settings, 24);
         let from = |id: &str, minutes: i64| {
             let mut m = mock::message(
                 id,
@@ -657,49 +588,18 @@ mod tests {
             m.from = Some(mett_core::Address::new(format!("{id}@x.org")));
             m
         };
-        let listed = |app: &mut App, id, messages, more: bool| {
-            let effects = app.update(Msg::Response(Response {
-                id,
-                event: Event::MessagesListed(Ok(MessagePage {
-                    messages,
-                    next: more.then(|| mett_core::PageCursor::new("in next")),
-                })),
-            }));
-            match effects.first() {
-                Some(Effect::Request(next, _)) => Some(*next),
-                _ => None,
-            }
-        };
-        let next = listed(&mut app, list, vec![from("c", 5)], true).unwrap();
+        let next = page(&mut app, list, vec![from("c", 5)], "in next");
         act(&mut app, Action::NextEntry);
         // e may not come right after c: d, from the same time, may follow.
-        let next = listed(&mut app, next, vec![from("e", 3)], true).unwrap();
+        let next = page(&mut app, next, vec![from("e", 3)], "in next");
         assert_eq!(app.messages[app.selected].id.as_str(), "c");
-        listed(&mut app, next, vec![from("d", 3)], false);
+        listed(&mut app, next, vec![from("d", 3)], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "d");
     }
 
     #[test]
     fn a_pending_move_waits_among_drafts() {
-        let settings = Settings {
-            ordering: Ordering {
-                sort: Sort::parse("reverse-date", true).unwrap(),
-                ..Ordering::default()
-            },
-            ..Settings::default()
-        };
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(sorted("reverse-date"), 24);
         let at = |id: &str, minutes: i64, draft: bool| {
             let mut m = mock::message(
                 id,
@@ -711,25 +611,12 @@ mod tests {
             m.draft = draft;
             m
         };
-        let listed = |app: &mut App, id, messages, more: bool| {
-            let effects = app.update(Msg::Response(Response {
-                id,
-                event: Event::MessagesListed(Ok(MessagePage {
-                    messages,
-                    next: more.then(|| mett_core::PageCursor::new("in next")),
-                })),
-            }));
-            match effects.first() {
-                Some(Effect::Request(next, _)) => Some(*next),
-                _ => None,
-            }
-        };
         // Drafts first, then the rest, each by its own date.
-        let next = listed(&mut app, list, vec![at("d9", 9, true)], true).unwrap();
+        let next = page(&mut app, list, vec![at("d9", 9, true)], "in next");
         act(&mut app, Action::NextEntry);
-        let next = listed(&mut app, next, vec![at("d2", 2, true)], true).unwrap();
+        let next = page(&mut app, next, vec![at("d2", 2, true)], "in next");
         assert_eq!(app.messages[app.selected].id.as_str(), "d9");
-        listed(&mut app, next, vec![at("s5", 5, false)], false);
+        listed(&mut app, next, vec![at("s5", 5, false)], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "s5");
     }
 
@@ -788,46 +675,8 @@ mod tests {
     /// An app sorted by threads whose first page is `first`, with more to
     /// come; returns the request for the next page.
     fn paged(first: Vec<MessageSummary>) -> (App, crate::worker::RequestId) {
-        let settings = Settings {
-            ordering: Ordering {
-                sort: Sort::parse("threads", true).unwrap(),
-                ..Ordering::default()
-            },
-            ..Settings::default()
-        };
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: first,
-                next: Some(mett_core::PageCursor::new("in next")),
-            })),
-        }));
-        let Effect::Request(next, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        (app, next)
-    }
-
-    fn page(app: &mut App, id: crate::worker::RequestId, messages: Vec<MessageSummary>) {
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        let (app, next) = opened(sorted("threads"), 24, first, Some("in next"));
+        (app, next.unwrap())
     }
 
     #[test]
@@ -841,7 +690,7 @@ mod tests {
             ..Ordering::default()
         });
         app.selected = 1;
-        page(
+        listed(
             &mut app,
             next,
             vec![
@@ -849,6 +698,7 @@ mod tests {
                 message("x1", 1, "x", &[0, 3]),
                 message("x3", 3, "x", &[0, 4]),
             ],
+            None,
         );
         let ids: Vec<&str> = app.messages.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["x1", "x2", "x3", "x4", "x5"]);
@@ -862,22 +712,13 @@ mod tests {
             message("a2", 4, "a", &[0, 2]),
             message("a1", 2, "a", &[0, 1]),
         ]);
-        let effects = app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message("b0", 3, "b", &[0])],
-                next: Some(mett_core::PageCursor::new("in more")),
-            })),
-        }));
+        let more = page(&mut app, next, vec![message("b0", 3, "b", &[0])], "in more");
         // Three of the two threaded so far: listed, not threaded yet…
         assert!(app.thread_of(&MessageId::new("b0")).is_none());
         // …until a thread action needs them.
         act(&mut app, Action::NextThread);
         assert!(app.thread_of(&MessageId::new("b0")).is_some());
-        let Effect::Request(more, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        page(&mut app, more, vec![message("a0", 1, "a", &[0])]);
+        listed(&mut app, more, vec![message("a0", 1, "a", &[0])], None);
         assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0"]);
     }
 
@@ -891,13 +732,12 @@ mod tests {
         ]);
         act(&mut app, Action::CollapseAll);
         // One more message: not enough to thread the index again.
-        let effects = app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message("b1", 0, "b", &[0, 1])],
-                next: Some(mett_core::PageCursor::new("in more")),
-            })),
-        }));
+        let effects = listed(
+            &mut app,
+            next,
+            vec![message("b1", 0, "b", &[0, 1])],
+            Some("in more"),
+        );
         assert!(!effects.is_empty());
         assert!(!app.messages.iter().any(|m| m.id.as_str() == "b1"));
     }
@@ -906,10 +746,11 @@ mod tests {
     fn collapsing_all_takes_in_threads_listed_later() {
         let (mut app, next) = paged(vec![message("a1", 2, "a", &[0])]);
         act(&mut app, Action::CollapseAll);
-        page(
+        listed(
             &mut app,
             next,
             vec![message("a2", 1, "a", &[0, 1]), message("b0", 0, "b", &[0])],
+            None,
         );
         assert_eq!(shown(&app), ["b0", "a1 (1)"]);
         // And all open again.
@@ -925,7 +766,7 @@ mod tests {
         ]);
         act(&mut app, Action::CollapseThread);
         assert_eq!(shown(&app), ["a1 (1)"]);
-        page(&mut app, next, vec![message("a0", 1, "a", &[0])]);
+        listed(&mut app, next, vec![message("a0", 1, "a", &[0])], None);
         assert_eq!(shown(&app), ["a0 (2)"]);
     }
 
@@ -938,96 +779,33 @@ mod tests {
         act(&mut app, Action::NextThread);
         assert_ne!(app.status, "You are on the last thread.");
         // (A later page normally has older mail; this thread sorts after.)
-        page(&mut app, next, vec![message("b0", 9, "b", &[0])]);
+        listed(&mut app, next, vec![message("b0", 9, "b", &[0])], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "b0");
     }
 
     #[test]
     fn a_pending_next_entry_goes_after_its_message_whatever_comes_before() {
-        let settings = Settings {
-            ordering: Ordering {
-                sort: Sort::parse("subject", true).unwrap(),
-                ..Ordering::default()
-            },
-            ..Settings::default()
-        };
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(sorted("subject"), 24);
         let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
-        let effects = app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![named("b")],
-                next: Some(mett_core::PageCursor::new("in next")),
-            })),
-        }));
-        let Effect::Request(next, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let next = page(&mut app, list, vec![named("b")], "in next");
         act(&mut app, Action::NextEntry);
         // d comes first, but the last page may hold what goes between.
-        let effects = app.update(Msg::Response(Response {
-            id: next,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![named("d")],
-                next: Some(mett_core::PageCursor::new("in more")),
-            })),
-        }));
+        let more = page(&mut app, next, vec![named("d")], "in more");
         assert_eq!(app.messages[app.selected].id.as_str(), "b");
-        let Effect::Request(more, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        page(&mut app, more, vec![named("a"), named("c")]);
+        listed(&mut app, more, vec![named("a"), named("c")], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "c");
     }
 
     #[test]
     fn a_pending_next_entry_survives_its_message_going() {
-        let settings = Settings {
-            ordering: Ordering {
-                sort: Sort::parse("subject", true).unwrap(),
-                ..Ordering::default()
-            },
-            ..Settings::default()
-        };
-        let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
-        let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let (mut app, list) = opening(sorted("subject"), 24);
         let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
-        let effects = app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![named("a"), named("b")],
-                next: Some(mett_core::PageCursor::new("in next")),
-            })),
-        }));
-        let Effect::Request(next, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let next = page(&mut app, list, vec![named("a"), named("b")], "in next");
         act(&mut app, Action::LastEntry);
         act(&mut app, Action::NextEntry);
         // b goes (moved elsewhere, say) before the next page comes.
         app.remove_messages(&std::collections::HashSet::from([MessageId::new("b")]));
-        page(&mut app, next, vec![named("c"), named("d")]);
+        listed(&mut app, next, vec![named("c"), named("d")], None);
         assert_eq!(app.messages[app.selected].id.as_str(), "c");
     }
 

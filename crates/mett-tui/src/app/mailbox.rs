@@ -1292,43 +1292,66 @@ fn tree(folders: Vec<Folder>) -> Vec<BrowserEntry> {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeDelta};
-    use mett_core::{Error, MessagePage, WellKnownFolder, mock};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use mett_core::{AccountId, Error, Message, WellKnownFolder, mock};
+    use ratatui::crossterm::event::KeyCode;
 
     use super::*;
-    use crate::app::{Msg, Settings};
+    use crate::app::Settings;
+    use crate::app::testing::*;
     use crate::keymap::Menu;
-    use crate::worker::{Event, Response};
+    use crate::worker::Event;
 
     /// An app with Inbox messages m0, m1 and m2, newest first.
     fn app(settings: Settings) -> App {
         let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let (mut app, effects) = App::open(80, 24, inbox, settings);
-        let Effect::Request(open, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let open = first_request(&effects);
         let folder = mett_core::mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(folder)),
-        }));
-        let Effect::Request(list, _) = effects[0].clone() else {
-            panic!("expected a request, got {effects:?}");
-        };
+        let list = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(folder))));
         let messages = (0..3)
             .map(|i| {
                 let date = DateTime::UNIX_EPOCH + TimeDelta::minutes(10 - i);
                 mock::message(&format!("m{i}"), "in", "s", date).summary
             })
             .collect();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         app
+    }
+
+    /// An app that purges without asking.
+    fn yes() -> App {
+        app(Settings {
+            delete: Quad::Yes,
+            ..settings()
+        })
+    }
+
+    /// Answers the transfer of `message` to the folder `to`: it is
+    /// `new` there, or failed.
+    fn transferred(
+        app: &mut App,
+        id: RequestId,
+        to: &str,
+        message: &str,
+        result: mett_core::Result<&str>,
+    ) -> Vec<Effect> {
+        let moved = vec![(message.into(), result.map(MessageId::new))];
+        respond(app, id, Event::Transferred(Ok((FolderId::new(to), moved))))
+    }
+
+    /// Answers the purge of `message`: done.
+    fn purged(app: &mut App, id: RequestId, message: &str) -> Vec<Effect> {
+        respond(app, id, Event::Purged(Ok(vec![(message.into(), Ok(()))])))
+    }
+
+    fn m0() -> Message {
+        mock::message("m0", "in", "s", DateTime::UNIX_EPOCH)
+    }
+
+    /// Shows m0 in the pager; returns the effects of its delivery.
+    fn show_m0(app: &mut App) -> Vec<Effect> {
+        let (fetch, _) = sent(&act(app, Action::DisplayMessage));
+        respond(app, fetch, Event::MessageFetched(Ok(m0())))
     }
 
     fn settings() -> Settings {
@@ -1338,42 +1361,6 @@ mod tests {
             ..Settings::default()
         }
     }
-
-    fn act(app: &mut App, action: Action) -> Vec<Effect> {
-        app.update(Msg::Action(action))
-    }
-
-    fn key(app: &mut App, code: KeyCode) -> Vec<Effect> {
-        app.update(Msg::Key(KeyEvent::from(code)))
-    }
-
-    fn answer(app: &mut App, text: &str) -> Vec<Effect> {
-        for c in text.chars() {
-            key(app, KeyCode::Char(c));
-        }
-        key(app, KeyCode::Enter)
-    }
-
-    fn sent(effects: &[Effect]) -> (RequestId, Request) {
-        match effects {
-            [Effect::Request(id, request)] => (*id, request.clone()),
-            _ => panic!("expected one request, got {effects:?}"),
-        }
-    }
-
-    fn ids(app: &App) -> Vec<&str> {
-        app.messages.iter().map(|m| m.id.as_str()).collect()
-    }
-
-    fn prompt(app: &App) -> String {
-        match &app.input {
-            Some(Input::Line { prompt, editor, .. }) => format!("{prompt}{}", editor.text()),
-            Some(Input::YesNo { prompt, .. }) => prompt.clone(),
-            None => String::new(),
-        }
-    }
-
-    use mett_core::AccountId;
 
     #[test]
     fn marks_and_purges_deleted_messages() {
@@ -1403,10 +1390,7 @@ mod tests {
         act(&mut app, Action::SyncMailbox);
         assert!(app.input.is_none());
         assert_eq!(app.status, "Deleted messages are already being purged.");
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, id, "m0");
         assert_eq!(ids(&app), ["m1", "m2"]);
         assert_eq!(app.status, "1 message purged.");
         // `u` moved on to m2, which stays selected.
@@ -1424,10 +1408,7 @@ mod tests {
         let (id, request) = sent(&act(&mut app, Action::SyncMailbox));
         assert!(matches!(request, Request::Purge { trash: Some(ref to), .. }
             if *to == FolderPath::WellKnown(WellKnownFolder::DeletedItems, vec![])));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, id, "m0");
         assert_eq!(ids(&app), ["m1", "m2"]);
     }
 
@@ -1439,13 +1420,11 @@ mod tests {
         assert!(!app.quit);
         let (id, _) = sent(&key(&mut app, KeyCode::Enter));
         assert!(!app.quit, "not before the purge is done");
-        app.update(Msg::Response(Response {
+        respond(
+            &mut app,
             id,
-            event: Event::Purged(Ok(vec![(
-                "m0".into(),
-                Err(Error::Network("offline".into())),
-            )])),
-        }));
+            Event::Purged(Ok(vec![("m0".into(), Err(offline()))])),
+        );
         assert!(!app.quit, "the purge failed: stay");
         assert_eq!(app.status, "1 of 1 message failed: network error: offline");
         assert!(app.is_deleted(&"m0".into()));
@@ -1471,10 +1450,7 @@ mod tests {
             )
         ));
         assert!(app.messages[0].flags.flagged);
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        respond(&mut app, id, Event::FlagsUpdated(Err(offline())));
         assert!(!app.messages[0].flags.flagged, "undone");
 
         let (_, request) = sent(&act(&mut app, Action::ToggleNew));
@@ -1505,26 +1481,14 @@ mod tests {
                 copy: false,
             }
         );
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Ok("a0".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Ok("a0"));
         assert_eq!(ids(&app), ["m1", "m2"]);
         assert_eq!(app.status, "Message saved.");
 
         act(&mut app, Action::CopyMessage);
         let (id, request) = sent(&answer(&mut app, "=@archive"));
         assert!(matches!(request, Request::Transfer { copy: true, .. }));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m1".into(), Ok("c1".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m1", Ok("c1"));
         assert_eq!(ids(&app), ["m1", "m2"], "copies stay");
 
         act(&mut app, Action::SaveMessage);
@@ -1547,14 +1511,15 @@ mod tests {
         );
         // The Inbox stays until Sent Items is found.
         assert_eq!(ids(&app), ["m0", "m1", "m2"]);
-        let effects = app.update(Msg::Response(Response {
+        let effects = respond(
+            &mut app,
             id,
-            event: Event::FolderOpened(Ok(mock::folder(
+            Event::FolderOpened(Ok(mock::folder(
                 "sent",
                 "Sent Items",
                 Some(WellKnownFolder::SentItems),
             ))),
-        }));
+        );
         assert!(matches!(sent(&effects).1, Request::ListMessages { .. }));
         assert!(app.messages.is_empty());
         assert_eq!(app.folder.as_ref().unwrap().name, "Sent Items");
@@ -1562,10 +1527,11 @@ mod tests {
         // A folder that isn't there leaves the user where they were.
         act(&mut app, Action::ChangeFolder);
         let (id, _) = sent(&answer(&mut app, "=Nowhere"));
-        app.update(Msg::Response(Response {
+        respond(
+            &mut app,
             id,
-            event: Event::FolderOpened(Err(Error::not_found("folder", "Nowhere"))),
-        }));
+            Event::FolderOpened(Err(Error::not_found("folder", "Nowhere"))),
+        );
         assert_eq!(app.folder.as_ref().unwrap().name, "Sent Items");
         assert_eq!(app.status, "folder not found: Nowhere");
     }
@@ -1589,10 +1555,7 @@ mod tests {
         let (id, request) = sent(&act(&mut app, Action::BrowseMailboxes));
         assert_eq!(request, Request::ListFolders);
         assert_eq!(app.menu(), Menu::Browser);
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::FoldersListed(Ok(folders())),
-        }));
+        respond(&mut app, id, Event::FoldersListed(Ok(folders())));
         let Screen::Browser(browser) = app.screen() else {
             panic!("not in the browser");
         };
@@ -1625,10 +1588,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&key(&mut app, KeyCode::Char('?')));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::FoldersListed(Ok(folders())),
-        }));
+        respond(&mut app, id, Event::FoldersListed(Ok(folders())));
         act(&mut app, Action::FirstEntry);
         act(&mut app, Action::DisplayMessage);
         assert_eq!(prompt(&app), "Save to mailbox ('?' for list): Archive");
@@ -1638,10 +1598,7 @@ mod tests {
         act(&mut app, Action::CopyMessage);
         key(&mut app, KeyCode::Char('='));
         let (id, _) = sent(&key(&mut app, KeyCode::Tab));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::FoldersListed(Ok(folders())),
-        }));
+        respond(&mut app, id, Event::FoldersListed(Ok(folders())));
         act(&mut app, Action::Exit);
         assert_eq!(prompt(&app), "Copy to mailbox ('?' for list): =");
     }
@@ -1655,10 +1612,7 @@ mod tests {
             ..settings()
         });
         let (id, _) = sent(&act(&mut app, Action::BrowseMailboxes));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::FoldersListed(Ok(folders())),
-        }));
+        respond(&mut app, id, Event::FoldersListed(Ok(folders())));
         act(&mut app, Action::FirstEntry);
         let (_, request) = sent(&act(&mut app, Action::DisplayMessage));
         assert_eq!(
@@ -1674,10 +1628,7 @@ mod tests {
         // Toggled back before the first change is saved: it waits.
         assert!(act(&mut app, Action::FlagMessage).is_empty());
         assert!(!app.messages[0].flags.flagged);
-        let effects = app.update(Msg::Response(Response {
-            id: first,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        let effects = respond(&mut app, first, Event::FlagsUpdated(Ok(())));
         let (second, request) = sent(&effects);
         assert!(matches!(
             request,
@@ -1693,10 +1644,7 @@ mod tests {
         // still has the flag from the first update, which is what the index
         // shows, so nothing more is sent.
         act(&mut app, Action::FlagMessage);
-        let effects = app.update(Msg::Response(Response {
-            id: second,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, second, Event::FlagsUpdated(Err(offline())));
         assert!(effects.is_empty(), "{effects:?}");
         assert!(app.messages[0].flags.flagged);
         assert!(!app.saving());
@@ -1706,10 +1654,7 @@ mod tests {
         let (first, _) = sent(&act(&mut app, Action::ToggleNew));
         act(&mut app, Action::ToggleNew);
         act(&mut app, Action::ToggleNew);
-        let effects = app.update(Msg::Response(Response {
-            id: first,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, first, Event::FlagsUpdated(Err(offline())));
         assert!(matches!(
             sent(&effects).1,
             Request::UpdateFlags(
@@ -1727,14 +1672,8 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, request) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         let effects = act(&mut app, Action::Retry);
         assert_eq!(sent(&effects).1, request);
     }
@@ -1746,10 +1685,7 @@ mod tests {
         act(&mut app, Action::SaveMessage);
         assert!(answer(&mut app, "=Archive").is_empty(), "waits");
         assert!(app.saving());
-        let effects = app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
         assert!(matches!(sent(&effects).1, Request::Transfer { .. }));
     }
 
@@ -1758,13 +1694,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Err(offline()));
         assert_eq!(app.save_failures(), ["network error: offline"]);
     }
 
@@ -1773,10 +1703,7 @@ mod tests {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::ToggleNew);
-        let effects = app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         assert!(matches!(
             sent(&effects).1,
             Request::UpdateFlags(
@@ -1794,13 +1721,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=@inbox"));
-        let effects = app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("in"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        let effects = transferred(&mut app, id, "in", "m0", Ok("c0"));
         assert!(matches!(sent(&effects).1, Request::ListMessages { .. }));
     }
 
@@ -1810,18 +1731,9 @@ mod tests {
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::SaveMessage);
         assert!(answer(&mut app, "=Archive").is_empty(), "waits its turn");
-        let effects = app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (moving, _) = sent(&effects);
-        app.update(Msg::Response(Response {
-            id: moving,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Ok("a0".into()))],
-            ))),
-        }));
+        transferred(&mut app, moving, "archive", "m0", Ok("a0"));
         assert!(!app.saving());
         // Trying again changes the moved message.
         assert!(app.save_failures.contains_key(&MessageId::new("a0")));
@@ -1830,10 +1742,7 @@ mod tests {
 
     #[test]
     fn a_purge_waiting_for_flags_counts_as_in_progress() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::DeleteMessage);
         assert!(
@@ -1846,19 +1755,17 @@ mod tests {
 
     #[test]
     fn messages_already_gone_count_as_purged() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         let (id, _) = sent(&act(&mut app, Action::SyncMailbox));
-        app.update(Msg::Response(Response {
+        respond(
+            &mut app,
             id,
-            event: Event::Purged(Ok(vec![(
+            Event::Purged(Ok(vec![(
                 "m0".into(),
                 Err(Error::not_found("message", "m0")),
             )])),
-        }));
+        );
         assert_eq!(app.deleted_count(), 0);
         assert_eq!(ids(&app), ["m1", "m2"]);
     }
@@ -1868,22 +1775,10 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Err(offline()));
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Ok("c0"));
         assert_eq!(app.save_failures(), ["network error: offline"]);
     }
 
@@ -1894,14 +1789,8 @@ mod tests {
         let (id, request) = sent(&answer(&mut app, "=Archive"));
         act(&mut app, Action::Quit);
         assert!(app.quit);
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         let effects = act(&mut app, Action::Retry);
         assert_eq!(sent(&effects).1, request);
     }
@@ -1909,24 +1798,11 @@ mod tests {
     #[test]
     fn a_copy_into_the_open_folder_waits_for_the_pager_to_close() {
         let mut app = app(settings());
-        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
-        let (read, _) = sent(&app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
-        })));
-        app.update(Msg::Response(Response {
-            id: read,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        let (read, _) = sent(&show_m0(&mut app));
+        respond(&mut app, read, Event::FlagsUpdated(Ok(())));
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=@inbox"));
-        let effects = app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("in"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        let effects = transferred(&mut app, id, "in", "m0", Ok("c0"));
         assert!(effects.is_empty(), "not under the pager: {effects:?}");
         assert_eq!(ids(&app), ["m0", "m1", "m2"]);
         let effects = act(&mut app, Action::Exit);
@@ -1939,14 +1815,8 @@ mod tests {
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::ChangeFolder);
         answer(&mut app, "=Archive");
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
         let effects = act(&mut app, Action::Retry);
         assert!(
             effects.iter().any(|e| matches!(e,
@@ -1957,20 +1827,18 @@ mod tests {
 
     #[test]
     fn leaving_waits_if_the_purge_left_a_message_behind() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::DeleteMessage);
         let (purge, _) = sent(&act(&mut app, Action::Quit));
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![
-                ("m0".into(), Err(Error::Network("offline".into()))),
+        respond(
+            &mut app,
+            purge,
+            Event::Purged(Ok(vec![
+                ("m0".into(), Err(offline())),
                 ("m1".into(), Ok(())),
             ])),
-        }));
+        );
         assert!(!app.quit, "m0 is still marked: stay");
         assert!(app.is_deleted(&"m0".into()));
         assert!(!app.leaving());
@@ -1978,10 +1846,7 @@ mod tests {
 
     #[test]
     fn a_purge_after_a_failed_move_still_goes_ahead() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::PreviousEntry);
@@ -1989,43 +1854,33 @@ mod tests {
         answer(&mut app, "=Archive");
         assert!(act(&mut app, Action::Quit).is_empty(), "waits its turn");
         assert!(app.leaving());
-        let (moving, _) = sent(&app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        })));
+        let (moving, _) = sent(&respond(
+            &mut app,
+            flag,
+            Event::FlagsUpdated(Err(offline())),
+        ));
         // The move fails: m0 stays, marked, and is purged.
-        let (purge, request) = sent(&app.update(Msg::Response(Response {
-            id: moving,
-            event: Event::Transferred(Err(Error::Network("offline".into()))),
-        })));
+        let (purge, request) = sent(&respond(
+            &mut app,
+            moving,
+            Event::Transferred(Err(offline())),
+        ));
         assert!(
             matches!(request, Request::Purge { ref ids, .. } if ids == &[MessageId::new("m0")])
         );
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, purge, "m0");
         assert!(app.quit);
     }
 
     #[test]
     fn a_purge_leaves_out_messages_moved_away_before_it() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::PreviousEntry);
         act(&mut app, Action::SaveMessage);
         let (moving, _) = sent(&answer(&mut app, "=Archive"));
         assert!(act(&mut app, Action::Quit).is_empty(), "waits its turn");
-        let effects = app.update(Msg::Response(Response {
-            id: moving,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Ok("a0".into()))],
-            ))),
-        }));
+        let effects = transferred(&mut app, moving, "archive", "m0", Ok("a0"));
         assert!(effects.is_empty(), "nothing left to purge: {effects:?}");
         assert_eq!(app.status, "Mailbox is unchanged.");
         assert!(app.quit);
@@ -2033,10 +1888,7 @@ mod tests {
 
     #[test]
     fn a_purge_waits_for_a_copy() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::PreviousEntry);
         act(&mut app, Action::CopyMessage);
@@ -2045,13 +1897,7 @@ mod tests {
             act(&mut app, Action::SyncMailbox).is_empty(),
             "waits its turn"
         );
-        let (_, request) = sent(&app.update(Msg::Response(Response {
-            id: copy,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        })));
+        let (_, request) = sent(&transferred(&mut app, copy, "archive", "m0", Ok("c0")));
         assert!(
             matches!(request, Request::Purge { ref ids, .. } if ids == &[MessageId::new("m0")])
         );
@@ -2062,10 +1908,11 @@ mod tests {
         let inbox = FolderPath::WellKnown(WellKnownFolder::Inbox, vec![]);
         let (mut app, effects) = App::open(80, 24, inbox, settings());
         let (open, _) = sent(&effects);
-        let effects = app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
-        }));
+        let effects = respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Ok(mock::folder("in", "Inbox", None))),
+        );
         // The listing, and the user's own addresses alongside.
         let Effect::Request(first, _) = effects[0] else {
             panic!("expected a request, got {effects:?}");
@@ -2079,23 +1926,11 @@ mod tests {
             )
             .summary
         };
-        let effects = app.update(Msg::Response(Response {
-            id: first,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message("m0", 9)],
-                next: Some(mett_core::PageCursor::new("c")),
-            })),
-        }));
+        let effects = listed(&mut app, first, vec![message("m0", 9)], Some("c"));
         let (second, _) = sent(&effects);
         act(&mut app, Action::DeleteMessage);
         assert_eq!(app.selected, 0);
-        app.update(Msg::Response(Response {
-            id: second,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![message("m1", 8)],
-                next: None,
-            })),
-        }));
+        listed(&mut app, second, vec![message("m1", 8)], None);
         assert_eq!(app.selected, 1, "moved on once it arrived");
     }
 
@@ -2103,14 +1938,8 @@ mod tests {
     fn the_browser_opens_again_after_a_sign_in() {
         let mut app = app(settings());
         let (id, _) = sent(&act(&mut app, Action::BrowseMailboxes));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, id, Event::FoldersListed(Err(expired())));
         assert_eq!(app.screen(), &Screen::Index);
         let (_, request) = sent(&act(&mut app, Action::Retry));
         assert_eq!(request, Request::ListFolders);
@@ -2144,10 +1973,7 @@ mod tests {
             "waits for the move"
         );
         // A move that fails keeps the mark, and the purge takes it.
-        let effects = app.update(Msg::Response(Response {
-            id: moving,
-            event: Event::Transferred(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, moving, Event::Transferred(Err(offline())));
         assert!(app.is_deleted(&"m0".into()));
         assert!(matches!(sent(&effects).1, Request::Purge { .. }));
     }
@@ -2158,10 +1984,11 @@ mod tests {
         // Browse from the question.
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&key(&mut app, KeyCode::Tab));
-        app.update(Msg::Response(Response {
+        respond(
+            &mut app,
             id,
-            event: Event::FoldersListed(Ok(vec![mock::folder("odd", "@archive", None)])),
-        }));
+            Event::FoldersListed(Ok(vec![mock::folder("odd", "@archive", None)])),
+        );
         act(&mut app, Action::DisplayMessage);
         let (_, request) = sent(&key(&mut app, KeyCode::Enter));
         assert!(matches!(request, Request::Transfer { ref to, .. }
@@ -2173,10 +2000,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&key(&mut app, KeyCode::Tab));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::FoldersListed(Err(Error::Network("offline".into()))),
-        }));
+        respond(&mut app, id, Event::FoldersListed(Err(offline())));
         assert_eq!(
             prompt(&app),
             "network error: offline. Copy to mailbox ('?' for list): "
@@ -2189,13 +2013,7 @@ mod tests {
         act(&mut app, Action::CopyMessage);
         let (copy, _) = sent(&answer(&mut app, "=@inbox"));
         sent(&act(&mut app, Action::BrowseMailboxes));
-        app.update(Msg::Response(Response {
-            id: copy,
-            event: Event::Transferred(Ok((
-                FolderId::new("in"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        transferred(&mut app, copy, "in", "m0", Ok("c0"));
         let effects = act(&mut app, Action::Exit);
         assert!(matches!(sent(&effects).1, Request::ListMessages { .. }));
     }
@@ -2207,16 +2025,14 @@ mod tests {
         act(&mut app, Action::FlagMessage);
         act(&mut app, Action::ChangeFolder);
         let (open, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder("arc", "Archive", None))),
-        }));
+        respond(
+            &mut app,
+            open,
+            Event::FolderOpened(Ok(mock::folder("arc", "Archive", None))),
+        );
         // The first update lands; the user's last choice (unflagged) goes
         // out though m0 is no longer in the index.
-        let effects = app.update(Msg::Response(Response {
-            id: first,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        let effects = respond(&mut app, first, Event::FlagsUpdated(Ok(())));
         assert!(
             matches!(sent(&effects).1, Request::UpdateFlags(ref id, FlagsUpdate { flagged: Some(false), .. }) if id.as_str() == "m0"),
             "{effects:?}"
@@ -2227,15 +2043,9 @@ mod tests {
     fn an_unrelated_save_does_not_hide_a_failed_one() {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (read, _) = sent(&act(&mut app, Action::ToggleNew));
-        app.update(Msg::Response(Response {
-            id: read,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        respond(&mut app, read, Event::FlagsUpdated(Ok(())));
         assert_eq!(app.save_failures(), ["network error: offline"]);
     }
 
@@ -2259,14 +2069,8 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::ChangeFolder);
         let (open, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
         let (_, request) = sent(&act(&mut app, Action::Retry));
         assert_eq!(
             request,
@@ -2279,14 +2083,8 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (list, _) = sent(&key(&mut app, KeyCode::Tab));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         act(&mut app, Action::Retry);
         assert_eq!(app.menu(), Menu::Browser);
         assert!(app.input.is_none(), "the question waits for the browser");
@@ -2294,10 +2092,7 @@ mod tests {
 
     #[test]
     fn a_purge_on_its_way_cannot_be_undeleted() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::PreviousEntry);
         sent(&act(&mut app, Action::SyncMailbox));
@@ -2310,23 +2105,11 @@ mod tests {
     fn a_failed_flag_change_follows_its_message_when_moved() {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
         act(&mut app, Action::SaveMessage);
         let (save, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id: save,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Ok("a0".into()))],
-            ))),
-        }));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
+        transferred(&mut app, save, "arc", "m0", Ok("a0"));
+        signed_out(&mut app);
         let effects = act(&mut app, Action::Retry);
         assert!(
             effects.iter().any(|e| matches!(e,
@@ -2340,10 +2123,11 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&key(&mut app, KeyCode::Tab));
-        app.update(Msg::Response(Response {
+        respond(
+            &mut app,
             id,
-            event: Event::FoldersListed(Ok(vec![mock::folder("odd", "@archive", None)])),
-        }));
+            Event::FoldersListed(Ok(vec![mock::folder("odd", "@archive", None)])),
+        );
         act(&mut app, Action::DisplayMessage);
         key(&mut app, KeyCode::Esc);
         act(&mut app, Action::SaveMessage);
@@ -2357,20 +2141,15 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::ChangeFolder);
         let (a, _) = sent(&answer(&mut app, "=A"));
-        app.update(Msg::Response(Response {
-            id: a,
-            event: Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, a, Event::FolderOpened(Err(expired())));
         act(&mut app, Action::ChangeFolder);
         let (b, _) = sent(&answer(&mut app, "=B"));
-        app.update(Msg::Response(Response {
-            id: b,
-            event: Event::FolderOpened(Ok(mock::folder("b", "B", None))),
-        }));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
+        respond(
+            &mut app,
+            b,
+            Event::FolderOpened(Ok(mock::folder("b", "B", None))),
+        );
+        signed_out(&mut app);
         let effects = act(&mut app, Action::Retry);
         assert!(
             !effects
@@ -2392,10 +2171,7 @@ mod tests {
 
     #[test]
     fn leaving_waits_for_moves_of_marked_messages() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::PreviousEntry);
         act(&mut app, Action::SaveMessage);
@@ -2407,27 +2183,18 @@ mod tests {
         act(&mut app, Action::DeleteMessage);
         assert_eq!(app.status, "Leaving the folder; wait a moment.");
         // The move fails: m0 stays, still marked, and is purged.
-        let effects = app.update(Msg::Response(Response {
-            id: save,
-            event: Event::Transferred(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, save, Event::Transferred(Err(offline())));
         let (purge, request) = sent(&effects);
         assert!(
             matches!(request, Request::Purge { ref ids, .. } if ids == &[MessageId::new("m0")])
         );
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, purge, "m0");
         assert!(app.quit);
     }
 
     #[test]
     fn a_message_being_purged_is_left_alone() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::PreviousEntry);
         sent(&act(&mut app, Action::SyncMailbox));
@@ -2459,18 +2226,9 @@ mod tests {
         // Listed again before the flag is saved; the listing still has m0
         // unflagged.
         let (list, _) = sent(&app.relist());
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![mock::message("m0", "in", "s", DateTime::UNIX_EPOCH).summary],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![m0().summary], None);
         assert!(app.messages[0].flags.flagged, "still the user's choice");
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
         assert!(app.messages[0].flags.flagged);
     }
 
@@ -2480,27 +2238,12 @@ mod tests {
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         let (list, _) = sent(&app.relist());
         // Saved before the listing, which was taken earlier, comes back.
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![mock::message("m0", "in", "s", DateTime::UNIX_EPOCH).summary],
-                next: None,
-            })),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
+        listed(&mut app, list, vec![m0().summary], None);
         assert!(app.messages[0].flags.flagged);
         // The next listing is newer: it is taken as it is.
         let (list, _) = sent(&app.relist());
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![mock::message("m0", "in", "s", DateTime::UNIX_EPOCH).summary],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![m0().summary], None);
         assert!(!app.messages[0].flags.flagged);
     }
 
@@ -2508,15 +2251,9 @@ mod tests {
     fn failed_flag_changes_are_kept_together() {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (read, _) = sent(&act(&mut app, Action::ToggleNew));
-        app.update(Msg::Response(Response {
-            id: read,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        respond(&mut app, read, Event::FlagsUpdated(Err(offline())));
         let (_, failed) = &app.save_failures[&MessageId::new("m0")];
         assert_eq!(
             *failed,
@@ -2527,10 +2264,7 @@ mod tests {
         );
         // Saving one of them leaves the other to try again.
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
         let (_, failed) = &app.save_failures[&MessageId::new("m0")];
         assert_eq!(
             *failed,
@@ -2548,18 +2282,9 @@ mod tests {
         // Saved from the pager before the message arrives.
         act(&mut app, Action::SaveMessage);
         let (moving, _) = sent(&answer(&mut app, "=Archive"));
-        let effects = app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
-        }));
+        let effects = respond(&mut app, fetch, Event::MessageFetched(Ok(m0())));
         assert!(effects.is_empty(), "the read mark waits its turn");
-        let (_, request) = sent(&app.update(Msg::Response(Response {
-            id: moving,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Ok("a0".into()))],
-            ))),
-        })));
+        let (_, request) = sent(&transferred(&mut app, moving, "archive", "m0", Ok("a0")));
         assert!(
             matches!(request, Request::UpdateFlags(ref id, _) if id.as_str() == "a0"),
             "{request:?}"
@@ -2569,25 +2294,12 @@ mod tests {
     #[test]
     fn a_pager_under_the_browser_closes_when_its_message_moves() {
         let mut app = app(settings());
-        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
-        let (read, _) = sent(&app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
-        })));
-        app.update(Msg::Response(Response {
-            id: read,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        let (read, _) = sent(&show_m0(&mut app));
+        respond(&mut app, read, Event::FlagsUpdated(Ok(())));
         act(&mut app, Action::SaveMessage);
         let (moving, _) = sent(&answer(&mut app, "=Archive"));
         sent(&act(&mut app, Action::BrowseMailboxes));
-        app.update(Msg::Response(Response {
-            id: moving,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Ok("a0".into()))],
-            ))),
-        }));
+        transferred(&mut app, moving, "archive", "m0", Ok("a0"));
         assert_eq!(app.menu(), Menu::Browser);
         act(&mut app, Action::Exit);
         assert_eq!(app.screen(), &Screen::Index);
@@ -2609,10 +2321,7 @@ mod tests {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         assert!(act(&mut app, Action::FlagMessage).is_empty(), "queued");
-        let effects = app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         assert!(effects.is_empty(), "nothing left to change");
         assert!(app.save_failures().is_empty());
         assert!(!app.saving());
@@ -2620,22 +2329,13 @@ mod tests {
 
     #[test]
     fn a_purged_message_has_nothing_left_to_save() {
-        let mut app = app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        });
+        let mut app = yes();
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         app.selected = 0;
         act(&mut app, Action::DeleteMessage);
         let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, purge, "m0");
         assert!(app.save_failures().is_empty());
     }
 
@@ -2644,24 +2344,12 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         app.sign_in = None;
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "archive", "m0", Ok("c0"));
         let effects = act(&mut app, Action::Retry);
         assert!(
             !effects
@@ -2671,30 +2359,17 @@ mod tests {
         );
     }
 
-    fn moved(app: &mut App, id: RequestId, to: &str, new: &str) -> Vec<Effect> {
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((FolderId::new(to), vec![("m0".into(), Ok(new.into()))]))),
-        }))
-    }
-
     #[test]
     fn moving_elsewhere_replaces_the_retry() {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, id, Event::Transferred(Err(expired())));
         app.sign_in = None;
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Projects"));
-        moved(&mut app, id, "projects", "p0");
+        transferred(&mut app, id, "projects", "m0", Ok("p0"));
         let effects = act(&mut app, Action::Retry);
         assert!(
             !effects
@@ -2724,18 +2399,12 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
-            ))),
-        }));
+        transferred(&mut app, id, "archive", "m0", Err(offline()));
         assert!(!app.save_failures().is_empty());
         app.selected = 0;
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        moved(&mut app, id, "archive", "a0");
+        transferred(&mut app, id, "archive", "m0", Ok("a0"));
         assert!(app.save_failures().is_empty(), "{:?}", app.save_failures());
     }
 
@@ -2744,19 +2413,12 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=@inbox"));
-        let effects = moved(&mut app, id, "in", "n0");
+        let effects = transferred(&mut app, id, "in", "m0", Ok("n0"));
         assert!(!app.messages.iter().any(|m| m.id.as_str() == "m0"));
         assert!(
             matches!(sent(&effects).1, Request::ListMessages { .. }),
             "listed again"
         );
-    }
-
-    fn yes() -> App {
-        app(Settings {
-            delete: Quad::Yes,
-            ..settings()
-        })
     }
 
     #[test]
@@ -2766,10 +2428,7 @@ mod tests {
         let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
         assert!(act(&mut app, Action::Quit).is_empty(), "no second purge");
         assert!(!app.quit);
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, purge, "m0");
         assert!(app.quit);
     }
 
@@ -2778,28 +2437,12 @@ mod tests {
         let mut app = yes();
         act(&mut app, Action::DeleteMessage);
         let (purge, _) = sent(&act(&mut app, Action::Quit));
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Err(Error::Auth("expired".into()))),
-        }));
+        signed_out(&mut app);
+        respond(&mut app, purge, Event::Purged(Err(expired())));
         assert!(!app.quit);
         let (purge, _) = sent(&act(&mut app, Action::Retry));
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, purge, "m0");
         assert!(app.quit);
-    }
-
-    fn signed_out(app: &mut App) {
-        app.update(Msg::SignIn(crate::signin::SignInEvent::Finished {
-            account: AccountId::new("alice@contoso.com"),
-            outcome: Err("expired".into()),
-        }));
     }
 
     #[test]
@@ -2809,10 +2452,7 @@ mod tests {
         act(&mut app, Action::PreviousEntry);
         let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, purge, Event::Purged(Err(expired())));
         app.sign_in = None;
         act(&mut app, Action::UndeleteMessage);
         assert!(!app.is_deleted(&"m0".into()));
@@ -2832,10 +2472,7 @@ mod tests {
         act(&mut app, Action::SaveMessage);
         let (list, _) = sent(&key(&mut app, KeyCode::Tab));
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         app.sign_in = None;
         assert!(app.input.is_some(), "the question is back");
         key(&mut app, KeyCode::Esc);
@@ -2851,19 +2488,13 @@ mod tests {
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::FlagMessage);
         act(&mut app, Action::ToggleNew);
-        let effects = app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
         let (read, request) = sent(&effects);
         assert!(matches!(
             request,
             Request::UpdateFlags(_, FlagsUpdate { flagged: None, .. })
         ));
-        app.update(Msg::Response(Response {
-            id: read,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        respond(&mut app, read, Event::FlagsUpdated(Ok(())));
         assert!(app.save_failures().is_empty(), "{:?}", app.save_failures());
     }
 
@@ -2878,41 +2509,16 @@ mod tests {
             act(&mut app, Action::SyncMailbox).is_empty(),
             "behind the copy"
         );
-        let effects = app.update(Msg::Response(Response {
-            id: copy,
-            event: Event::Transferred(Ok((
-                FolderId::new("in"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
-        let list = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request(id, Request::ListMessages { .. }) => Some(*id),
-                _ => None,
-            })
+        let effects = transferred(&mut app, copy, "in", "m0", Ok("c0"));
+        let list = request_for(&effects, |r| matches!(r, Request::ListMessages { .. }))
             .expect("listed again");
-        let purge = effects
-            .iter()
-            .find_map(|e| match e {
-                Effect::Request(id, Request::Purge { .. }) => Some(*id),
-                _ => None,
-            })
+        let purge = request_for(&effects, |r| matches!(r, Request::Purge { .. }))
             .expect("the purge goes next");
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        purged(&mut app, purge, "m0");
         let messages = ["m0", "c0", "m1"]
             .map(|id| mock::message(id, "in", "s", DateTime::UNIX_EPOCH).summary)
             .to_vec();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         assert!(!app.messages.iter().any(|m| m.id.as_str() == "m0"));
     }
 
@@ -2927,10 +2533,7 @@ mod tests {
         let mut app = app(settings());
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
         // Its folder isn't open any more.
         app.messages.clear();
         let first = app.retry();
@@ -2949,14 +2552,8 @@ mod tests {
         let (open, _) = sent(&effects);
         let (list, _) = sent(&act(&mut app, Action::BrowseMailboxes));
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Err(Error::Auth("expired".into()))),
-        }));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, open, Event::FolderOpened(Err(expired())));
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         let effects = app.retry();
         assert!(lists_folders(&effects), "{effects:?}");
         assert!(
@@ -2972,10 +2569,7 @@ mod tests {
         act(&mut app, Action::SaveMessage);
         let (list, _) = sent(&key(&mut app, KeyCode::Tab));
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         app.sign_in = None;
         sent(&answer(&mut app, "=Archive"));
         assert!(!lists_folders(&app.retry()));
@@ -2986,10 +2580,7 @@ mod tests {
         app.selected = 0;
         let (purge, _) = sent(&act(app, Action::SyncMailbox));
         signed_out(app);
-        app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Err(Error::Auth("expired".into()))),
-        }));
+        respond(app, purge, Event::Purged(Err(expired())));
         app.sign_in = None;
     }
 
@@ -3014,7 +2605,7 @@ mod tests {
         app.selected = 0;
         act(&mut app, Action::SaveMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        moved(&mut app, id, "archive", "a0");
+        transferred(&mut app, id, "archive", "m0", Ok("a0"));
         assert!(app.save_failures().is_empty(), "{:?}", app.save_failures());
     }
 
@@ -3049,10 +2640,7 @@ mod tests {
 
     fn flag_failed(app: &mut App) {
         let (flag, _) = sent(&act(app, Action::FlagMessage));
-        app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        respond(app, flag, Event::FlagsUpdated(Err(offline())));
     }
 
     #[test]
@@ -3066,10 +2654,7 @@ mod tests {
         app.messages = listed;
         app.messages[0].flags.read = true;
         app.messages[0].flags.flagged = false;
-        app.update(Msg::Response(Response {
-            id: retry,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        respond(&mut app, retry, Event::FlagsUpdated(Ok(())));
         assert!(app.messages[0].flags.flagged);
         assert!(app.messages[0].flags.read, "untouched");
         assert!(app.save_failures().is_empty());
@@ -3094,35 +2679,20 @@ mod tests {
     #[test]
     fn a_save_before_a_failure_survives_an_older_listing() {
         let mut app = app(settings());
-        let list = app.relist().into_iter().find_map(|e| match e {
-            Effect::Request(id, Request::ListMessages { .. }) => Some(id),
-            _ => None,
-        });
-        let list = list.expect("listed again");
+        let list = request_for(&app.relist(), |r| matches!(r, Request::ListMessages { .. }))
+            .expect("listed again");
         app.messages = (0..3)
             .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
             .collect();
         let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
         act(&mut app, Action::ToggleNew);
-        let effects = app.update(Msg::Response(Response {
-            id: flag,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        let effects = respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
         let (read, _) = sent(&effects);
-        app.update(Msg::Response(Response {
-            id: read,
-            event: Event::FlagsUpdated(Err(Error::Network("offline".into()))),
-        }));
+        respond(&mut app, read, Event::FlagsUpdated(Err(offline())));
         // The listing taken before both changes arrives now, into an
         // index it fills afresh.
         app.messages.clear();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![mock::message("m0", "in", "s", DateTime::UNIX_EPOCH).summary],
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, vec![m0().summary], None);
         assert!(app.messages[0].flags.flagged, "the saved flag stays");
         assert!(
             !app.save_failures().is_empty(),
@@ -3133,10 +2703,11 @@ mod tests {
     fn switch_to(app: &mut App, text: &str, id: &str) {
         act(app, Action::ChangeFolder);
         let (open, _) = sent(&answer(app, text));
-        app.update(Msg::Response(Response {
-            id: open,
-            event: Event::FolderOpened(Ok(mock::folder(id, id, None))),
-        }));
+        respond(
+            app,
+            open,
+            Event::FolderOpened(Ok(mock::folder(id, id, None))),
+        );
     }
 
     #[test]
@@ -3206,10 +2777,7 @@ mod tests {
             "waits its turn"
         );
         assert!(app.messages[0].flags.flagged, "the retry shows");
-        let effects = app.update(Msg::Response(Response {
-            id: retry,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        let effects = respond(&mut app, retry, Event::FlagsUpdated(Ok(())));
         let (_, request) = sent(&effects);
         let Request::UpdateFlags(_, update) = request else {
             panic!("expected a flag update, got {request:?}");
@@ -3223,23 +2791,11 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
-            ))),
-        }));
+        transferred(&mut app, id, "archive", "m0", Err(offline()));
         app.selected = 0;
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Projects"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("projects"),
-                vec![("m0".into(), Ok("p0".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "projects", "m0", Ok("p0"));
         assert_eq!(
             app.save_failures().len(),
             1,
@@ -3249,13 +2805,7 @@ mod tests {
         app.selected = 0;
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("archive"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "archive", "m0", Ok("c0"));
         assert!(app.save_failures().is_empty());
     }
 
@@ -3265,24 +2815,12 @@ mod tests {
         app.selected = 1;
         act(&mut app, Action::CopyMessage);
         let (copy, _) = sent(&answer(&mut app, "=@inbox"));
-        let effects = app.update(Msg::Response(Response {
-            id: copy,
-            event: Event::Transferred(Ok((
-                FolderId::new("in"),
-                vec![("m1".into(), Ok("c1".into()))],
-            ))),
-        }));
+        let effects = transferred(&mut app, copy, "in", "m1", Ok("c1"));
         let (list, _) = sent(&effects);
         let messages = ["c1", "m0", "m1", "m2"]
             .map(|id| mock::message(id, "in", "s", DateTime::UNIX_EPOCH).summary)
             .to_vec();
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages,
-                next: None,
-            })),
-        }));
+        listed(&mut app, list, messages, None);
         assert_eq!(app.messages[app.selected].id.as_str(), "m1");
     }
 
@@ -3291,13 +2829,7 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::CopyMessage);
         let (copy, _) = sent(&answer(&mut app, "=@inbox"));
-        let effects = app.update(Msg::Response(Response {
-            id: copy,
-            event: Event::Transferred(Ok((
-                FolderId::new("in"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
-            ))),
-        }));
+        let effects = transferred(&mut app, copy, "in", "m0", Err(offline()));
         assert!(effects.is_empty(), "{effects:?}");
     }
 
@@ -3308,27 +2840,12 @@ mod tests {
         app.messages.clear();
         let (retry, _) = sent(&app.retry());
         // The folder is listed again before the retry is done.
-        let list = app
-            .relist()
-            .into_iter()
-            .find_map(|e| match e {
-                Effect::Request(id, Request::ListMessages { .. }) => Some(id),
-                _ => None,
-            })
+        let list = request_for(&app.relist(), |r| matches!(r, Request::ListMessages { .. }))
             .expect("listed again");
-        app.update(Msg::Response(Response {
-            id: retry,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
-        let mut listed = mock::message("m0", "in", "s", DateTime::UNIX_EPOCH).summary;
-        listed.flags.read = true;
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::MessagesListed(Ok(MessagePage {
-                messages: vec![listed],
-                next: None,
-            })),
-        }));
+        respond(&mut app, retry, Event::FlagsUpdated(Ok(())));
+        let mut m0 = m0().summary;
+        m0.flags.read = true;
+        listed(&mut app, list, vec![m0], None);
         assert!(app.messages[0].flags.flagged, "the retry's flag");
         assert!(app.messages[0].flags.read, "the rest as listed");
     }
@@ -3338,16 +2855,14 @@ mod tests {
         let mut app = app(settings());
         let (list, _) = sent(&act(&mut app, Action::BrowseMailboxes));
         signed_out(&mut app);
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Err(Error::Auth("expired".into()))),
-        }));
+        respond(&mut app, list, Event::FoldersListed(Err(expired())));
         app.sign_in = None;
         let (list, _) = sent(&act(&mut app, Action::BrowseMailboxes));
-        app.update(Msg::Response(Response {
-            id: list,
-            event: Event::FoldersListed(Ok(vec![mock::folder("arc", "Archive", None)])),
-        }));
+        respond(
+            &mut app,
+            list,
+            Event::FoldersListed(Ok(vec![mock::folder("arc", "Archive", None)])),
+        );
         act(&mut app, Action::Exit);
         assert!(!lists_folders(&app.retry()));
     }
@@ -3362,19 +2877,13 @@ mod tests {
         app.selected = 1;
         act(&mut app, Action::DeleteMessage);
         act(&mut app, Action::Quit);
-        let effects = app.update(Msg::Response(Response {
-            id: purge,
-            event: Event::Purged(Ok(vec![("m0".into(), Ok(()))])),
-        }));
+        let effects = purged(&mut app, purge, "m0");
         assert!(!app.quit, "m1 first");
         let (second, request) = sent(&effects);
         assert!(
             matches!(request, Request::Purge { ref ids, .. } if ids == &[MessageId::new("m1")])
         );
-        app.update(Msg::Response(Response {
-            id: second,
-            event: Event::Purged(Ok(vec![("m1".into(), Ok(()))])),
-        }));
+        purged(&mut app, second, "m1");
         assert!(app.quit);
     }
 
@@ -3384,15 +2893,9 @@ mod tests {
         app.messages[0].flags.read = true;
         let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
         let (toggle, _) = sent(&act(&mut app, Action::ToggleNew));
-        let effects = app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
-        }));
+        let effects = respond(&mut app, fetch, Event::MessageFetched(Ok(m0())));
         assert!(effects.is_empty(), "not marked read again: {effects:?}");
-        app.update(Msg::Response(Response {
-            id: toggle,
-            event: Event::FlagsUpdated(Ok(())),
-        }));
+        respond(&mut app, toggle, Event::FlagsUpdated(Ok(())));
         assert!(!app.messages[0].flags.read);
     }
 
@@ -3401,24 +2904,12 @@ mod tests {
         let mut app = app(settings());
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=Archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Network("offline".into())))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Err(offline()));
         assert!(!app.save_failures().is_empty());
         app.selected = 0;
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=@archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Ok("c0"));
         assert!(app.save_failures().is_empty(), "{:?}", app.save_failures());
     }
 
@@ -3429,24 +2920,12 @@ mod tests {
         let (id, _) = sent(&answer(&mut app, "=Archive"));
         signed_out(&mut app);
         // The folder was found, but copying needed a sign-in.
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Err(Error::Auth("expired".into())))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Err(expired()));
         app.sign_in = None;
         app.selected = 0;
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, "=@archive"));
-        app.update(Msg::Response(Response {
-            id,
-            event: Event::Transferred(Ok((
-                FolderId::new("arc"),
-                vec![("m0".into(), Ok("c0".into()))],
-            ))),
-        }));
+        transferred(&mut app, id, "arc", "m0", Ok("c0"));
         assert!(
             !app.retry()
                 .iter()
@@ -3463,13 +2942,7 @@ mod tests {
             app.selected = 0;
             act(&mut app, Action::CopyMessage);
             let (id, _) = sent(&answer(&mut app, name));
-            app.update(Msg::Response(Response {
-                id,
-                event: Event::Transferred(Ok((
-                    FolderId::new("arc"),
-                    vec![("m0".into(), Err(Error::Auth("expired".into())))],
-                ))),
-            }));
+            transferred(&mut app, id, "arc", "m0", Err(expired()));
         }
         // One retry is kept (changes go out one at a time, so look at what
         // is kept, not just what is sent first).
@@ -3489,11 +2962,7 @@ mod tests {
             resolve: false,
             ..settings()
         });
-        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
-        }));
+        show_m0(&mut app);
         // A background listing moves the index's selection meanwhile.
         app.selected = 1;
         act(&mut app, Action::DeleteMessage);
@@ -3504,11 +2973,7 @@ mod tests {
     #[test]
     fn marking_in_the_pager_goes_on_from_its_message() {
         let mut app = app(settings());
-        let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
-        app.update(Msg::Response(Response {
-            id: fetch,
-            event: Event::MessageFetched(Ok(mock::message("m0", "in", "s", DateTime::UNIX_EPOCH))),
-        }));
+        show_m0(&mut app);
         // A background listing moves the index's selection meanwhile.
         app.selected = 2;
         let (_, request) = sent(&act(&mut app, Action::DeleteMessage));

@@ -791,8 +791,9 @@ mod tests {
 
     use super::*;
     use crate::action::Action;
+    use crate::app::testing::*;
     use crate::app::{Input, Msg, Settings};
-    use crate::worker::{Event, Response};
+    use crate::worker::Event;
     use mett_core::MessagePage;
 
     const MINUTE: Duration = Duration::from_secs(60);
@@ -828,20 +829,6 @@ mod tests {
             mailboxes: vec![entry("=@inbox", inbox()), entry("=Work", work())],
             ..Settings::default()
         }
-    }
-
-    fn respond(app: &mut App, id: RequestId, event: Event) -> Vec<Effect> {
-        app.update(Msg::Response(Response { id, event }))
-    }
-
-    fn requests(effects: &[Effect]) -> Vec<(RequestId, Request)> {
-        effects
-            .iter()
-            .filter_map(|e| match e {
-                Effect::Request(id, request) => Some((*id, request.clone())),
-                _ => None,
-            })
-            .collect()
     }
 
     fn folder(id: &str, name: &str, unread: u32) -> Folder {
@@ -885,11 +872,8 @@ mod tests {
         assert!(matches!(sent[0].1, Request::ListMessages { .. }));
         assert!(matches!(&sent[1].1, Request::CheckMailboxes(m) if m.len() == 2));
         assert!(effects.contains(&Effect::Later(MINUTE, Timer::Poll(0))));
-        let page = MessagePage {
-            messages: vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)],
-            next: None,
-        };
-        respond(&mut app, sent[0].0, Event::MessagesListed(Ok(page)));
+        let messages = vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)];
+        listed(&mut app, sent[0].0, messages, None);
         (app, sent[1].0)
     }
 
@@ -898,10 +882,6 @@ mod tests {
             sort: crate::sort::Sort::parse("unsorted", true).unwrap(),
             ..crate::app::Ordering::default()
         }
-    }
-
-    fn ids(app: &App) -> Vec<&str> {
-        app.messages.iter().map(|m| m.id.as_str()).collect()
     }
 
     /// Fires the poll timer and returns the folder's listing request.
@@ -922,12 +902,81 @@ mod tests {
         }
     }
 
+    /// A page with more to come after it, at `next`.
+    fn more(messages: Vec<MessageSummary>, next: &str) -> MessagePage {
+        MessagePage {
+            messages,
+            next: Some(mett_core::PageCursor::new(next)),
+        }
+    }
+
+    /// Answers the check of the open folder with its `newest` messages
+    /// and those `changed` since the last check.
+    fn polled_with(
+        app: &mut App,
+        id: RequestId,
+        newest: MessagePage,
+        changed: MessagePage,
+    ) -> Vec<Effect> {
+        respond(app, id, Event::FolderPolled(Ok(Polled { newest, changed })))
+    }
+
+    /// Answers the check of the open folder with its newest `messages`,
+    /// and no changes.
     fn polled(app: &mut App, id: RequestId, messages: Vec<MessageSummary>) -> Vec<Effect> {
-        let polled = Polled {
-            newest: page(messages),
-            changed: page(Vec::new()),
-        };
-        respond(app, id, Event::FolderPolled(Ok(polled)))
+        polled_with(app, id, page(messages), page(Vec::new()))
+    }
+
+    /// Fires the poll timer; returns the check of the mailboxes it starts.
+    fn checking(app: &mut App) -> (RequestId, Request) {
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        requests(&effects)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
+            .unwrap()
+    }
+
+    fn next_check(app: &mut App) -> RequestId {
+        checking(app).0
+    }
+
+    /// Answers a check of the mailboxes with what it found in the Inbox
+    /// and in Work.
+    fn check_both(
+        app: &mut App,
+        id: RequestId,
+        inbox_found: mett_core::Result<Checked>,
+        work_found: mett_core::Result<Checked>,
+    ) -> Vec<Effect> {
+        let found = vec![(inbox(), inbox_found), (work(), work_found)];
+        respond(app, id, Event::MailboxesChecked(found))
+    }
+
+    /// Unread mail found by a check: each message and its minute.
+    fn recent(messages: &[(&str, i64)]) -> Vec<(MessageId, DateTime<Utc>)> {
+        messages
+            .iter()
+            .map(|(id, m)| {
+                (
+                    MessageId::new(*id),
+                    DateTime::UNIX_EPOCH + TimeDelta::minutes(*m),
+                )
+            })
+            .collect()
+    }
+
+    /// Opens the folder at `path`, found as `found`.
+    fn switch_to(app: &mut App, path: FolderPath, found: Folder) -> Vec<Effect> {
+        app.change_folder(path);
+        let (switch, _) = app.switching.clone().unwrap();
+        respond(app, switch, Event::FolderOpened(Ok(found)))
+    }
+
+    /// A draft dated (and last changed) at `minutes`.
+    fn draft(id: &str, minutes: i64) -> MessageSummary {
+        let mut draft = summary(id, minutes);
+        draft.draft = true;
+        draft
     }
 
     #[test]
@@ -941,14 +990,8 @@ mod tests {
         });
         let partial = |app: &mut App| {
             let id = poll(app);
-            let polled = Polled {
-                newest: MessagePage {
-                    messages: vec![summary("m2", 2), summary("m1", 1)],
-                    next: Some(mett_core::PageCursor::new("in more")),
-                },
-                changed: page(Vec::new()),
-            };
-            respond(app, id, Event::FolderPolled(Ok(polled)))
+            let newest = more(vec![summary("m2", 2), summary("m1", 1)], "in more");
+            polled_with(app, id, newest, page(Vec::new()))
         };
         let still_there = |effects: &[Effect]| {
             requests(effects)
@@ -975,7 +1018,7 @@ mod tests {
     #[test]
     fn new_mail_joins_the_index_where_its_date_puts_it() {
         let (mut app, _) = app();
-        app.update(Msg::Action(Action::NextEntry));
+        act(&mut app, Action::NextEntry);
         let id = poll(&mut app);
         let mut read = summary("m1", 1);
         read.flags.read = true;
@@ -998,11 +1041,12 @@ mod tests {
         let Some(Polling { started, .. }) = app.polling.clone() else {
             panic!("expected a check");
         };
-        let polled = Polled {
-            newest: page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
-            changed: page(vec![summary("late", -5)]),
-        };
-        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        polled_with(
+            &mut app,
+            id,
+            page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
+            page(vec![summary("late", -5)]),
+        );
         assert_eq!(ids(&app), ["m2", "m1", "m0", "late"]);
         assert_eq!(app.status, NEW_MAIL);
         // The next check asks for changes since this one began.
@@ -1034,15 +1078,12 @@ mod tests {
         let (mut app, _) = app();
         let id = poll(&mut app);
         // A full page that ends at m1: m0 may be on the next.
-        let newest = MessagePage {
-            messages: vec![summary("m1", 1)],
-            next: Some(mett_core::PageCursor::new("in next")),
-        };
-        let polled = Polled {
-            newest,
-            changed: page(Vec::new()),
-        };
-        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        polled_with(
+            &mut app,
+            id,
+            more(vec![summary("m1", 1)], "in next"),
+            page(Vec::new()),
+        );
         assert_eq!(ids(&app), ["m1", "m0"]);
         assert!(app.status.is_empty());
     }
@@ -1055,18 +1096,14 @@ mod tests {
         let id = poll(&mut app);
         // A draft created after m1 was sent, but listed after the sent
         // mail, as Graph sorts unsent drafts.
-        let mut draft = summary("d", 5);
-        draft.draft = true;
+        let draft = draft("d", 5);
         app.messages.push(draft);
-        let newest = MessagePage {
-            messages: vec![summary("m2", 2), summary("m1", 1)],
-            next: Some(mett_core::PageCursor::new("in next")),
-        };
-        let polled = Polled {
-            newest,
-            changed: page(Vec::new()),
-        };
-        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        polled_with(
+            &mut app,
+            id,
+            more(vec![summary("m2", 2), summary("m1", 1)], "in next"),
+            page(Vec::new()),
+        );
         assert_eq!(ids(&app), ["m2", "m1", "m0", "d"]);
     }
 
@@ -1075,11 +1112,6 @@ mod tests {
         let (mut app, _) = app();
         // In the order the folder is listed in.
         app.apply_ordering(unsorted());
-        let draft = |id: &str, minutes| {
-            let mut m = summary(id, minutes);
-            m.draft = true;
-            m
-        };
         // The drafts were listed after the sent mail.
         app.messages.push(draft("d2", 9));
         app.messages.push(draft("d1", 8));
@@ -1087,21 +1119,21 @@ mod tests {
         app.positions.insert(MessageId::new("d1"), 4);
         let id = poll(&mut app);
         // d3 is new, and d2 went; d1 may be on the next page.
-        let newest = MessagePage {
-            messages: vec![
-                summary("m2", 2),
-                summary("m1", 1),
-                summary("m0", 0),
-                draft("d3", 10),
-                draft("d1", 8),
-            ],
-            next: Some(mett_core::PageCursor::new("in next")),
-        };
-        let polled = Polled {
-            newest,
-            changed: page(Vec::new()),
-        };
-        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        polled_with(
+            &mut app,
+            id,
+            more(
+                vec![
+                    summary("m2", 2),
+                    summary("m1", 1),
+                    summary("m0", 0),
+                    draft("d3", 10),
+                    draft("d1", 8),
+                ],
+                "in next",
+            ),
+            page(Vec::new()),
+        );
         assert_eq!(ids(&app), ["m2", "m1", "m0", "d3", "d1"]);
     }
 
@@ -1109,15 +1141,12 @@ mod tests {
     fn changes_older_than_the_listing_need_no_listing_again() {
         let (mut app, _) = app();
         let id = poll(&mut app);
-        let changed = MessagePage {
-            messages: vec![summary("m1", 1)],
-            next: Some(mett_core::PageCursor::new("in more")),
-        };
-        let polled = Polled {
-            newest: page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
-            changed,
-        };
-        let effects = respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        let effects = polled_with(
+            &mut app,
+            id,
+            page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
+            more(vec![summary("m1", 1)], "in more"),
+        );
         assert!(requests(&effects).is_empty(), "{effects:?}");
         // And the next check still allows for the clocks.
         let effects = app.update(Msg::Timer(Timer::Poll(0)));
@@ -1138,7 +1167,7 @@ mod tests {
         respond(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![(inbox(), Err(Error::Auth("expired".into())))]),
+            Event::MailboxesChecked(vec![(inbox(), Err(expired()))]),
         );
         poll(&mut app);
     }
@@ -1156,21 +1185,13 @@ mod tests {
     #[test]
     fn mail_seen_before_the_first_check_is_not_new() {
         let (mut app, check) = app();
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 0))),
-        );
+        switch_to(&mut app, work(), folder("work", "Work", 0));
         // The Inbox index had m2 (dated 2) unread when the user left.
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 3, Some(2))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 3, Some(2)),
+            checked("work", "Work", 0, None),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 0);
     }
@@ -1178,13 +1199,11 @@ mod tests {
     #[test]
     fn another_folder_at_a_mailbox_s_path_starts_afresh() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 0, None),
         );
         app.seen.insert(
             FolderId::new("work"),
@@ -1193,18 +1212,12 @@ mod tests {
                 messages: HashSet::new(),
             },
         );
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        respond(
+        let check = next_check(&mut app);
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work2", "Work", 1, Some(3))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work2", "Work", 1, Some(3)),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 1);
     }
@@ -1216,15 +1229,12 @@ mod tests {
         // More changes than were read, since the folder was listed.
         let mut recent = summary("m1", 1);
         recent.modified = Some(Utc::now());
-        let changed = MessagePage {
-            messages: vec![recent],
-            next: Some(mett_core::PageCursor::new("in more")),
-        };
-        let polled = Polled {
-            newest: page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
-            changed,
-        };
-        let effects = respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        let effects = polled_with(
+            &mut app,
+            id,
+            page(vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)]),
+            more(vec![recent], "in more"),
+        );
         assert!(app.status.is_empty(), "nothing new seen yet");
         let (list, _) = requests(&effects)[0].clone();
         respond(
@@ -1246,36 +1256,31 @@ mod tests {
         // In the order the folder is listed in.
         app.apply_ordering(unsorted());
         // Listed out of date order, as drafts can be.
-        let mut draft = summary("d", 9);
-        draft.draft = true;
+        let draft = draft("d", 9);
         app.messages.push(draft.clone());
         app.positions.insert(draft.id.clone(), 3);
-        app.update(Msg::Action(Action::Limit));
-        for c in "~s m2".chars() {
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
-        }
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        act(&mut app, Action::Limit);
+        typed(&mut app, "~s m2");
+        key(&mut app, KeyCode::Enter);
         assert_eq!(ids(&app), ["m2"]);
         let id = poll(&mut app);
-        let newest = MessagePage {
-            messages: vec![summary("m3", 3), summary("m2", 2), summary("m1", 1)],
-            next: Some(mett_core::PageCursor::new("in next")),
-        };
-        let polled = Polled {
-            newest,
-            changed: page(Vec::new()),
-        };
-        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
-        app.update(Msg::Action(Action::Limit));
+        polled_with(
+            &mut app,
+            id,
+            more(
+                vec![summary("m3", 3), summary("m2", 2), summary("m1", 1)],
+                "in next",
+            ),
+            page(Vec::new()),
+        );
+        act(&mut app, Action::Limit);
         // The question starts with the limit in force.
         app.update(Msg::Key(KeyEvent::new(
             KeyCode::Char('u'),
             ratatui::crossterm::event::KeyModifiers::CONTROL,
         )));
-        for c in "all".chars() {
-            app.update(Msg::Key(KeyEvent::from(KeyCode::Char(c))));
-        }
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        typed(&mut app, "all");
+        key(&mut app, KeyCode::Enter);
         assert_eq!(ids(&app), ["m3", "m2", "m1", "m0", "d"]);
     }
 
@@ -1283,15 +1288,12 @@ mod tests {
     fn a_full_page_of_new_mail_lists_the_folder_again() {
         let (mut app, _) = app();
         let id = poll(&mut app);
-        let newest = MessagePage {
-            messages: vec![summary("m4", 4), summary("m3", 3)],
-            next: Some(mett_core::PageCursor::new("in next")),
-        };
-        let polled = Polled {
-            newest,
-            changed: page(Vec::new()),
-        };
-        let effects = respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        let effects = polled_with(
+            &mut app,
+            id,
+            more(vec![summary("m4", 4), summary("m3", 3)], "in next"),
+            page(Vec::new()),
+        );
         assert!(matches!(
             requests(&effects)[..],
             [(_, Request::ListMessages { .. })]
@@ -1347,11 +1349,7 @@ mod tests {
     fn checks_wait_for_a_sign_in_after_one_failed() {
         let (mut app, _) = app();
         let id = poll(&mut app);
-        respond(
-            &mut app,
-            id,
-            Event::FolderPolled(Err(Error::Auth("expired".into()))),
-        );
+        respond(&mut app, id, Event::FolderPolled(Err(expired())));
         let effects = app.update(Msg::Timer(Timer::Poll(0)));
         assert_eq!(effects, [Effect::Later(MINUTE, Timer::Poll(0))]);
         app.retry();
@@ -1383,21 +1381,15 @@ mod tests {
     #[test]
     fn says_which_mailboxes_have_new_mail() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 0, None),
         );
         // The open folder doesn't count.
         assert_eq!(app.mailboxes_with_new_mail(), 0);
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, request) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
+        let (check, request) = checking(&mut app);
         // Checked again by ID.
         assert_eq!(
             request,
@@ -1410,24 +1402,22 @@ mod tests {
                 (work(), Some(FolderId::new("work")), None),
             ])
         );
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 2, Some(2))),
-                (work(), checked("work", "Work", 3, Some(3))),
-            ]),
+            checked("in", "Inbox", 2, Some(2)),
+            checked("work", "Work", 3, Some(3)),
         );
         assert_eq!(app.status, "New mail in =Work.");
         assert_eq!(app.mailboxes_with_new_mail(), 1);
 
         // `c` offers it.
-        app.update(Msg::Action(Action::ChangeFolder));
+        act(&mut app, Action::ChangeFolder);
         let Some(Input::Line { editor, .. }) = &app.input else {
             panic!("expected a question");
         };
         assert_eq!(editor.text(), "=Work");
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        key(&mut app, KeyCode::Enter);
         let (switch, _) = app.switching.clone().expect("the folder is being opened");
         respond(
             &mut app,
@@ -1440,13 +1430,11 @@ mod tests {
     #[test]
     fn mail_that_arrives_after_leaving_is_new_whatever_was_read() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 0, None),
         );
         // m0 is read in the Inbox; then the user leaves for Work, before
         // the change is saved.
@@ -1458,13 +1446,7 @@ mod tests {
             },
         );
         let (write, _) = requests(&effects)[0].clone();
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        let effects = respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 0))),
-        );
+        let effects = switch_to(&mut app, work(), folder("work", "Work", 0));
         respond(&mut app, write, Event::FlagsUpdated(Ok(())));
         assert!(
             requests(&effects)
@@ -1473,18 +1455,12 @@ mod tests {
         );
         // Old unread mail isn't new.
         let check_again = |app: &mut App, newest: i64| {
-            let effects = app.update(Msg::Timer(Timer::Poll(0)));
-            let (check, _) = requests(&effects)
-                .into_iter()
-                .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-                .unwrap();
-            respond(
+            let check = next_check(app);
+            check_both(
                 app,
                 check,
-                Event::MailboxesChecked(vec![
-                    (inbox(), checked("in", "Inbox", 1, Some(newest))),
-                    (work(), checked("work", "Work", 0, None)),
-                ]),
+                checked("in", "Inbox", 1, Some(newest)),
+                checked("work", "Work", 0, None),
             );
         };
         check_again(&mut app, 1);
@@ -1499,23 +1475,15 @@ mod tests {
     #[test]
     fn mail_seen_on_a_visit_is_not_new_after_it() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 0, None),
         );
         // Mail arrives in Work; the user opens it before the next check,
         // and leaves before that check answers.
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        let effects = respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 1))),
-        );
+        let effects = switch_to(&mut app, work(), folder("work", "Work", 1));
         let sent = requests(&effects);
         // The new mail is listed: the user sees it.
         let (list, _) = sent
@@ -1530,25 +1498,13 @@ mod tests {
             list,
             Event::MessagesListed(Ok(page(vec![arrived]))),
         );
-        app.change_folder(inbox());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("in", "Inbox", 1))),
-        );
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        respond(
+        switch_to(&mut app, inbox(), folder("in", "Inbox", 1));
+        let check = next_check(&mut app);
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 1, Some(3))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 1, Some(3)),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 0);
         assert!(!app.status.starts_with("New mail"), "{}", app.status);
@@ -1557,35 +1513,21 @@ mod tests {
     #[test]
     fn mail_arriving_after_leaving_is_new_even_if_a_check_straddles_it() {
         let (mut app, first) = app();
-        respond(
+        check_both(
             &mut app,
             first,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 0, None),
         );
         // A check starts while the Inbox is open; the user leaves; mail
         // arrives in the Inbox before the check reads it.
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 0))),
-        );
-        respond(
+        let check = next_check(&mut app);
+        switch_to(&mut app, work(), folder("work", "Work", 0));
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 2, Some(9))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 2, Some(9)),
+            checked("work", "Work", 0, None),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 1);
     }
@@ -1595,40 +1537,20 @@ mod tests {
         let (mut app, check) = app();
         // The check finds w9 in Work while it is open, before the listing
         // shows it; the user leaves before it does.
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 1))),
-        );
-        respond(
+        switch_to(&mut app, work(), folder("work", "Work", 1));
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 1, Some(9))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 1, Some(9)),
         );
-        app.change_folder(inbox());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("in", "Inbox", 1))),
-        );
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        respond(
+        switch_to(&mut app, inbox(), folder("in", "Inbox", 1));
+        let check = next_check(&mut app);
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 1, Some(9))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 1, Some(9)),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 1);
     }
@@ -1637,28 +1559,20 @@ mod tests {
     fn a_failure_hidden_by_another_message_is_said_later() {
         let (mut app, check) = app();
         app.status = "Loading Inbox...".into();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), Err(Error::Network("down".into()))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            Err(Error::Network("down".into())),
         );
         assert_eq!(app.status, "Loading Inbox...");
         app.status.clear();
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        respond(
+        let check = next_check(&mut app);
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), Err(Error::Network("down".into()))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            Err(Error::Network("down".into())),
         );
         assert!(
             app.status.starts_with("Couldn't check =Work"),
@@ -1670,13 +1584,11 @@ mod tests {
     #[test]
     fn an_unchecked_mailbox_has_no_new_mail() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 2, Some(2))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 2, Some(2)),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 1);
         let mut settings = settings();
@@ -1689,33 +1601,19 @@ mod tests {
     fn mail_found_while_open_but_unseen_is_announced_after_leaving() {
         let (mut app, check) = app();
         // Found while the Inbox is open, before its index shows it.
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 4, Some(9))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 4, Some(9)),
+            checked("work", "Work", 0, None),
         );
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 0))),
-        );
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        respond(
+        switch_to(&mut app, work(), folder("work", "Work", 0));
+        let check = next_check(&mut app);
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 4, Some(9))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 4, Some(9)),
+            checked("work", "Work", 0, None),
         );
         assert_eq!(app.status, "New mail in =@inbox.");
     }
@@ -1723,13 +1621,11 @@ mod tests {
     #[test]
     fn a_refused_mailbox_is_said_and_checks_go_on() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), Err(Error::Auth("access denied".into()))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            Err(Error::Auth("access denied".into())),
         );
         assert!(
             app.status.starts_with("Couldn't check =Work"),
@@ -1760,54 +1656,28 @@ mod tests {
 
     /// Leaves the Inbox for Work, then has a check find the Inbox's
     /// `recent` unread mail.
-    fn leave_and_check(app: &mut App, recent: Vec<(&str, i64)>) {
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 0))),
-        );
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        let recent = recent
-            .into_iter()
-            .map(|(id, m)| {
-                (
-                    MessageId::new(id),
-                    DateTime::UNIX_EPOCH + TimeDelta::minutes(m),
-                )
-            })
-            .collect();
-        respond(
+    fn leave_and_check(app: &mut App, found: Vec<(&str, i64)>) {
+        switch_to(app, work(), folder("work", "Work", 0));
+        let check = next_check(app);
+        check_both(
             app,
             check,
-            Event::MailboxesChecked(vec![
-                (
-                    inbox(),
-                    Ok(Checked {
-                        folder: folder("in", "Inbox", 3),
-                        recent,
-                    }),
-                ),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            Ok(Checked {
+                folder: folder("in", "Inbox", 3),
+                recent: recent(&found),
+            }),
+            checked("work", "Work", 0, None),
         );
     }
 
     #[test]
     fn mail_the_user_changed_is_not_new() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 3, Some(2))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 3, Some(2)),
+            checked("work", "Work", 0, None),
         );
         // m1 is flagged: Graph says it changed (at 30).
         let effects = app.update_flags(
@@ -1822,13 +1692,7 @@ mod tests {
         leave_and_check(&mut app, vec![("m1", 30), ("m2", 2)]);
         assert_eq!(app.mailboxes_with_new_mail(), 0);
         // Mail that really is new still counts.
-        app.change_folder(inbox());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("in", "Inbox", 3))),
-        );
+        switch_to(&mut app, inbox(), folder("in", "Inbox", 3));
         leave_and_check(&mut app, vec![("m9", 40), ("m1", 30)]);
         assert_eq!(app.mailboxes_with_new_mail(), 1);
     }
@@ -1838,20 +1702,12 @@ mod tests {
         // The user leaves the Inbox before the first check answers; mail
         // arrives after what they saw.
         let (mut app, check) = app();
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 0))),
-        );
-        respond(
+        switch_to(&mut app, work(), folder("work", "Work", 0));
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 4, Some(50))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 4, Some(50)),
+            checked("work", "Work", 0, None),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 1);
         assert_eq!(app.status, "New mail in =@inbox.");
@@ -1863,13 +1719,7 @@ mod tests {
         // user leaves before the first check answers.
         let (mut app, check) = app();
         app.mailboxes[0].path = FolderPath::Named(vec!["Inbox".into()]);
-        app.change_folder(work());
-        let (switch, _) = app.switching.clone().unwrap();
-        respond(
-            &mut app,
-            switch,
-            Event::FolderOpened(Ok(folder("work", "Work", 0))),
-        );
+        switch_to(&mut app, work(), folder("work", "Work", 0));
         respond(
             &mut app,
             check,
@@ -1892,16 +1742,17 @@ mod tests {
         let mut read = unread.clone();
         read.flags.read = true;
         read.modified = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(9));
-        let polled = Polled {
-            newest: page(vec![
+        polled_with(
+            &mut app,
+            id,
+            page(vec![
                 unread,
                 summary("m2", 2),
                 summary("m1", 1),
                 summary("m0", 0),
             ]),
-            changed: page(vec![read]),
-        };
-        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+            page(vec![read]),
+        );
         assert!(app.messages[0].flags.read);
         assert_ne!(app.status, NEW_MAIL);
     }
@@ -1914,24 +1765,23 @@ mod tests {
         read.flags.read = true;
         read.modified = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(9));
         // The changes saw it before it was read.
-        let polled = Polled {
-            newest: page(vec![summary("m2", 2), read, summary("m0", 0)]),
-            changed: page(vec![summary("m1", 1)]),
-        };
-        respond(&mut app, id, Event::FolderPolled(Ok(polled)));
+        polled_with(
+            &mut app,
+            id,
+            page(vec![summary("m2", 2), read, summary("m0", 0)]),
+            page(vec![summary("m1", 1)]),
+        );
         assert!(app.messages[1].flags.read);
     }
 
     #[test]
     fn too_many_changes_to_tell_count_as_new_mail() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 3, Some(2))),
-                (work(), checked("work", "Work", 0, None)),
-            ]),
+            checked("in", "Inbox", 3, Some(2)),
+            checked("work", "Work", 0, None),
         );
         let recent: Vec<(&str, i64)> = vec![("m2", 30); mett_core::RECENT_UNREAD];
         leave_and_check(&mut app, recent);
@@ -1939,39 +1789,16 @@ mod tests {
     }
 
     /// Has a check find Work's `recent` unread mail.
-    fn check_work(app: &mut App, check: RequestId, recent: &[(&str, i64)]) {
-        let recent = recent
-            .iter()
-            .map(|(id, m)| {
-                (
-                    MessageId::new(*id),
-                    DateTime::UNIX_EPOCH + TimeDelta::minutes(*m),
-                )
-            })
-            .collect();
-        respond(
+    fn check_work(app: &mut App, check: RequestId, found: &[(&str, i64)]) {
+        check_both(
             app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (
-                    work(),
-                    Ok(Checked {
-                        folder: folder("work", "Work", 2),
-                        recent,
-                    }),
-                ),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            Ok(Checked {
+                folder: folder("work", "Work", 2),
+                recent: recent(found),
+            }),
         );
-    }
-
-    fn next_check(app: &mut App) -> RequestId {
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap()
-            .0
     }
 
     #[test]
@@ -2004,38 +1831,24 @@ mod tests {
     fn a_change_to_unread_mail_already_there_is_not_announced() {
         let (mut app, check) = app();
         // Work had unread m5 before the user ever opened it.
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 1, Some(5))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 1, Some(5)),
         );
         assert_eq!(app.mailboxes_with_new_mail(), 1);
         app.status.clear();
         // m5 is flagged in Outlook: it changed, but didn't arrive.
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        respond(
+        let check = next_check(&mut app);
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (
-                    work(),
-                    Ok(Checked {
-                        folder: folder("work", "Work", 1),
-                        recent: vec![(
-                            MessageId::new("m5"),
-                            DateTime::UNIX_EPOCH + TimeDelta::minutes(30),
-                        )],
-                    }),
-                ),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            Ok(Checked {
+                folder: folder("work", "Work", 1),
+                recent: recent(&[("m5", 30)]),
+            }),
         );
         assert!(app.status.is_empty(), "{}", app.status);
     }
@@ -2043,27 +1856,19 @@ mod tests {
     #[test]
     fn a_failed_first_check_is_no_baseline() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), Err(Error::Network("down".into()))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            Err(Error::Network("down".into())),
         );
         app.status.clear();
-        let effects = app.update(Msg::Timer(Timer::Poll(0)));
-        let (check, _) = requests(&effects)
-            .into_iter()
-            .find(|(_, r)| matches!(r, Request::CheckMailboxes(_)))
-            .unwrap();
-        respond(
+        let check = next_check(&mut app);
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), checked("work", "Work", 2, Some(2))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            checked("work", "Work", 2, Some(2)),
         );
         // Unread mail it had all along: shown, not announced.
         assert_eq!(app.mailboxes_with_new_mail(), 1);
@@ -2077,8 +1882,7 @@ mod tests {
         app.apply_ordering(unsorted());
         app.messages.clear();
         app.positions.clear();
-        let mut draft = summary("d", 9);
-        draft.draft = true;
+        let draft = draft("d", 9);
         app.messages.push(draft.clone());
         app.positions.insert(draft.id.clone(), 0);
         let id = poll(&mut app);
@@ -2120,20 +1924,18 @@ mod tests {
     #[test]
     fn the_browser_starts_on_the_mailboxes() {
         let (mut app, check) = app();
-        respond(
+        check_both(
             &mut app,
             check,
-            Event::MailboxesChecked(vec![
-                (inbox(), checked("in", "Inbox", 1, Some(1))),
-                (work(), Err(Error::not_found("folder", "Work"))),
-            ]),
+            checked("in", "Inbox", 1, Some(1)),
+            Err(Error::not_found("folder", "Work")),
         );
         assert!(app.status.starts_with("Couldn't check =Work"));
         assert!(!app.has_new_mail(&app.mailboxes[1]));
         // New mail elsewhere leaves the failure on the message line.
         app.announce("New mail in =Elsewhere.");
         assert!(app.status.starts_with("Couldn't check =Work"));
-        let effects = app.update(Msg::Action(Action::BrowseMailboxes));
+        let effects = act(&mut app, Action::BrowseMailboxes);
         // With fresh counts.
         assert!(matches!(
             requests(&effects)[..],
@@ -2148,7 +1950,7 @@ mod tests {
             .map(|e| (e.name.as_str(), e.counts))
             .collect();
         assert_eq!(names, [("=@inbox", Some((1, 0))), ("=Work", None)]);
-        let effects = app.update(Msg::Action(Action::ToggleMailboxes));
+        let effects = act(&mut app, Action::ToggleMailboxes);
         assert!(matches!(
             requests(&effects)[..],
             [(_, Request::ListFolders)]
@@ -2185,15 +1987,15 @@ mod tests {
                 ),
             ]),
         );
-        app.update(Msg::Action(Action::ChangeFolder));
+        act(&mut app, Action::ChangeFolder);
         let text = |app: &App| match &app.input {
             Some(Input::Line { editor, .. }) => editor.text(),
             _ => panic!("expected a question"),
         };
         assert_eq!(text(&app), "=Work");
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(' '))));
+        key(&mut app, KeyCode::Char(' '));
         assert_eq!(text(&app), "=Lists");
-        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(' '))));
+        key(&mut app, KeyCode::Char(' '));
         assert_eq!(text(&app), "=Work");
     }
 }
