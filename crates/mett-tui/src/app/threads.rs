@@ -201,6 +201,7 @@ impl App {
             sort::Key::new(m, sort, aux, at)
         };
         let compare = |a: &sort::Key, b: &sort::Key| sort::compare(a, b, sort, aux);
+        debug_assert!(self.in_order(), "the index is in order");
         let mut listed: Vec<(sort::Key, MessageSummary)> =
             listed.into_iter().map(|m| (key(&m), m)).collect();
         listed.sort_by(|(a, _), (b, _)| compare(a, b));
@@ -252,6 +253,21 @@ impl App {
         if let Some(at) = selected_id.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
             self.selected = at;
         }
+    }
+
+    /// Whether the index is in order, as it always is without threads
+    /// (with them, until messages listed since are threaded).
+    pub(super) fn in_order(&self) -> bool {
+        let (sort, aux) = (self.ordering.sort, self.ordering.aux);
+        let key = |m: &MessageSummary| {
+            let at = self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
+            sort::Key::new(m, sort, aux, at)
+        };
+        self.threaded()
+            || self
+                .messages
+                .windows(2)
+                .all(|pair| sort::compare(&key(&pair[0]), &key(&pair[1]), sort, aux).is_le())
     }
 
     /// Threads the messages listed so far, if some aren't yet.
