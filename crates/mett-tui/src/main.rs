@@ -448,6 +448,10 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             effects,
         )
     };
+    // Drawing writes only the cells that changed, so what the terminal
+    // showed before goes first: without an alternate screen (GNU screen
+    // without `altscreen`), the shell's output would show through.
+    terminal.clear()?;
     let size = terminal.size()?;
     let (mut app, effects) = App::open(size.width, size.height, folder, settings);
     app.keymap = keymap;
