@@ -18,7 +18,7 @@ pub struct Settings {
     /// mutt's `alternates`: regular expressions for the user's other
     /// addresses, such as a mail address that differs from the account's
     /// name. They match ignoring case.
-    pub alternates: Vec<String>,
+    pub alternates: Alternates,
     /// The signature's text, if there is one.
     pub signature: Option<String>,
     /// `sig_dashes`: put `-- ` before the signature.
@@ -59,7 +59,7 @@ impl Default for Settings {
         Self {
             from: None,
             me: Vec::new(),
-            alternates: Vec::new(),
+            alternates: Alternates::default(),
             signature: None,
             sig_dashes: true,
             attribution: "On %d, %n wrote:".into(),
@@ -121,7 +121,7 @@ impl Settings {
         Ok(Settings {
             from,
             me,
-            alternates: config.alternates().to_vec(),
+            alternates: config.alternates().to_vec().into(),
             signature,
             sig_dashes: config.flag("sig_dashes"),
             attribution: config.string("attribution").to_owned(),
@@ -143,15 +143,56 @@ impl Settings {
 
     pub fn is_me(&self, address: &Address) -> bool {
         let email = address.email.to_lowercase();
-        self.me.contains(&email)
-            || self.alternates.iter().any(|alternate| {
-                regex::RegexBuilder::new(alternate)
-                    .case_insensitive(true)
-                    .build()
-                    .is_ok_and(|regex| regex.is_match(&address.email))
-            })
+        self.me.contains(&email) || self.alternates.is_match(&address.email)
     }
 }
+
+/// mutt's `alternates`, as given, and compiled once: those that don't
+/// compile (reported when they were set) match nothing.
+#[derive(Clone, Debug, Default)]
+pub struct Alternates {
+    patterns: Vec<String>,
+    compiled: Vec<regex::Regex>,
+}
+
+impl Alternates {
+    /// Whether any of them matches `email`, ignoring case.
+    pub fn is_match(&self, email: &str) -> bool {
+        self.compiled.iter().any(|regex| regex.is_match(email))
+    }
+}
+
+impl From<Vec<String>> for Alternates {
+    fn from(patterns: Vec<String>) -> Self {
+        let compiled = patterns
+            .iter()
+            .filter_map(|pattern| {
+                regex::RegexBuilder::new(pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .ok()
+            })
+            .collect();
+        Self { patterns, compiled }
+    }
+}
+
+impl std::ops::Deref for Alternates {
+    type Target = [String];
+
+    fn deref(&self) -> &[String] {
+        &self.patterns
+    }
+}
+
+/// The same patterns: they compile alike.
+impl PartialEq for Alternates {
+    fn eq(&self, other: &Self) -> bool {
+        self.patterns == other.patterns
+    }
+}
+
+impl Eq for Alternates {}
 
 /// What is being written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,15 +373,10 @@ pub fn reply_recipients(
         );
     }
     // Keep the first of any duplicates, To before Cc.
-    let mut seen = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut unique = |list: Vec<Address>| {
         list.into_iter()
-            .filter(|a| {
-                let email = a.email.to_lowercase();
-                let new = !seen.contains(&email);
-                seen.push(email);
-                new
-            })
+            .filter(|a| seen.insert(a.email.to_lowercase()))
             .collect::<Vec<_>>()
     };
     let to = unique(to);
@@ -446,7 +482,7 @@ mod tests {
             &account,
         )
         .unwrap();
-        assert_eq!(settings.alternates, ["^me@x\\.org$", "other"]);
+        assert_eq!(*settings.alternates, ["^me@x\\.org$", "other"]);
         assert_eq!(
             settings.from,
             Some(Address::new("Me@Contoso.com").with_name("Me Myself"))
@@ -563,13 +599,35 @@ mod tests {
     #[test]
     fn alternates_count_as_me() {
         let settings = Settings {
-            alternates: vec!["^isaac\\..*@contoso\\.com$".into()],
+            alternates: vec!["^isaac\\..*@contoso\\.com$".to_owned()].into(),
             ..settings()
         };
         let mut message = message();
         message.summary.from = Some(Address::new("Isaac.Gelado@contoso.com"));
         let (to, _) = reply_recipients(&message, true, false, &settings);
         assert!(to.iter().all(|a| a.email != "Isaac.Gelado@contoso.com"));
+        // One that doesn't compile matches nothing; the others still do,
+        // in a group reply too.
+        let settings = Settings {
+            alternates: vec!["(".to_owned(), "^ME2@".to_owned()].into(),
+            ..settings
+        };
+        assert_eq!(*settings.alternates, ["(", "^ME2@"]);
+        assert!(!settings.is_me(&Address::new("(@x.org")));
+        let mut message = self::message();
+        message.summary.to = vec![
+            Address::new("me2@x.org"),
+            Address::new("carol@x.org"),
+            Address::new("Isaac.G@contoso.com"),
+        ];
+        message.cc = vec![Address::new("CAROL@x.org"), Address::new("dave@x.org")];
+        let (to, cc) = reply_recipients(&message, true, true, &settings);
+        let emails = |list: &[Address]| list.iter().map(|a| a.email.clone()).collect::<Vec<_>>();
+        assert_eq!(emails(&to), ["bob@x.org"]);
+        assert_eq!(
+            emails(&cc),
+            ["carol@x.org", "Isaac.G@contoso.com", "dave@x.org"]
+        );
     }
 
     #[test]

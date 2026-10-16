@@ -800,6 +800,13 @@ impl App {
 
     /// Shows fresh counts in the browser, if it lists the mailboxes.
     fn refresh_mailbox_browser(&mut self) {
+        let browsing = self
+            .screens
+            .iter()
+            .any(|screen| matches!(screen, Screen::Browser(browser) if browser.mailboxes));
+        if !browsing {
+            return;
+        }
         let entries = self.mailbox_entries();
         for screen in &mut self.screens {
             if let Screen::Browser(browser) = screen

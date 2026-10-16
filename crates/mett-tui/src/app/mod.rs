@@ -1270,15 +1270,6 @@ impl App {
         effects
     }
 
-    /// Whether a flag change of `message` is waiting its turn or on its way.
-    fn flags_pending(&self, message: &MessageId) -> bool {
-        self.writing
-            .iter()
-            .map(|(_, write)| write)
-            .chain(&self.writes)
-            .any(|write| matches!(write, Write::Flags(id, _) if id == message))
-    }
-
     /// Makes again the changes that failed to save, which the index undid.
     /// (Their failures are cleared once that succeeds.)
     fn retry_saves(&mut self) -> Vec<Effect> {
@@ -1288,22 +1279,41 @@ impl App {
             .map(|(id, (_, update))| (id.clone(), *update))
             .collect();
         unsaved.sort_by(|a, b| a.0.cmp(&b.0));
+        // What the index shows of each, and whether a change of its flags
+        // is on its way, in one pass each. (Retrying one message changes
+        // only its own.)
+        let mut shown = HashMap::new();
+        for summary in self.folder_messages() {
+            if self.save_failures.contains_key(&summary.id) {
+                shown.entry(summary.id.clone()).or_insert(summary.flags);
+            }
+        }
+        let pending: HashSet<MessageId> = self
+            .writing
+            .iter()
+            .map(|(_, write)| write)
+            .chain(&self.writes)
+            .filter_map(|write| match write {
+                Write::Flags(id, _) if self.save_failures.contains_key(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
         unsaved
             .into_iter()
             .flat_map(|(message, update)| {
                 // Its folder may not be open any more: save it all the
                 // same, once (a retry may come again before it is done).
-                if let Some(summary) = self.summary(&message) {
+                if let Some(&before) = shown.get(&message) {
                     // The mailbox may have it after all (the response was
                     // lost): a fresh listing shows it, and that settles it.
-                    let mut flags = summary.flags;
+                    let mut flags = before;
                     update.apply(&mut flags);
-                    if flags == summary.flags && !self.flags_pending(&message) {
+                    if flags == before && !pending.contains(&message) {
                         self.save_failures.remove(&message);
                         return Vec::new();
                     }
                     self.update_flags(message, update)
-                } else if self.flags_pending(&message) {
+                } else if pending.contains(&message) {
                     Vec::new()
                 } else {
                     self.write(Write::Flags(message, update))
@@ -2005,11 +2015,22 @@ impl App {
     /// The summary of a message in the folder, shown or hidden by the
     /// limit.
     fn summary(&self, id: &MessageId) -> Option<&MessageSummary> {
+        // Most often the selected one (IDs are unique).
+        if let Some(selected) = self.messages.get(self.selected).filter(|s| &s.id == id) {
+            return Some(selected);
+        }
         self.folder_messages().find(|s| &s.id == id)
     }
 
     /// The summary of a message in the folder, to change.
     fn summary_mut(&mut self, id: &MessageId) -> Option<&mut MessageSummary> {
+        if self
+            .messages
+            .get(self.selected)
+            .is_some_and(|s| &s.id == id)
+        {
+            return self.messages.get_mut(self.selected);
+        }
         self.messages
             .iter_mut()
             .chain(&mut self.hidden)

@@ -113,10 +113,24 @@ fn unquote(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Whether two alias names are the same, ignoring case (in any script, as
-/// completion does).
-pub fn same_key(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
+/// An alias name ignoring case (in any script, as completion does): two
+/// names are the same alias when these are equal.
+pub fn folded_key(key: &str) -> String {
+    key.to_lowercase()
+}
+
+/// Whether `key`, ignoring case, is `folded` (a [`folded_key`]).
+fn folds_to(key: &str, folded: &str) -> bool {
+    // An ASCII name folds byte by byte, without a copy.
+    if key.is_ascii() {
+        key.len() == folded.len()
+            && key
+                .bytes()
+                .zip(folded.bytes())
+                .all(|(k, f)| k.to_ascii_lowercase() == f)
+    } else {
+        folded_key(key) == folded
+    }
 }
 
 /// The alias called `key`, ignoring case, as mutt does.
@@ -124,18 +138,20 @@ pub fn find<'a>(aliases: &'a [Alias], key: &str) -> Option<&'a Alias> {
     if key.is_empty() || key.contains(['@', '<', '"', ' ']) {
         return None;
     }
-    aliases.iter().find(|a| same_key(&a.key, key))
+    let key = folded_key(key);
+    aliases.iter().find(|a| folds_to(&a.key, &key))
 }
 
 /// The aliases whose keys start with `prefix`, ignoring case.
 pub fn completions<'a>(aliases: &'a [Alias], prefix: &str) -> Vec<&'a Alias> {
-    let prefix = prefix.to_lowercase();
-    let mut found: Vec<&Alias> = aliases
+    let prefix = folded_key(prefix);
+    let mut found: Vec<(String, &Alias)> = aliases
         .iter()
-        .filter(|a| a.key.to_lowercase().starts_with(&prefix))
+        .map(|a| (folded_key(&a.key), a))
+        .filter(|(key, _)| key.starts_with(&prefix))
         .collect();
-    found.sort_by_key(|a| a.key.to_lowercase());
-    found
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.into_iter().map(|(_, a)| a).collect()
 }
 
 /// The entry being typed at the end of an address list, and where it
