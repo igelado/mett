@@ -9,7 +9,9 @@ Architecture (`docs/DESIGN.md` §5.2):
   attribution, recipients, signature); **`lineedit.rs`:** the line editor
   for questions such as `To:`; **`editor.rs`:** runs the external editor;
   **`pattern.rs`:** mutt's patterns, for searching and limiting.
-- **`view.rs`:** draws the model with [ratatui](https://ratatui.rs).
+- **`view.rs`:** draws the model with [ratatui](https://ratatui.rs);
+  `view/sidebar.rs` draws the sidebar, whose entries `app/sidebar.rs`
+  keeps.
 - **`action.rs` and `keymap.rs`:** mutt-style named actions, and key bindings
   for each menu (the Command pattern, §5.3).
 - **`worker.rs`:** the background actor that owns all mailbox I/O (§5.4).
@@ -57,7 +59,8 @@ set msgraph_client_id = <your app's client ID>
 
 So far `set`, `unset`, `toggle`, `reset`, `source`, `alternates` (the
 user's other addresses, for replies), `mailboxes` and `unmailboxes` (with
-`-label`, `-notify`/`-nonotify` and `-poll`/`-nopoll`), `color`, `mono`,
+`-label`, `-notify`/`-nonotify` and `-poll`/`-nopoll`),
+`sidebar_whitelist` and `unsidebar_whitelist`, `color`, `mono`,
 `uncolor` and `unmono`, `bind`, `macro`, `push` and `exec` are supported, with mutt's quoting, `$` expansion, backticks and `my_`
 variables. `bind` and `macro` take mutt's menus (`generic`, `index`,
 `pager`, `compose`, `browser`) plus mett's `signin` and `help`, and mutt's
@@ -118,7 +121,36 @@ its default. As in mutt, `mono` and `unmono` set the attributes used
 instead on a terminal without colors (`TERM` such as `vt100` or `dumb`,
 or `NO_COLOR` set). Objects and patterns mett doesn't do yet (such as
 `color compose ...` or `color index ... ~T`) are ignored with a warning.
-`tree`, `tilde` and `markers` are accepted but not drawn yet.
+`tree`, `tilde` and `markers` are accepted but not drawn yet. The
+sidebar's objects are `sidebar_new`, `sidebar_flagged`,
+`sidebar_spoolfile`, `sidebar_indicator`, `sidebar_highlight`,
+`sidebar_divider` and `sidebar_ordinary`.
+
+### Sidebar
+
+With `set sidebar_visible`, mutt's sidebar lists the `mailboxes` beside
+the menus (`docs/MUTTRC.md` §4.10 has its variables and functions). As in
+mutt, it takes `sidebar_width` columns, its divider included, beside the
+index, the pager and the other menus, while the help line, the status
+bar and the message line span the screen; everything in the menus fits
+the width it leaves. Its functions are unbound, as in mutt: bind them,
+for example `bind index,pager \CN sidebar-next`.
+
+mett's own `sidebar_min_width` (100 by default) keeps today's layout on a
+small terminal: narrower than that, or too narrow to leave the menus 40
+columns, the sidebar hides even if visible, and comes back when the
+terminal widens. `0` turns that off, as in mutt (which only keeps a
+column for the menus). 100 leaves 70 columns for the index beside the
+default 30-column sidebar, close to the 80 that mutt's formats are made
+for.
+
+Office365 counts the unread and total messages of a folder, but not its
+flagged ones: `%F` and `%!` count only the open folder's (whose counts
+are the index's), and `flagged` sorting keeps the mailboxes' order. Counts not checked yet are empty, and `%t` is 0 (mett has no
+tags). mutt's `sidebar_relative_shortpath_indent` and
+`sidebar_use_mailbox_shortcuts` are not supported yet. As in mutt, the
+sidebar lists only the `mailboxes`: open another folder and none is
+highlighted as open.
 
 ### Aliases and queries
 
@@ -210,6 +242,7 @@ flagged (`!`) or have attachments (`+`), and the first is HTML.
 | Pager | `Space`/`-`: next or previous page. `Enter`/`Backspace`: scroll one line. `j`/`k`: next or previous message. `i`/`q`: back to the index. |
 | Everywhere but the sign-in window | `?`: the keys of the current menu. `:`: run a mettrc command, such as `set sig_dashes=no` or `bind index J last-entry` (`msgraph_` settings other than `msgraph_page_size`, `msgraph_sync_interval` and `msgraph_query_directory` take effect when mett starts again). |
 | Index and pager | `m`: new message. `r`: reply. `g`: reply to all. `f`: forward. `/`: search with a pattern, such as `~f alice ~N` (in the pager, the text). `n`: the next match. `l` (index): show only the messages matching a pattern; `all` shows them all again. `d`/`u`: mark or unmark for deletion. `$`: purge the marked messages (to `trash`, or for good if it is unset). `F`: flag. `N`: toggle new. `^N`/`^P`: next or previous thread. `v`: the message's attachments. `Q`: look up addresses, to write to one. `a`: save the sender as an alias. `R`: recall a postponed message (from Drafts; a menu if there are several). `s`/`C`: move or copy to another folder. `c`: open another folder (offers a mailbox with new mail; `Space` offers the next). `y`: the folder browser. |
+| Sidebar (after `:set sidebar_visible`, `:mailboxes @inbox Archive` and binding its functions, such as `:bind index,pager \CN sidebar-next`) | `<sidebar-next>`/`<sidebar-prev>`, `<sidebar-next-new>`/`<sidebar-prev-new>`, `<sidebar-page-down>`/`<sidebar-page-up>`, `<sidebar-first>`/`<sidebar-last>`: move its highlight. `<sidebar-open>`: open the highlighted mailbox. `<sidebar-toggle-visible>`: show or hide it. On a terminal narrower than 100 columns it hides. |
 | Folder browser | `j`/`k`, arrows, `z`/`Z`: move. `Enter`: choose. `q`: back. `Tab`: switch between the `mailboxes` (listed first, if there are any) and every folder. In a folder question (`s`, `C`, `c`), `Tab` or `?` opens the browser, and mutt's shortcuts work: `=`/`+` (under `folder`), `!` (`spoolfile`), `>` (`mbox`), `<` (`record`), `^` (this folder), `-` or `!!` (the one before). |
 | Compose menu | `y`: send. `q`: leave (asks whether to postpone). `P`: postpone to Drafts. `e`: edit the text again. `t`/`c`/`b`/`s`: edit To, Cc, Bcc, Subject. `a`: attach a file. `D`: take the selected file off. `j`/`k`: select a part. |
 | Postponed messages | `Enter`/`Space`: recall the message. `j`/`k`, `z`/`Z`, `=`/`*`: move. `q`: back. |
