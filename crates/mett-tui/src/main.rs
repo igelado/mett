@@ -451,7 +451,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     // Drawing writes only the cells that changed, so what the terminal
     // showed before goes first: without an alternate screen (GNU screen
     // without `altscreen`), the shell's output would show through.
-    terminal.clear()?;
+    clear_screen()?;
     let size = terminal.size()?;
     let (mut app, effects) = App::open(size.width, size.height, folder, settings);
     app.keymap = keymap;
@@ -712,6 +712,15 @@ async fn ready<F: Future + Unpin>(mut future: F) -> Option<F::Output> {
         })
     })
     .await
+}
+
+/// Clears the screen. Unlike `Terminal::clear`, this doesn't ask the
+/// terminal where the cursor is, which one that doesn't answer would make
+/// fail; a terminal just made has nothing drawn to forget.
+fn clear_screen() -> std::io::Result<()> {
+    use ratatui::crossterm::{execute, terminal};
+
+    execute!(std::io::stdout(), terminal::Clear(terminal::ClearType::All))
 }
 
 /// Draws the screen, then prints the view's overlay, if any, as plain text
@@ -1307,7 +1316,8 @@ impl Input {
             drop(resume);
             result
         });
-        terminal.clear()?;
+        // A new terminal draws everything: only the screen needs clearing.
+        clear_screen()?;
         Ok(result)
     }
 }
