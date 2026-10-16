@@ -305,14 +305,72 @@ impl App {
 
     /// Opens the collapsed thread `message` is folded into, and selects it.
     pub(super) fn uncollapse_to(&mut self, message: &MessageId) {
-        if let Some(thread) = self.threads.get(message) {
-            let key = thread.key.clone();
+        let thread = self
+            .threads
+            .get(message)
+            .map(|t| (t.key.clone(), t.root.clone()));
+        let opened = thread.is_some_and(|(key, root)| {
             self.set_collapsed(key, false);
+            let start = self.messages.iter().position(|m| m.id == root);
+            start.is_some_and(|start| self.refold(start))
+        });
+        if !opened {
+            self.arrange();
         }
-        self.arrange();
         if let Some(at) = self.messages.iter().position(|m| &m.id == message) {
             self.selected = at;
         }
+    }
+
+    /// Folds the thread that starts at entry `start` into it, or unfolds
+    /// it, as it is now collapsed or open: what [`Self::arrange`] would do,
+    /// without ordering the whole index again, but for the selection,
+    /// which the caller makes. Returns false, changing nothing, unless the
+    /// index is threaded as arranging it again would thread it (see
+    /// [`crate::sort::Arranged::settled`]), with nothing listed since.
+    fn refold(&mut self, start: usize) -> bool {
+        if !self.settled || self.shown_count() != self.threaded_count {
+            return false;
+        }
+        let root = &self.messages[start].id;
+        let Some(thread) = self.threads.get(root).filter(|t| &t.root == root) else {
+            return false;
+        };
+        let collapsed = self.is_collapsed(&thread.key);
+        // The messages folded into collapsed threads go in the threads'
+        // order: those of the threads before this one come first. They are
+        // counted on the shorter side.
+        let folded = |m: &MessageSummary| self.threads.get(&m.id).map_or(0, |t| t.folded);
+        let at = if start <= self.messages.len() / 2 {
+            self.messages[..start].iter().map(folded).sum()
+        } else {
+            let after: usize = self.messages[start + 1..].iter().map(folded).sum();
+            self.folded.len() - after - thread.folded
+        };
+        let moved = if collapsed {
+            // Its replies follow it.
+            let replies = self.messages[start + 1..]
+                .iter()
+                .take_while(|m| self.threads.get(&m.id).is_some_and(|t| &t.root == root))
+                .count();
+            let replies: Vec<MessageSummary> = self
+                .messages
+                .drain(start + 1..start + 1 + replies)
+                .collect();
+            let count = replies.len();
+            self.folded.splice(at..at, replies);
+            count
+        } else {
+            let replies: Vec<MessageSummary> = self.folded.drain(at..at + thread.folded).collect();
+            let count = replies.len();
+            self.messages.splice(start + 1..start + 1, replies);
+            count
+        };
+        let root = self.messages[start].id.clone();
+        if let Some(thread) = self.threads.get_mut(&root) {
+            thread.folded = if collapsed { thread.folded + moved } else { 0 };
+        }
+        true
     }
 
     /// Whether the entry `at` starts a thread.
@@ -415,23 +473,24 @@ impl App {
                 let collapsed = self.is_collapsed(&key);
                 self.set_collapsed(key, !collapsed);
                 self.selected = start;
-                self.arrange();
+                if !self.refold(start) {
+                    self.arrange();
+                }
                 return Some(Vec::new());
             }
             _ => {
                 // Collapses every thread, or if they all are, opens them.
-                let roots: Vec<String> = self
+                let mut replies = self
                     .threads
                     .iter()
                     .filter(|(id, t)| *id != &t.root)
-                    .map(|(_, t)| t.key.clone())
-                    .collect();
+                    .peekable();
                 // Those listed later too: every thread is, until opened.
                 // (With no replies listed yet, by what was asked last.)
-                let all_collapsed = if roots.is_empty() {
+                let all_collapsed = if replies.peek().is_none() {
                     self.collapse_all
                 } else {
-                    roots.iter().all(|key| self.is_collapsed(key))
+                    replies.all(|(_, t)| self.is_collapsed(&t.key))
                 };
                 self.collapsed.clear();
                 self.collapse_all = !all_collapsed;
@@ -896,6 +955,101 @@ mod tests {
         assert_eq!(app.messages[app.selected].id.as_str(), "a1");
         app.set_limit("~s a");
         assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+    }
+
+    /// What the index shows and the folded messages, how each is
+    /// threaded, and the entry selected.
+    type State = (
+        Vec<MessageId>,
+        Vec<MessageId>,
+        Vec<(MessageId, Threaded)>,
+        usize,
+    );
+
+    fn state(app: &App) -> State {
+        let ids = |list: &[MessageSummary]| list.iter().map(|m| m.id.clone()).collect();
+        let mut threads: Vec<_> = app.threads.clone().into_iter().collect();
+        threads.sort_by(|a, b| a.0.cmp(&b.0));
+        (ids(&app.messages), ids(&app.folded), threads, app.selected)
+    }
+
+    #[test]
+    fn collapsing_and_opening_one_thread_is_arranging_the_index_again() {
+        // A small random generator, so that the test is the same each run.
+        let mut seed = 7_u64;
+        let mut below = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n.max(1)
+        };
+        for round in 0..60 {
+            // Threads of up to six messages, a few deep; listed newest
+            // first, in pages.
+            let mut messages = Vec::new();
+            for t in 0..1 + below(8) {
+                let size = 1 + below(6);
+                for k in 0..size {
+                    let path: Vec<u8> = match k {
+                        0 => vec![0],
+                        1..=3 => vec![0, k as u8],
+                        _ => vec![0, 1, k as u8],
+                    };
+                    let minutes = (below(50) * 10 + messages.len()) as i64;
+                    messages.push(message(
+                        &format!("t{t}m{k}"),
+                        minutes,
+                        &format!("c{t}"),
+                        &path,
+                    ));
+                }
+            }
+            messages.sort_by_key(|m| std::cmp::Reverse(m.received));
+            let mut pages: Vec<Vec<MessageSummary>> = Vec::new();
+            while !messages.is_empty() {
+                let size = (1 + below(5)).min(messages.len());
+                pages.push(messages.drain(..size).collect());
+            }
+            let last = pages.len() == 1;
+            let (mut app, mut next) = opened(
+                sorted(["threads", "reverse-threads", "last-threads"][below(3)]),
+                24,
+                pages.remove(0),
+                (!last).then_some("in next"),
+            );
+            for step in 0..30 {
+                match below(5) {
+                    0 | 1 if !app.messages.is_empty() => {
+                        app.selected = below(app.messages.len());
+                        act(&mut app, Action::CollapseThread);
+                    }
+                    2 if !app.folded.is_empty() => {
+                        let id = app.folded[below(app.folded.len())].id.clone();
+                        app.uncollapse_to(&id);
+                    }
+                    3 if below(4) == 0 => {
+                        act(&mut app, Action::CollapseAll);
+                    }
+                    _ => {
+                        if let Some(id) = next.take()
+                            && !pages.is_empty()
+                        {
+                            let page = pages.remove(0);
+                            let more = (!pages.is_empty()).then_some("in next");
+                            let effects = listed(&mut app, id, page, more);
+                            next = more.map(|_| first_request(&effects));
+                        }
+                    }
+                }
+                // Threaded, it is as arranging it all again makes it.
+                if app.shown_count() == app.threaded_count {
+                    assert!(app.settled);
+                    let before = state(&app);
+                    app.arrange();
+                    assert_eq!(state(&app), before, "round {round}, step {step}");
+                }
+            }
+        }
     }
 
     #[test]
