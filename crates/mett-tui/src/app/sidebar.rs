@@ -425,18 +425,34 @@ impl App {
                     }
                     FolderPath::Root => false,
                 };
-                (*path == self.path || names_open).then_some(&open.id)
+                (same_path(path, &self.path) || names_open).then_some(&open.id)
             })
     }
 
-    /// Whether `a` and `b` name the same mailbox: as written (`=@inbox`
-    /// and `=Inbox` are told apart until their folders are known), or as
-    /// found.
+    /// Whether `a` and `b` name the same mailbox: as written, ignoring
+    /// case as Office365 does (`=@inbox` and `=Inbox` are told apart
+    /// until their folders are known), or as found.
     fn same_mailbox(&self, a: &FolderPath, b: &FolderPath) -> bool {
-        a == b
+        same_path(a, b)
             || self
                 .folder_at(a)
                 .is_some_and(|id| self.folder_at(b) == Some(id))
+    }
+}
+
+/// Whether `a` and `b` are the same path, ignoring case as Office365
+/// does.
+fn same_path(a: &FolderPath, b: &FolderPath) -> bool {
+    let same_names = |a: &[String], b: &[String]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_name(a, b))
+    };
+    match (a, b) {
+        (FolderPath::Root, FolderPath::Root) => true,
+        (FolderPath::WellKnown(a, a_below), FolderPath::WellKnown(b, b_below)) => {
+            a == b && same_names(a_below, b_below)
+        }
+        (FolderPath::Named(a), FolderPath::Named(b)) => same_names(a, b),
+        _ => false,
     }
 }
 
@@ -583,7 +599,8 @@ mod tests {
         // `=Inbox`, unchecked, is the Inbox opened as `=@inbox`.
         settings.mailboxes[0].path = FolderPath::Named(vec!["Inbox".into()]);
         settings.mailboxes[0].poll = false;
-        settings.sidebar.whitelist = vec![mailbox_path("Work"), mailbox_path("Lists")];
+        // Named as Office365 names folders, ignoring case.
+        settings.sidebar.whitelist = vec![mailbox_path("WORK"), mailbox_path("lists")];
         let (app, _) = mailboxes_app(settings, 80, 24);
         assert_eq!(shown(&app), ["Lists", "Work", "*Inbox"], "reversed");
         let inbox = &app.sidebar.entries[2];
