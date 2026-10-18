@@ -62,6 +62,9 @@ GitLab enforces this workflow:
 - CI is defined in `.gitlab-ci.yml`. Its jobs run on the shared Linux Docker
   runners (`os/linux`, `type/docker`, `size/medium`). Add new checks there,
   so that they gate merging.
+- `.forgejo/workflows/ci.yml` runs the same checks with Forgejo Actions when
+  commits are pushed to the copy at git.gelado.org. It doesn't gate GitLab
+  merges; keep it in step with `.gitlab-ci.yml`.
 - CodeRabbit reviews every MR automatically, configured in
   `.coderabbit.yaml`. Its comments are review threads, so they must be
   resolved before merging.
