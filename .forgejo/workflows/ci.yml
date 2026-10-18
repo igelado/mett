@@ -1,6 +1,7 @@
-# The same checks as .gitlab-ci.yml, run by Forgejo Actions on the copy at
-# git.gelado.org. Keep the two in step.
+# CI, run by Forgejo Actions on every push. PRs can only be merged into main
+# when these jobs succeed (see AGENTS.md).
 
+name: ci
 on: push
 
 jobs:
