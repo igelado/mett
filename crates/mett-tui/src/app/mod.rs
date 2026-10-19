@@ -762,6 +762,8 @@ pub struct App {
     /// The request ending what the mailbox keeps for watching, while it
     /// is under way.
     unwatching: Option<RequestId>,
+    /// The `poll_epoch` the watch started in.
+    watch_epoch: u64,
     /// What a watch said changed and is still to be checked (a check under
     /// way when it said may predate the change): the open folder, and the
     /// folders of `mailboxes` (the open one among them, for its counts).
@@ -923,6 +925,7 @@ impl App {
             api: settings.api,
             watching: None,
             unwatching: None,
+            watch_epoch: 0,
             watched: Vec::new(),
             recheck_folder: false,
             recheck_mailboxes: Vec::new(),

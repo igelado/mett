@@ -205,6 +205,7 @@ impl App {
         }
         let watch = self.request(Request::Watch(folders.clone()));
         self.watching = Some(effect_id(&watch));
+        self.watch_epoch = self.poll_epoch;
         self.watched = folders;
         effects.push(watch);
         effects
@@ -281,6 +282,12 @@ impl App {
                 self.note_changed(changed);
                 effects.extend(self.recheck());
                 effects.extend(self.watch());
+            }
+            // A sign-in failed (say, the user dismissed it): held off,
+            // like checks, until the user signs in again, rather than ask
+            // again unbidden. (Unless the user has since.)
+            Some(Err(Error::Auth(_))) if self.watch_epoch == self.poll_epoch => {
+                self.poll_paused = true;
             }
             // The timer's checks go on meanwhile.
             Some(Err(_)) => {
@@ -1237,6 +1244,27 @@ mod tests {
         let mut draft = summary(id, minutes);
         draft.draft = true;
         draft
+    }
+
+    #[test]
+    fn a_watch_whose_sign_in_failed_waits_for_the_user() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        let denied = || Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        // Not tried again unbidden: nor are checks.
+        assert!(respond(&mut app, watch, denied()).is_empty());
+        assert!(app.poll_paused);
+        assert!(app.watch().is_empty());
+        // The user signs in again: watched again.
+        app.retry();
+        let effects = app.watch();
+        assert!(matches!(requests(&effects)[..], [(_, Request::Watch(_))]));
+        // A failure from before then doesn't hold it off again.
+        let watch = app.watching.expect("watched");
+        app.poll_epoch += 1;
+        let effects = respond(&mut app, watch, denied());
+        assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
+        assert!(!app.poll_paused);
     }
 
     #[test]
