@@ -66,6 +66,11 @@ string_id!(
     /// An opaque cursor to the next page of a listing.
     PageCursor
 );
+string_id!(
+    /// Where a folder's sync stands: an opaque token from the backend, to
+    /// ask for what changed in the folder since.
+    SyncState
+);
 
 #[cfg(test)]
 mod tests {

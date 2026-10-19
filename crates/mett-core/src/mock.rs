@@ -13,9 +13,9 @@ use crate::attachment::{Attachment, AttachmentKind};
 use crate::draft::{Draft, DraftOrigin};
 use crate::error::{Error, Result};
 use crate::folder::{Folder, WellKnownFolder};
-use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor};
+use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor, SyncState};
 use crate::message::{Address, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary};
-use crate::ports::{MailSender, MailStore, MessagePage, Page};
+use crate::ports::{FolderChanges, MailSender, MailStore, MessagePage, Page};
 
 /// A [`MailStore`] and [`MailSender`] that keeps everything in memory.
 /// Sent drafts are recorded (see [`MemoryStore::sent`]), and copies and
@@ -33,6 +33,13 @@ struct State {
     sent: Vec<Draft>,
     /// Each message's attachments, with their content.
     attachments: HashMap<MessageId, Vec<(Attachment, Vec<u8>)>>,
+    /// Whether folders can be synced ([`MemoryStore::with_sync`]).
+    sync: bool,
+    /// Sync states from before this many [`MemoryStore::forget_syncs`]
+    /// are stale.
+    sync_epoch: u64,
+    /// How many times folders were synced.
+    syncs: u64,
 }
 
 impl MemoryStore {
@@ -83,6 +90,22 @@ impl MemoryStore {
         }
         drop(state);
         self
+    }
+
+    /// Lets folders be synced ([`MailStore::sync_folder`]).
+    pub fn with_sync(self) -> Self {
+        self.state().sync = true;
+        self
+    }
+
+    /// Makes every sync state handed out so far stale.
+    pub fn forget_syncs(&self) {
+        self.state().sync_epoch += 1;
+    }
+
+    /// How many times folders were synced.
+    pub fn syncs(&self) -> u64 {
+        self.state().syncs
     }
 
     /// The drafts sent so far, oldest first.
@@ -477,6 +500,71 @@ impl MailStore for MemoryStore {
         Ok(())
     }
 
+    fn can_sync(&self) -> bool {
+        self.state().sync
+    }
+
+    /// The state is a snapshot of the folder: its epoch, then each
+    /// message's ID and a hash of its summary. What differs from it now
+    /// changed.
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&SyncState>,
+    ) -> Result<FolderChanges> {
+        use std::hash::{Hash, Hasher};
+
+        let mut store = self.state();
+        if !store.sync {
+            return Err(Error::Backend("this mailbox can't sync folders".into()));
+        }
+        store.folder(folder)?;
+        store.syncs += 1;
+        let epoch = store.sync_epoch.to_string();
+        let mut before: HashMap<&str, &str> = HashMap::new();
+        if let Some(state) = state {
+            let mut lines = state.as_str().lines();
+            if lines.next() != Some(epoch.as_str()) {
+                return Err(Error::StaleSync);
+            }
+            for line in lines {
+                let (id, hash) = line.split_once('\t').ok_or(Error::StaleSync)?;
+                before.insert(id, hash);
+            }
+        }
+        let hash = |summary: &MessageSummary| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{summary:?}").hash(&mut hasher);
+            hasher.finish().to_string()
+        };
+        let now: Vec<(&MessageSummary, String)> = store
+            .messages
+            .iter()
+            .filter(|m| &m.summary.folder == folder)
+            .map(|m| (&m.summary, hash(&m.summary)))
+            .collect();
+        let changed = now
+            .iter()
+            .filter(|(m, hash)| before.get(m.id.as_str()) != Some(&hash.as_str()))
+            .map(|(m, _)| (*m).clone())
+            .collect();
+        let removed = before
+            .keys()
+            .filter(|id| !now.iter().any(|(m, _)| m.id.as_str() == **id))
+            .map(|id| MessageId::new(*id))
+            .collect();
+        let mut snapshot = epoch;
+        for (m, hash) in &now {
+            snapshot.push_str(&format!("\n{}\t{hash}", m.id));
+        }
+        Ok(FolderChanges {
+            changed,
+            removed,
+            state: SyncState::new(snapshot),
+            more: false,
+        })
+    }
+
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         let mut state = self.state();
         state.check_recalled(draft)?;
@@ -600,6 +688,37 @@ mod tests {
 
     fn at(minutes: i64) -> DateTime<Utc> {
         DateTime::UNIX_EPOCH + TimeDelta::minutes(minutes)
+    }
+
+    #[tokio::test]
+    async fn syncs_tell_what_changed_since() {
+        let store = store().with_sync();
+        let inbox = FolderId::new("in");
+        let all = store.sync_folder(&inbox, None).await.unwrap();
+        assert_eq!(all.changed.len(), 3);
+        assert!(all.removed.is_empty() && !all.more);
+        let none = store.sync_folder(&inbox, Some(&all.state)).await.unwrap();
+        assert!(none.changed.is_empty() && none.removed.is_empty());
+
+        store
+            .update_flags(&"m1".into(), FlagsUpdate::read(true))
+            .await
+            .unwrap();
+        store
+            .move_message(&"m2".into(), &FolderId::new("arc"))
+            .await
+            .unwrap();
+        let some = store.sync_folder(&inbox, Some(&none.state)).await.unwrap();
+        let changed: Vec<&str> = some.changed.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(changed, ["m1"]);
+        assert_eq!(some.removed, [MessageId::new("m2")]);
+
+        store.forget_syncs();
+        assert!(matches!(
+            store.sync_folder(&inbox, Some(&some.state)).await,
+            Err(Error::StaleSync)
+        ));
+        assert_eq!(store.syncs(), 4);
     }
 
     fn store() -> MemoryStore {

@@ -44,6 +44,11 @@ pub enum Error {
     #[error("not sent: {0}")]
     NotSent(String),
 
+    /// A sync state ([`crate::SyncState`]) is no longer good: the folder
+    /// has to be synced again from the start.
+    #[error("the folder has to be synced again from the start")]
+    StaleSync,
+
     /// The backend returned an error not covered by another variant.
     #[error("backend error: {0}")]
     Backend(String),
