@@ -608,3 +608,17 @@ async fn a_message_changed_on_the_server_is_fetched_again() {
     store.inner().delete_message(&id).await.unwrap();
     assert!(store.fetch_message(&id).await.is_err());
 }
+
+#[tokio::test(start_paused = true)]
+async fn syncs_tell_how_far_they_have_got() {
+    let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress = {
+        let told = std::sync::Arc::clone(&told);
+        Box::new(move |folder: &FolderId, taken: u64| {
+            told.lock().unwrap().push((folder.to_string(), taken));
+        })
+    };
+    let store = cached(mailbox(3)).unwrap().with_progress(progress);
+    listing(&store, 10).await;
+    assert_eq!(*told.lock().unwrap(), [("in".to_owned(), 3)]);
+}

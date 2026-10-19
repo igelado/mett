@@ -57,7 +57,13 @@ pub struct CachedStore<S> {
     /// made then. Its lock also keeps two syncs of one folder from running
     /// at once.
     synced: Mutex<HashMap<FolderId, Arc<tokio::sync::Mutex<LastSync>>>>,
+    /// Told how far each sync has got.
+    progress: Option<Progress>,
 }
+
+/// Told, as a folder syncs, how many changes (on a first sync, messages)
+/// it has taken in so far.
+pub type Progress = Box<dyn Fn(&FolderId, u64) + Send + Sync>;
 
 /// When a folder was last synced, and how many changes mett had made then.
 type LastSync = Option<(Instant, u64)>;
@@ -103,7 +109,15 @@ impl<S> CachedStore<S> {
             broken: AtomicBool::new(false),
             writes: AtomicU64::new(0),
             synced: Mutex::new(HashMap::new()),
+            progress: None,
         }
+    }
+
+    /// Tells `progress` how far each sync has got, batch by batch: a first
+    /// sync of a large folder takes a while.
+    pub fn with_progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     /// The store behind the cache.
@@ -248,6 +262,7 @@ impl<S: MailStore> CachedStore<S> {
             }
         };
         let mut lost = 0;
+        let mut taken = 0;
         loop {
             let changes = match self.inner.sync_folder(folder, state.as_ref()).await {
                 // The server forgot where the sync stood: start over,
@@ -282,6 +297,10 @@ impl<S: MailStore> CachedStore<S> {
                     }
                 }
                 continue;
+            }
+            taken += (changes.changed.len() + changes.removed.len()) as u64;
+            if let Some(progress) = &self.progress {
+                progress(folder, taken);
             }
             let FolderChanges {
                 state: next, more, ..
