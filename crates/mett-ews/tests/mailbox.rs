@@ -1334,18 +1334,22 @@ async fn a_canceled_watch_keeps_the_subscription_it_made() {
     assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
 }
 
-/// A store on a server whose stream of events tells of new mail in the
-/// Inbox, then stays open for `hold`, and breaks: wiremock can't break
-/// one.
-async fn store_breaking_streams(hold: Duration) -> EwsMailStore<StaticAuth> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mail = Arc::new(streamed(
+/// A stream's envelope telling of new mail in the Inbox.
+fn inbox_mail() -> String {
+    streamed(
         "NoError",
         "<m:Notifications><m:Notification>\
          <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/>\
          </t:NewMailEvent></m:Notification></m:Notifications>",
-    ));
+    )
+}
+
+/// A store on a server whose stream of events sends `events`, then stays
+/// open for `hold`, and breaks: wiremock can't break one.
+async fn store_breaking_streams(events: String, hold: Duration) -> EwsMailStore<StaticAuth> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mail = Arc::new(events);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1426,7 +1430,7 @@ async fn store_breaking_streams(hold: Duration) -> EwsMailStore<StaticAuth> {
 
 #[tokio::test]
 async fn changes_read_before_a_broken_stream_are_kept() {
-    let store = store_breaking_streams(Duration::from_millis(50)).await;
+    let store = store_breaking_streams(inbox_mail(), Duration::from_millis(50)).await;
     // What came after the mail is lost: any folder watched may have
     // changed.
     let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
@@ -1436,7 +1440,7 @@ async fn changes_read_before_a_broken_stream_are_kept() {
 #[tokio::test]
 async fn changes_read_by_a_canceled_watch_are_told_by_the_next() {
     // Canceled while reading the rest of the burst.
-    let store = store_breaking_streams(Duration::from_secs(5)).await;
+    let store = store_breaking_streams(inbox_mail(), Duration::from_secs(5)).await;
     let inbox = [FolderId::new("inbox-id")];
     let canceled = tokio::time::timeout(Duration::from_millis(500), store.watch(&inbox)).await;
     assert!(canceled.is_err());
@@ -1589,4 +1593,17 @@ async fn watching_stops_after_a_canceled_subscription_is_made() {
     assert!(canceled.is_err());
     // Stopped after: the subscription made meanwhile is ended.
     assert!(store.watch(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_envelope_a_canceled_watch_read_part_of_is_told_by_the_next() {
+    let mail = inbox_mail();
+    let store =
+        store_breaking_streams(mail[..mail.len() / 2].to_owned(), Duration::from_secs(5)).await;
+    let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
+    let canceled = tokio::time::timeout(Duration::from_millis(500), store.watch(&folders)).await;
+    assert!(canceled.is_err());
+    // Any folder watched may have changed: EWS won't tell again.
+    let told = tokio::time::timeout(Duration::from_millis(100), store.watch(&folders)).await;
+    assert_eq!(told.expect("told at once").unwrap(), folders);
 }

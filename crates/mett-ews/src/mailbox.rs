@@ -127,9 +127,32 @@ pub struct EwsMailStore<A> {
     /// The streaming subscriptions. Shared with the task that changes
     /// them, which a canceled watch doesn't stop.
     subscriptions: Arc<tokio::sync::Mutex<Subscriptions>>,
-    /// Folders a watch read had changed, until it says so: a watch
-    /// canceled first leaves them to the next (EWS doesn't tell again).
-    unreported: Mutex<Vec<FolderId>>,
+    /// What a watch read, until it tells: a watch canceled first leaves
+    /// it to the next (EWS doesn't tell again).
+    unreported: Mutex<Unreported>,
+}
+
+/// What a watch read and hasn't told yet.
+#[derive(Debug, Default)]
+struct Unreported {
+    /// The folders it read had changed.
+    changed: Vec<FolderId>,
+    /// The folders it watched, while it has read part of an envelope: any
+    /// of them may have changed.
+    partly: Vec<FolderId>,
+}
+
+impl Unreported {
+    /// The folders that changed, or may have.
+    fn folders(self) -> Vec<FolderId> {
+        let mut folders = self.changed;
+        for folder in self.partly {
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+        }
+        folders
+    }
 }
 
 /// How long a stream of notifications stays open, in minutes (EWS takes 1
@@ -269,7 +292,7 @@ impl<A: Authenticator> EwsMailStore<A> {
             uploads: Mutex::new(HashMap::new()),
             watching: tokio::sync::Mutex::new(()),
             subscriptions: Arc::new(tokio::sync::Mutex::new(Subscriptions::default())),
-            unreported: Mutex::new(Vec::new()),
+            unreported: Mutex::new(Unreported::default()),
         }
     }
 
@@ -1213,16 +1236,16 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
             self.unsubscribed().await?;
             return Ok(Vec::new());
         }
-        let unreported = std::mem::take(&mut *self.unreported.lock().expect("lock"));
+        let unreported = std::mem::take(&mut *self.unreported.lock().expect("lock")).folders();
         if !unreported.is_empty() {
             return Ok(unreported);
         }
         for _ in 0..2 {
             let id = self.subscribed(folders).await?;
             let started = tokio::time::Instant::now();
-            let streamed = self.stream_events(&id).await;
+            let streamed = self.stream_events(&id, folders).await;
             // Told now (or lost to an error), whatever comes of it.
-            self.unreported.lock().expect("lock").clear();
+            *self.unreported.lock().expect("lock") = Unreported::default();
             match streamed? {
                 // Part of an envelope was left unread: any folder may have
                 // changed.
@@ -1386,8 +1409,12 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
     /// Reads the events of subscription `id` until some say folders
     /// changed (those), or the server closes the stream (none), and
     /// whether part of an envelope was left unread. `None` if the
-    /// subscription is gone.
-    async fn stream_events(&self, id: &str) -> Result<Option<(Vec<FolderId>, bool)>> {
+    /// subscription is gone. It watches `folders`.
+    async fn stream_events(
+        &self,
+        id: &str,
+        folders: &[FolderId],
+    ) -> Result<Option<(Vec<FolderId>, bool)>> {
         use crate::stream::{Streamed, read_envelope, take_envelopes};
 
         let body = format!(
@@ -1441,8 +1468,8 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                     Streamed::Changed(folders) => {
                         let mut unreported = self.unreported.lock().expect("lock");
                         for folder in folders {
-                            if !unreported.contains(&folder) {
-                                unreported.push(folder.clone());
+                            if !unreported.changed.contains(&folder) {
+                                unreported.changed.push(folder.clone());
                             }
                             if !changed.contains(&folder) {
                                 changed.push(folder);
@@ -1454,6 +1481,11 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                     Streamed::Unsubscribed => return Ok(Some((changed, false))),
                 }
             }
+            self.unreported.lock().expect("lock").partly = if unread(&buffer) {
+                folders.to_vec()
+            } else {
+                Vec::new()
+            };
             if !changed.is_empty() && until.is_none() {
                 until = Some(tokio::time::Instant::now() + BURST);
             }
