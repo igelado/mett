@@ -1103,3 +1103,30 @@ async fn a_stale_sync_state_starts_over() {
         assert!(matches!(e, Error::StaleSync), "{code}: {e:?}");
     }
 }
+
+#[tokio::test]
+async fn items_are_looked_up_a_hundred_at_a_time() {
+    let server = MockServer::start().await;
+    let ids: Vec<String> = (0..150).map(|i| format!("m{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    ews("<m:FindItem")
+        .respond_with(found_items(&refs, true, 150))
+        .mount(&server)
+        .await;
+    ews("<m:GetItem>")
+        .respond_with(success("GetItem", "<m:Items/>"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    store(&server)
+        .list_messages(&FolderId::new("inbox-id"), Page::first(150))
+        .await
+        .unwrap();
+    let sent = requests(&server).await;
+    let looked_up: Vec<usize> = sent
+        .iter()
+        .filter(|r| r.contains("<m:GetItem>"))
+        .map(|r| r.matches("<t:ItemId ").count())
+        .collect();
+    assert_eq!(looked_up, [100, 50]);
+}

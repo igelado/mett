@@ -75,6 +75,10 @@ const MESSAGE_FIELDS: &[&str] = &[
     "item:Body",
 ];
 
+/// The most items looked up in one `GetItem`: Exchange's limit (its
+/// `EWSMaxBatchSize`, by default) is often 100.
+const ITEMS_PER_REQUEST: usize = 100;
+
 /// The most changes one `SyncFolderItems` returns (EWS takes up to 512).
 const SYNC_BATCH: u32 = 512;
 
@@ -534,19 +538,19 @@ impl<A: Authenticator> EwsMailStore<A> {
     /// The summaries of the messages `ids`, in that order. Those gone
     /// meanwhile are left out.
     async fn summaries(&self, ids: &[String], about: About<'_>) -> Result<Vec<MessageSummary>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let xml = self.get_items(ids, SUMMARY_FIELDS, false, about).await?;
-        let doc = parse(&xml)?;
         let mut summaries = Vec::new();
-        for message in response_messages(&doc, about)? {
-            if response_code(message) == "ErrorItemNotFound" {
-                continue;
-            }
-            check(message, about)?;
-            if let Some(item) = first_item(message) {
-                summaries.push(summary(item)?);
+        // Exchange takes only so many items per request (often 100).
+        for ids in ids.chunks(ITEMS_PER_REQUEST) {
+            let xml = self.get_items(ids, SUMMARY_FIELDS, false, about).await?;
+            let doc = parse(&xml)?;
+            for message in response_messages(&doc, about)? {
+                if response_code(message) == "ErrorItemNotFound" {
+                    continue;
+                }
+                check(message, about)?;
+                if let Some(item) = first_item(message) {
+                    summaries.push(summary(item)?);
+                }
             }
         }
         Ok(summaries)

@@ -481,6 +481,8 @@ impl Db {
             )
             .map_err(failed)?;
         }
+        // The folders found gone, whose mail goes too.
+        let mut purged: Vec<String> = Vec::new();
         if let Some(name) = listing.name() {
             tx.execute("INSERT OR IGNORE INTO listed (what) VALUES (?1)", [name])
                 .map_err(failed)?;
@@ -512,6 +514,7 @@ impl Db {
                     .map_err(failed)?;
                 tx.execute("DELETE FROM well_known WHERE id = ?1", [&id])
                     .map_err(failed)?;
+                purged.push(id);
             }
         }
         for (ord, folder) in folders.iter().enumerate() {
@@ -559,6 +562,20 @@ impl Db {
                 )
                 .map_err(failed)?;
             }
+        }
+        // A listing of them all leaves out every folder gone.
+        if matches!(listing, Listing::All) {
+            tx.execute_batch(
+                "DELETE FROM messages WHERE folder NOT IN (SELECT id FROM folder_info);
+                 DELETE FROM folders WHERE id NOT IN (SELECT id FROM folder_info);",
+            )
+            .map_err(failed)?;
+        }
+        for id in &purged {
+            tx.execute("DELETE FROM messages WHERE folder = ?1", [id])
+                .map_err(failed)?;
+            tx.execute("DELETE FROM folders WHERE id = ?1", [id])
+                .map_err(failed)?;
         }
         tx.commit().map_err(failed)
     }
@@ -932,9 +949,21 @@ mod tests {
         db.keep_folders(&[folder("c")], Listing::Some).unwrap();
         assert_eq!(all(&db), ["a", "b", "c"]);
         // A listing of them all, without b (deleted), leaves it out.
+        let b = FolderId::new("b");
+        db.start_over(&b).unwrap();
+        let mail = FolderChanges {
+            changed: vec![mett_core::mock::message("m1", "b", "hi", DateTime::UNIX_EPOCH).summary],
+            removed: Vec::new(),
+            state: SyncState::new("s1"),
+            more: false,
+        };
+        assert!(db.apply(&b, None, &mail).unwrap());
         db.keep_folders(&[folder("a"), folder("c")], Listing::All)
             .unwrap();
         assert_eq!(all(&db), ["a", "c"]);
+        // Its mail went with it.
+        assert!(db.page(&b, None, 10).unwrap().is_empty());
+        assert!(db.synced(&b).unwrap().is_none());
         // A listing below a folder replaces those kept there, and those
         // below them.
         let mut below_a = folder("d");
