@@ -238,6 +238,8 @@ impl Db {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failed)?;
+        // A change the backend doesn't date happened by now.
+        let synced_at = Utc::now();
         let now: Option<String> = tx
             .query_row(
                 "SELECT state FROM folders WHERE id = ?1",
@@ -251,7 +253,9 @@ impl Db {
             return Ok(false);
         }
         for summary in &changes.changed {
-            let stored = serde_json::to_string(&StoredSummary::from(summary)).map_err(failed)?;
+            let mut summary = summary.clone();
+            summary.modified.get_or_insert(synced_at);
+            let stored = serde_json::to_string(&StoredSummary::from(&summary)).map_err(failed)?;
             // Only a draft's body can change (Graph and EWS let only
             // drafts' be edited): a draft's is fetched again.
             tx.execute(
@@ -837,6 +841,26 @@ mod tests {
         assert!(!db.apply(&inbox, Some(&s1), &changes("s2'")).unwrap());
         let synced = db.synced(&inbox).unwrap().unwrap();
         assert_eq!(synced.state, Some(SyncState::new("s2")));
+    }
+
+    #[test]
+    fn undated_changes_are_dated_when_synced() {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        let inbox = FolderId::new("in");
+        let mut summary = mett_core::mock::message("m1", "in", "hi", DateTime::UNIX_EPOCH).summary;
+        summary.modified = None;
+        let before = Utc::now();
+        db.start_over(&inbox).unwrap();
+        let changes = FolderChanges {
+            changed: vec![summary],
+            removed: Vec::new(),
+            state: SyncState::new("s1"),
+            more: false,
+        };
+        assert!(db.apply(&inbox, None, &changes).unwrap());
+        let changed = db.changed(&inbox, before, None, 10).unwrap();
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].modified.is_some_and(|m| m >= before));
     }
 
     #[test]

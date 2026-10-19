@@ -2858,6 +2858,9 @@ async fn syncs_a_folder_with_delta_links() {
             "value": [
                 message("m2", "2026-10-14T11:00:00Z"),
                 { "id": "m0", "@removed": { "reason": "deleted" } },
+                // Gone, then back: it is here.
+                { "id": "m4", "@removed": { "reason": "deleted" } },
+                message("m4", "2026-10-14T13:00:00Z"),
                 // An entry that leaves out its folder is in this one.
                 {
                     "id": "m3",
@@ -2876,8 +2879,9 @@ async fn syncs_a_folder_with_delta_links() {
     assert_eq!(first.changed[0].id, MessageId::new("m1"));
     assert!(first.more);
     let second = store.sync_folder(&inbox, Some(&first.state)).await.unwrap();
-    assert_eq!(second.changed[0].id, MessageId::new("m2"));
-    assert_eq!(second.changed[1].folder, inbox);
+    let changed: Vec<&str> = second.changed.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(changed, ["m2", "m4", "m3"]);
+    assert_eq!(second.changed[2].folder, inbox, "m3 left out its folder");
     assert_eq!(second.removed, [MessageId::new("m0")]);
     assert!(!second.more);
     assert!(second.state.as_str().ends_with("$deltatoken=d1"));

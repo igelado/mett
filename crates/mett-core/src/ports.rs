@@ -74,7 +74,8 @@ pub struct MessagePage {
 pub struct FolderChanges {
     /// The messages that arrived or changed, as they are now.
     pub changed: Vec<MessageSummary>,
-    /// The messages that left the folder (deleted, or moved away).
+    /// The messages that left the folder (deleted, or moved away). A
+    /// message is in at most one of `changed` and `removed`, as it ended.
     pub removed: Vec<MessageId>,
     /// Where the sync stands after these changes.
     pub state: SyncState,

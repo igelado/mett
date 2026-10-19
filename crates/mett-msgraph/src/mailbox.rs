@@ -911,13 +911,18 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             state: SyncState::new(String::new()),
             more: page.next_link.is_some(),
         };
+        // A message may come more than once: its last entry tells.
         for mut entry in page.value {
             if entry.get("@removed").is_some() {
                 let id = entry
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| Error::Backend("delta entry without an id".into()))?;
-                changes.removed.push(MessageId::new(id));
+                let id = MessageId::new(id);
+                changes.changed.retain(|m| m.id != id);
+                if !changes.removed.contains(&id) {
+                    changes.removed.push(id);
+                }
                 continue;
             }
             // Delta entries are in the folder synced, whether or not they
@@ -929,7 +934,10 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             }
             let message: GraphMessage = serde_json::from_value(entry)
                 .map_err(|e| Error::Backend(format!("unexpected delta entry from Graph: {e}")))?;
-            changes.changed.push(message.into_summary()?);
+            let summary = message.into_summary()?;
+            changes.removed.retain(|id| *id != summary.id);
+            changes.changed.retain(|m| m.id != summary.id);
+            changes.changed.push(summary);
         }
         let link = page
             .next_link
