@@ -565,6 +565,9 @@ impl Config {
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
                         let path = self.resolve_source(&path, origin.file);
+                        // This line's warnings are this line's, not the
+                        // sourced file's.
+                        self.flush_warnings(&at);
                         self.source(&path, origin.depth + 1);
                     }),
                     _ => Err("source: expected one file name".to_owned()),
@@ -592,6 +595,12 @@ impl Config {
         if let Err(message) = result {
             self.errors.push(format!("{at}: {message}"));
         }
+        self.flush_warnings(&at);
+    }
+
+    /// Reports the warnings of the command at `at`, those about the old
+    /// names its expansions used too.
+    fn flush_warnings(&mut self, at: &str) {
         for old in self.expanded_renamed.take() {
             // Warns (once) as using the old name does.
             self.find(old);
@@ -1280,6 +1289,25 @@ mod tests {
         assert_eq!(both.warnings.len(), 2, "{:?}", both.warnings);
         assert!(config.warnings[0].starts_with("/conf/mettrc:1:"));
         assert!(config.warnings[1].starts_with("/conf/mettrc:3:"));
+    }
+
+    #[test]
+    fn an_old_name_in_a_source_path_is_warned_about_where_it_is() {
+        let dir = std::env::temp_dir().join(format!("mett-renamed-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(
+            dir.join("mettrc"),
+            "set office365_tenant=sub\nsource $msgraph_tenant/rc\n",
+        )
+        .unwrap();
+        fs::write(dir.join("sub/rc"), "set realname=Me\n").unwrap();
+        let mut config = Config::new(None);
+        config.load_file(&dir.join("mettrc"));
+        assert_eq!(config.string("realname"), "Me");
+        let at = format!("{}:2: ", dir.join("mettrc").display());
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].starts_with(&at), "{:?}", config.warnings);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
