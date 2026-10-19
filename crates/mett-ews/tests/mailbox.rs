@@ -1567,3 +1567,26 @@ async fn watching_no_folders_ends_the_subscription() {
     // Ended once.
     assert!(store.watch(&[]).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn watching_stops_after_a_canceled_subscription_is_made() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1").set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let canceled = tokio::time::timeout(
+        Duration::from_millis(50),
+        store.watch(&[FolderId::new("inbox-id")]),
+    )
+    .await;
+    assert!(canceled.is_err());
+    // Stopped after: the subscription made meanwhile is ended.
+    assert!(store.watch(&[]).await.unwrap().is_empty());
+}

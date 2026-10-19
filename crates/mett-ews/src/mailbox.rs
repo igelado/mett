@@ -1340,10 +1340,11 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
     /// Exchange's limit.
     async fn subscribed(&self, folders: &[FolderId]) -> Result<String> {
         let conn = self.conn.clone();
-        let subscriptions = Arc::clone(&self.subscriptions);
+        // Locked before the task starts, so whatever is asked of the
+        // subscriptions next (say, to end them) comes after.
+        let mut subscriptions = Arc::clone(&self.subscriptions).lock_owned().await;
         let folders = folders.to_vec();
         tokio::spawn(async move {
-            let mut subscriptions = subscriptions.lock().await;
             if let Some((id, watched)) = &subscriptions.current
                 && *watched == folders
             {
@@ -1367,9 +1368,8 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
     /// [`Self::subscribed`]'s.
     async fn unsubscribed(&self) -> Result<()> {
         let conn = self.conn.clone();
-        let subscriptions = Arc::clone(&self.subscriptions);
+        let mut subscriptions = Arc::clone(&self.subscriptions).lock_owned().await;
         tokio::spawn(async move {
-            let mut subscriptions = subscriptions.lock().await;
             if let Some((id, _)) = subscriptions.current.take() {
                 subscriptions.stale.push(id);
             }

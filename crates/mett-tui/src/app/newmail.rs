@@ -263,26 +263,22 @@ impl App {
             self.unwatching = None;
         }
         if self.watching != Some(id) {
-            return Vec::new();
+            // A watch replaced as it ended: what it said changed is not
+            // told again.
+            return match result {
+                Some(Ok(changed)) if !changed.is_empty() => {
+                    self.note_changed(changed);
+                    self.recheck()
+                }
+                _ => Vec::new(),
+            };
         }
         self.watching = None;
         let mut effects = Vec::new();
         match result {
             None => self.can_watch = false,
             Some(Ok(changed)) => {
-                // Only those that changed are checked.
-                if self
-                    .folder
-                    .as_ref()
-                    .is_some_and(|f| changed.contains(&f.id))
-                {
-                    self.recheck_folder = true;
-                }
-                for folder in changed {
-                    if !self.recheck_mailboxes.contains(&folder) {
-                        self.recheck_mailboxes.push(folder);
-                    }
-                }
+                self.note_changed(changed);
                 effects.extend(self.recheck());
                 effects.extend(self.watch());
             }
@@ -293,6 +289,23 @@ impl App {
             }
         }
         effects
+    }
+
+    /// Notes the folders a watch said `changed`, to be checked: only
+    /// those.
+    fn note_changed(&mut self, changed: Vec<mett_core::FolderId>) {
+        if self
+            .folder
+            .as_ref()
+            .is_some_and(|f| changed.contains(&f.id))
+        {
+            self.recheck_folder = true;
+        }
+        for folder in changed {
+            if !self.recheck_mailboxes.contains(&folder) {
+                self.recheck_mailboxes.push(folder);
+            }
+        }
     }
 
     /// Checks the folders a watch said changed, as far as checks under
@@ -1395,6 +1408,36 @@ mod tests {
         let unwatch = effect_id(&effects[1]);
         assert!(respond(&mut app, unwatch, Event::Watched(Some(Ok(Vec::new())))).is_empty());
         assert!(!app.unwatching());
+    }
+
+    #[test]
+    fn changes_told_by_a_replaced_watch_are_checked() {
+        let (mut app, check) = app();
+        let inbox = mett_core::FolderId::new("in");
+        let first = app.watching.expect("the folder is watched");
+        // The mailboxes found, the watch starts again; the first had ended
+        // already, telling of a change.
+        check_both(
+            &mut app,
+            check,
+            checked("in", "Inbox", 1, None),
+            checked("wk", "Work", 0, None),
+        );
+        let second = app.watching.expect("watched again");
+        assert_ne!(first, second);
+        let effects = respond(&mut app, first, Event::Watched(Some(Ok(vec![inbox]))));
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "{sent:?}"
+        );
+        // Not watched a third time.
+        assert_eq!(app.watching, Some(second));
+        assert!(
+            !sent.iter().any(|(_, r)| matches!(r, Request::Watch(_))),
+            "{sent:?}"
+        );
     }
 
     #[test]
