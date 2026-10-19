@@ -51,7 +51,10 @@ The repository lives on Forgejo at
 4. Make sure all checks pass, and wait for code review.
 5. Address every error and review comment on the same branch. Reply to each
    review comment and resolve its conversation.
-6. Then merge the PR into `main` and delete the feature branch.
+6. Once every review conversation is resolved, schedule the PR to merge
+   automatically ("merge when checks succeed", with the head branch
+   deleted). Forgejo merges it into `main` as soon as all its checks pass;
+   don't wait for them to merge by hand.
 
 While a PR waits for checks or review, start the next feature on its own
 branch instead of waiting. Return to the waiting PR when its results arrive,
@@ -70,7 +73,9 @@ Forgejo enforces this workflow:
   of the `main` protection rule, so that they gate merging.
 
 Forgejo can't require resolved conversations, so check by hand that every
-review conversation is resolved before merging.
+review conversation is resolved before scheduling the merge. If a new
+review comment arrives while the merge is scheduled, cancel it until the
+comment is addressed and its conversation resolved.
 
 ## Locally generated files
 
