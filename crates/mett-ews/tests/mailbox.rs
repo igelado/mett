@@ -467,6 +467,25 @@ async fn busy_servers_throttle() {
 }
 
 #[tokio::test]
+async fn a_send_refused_with_a_fault_was_not_sent() {
+    let server = MockServer::start().await;
+    let fault = "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+                 <s:Fault><faultcode>a:ErrorInvalidRecipients</faultcode>\
+                 <faultstring>No recipients.</faultstring><detail>\
+                 <e:ResponseCode xmlns:e=\"errors\">ErrorInvalidRecipients</e:ResponseCode>\
+                 </detail></s:Fault></s:Body></s:Envelope>";
+    ews("<m:CreateItem")
+        .respond_with(ResponseTemplate::new(500).set_body_raw(fault, "text/xml"))
+        .mount(&server)
+        .await;
+    let e = store(&server).send(&Draft::default()).await.unwrap_err();
+    assert!(
+        matches!(e, Error::Backend(ref m) if m.contains("ErrorInvalidRecipients")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
 async fn updates_read_and_flagged_state() {
     let server = MockServer::start().await;
     ews("<m:UpdateItem")

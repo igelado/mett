@@ -20,8 +20,8 @@ use roxmltree::Node;
 use url::Url;
 
 use crate::soap::{
-    About, check, child, child_text, children, descendant, envelope, escape, only_message, parse,
-    response_code, response_messages, text,
+    About, check, child, child_text, children, coded_fault, descendant, envelope, escape,
+    only_message, parse, response_code, response_messages, text,
 };
 
 /// Upper bound on each EWS request with a small body. Larger ones (with
@@ -310,10 +310,11 @@ impl<A: Authenticator> EwsMailStore<A> {
         if status.is_success() {
             return Ok(body);
         }
-        // Exchange reports most failures as a SOAP fault (HTTP 500).
+        // Exchange reports most failures as a SOAP fault (HTTP 500): one
+        // that says what failed is that error (a refused send wasn't sent);
+        // without a code, the status tells.
         if let Ok(doc) = parse(&body)
-            && let Err(e) = response_messages(&doc, about)
-            && !matches!(e, Error::Backend(_))
+            && let Some(e) = coded_fault(&doc, about)
         {
             return Err(e);
         }

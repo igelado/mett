@@ -174,6 +174,15 @@ pub(crate) fn error_for(
     }
 }
 
+/// The error the SOAP fault in a failed response reports, if it says which
+/// (with an Exchange response code). Without one, only the HTTP status
+/// tells.
+pub(crate) fn coded_fault(doc: &Document<'_>, about: About<'_>) -> Option<Error> {
+    let fault = doc.descendants().find(|n| n.has_tag_name_local("Fault"))?;
+    text(fault, "ResponseCode")?;
+    Some(fault_error(fault, about))
+}
+
 /// The error a SOAP fault reports.
 fn fault_error(fault: Node<'_, '_>, about: About<'_>) -> Error {
     let detail = text(fault, "faultstring").unwrap_or_default();
@@ -288,6 +297,25 @@ mod tests {
             e,
             Error::Throttled { retry_after: Some(d) } if d == Duration::from_millis(2500)
         ));
+    }
+
+    #[test]
+    fn only_faults_with_a_code_say_what_failed() {
+        let fault = |detail: &str| {
+            format!(
+                r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+                <s:Fault><faultstring>No.</faultstring><detail>{detail}</detail></s:Fault>
+                </s:Body></s:Envelope>"#
+            )
+        };
+        let coded = fault("<e:ResponseCode xmlns:e=\"errors\">ErrorQuotaExceeded</e:ResponseCode>");
+        let doc = Document::parse(&coded).unwrap();
+        assert!(matches!(
+            coded_fault(&doc, About::MAILBOX),
+            Some(Error::Backend(m)) if m.contains("ErrorQuotaExceeded")
+        ));
+        let bare = fault("");
+        assert!(coded_fault(&Document::parse(&bare).unwrap(), About::MAILBOX).is_none());
     }
 
     #[test]
