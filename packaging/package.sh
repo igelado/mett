@@ -46,8 +46,14 @@ deb_version=$(echo "$version" | sed 's/-/~/')-$release
 arch_version=${version//-/}
 
 # musl's copyright, from the zig that links it in.
+# (Installed with pip, zig is a Python module; with pipx, it is one of the
+# Python beside cargo-zigbuild, in pipx's environment for it.)
 zig_env() {
-    python3 -m ziglang env 2>/dev/null || zig env
+    local beside
+    beside=$(dirname "$(readlink -f "$(command -v cargo-zigbuild)")")/python3
+    python3 -m ziglang env 2>/dev/null ||
+        { [ -x "$beside" ] && "$beside" -m ziglang env 2>/dev/null; } ||
+        zig env
 }
 # (`zig env` prints JSON, or ZON in newer zigs: `.lib_dir = "..."`.)
 musl_copyright=$(zig_env | python3 -I -c '
