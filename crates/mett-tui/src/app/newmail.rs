@@ -224,12 +224,17 @@ impl App {
         if let Some(old) = self.watching.take() {
             effects.push(self.request(Request::Cancel(old)));
         }
-        // Tried again unless its sign-in failed, until the user signs in.
         if self.can_watch
-            && (!self.watched.is_empty() || self.unwatch_failed && !self.watch_paused)
+            && (!self.watched.is_empty() || self.unwatch_failed)
             && self.unwatching.is_none()
         {
             self.watched.clear();
+            // Watching's sign-in failed: ended once the user signs in, not
+            // to ask them again unbidden.
+            if self.watch_paused {
+                self.unwatch_failed = true;
+                return effects;
+            }
             self.unwatch_failed = false;
             let unwatch = self.request(Request::Watch(Vec::new()));
             self.unwatching = Some(effect_id(&unwatch));
@@ -1540,6 +1545,26 @@ mod tests {
         assert!(
             matches!(&sent[..], [(_, Request::Watch(f))] if f.is_empty()),
             "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_watch_paused_is_ended_once_signed_in() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        respond(&mut app, watch, denied);
+        // Checks turned off: not ended yet, not to ask for a sign-in.
+        app.sync_interval = None;
+        assert!(app.watch().is_empty());
+        let signed_in = crate::SignInEvent::Finished {
+            account: "alice@contoso.com".into(),
+            outcome: Ok(()),
+        };
+        let effects = app.update(Msg::SignIn(signed_in));
+        assert!(
+            matches!(&requests(&effects)[..], [(_, Request::Watch(f))] if f.is_empty()),
+            "{effects:?}"
         );
     }
 
