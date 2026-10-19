@@ -36,8 +36,9 @@ for tool in cargo-zigbuild dpkg-deb bsdtar zstd gzip sha256sum; do
     command -v "$tool" >/dev/null || { echo "$0: $tool is missing" >&2; exit 1; }
 done
 
-# Debian orders `~` before anything, Arch letters before numbers: both put
-# a pre-release such as 0.2.0-rc.1 before 0.2.0.
+# Debian orders `~` before anything; pacman orders letters right after a
+# number before the number alone (vercmp: 1.0rc < 1.0 < 1.0.1). Both put a
+# pre-release such as 0.2.0-rc.1 (0.2.0~rc.1, 0.2.0rc.1) before 0.2.0.
 deb_version=$(echo "$version" | sed 's/-/~/')-$release
 arch_version=$(echo "$version" | sed 's/-//')
 
@@ -83,6 +84,7 @@ Version: $deb_version
 Architecture: $deb_arch
 Maintainer: $maintainer
 Installed-Size: $(du -sk --apparent-size "$tree/usr" | cut -f1)
+Depends: ca-certificates
 Section: mail
 Priority: optional
 Homepage: $homepage
@@ -114,6 +116,7 @@ size = $(du -sb --apparent-size "$tree/usr" | cut -f1)
 arch = $arch
 license = MIT
 license = Apache-2.0
+depend = ca-certificates
 EOF
     stamp "$tree"
     # As makepkg does: an mtree of the package, then the package itself,
