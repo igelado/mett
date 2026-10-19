@@ -1,0 +1,71 @@
+# Release packages, run by Forgejo Actions (see docs/RELEASING.md).
+#
+# Pushing a tag vX.Y.Z builds the Debian/Ubuntu, Arch Linux and tarball
+# packages for x86_64 and aarch64, and publishes them as that tag's release.
+# Running it by hand (workflow_dispatch) only builds them, to check that
+# they build, and publishes nothing.
+
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  packages:
+    runs-on: docker
+    container:
+      image: rust:1.95
+    steps:
+      - run: >
+          apt-get update && apt-get install -y --no-install-recommends
+          nodejs python3-pip libarchive-tools zstd jq
+      - uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          # The whole history, to tell whether the tag is on main.
+          fetch-depth: 0
+      - uses: https://code.forgejo.org/actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            target
+          key: release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-
+      # cargo-zigbuild brings zig, which links for any architecture.
+      - run: pip install --break-system-packages cargo-zigbuild==0.23.4
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      # The tag goes to the scripts as data, never as shell code.
+      - name: The tag is the version in Cargo.toml
+        if: forgejo.event_name == 'push'
+        env:
+          TAG: ${{ forgejo.ref_name }}
+        run: |
+          version=$(packaging/version.sh)
+          if [ "$TAG" != "v$version" ]; then
+            echo "tag $TAG doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+      # Only what was merged (reviewed, checked) is released.
+      - name: The tag is on main
+        if: forgejo.event_name == 'push'
+        env:
+          TAG: ${{ forgejo.ref_name }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$TAG^{commit}" FETCH_HEAD; then
+            echo "tag $TAG isn't on main: tag the merge on main"
+            exit 1
+          fi
+      - run: packaging/package.sh x86_64 aarch64
+      - name: Publish the release
+        if: forgejo.event_name == 'push'
+        env:
+          FORGEJO_URL: ${{ forgejo.server_url }}
+          FORGEJO_REPOSITORY: ${{ forgejo.repository }}
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+          TAG: ${{ forgejo.ref_name }}
+        run: packaging/release.sh "$TAG"
+      - name: List the packages
+        if: forgejo.event_name == 'workflow_dispatch'
+        run: ls -l dist/
