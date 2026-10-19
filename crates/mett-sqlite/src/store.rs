@@ -61,8 +61,8 @@ pub struct CachedStore<S> {
     progress: Option<Progress>,
 }
 
-/// Told, as a folder syncs, how many changes (on a first sync, messages)
-/// it has taken in so far.
+/// Told, as a folder syncs, how many of its messages the cache has, batch
+/// by batch.
 pub type Progress = Box<dyn Fn(&FolderId, u64) + Send + Sync>;
 
 /// When a folder was last synced, and how many changes mett had made then.
@@ -262,7 +262,6 @@ impl<S: MailStore> CachedStore<S> {
             }
         };
         let mut lost = 0;
-        let mut taken = 0;
         loop {
             let changes = match self.inner.sync_folder(folder, state.as_ref()).await {
                 // The server forgot where the sync stood: start over,
@@ -270,7 +269,6 @@ impl<S: MailStore> CachedStore<S> {
                 Err(Error::StaleSync) if state.is_some() => {
                     self.with_cache(|db| db.start_over(folder))?;
                     state = None;
-                    taken = 0;
                     continue;
                 }
                 changes => changes?,
@@ -295,14 +293,16 @@ impl<S: MailStore> CachedStore<S> {
                     _ => {
                         self.with_cache(|db| db.start_over(folder))?;
                         state = None;
-                        taken = 0;
                     }
                 }
                 continue;
             }
-            taken += (changes.changed.len() + changes.removed.len()) as u64;
-            if let Some(progress) = &self.progress {
-                progress(folder, taken);
+            // How many are here, which only grows as a first sync goes on,
+            // however often it is cut short and taken up again.
+            if let Some(progress) = &self.progress
+                && let Ok(here) = self.with_cache(|db| db.count(folder))
+            {
+                progress(folder, here);
             }
             let FolderChanges {
                 state: next, more, ..

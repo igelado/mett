@@ -349,6 +349,18 @@ impl Db {
         Ok(true)
     }
 
+    /// How many of `folder`'s messages are here.
+    pub fn count(&self, folder: &FolderId) -> Result<u64, Error> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE folder = ?1",
+                [folder.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.unsigned_abs())
+            .map_err(failed)
+    }
+
     /// Up to `limit` of `folder`'s summaries, newest first (by
     /// [`received_key`], then ID), after the one `after` is the key of.
     pub fn page(

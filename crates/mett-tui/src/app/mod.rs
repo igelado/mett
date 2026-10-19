@@ -183,12 +183,11 @@ pub enum Msg {
     Appended(Result<std::path::PathBuf, String>),
     /// A timer the app set went off.
     Timer(Timer),
-    /// A folder's sync has taken in this many changes (on a first sync,
-    /// messages) so far.
+    /// A folder's sync goes on: the cache has this many of its messages.
     Syncing {
         /// The folder.
         folder: mett_core::FolderId,
-        /// How many changes.
+        /// How many messages.
         taken: u64,
     },
     /// The terminal was resized.
@@ -1268,9 +1267,9 @@ impl App {
 
     /// Retries once the last of the requests that were pending when the
     /// user asked to retry has reported back.
-    /// The open folder's sync, while it loads, has taken in `taken`
-    /// changes: the status line says so, as a large folder's first sync
-    /// takes a while.
+    /// The open folder's sync, while it loads, has `taken` of its messages
+    /// in the cache: the status line says so, as a large folder's first
+    /// sync takes a while.
     fn on_syncing(&mut self, folder: &mett_core::FolderId, taken: u64) {
         let Some(open) = self.folder.as_ref().filter(|f| &f.id == folder) else {
             return;
