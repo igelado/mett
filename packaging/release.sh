@@ -17,8 +17,9 @@ call() {
     curl -sSf -H "Authorization: token $FORGEJO_TOKEN" "$@"
 }
 
-# A version with a pre-release part (0.2.0-rc.1) is a pre-release.
-case $tag in
+# A version with a pre-release part (0.2.0-rc.1) is a pre-release; build
+# metadata (0.2.0+build-1), after the `+`, doesn't count.
+case ${tag%%+*} in
 *-*) prerelease=true ;;
 *) prerelease=false ;;
 esac
