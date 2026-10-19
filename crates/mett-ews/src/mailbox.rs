@@ -1244,8 +1244,11 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
             let id = self.subscribed(folders).await?;
             let started = tokio::time::Instant::now();
             let streamed = self.stream_events(&id, folders).await;
-            // Told now (or lost to an error), whatever comes of it.
-            *self.unreported.lock().expect("lock") = Unreported::default();
+            // Told now, whatever comes of it. After an error (which the
+            // caller waits a while after), the next watch tells.
+            if streamed.is_ok() {
+                *self.unreported.lock().expect("lock") = Unreported::default();
+            }
             match streamed? {
                 // Part of an envelope was left unread: any folder may have
                 // changed.

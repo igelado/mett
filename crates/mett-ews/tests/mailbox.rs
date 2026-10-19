@@ -1301,11 +1301,13 @@ async fn a_stream_ended_early_is_an_error() {
         .respond_with(ResponseTemplate::new(200).set_body_raw("<s:Envel", "text/xml"))
         .mount(&server)
         .await;
-    let e = store(&server)
-        .watch(&[FolderId::new("inbox-id")])
-        .await
-        .unwrap_err();
+    let store = store(&server);
+    let inbox = [FolderId::new("inbox-id")];
+    let e = store.watch(&inbox).await.unwrap_err();
     assert!(matches!(e, mett_core::Error::Network(_)), "{e:?}");
+    // Part of an envelope came: the next watch tells the folder may have
+    // changed, at once.
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
 }
 
 #[tokio::test]
