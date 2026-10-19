@@ -62,8 +62,11 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Reads one envelope of a `GetStreamingEvents` response.
 pub(crate) fn read_envelope(envelope: &[u8]) -> Result<Streamed, Error> {
+    // What separates envelopes (white space) comes before the next one,
+    // whose XML declaration must come first.
     let text = std::str::from_utf8(envelope)
-        .map_err(|_| Error::Backend("unexpected response from EWS: not UTF-8".into()))?;
+        .map_err(|_| Error::Backend("unexpected response from EWS: not UTF-8".into()))?
+        .trim_start();
     let doc = parse(text)?;
     let about = About::MAILBOX;
     let mut changed: Vec<FolderId> = Vec::new();
@@ -144,6 +147,18 @@ mod tests {
         let mut buffer = b"<Envelope><Body>NotEnvelope></Body></Envelope>".to_vec();
         assert_eq!(take_envelopes(&mut buffer).len(), 1);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn envelopes_may_be_apart() {
+        let one = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>{}",
+            envelope(&message("Success", "NoError", ""))
+        );
+        let mut buffer = format!("{one}\r\n{one}").into_bytes();
+        for envelope in take_envelopes(&mut buffer) {
+            assert_eq!(read_envelope(&envelope).unwrap(), Streamed::Changed(vec![]));
+        }
     }
 
     #[test]

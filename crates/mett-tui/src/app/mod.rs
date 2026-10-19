@@ -759,6 +759,9 @@ pub struct App {
     /// which folders it watches.
     watching: Option<RequestId>,
     watched: Vec<mett_core::FolderId>,
+    /// The folders a watch said changed, which are still to be checked:
+    /// a check under way when it said may predate the change.
+    to_recheck: Vec<mett_core::FolderId>,
     /// Whether the mailbox can tell when folders change (until it says it
     /// can't).
     can_watch: bool,
@@ -915,6 +918,7 @@ impl App {
             api: settings.api,
             watching: None,
             watched: Vec::new(),
+            to_recheck: Vec::new(),
             can_watch: true,
             watch_retry: false,
             throttled: HashMap::new(),
@@ -1746,7 +1750,11 @@ impl App {
                 }
                 return effects;
             }
-            Event::FolderPolled(result) => return self.on_polled(id, result),
+            Event::FolderPolled(result) => {
+                let mut effects = self.on_polled(id, result);
+                effects.extend(self.recheck());
+                return effects;
+            }
             Event::Watched(result) => return self.on_watched(id, result),
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
@@ -1818,7 +1826,11 @@ impl App {
             Event::AttachmentsListed(result) => return self.on_attachments_listed(id, result),
             Event::AttachmentFetched(result) => return self.on_attachment_fetched(id, result),
             Event::Queried(result) => return self.on_queried(id, result),
-            Event::MailboxesChecked(checked) => return self.on_mailboxes_checked(id, checked),
+            Event::MailboxesChecked(checked) => {
+                let mut effects = self.on_mailboxes_checked(id, checked);
+                effects.extend(self.recheck());
+                return effects;
+            }
             Event::StillThere(result) => return self.on_still_there(id, result),
             Event::Transferred(result) => {
                 // The messages leave the index, or it is listed again; the
