@@ -53,7 +53,7 @@ I/O and talks to the UI over channels.
 │  mett-core: domain model + ports (traits)      │
 │  MailStore, Authenticator, MailSender, …       │
 ├───────────────┬──────────────┬─────────────────┤
-│ mett-msgraph, │ cache crate¹ │ mock (tests)    │
+│ mett-msgraph, │ mett-sqlite  │ mock (tests)    │
 │ mett-ews      │              │                 │
 └───────────────┴──────────────┴─────────────────┘
 ```
@@ -69,11 +69,8 @@ a crate may only depend on crates below it in the diagram.
 | `mett-core`    | Domain model (messages, folders, threads, drafts) and port traits. | none (no I/O crates)           |
 | `mett-msgraph` | Microsoft Graph adapter: HTTP, OAuth2, paging, throttling, delta.  | `mett-core`                    |
 | `mett-ews`     | Exchange Web Services adapter: SOAP, paging, throttling.           | `mett-core`                    |
-| cache crate¹   | Local cache and sync state.                                        | `mett-core`                    |
+| `mett-sqlite`  | Local cache and sync state, in SQLite.                             | `mett-core`                    |
 | `mett-tui`     | The binary: TUI, key bindings, configuration, worker wiring.       | `mett-core`, adapters          |
-
-¹ Named after its storage technology once that is chosen, for example
-`mett-sqlite` or `mett-maildir` (see §10).
 
 `mett --demo` runs the UI on `mett-core`'s in-memory `MailStore`, without
 an account.
@@ -196,8 +193,17 @@ listing once for all of them.
 
 ### 5.5 Repository with local cache and sync engine
 
-The UI reads mailbox data from the cache crate. A sync component in the worker
-keeps the store up to date with Graph delta queries.
+The UI reads mailbox data from the cache, `mett-sqlite`, which keeps it up
+to date by syncing each folder with the backend (`MailStore::sync_folder`:
+Graph delta queries, or EWS `SyncFolderItems`).
+
+- **Implementation:** `CachedStore` is a decorator: it implements the
+  ports in front of the backend's store, so the app and the worker don't
+  change. Listing a folder syncs it (once for all the calls of a request)
+  and pages through the cache; changed and recent-unread queries read the
+  cache after syncing; message bodies are kept once fetched; changes go to
+  the server, then to the cache. A backend that can't sync, or
+  `unset header_cache`, leaves everything to the server.
 
 - **Pros:**
   - Browsing is fast, and the index opens instantly.
@@ -210,7 +216,7 @@ keeps the store up to date with Graph delta queries.
 - **Mitigation:** the first iteration may use online-only access behind the
   same `MailStore` port, adding the cache once the core flows work. The
   server is always treated as the source of truth.
-- **Until then:** new mail is found by polling. A timer (`Effect::Later`)
+- **New mail** is found by polling. A timer (`Effect::Later`)
   has the app list the newest page of the open folder again, and the
   messages changed since the last check (`MailStore::changed_messages`,
   which finds mail that arrives with an old date), and merge them into
@@ -321,7 +327,7 @@ covers the same needs more cleanly.
 
 ## 7. Error handling
 
-- Library crates (`mett-core`, the adapters and the cache crate) define typed
+- Library crates (`mett-core`, the adapters and `mett-sqlite`) define typed
   error enums.
 - The binary (`mett-tui`) adds context to errors at the top level.
 - Errors from the worker reach the UI as `Event`s and are shown in mutt's
@@ -355,7 +361,7 @@ their own through `msgraph_client_id`.
 - **Adapter tests:**
   - `mett-msgraph` and `mett-ews` against recorded or mocked HTTP
     responses.
-  - The cache crate against a temporary store.
+  - `mett-sqlite` in front of the in-memory store, with the clock paused.
 - **UI snapshot tests:** render `view` into a `ratatui` test backend and
   compare the result against stored snapshots.
 - **End-to-end tests:** the whole application wired to the mock `MailStore`.
@@ -363,6 +369,5 @@ their own through `msgraph_client_id`.
 ## 10. Open questions
 
 - Scope beyond mail: should calendar and contacts be included, and when?
-- Cache backend: SQLite or Maildir? The choice also names the cache crate.
 - Default authentication flow.
 - Should IMAP/SMTP with XOAUTH2 be supported as an alternative backend?

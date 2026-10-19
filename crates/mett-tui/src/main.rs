@@ -158,6 +158,10 @@ fn main() -> ExitCode {
         else {
             return ExitCode::FAILURE;
         };
+        let (mailbox, warning) = account::cached(&config, &spoolfile, mailbox);
+        if let Some(warning) = warning {
+            eprintln!("mett: warning: {warning}");
+        }
         let mut pushed = Vec::new();
         for keys in config.take_pushed() {
             match keymap::parse_strokes(&keys) {
@@ -1166,7 +1170,8 @@ fn run_command(
             changed
                 .iter()
                 .filter(|name| {
-                    (name.starts_with("msgraph_") || ["use_ews", "ews_url"].contains(*name))
+                    (name.starts_with("msgraph_")
+                        || ["use_ews", "ews_url", "header_cache"].contains(*name))
                         && ![
                             "msgraph_page_size",
                             "msgraph_sync_interval",
