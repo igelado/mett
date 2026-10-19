@@ -1284,3 +1284,21 @@ async fn watching_other_folders_ends_the_old_subscription() {
     store.watch(&[FolderId::new("inbox-id")]).await.unwrap();
     store.watch(&[FolderId::new("work-id")]).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_stream_ended_early_is_an_error() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<s:Envel", "text/xml"))
+        .mount(&server)
+        .await;
+    let e = store(&server)
+        .watch(&[FolderId::new("inbox-id")])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, mett_core::Error::Network(_)), "{e:?}");
+}

@@ -759,9 +759,11 @@ pub struct App {
     /// which folders it watches.
     watching: Option<RequestId>,
     watched: Vec<mett_core::FolderId>,
-    /// The folders a watch said changed, which are still to be checked:
-    /// a check under way when it said may predate the change.
-    to_recheck: Vec<mett_core::FolderId>,
+    /// What a watch said changed and is still to be checked (a check under
+    /// way when it said may predate the change): the open folder, and the
+    /// folders of `mailboxes` (the open one among them, for its counts).
+    recheck_folder: bool,
+    recheck_mailboxes: Vec<mett_core::FolderId>,
     /// Whether the mailbox can tell when folders change (until it says it
     /// can't).
     can_watch: bool,
@@ -918,7 +920,8 @@ impl App {
             api: settings.api,
             watching: None,
             watched: Vec::new(),
-            to_recheck: Vec::new(),
+            recheck_folder: false,
+            recheck_mailboxes: Vec::new(),
             can_watch: true,
             watch_retry: false,
             throttled: HashMap::new(),

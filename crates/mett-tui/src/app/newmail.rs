@@ -247,9 +247,16 @@ impl App {
             None => self.can_watch = false,
             Some(Ok(changed)) => {
                 // Only those that changed are checked.
+                if self
+                    .folder
+                    .as_ref()
+                    .is_some_and(|f| changed.contains(&f.id))
+                {
+                    self.recheck_folder = true;
+                }
                 for folder in changed {
-                    if !self.to_recheck.contains(&folder) {
-                        self.to_recheck.push(folder);
+                    if !self.recheck_mailboxes.contains(&folder) {
+                        self.recheck_mailboxes.push(folder);
                     }
                 }
                 effects.extend(self.recheck());
@@ -268,32 +275,21 @@ impl App {
     /// way allow: those still busy (whose check may predate the change)
     /// are checked once it ends.
     pub(super) fn recheck(&mut self) -> Vec<Effect> {
-        if self.to_recheck.is_empty()
-            || self.sync_interval.is_none()
-            || self.poll_paused
-            || self.sign_in.is_some()
-        {
+        if self.sync_interval.is_none() || self.poll_paused || self.sign_in.is_some() {
             return Vec::new();
         }
         let mut effects = Vec::new();
-        if let Some(open) = self.folder.as_ref().map(|f| f.id.clone())
-            && self.to_recheck.contains(&open)
-            && self.polling.is_none()
-        {
+        if self.recheck_folder && self.polling.is_none() {
             effects.extend(self.poll_folder());
             // Being checked now. (A listing under way may predate the
             // change: it is checked when that ends.)
             if self.polling.is_some() {
-                self.to_recheck.retain(|f| *f != open);
+                self.recheck_folder = false;
             }
         }
-        if self.checking.is_none() {
-            let changed = std::mem::take(&mut self.to_recheck);
-            let open = self.folder.as_ref().map(|f| f.id.clone());
-            let (mailboxes, rest): (Vec<_>, Vec<_>) =
-                changed.into_iter().partition(|f| Some(f) != open.as_ref());
-            self.to_recheck = rest;
-            effects.extend(self.check_mailboxes_in(Some(&mailboxes)));
+        if self.checking.is_none() && !self.recheck_mailboxes.is_empty() {
+            let changed = std::mem::take(&mut self.recheck_mailboxes);
+            effects.extend(self.check_mailboxes_in(Some(&changed)));
         }
         effects
     }
@@ -1283,6 +1279,30 @@ mod tests {
         );
         // The same folders: not again.
         assert!(app.watch().is_empty());
+        // The Inbox changed: its index is checked, and its counts (it is
+        // one of the mailboxes too).
+        let watch = app.watching.expect("watched");
+        let effects = respond(
+            &mut app,
+            watch,
+            Event::Watched(Some(Ok(vec![inbox.clone()]))),
+        );
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "{sent:?}"
+        );
+        let check = sent
+            .iter()
+            .find_map(|(id, r)| match r {
+                Request::CheckMailboxes(m) if m.len() == 1 && m[0].0 == super::tests::inbox() => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("the Inbox's counts are checked");
+        respond(&mut app, check, Event::MailboxesChecked(Vec::new()));
         // Work changed: only it is checked.
         let watch = app.watching.expect("watched");
         let effects = respond(

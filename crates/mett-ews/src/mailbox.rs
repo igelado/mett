@@ -1251,6 +1251,8 @@ impl<A: Authenticator> EwsMailStore<A> {
         // Once something changed, what follows at once (the rest of a
         // burst) is read too, for a moment: events sent are not sent again.
         let mut until: Option<tokio::time::Instant> = None;
+        // A stream that ends before telling anything ended early.
+        let mut told = false;
         loop {
             let next = match until {
                 None => response.chunk().await,
@@ -1264,6 +1266,7 @@ impl<A: Authenticator> EwsMailStore<A> {
             };
             buffer.extend_from_slice(&chunk);
             for envelope in take_envelopes(&mut buffer) {
+                told = true;
                 match read_envelope(&envelope)? {
                     Streamed::Changed(folders) => {
                         for folder in folders {
@@ -1279,6 +1282,11 @@ impl<A: Authenticator> EwsMailStore<A> {
             if !changed.is_empty() && until.is_none() {
                 until = Some(tokio::time::Instant::now() + BURST);
             }
+        }
+        if !told {
+            return Err(Error::Network(
+                "EWS ended the stream of changes before telling anything".into(),
+            ));
         }
         Ok(Some(changed))
     }
