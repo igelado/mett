@@ -231,6 +231,13 @@ async fn the_cache_is_private_and_lasts() {
     let link = dir.join("link.sqlite");
     std::os::unix::fs::symlink(&path, &link).unwrap();
     assert!(Cache::open(&link, &alice()).is_err());
+    // Nor, by a relative path, a cache in a working directory others can
+    // write to.
+    let here = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&shared).unwrap();
+    let relative = Cache::open(std::path::Path::new("c.sqlite"), &alice());
+    std::env::set_current_dir(here).unwrap();
+    assert!(relative.is_err());
     // Nor another program's database, which is left as it was.
     let other = dir.join("other.sqlite");
     rusqlite::Connection::open(&other)

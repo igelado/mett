@@ -74,8 +74,10 @@ impl Cache {
             path: path.display().to_string(),
             source,
         };
-        private_file(path).map_err(|e| error(Box::new(e)))?;
-        Db::open(path, account)
+        // A relative path's directory is the working one: it is checked too.
+        let path = std::path::absolute(path).map_err(|e| error(Box::new(e)))?;
+        private_file(&path).map_err(|e| error(Box::new(e)))?;
+        Db::open(&path, account)
             .map(Self)
             .map_err(|e| error(Box::new(e)))
     }

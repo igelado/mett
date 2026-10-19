@@ -445,14 +445,20 @@ impl Db {
     /// here (in a folder being cached) and it isn't a draft, which may
     /// change.
     pub fn keep_body(&self, message: &Message) -> Result<(), Error> {
-        if message.summary.draft {
+        // Only as the summary here is: a sync may have brought a newer one
+        // (whose body this isn't) while it was fetched.
+        let Some(modified) = message.summary.modified.filter(|_| !message.summary.draft) else {
             return Ok(());
-        }
+        };
         let extras = serde_json::to_string(&StoredExtras::from(message)).map_err(failed)?;
         self.conn
             .execute(
-                "UPDATE messages SET extras = ?2 WHERE id = ?1",
-                [message.summary.id.as_str(), extras.as_str()],
+                "UPDATE messages SET extras = ?2 WHERE id = ?1 AND modified = ?3",
+                params![
+                    message.summary.id.as_str(),
+                    extras,
+                    modified.timestamp_millis()
+                ],
             )
             .map_err(failed)?;
         Ok(())
@@ -933,6 +939,31 @@ mod tests {
                 .modified
                 .is_some_and(|m| m.timestamp_millis() >= before.timestamp_millis())
         );
+    }
+
+    #[test]
+    fn a_body_is_kept_only_with_its_summary() {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        let inbox = FolderId::new("in");
+        let at = |minutes| DateTime::UNIX_EPOCH + chrono::TimeDelta::minutes(minutes);
+        let mut message = mett_core::mock::message("m1", "in", "hi", at(0));
+        message.summary.modified = Some(at(1));
+        db.start_over(&inbox).unwrap();
+        let mut newer = message.summary.clone();
+        newer.modified = Some(at(2));
+        let changes = FolderChanges {
+            changed: vec![newer],
+            removed: Vec::new(),
+            state: SyncState::new("s1"),
+            more: false,
+        };
+        assert!(db.apply(&inbox, None, &changes).unwrap());
+        // Fetched before the sync brought the newer summary: not kept.
+        db.keep_body(&message).unwrap();
+        assert_eq!(db.message(&message.summary.id).unwrap(), None);
+        message.summary.modified = Some(at(2));
+        db.keep_body(&message).unwrap();
+        assert!(db.message(&message.summary.id).unwrap().is_some());
     }
 
     #[test]
