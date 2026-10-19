@@ -747,6 +747,9 @@ pub struct App {
     throttled: HashMap<RequestId, (Duration, u32)>,
     /// The countdown's timer, which goes while a request waits.
     throttle_timer: u64,
+    /// The requests given up on, whose waits that the worker told of
+    /// before it stopped them are ignored.
+    given_up: HashSet<RequestId>,
 }
 
 impl App {
@@ -888,6 +891,7 @@ impl App {
             api: settings.api,
             throttled: HashMap::new(),
             throttle_timer: 0,
+            given_up: HashSet::new(),
         };
         app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();
@@ -994,6 +998,7 @@ impl App {
         // A request given up on isn't tried again.
         if let Request::CancelQuery(query) = &request {
             self.throttled.remove(query);
+            self.given_up.insert(*query);
         }
         self.next_request += 1;
         Effect::Request(RequestId(self.next_request), request)
@@ -1249,8 +1254,13 @@ impl App {
     fn on_throttled(&mut self, id: RequestId, wait: Duration, attempt: u32) -> Vec<Effect> {
         // Whole seconds, so that the countdown ends when the wait does.
         let wait = Duration::from_secs(wait.as_secs() + u64::from(wait.subsec_nanos() > 0));
+        if self.given_up.contains(&id) {
+            return Vec::new();
+        }
         let counting = !self.throttled.is_empty();
-        self.throttled.insert(id, (wait, attempt));
+        // Calls of one request may wait at once: the longest wait counts.
+        let entry = self.throttled.entry(id).or_insert((wait, attempt));
+        *entry = (entry.0.max(wait), entry.1.max(attempt));
         if counting {
             return Vec::new();
         }
@@ -2421,6 +2431,15 @@ impl App {
 
     /// Whether changes to the mailbox are still being saved. mett waits
     /// for them before exiting, so they aren't lost.
+    /// Whether request `id` saves a change (one [`App::saving`] waits for).
+    pub fn saves(&self, id: RequestId) -> bool {
+        self.writing
+            .as_ref()
+            .is_some_and(|(writing, _)| *writing == id)
+            || self.delivery_request() == Some(id)
+            || self.discarding.contains_key(&id)
+    }
+
     pub fn saving(&self) -> bool {
         self.writing.is_some()
             || !self.writes.is_empty()
@@ -2603,9 +2622,28 @@ mod tests {
             [Effect::Later(SECOND, Timer::Throttled(2))]
         );
         assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), [], "stale");
-        // Giving it up ends it too.
+        // Giving it up ends it too, even if a wait told of before comes
+        // after.
         app.request(Request::CancelQuery(RequestId(91)));
         assert_eq!(app.throttled_notice(), None);
+        let late = Event::Throttled {
+            wait: Duration::from_secs(30),
+            attempt: 2,
+        };
+        assert_eq!(respond(&mut app, RequestId(91), late), []);
+        assert_eq!(app.throttled_notice(), None);
+        // Calls of one request waiting at once: the longest wait counts.
+        for wait in [20, 5] {
+            let throttled = Event::Throttled {
+                wait: Duration::from_secs(wait),
+                attempt: 1,
+            };
+            respond(&mut app, RequestId(92), throttled);
+        }
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 1/5 in 20s")
+        );
     }
 
     /// `n` messages, newest first, as Graph lists them.

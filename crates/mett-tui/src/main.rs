@@ -697,7 +697,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     // A save the server throttled is tried again after the
                     // wait it asked for: wait for it that much longer.
                     Some(response)
-                        if matches!(response.event, worker::Event::Throttled { .. }) =>
+                        if matches!(response.event, worker::Event::Throttled { .. })
+                            && app.saves(response.id) =>
                     {
                         if let worker::Event::Throttled { wait, .. } = response.event {
                             deadline =
