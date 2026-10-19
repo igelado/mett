@@ -36,35 +36,41 @@ where to store things, or similar project-wide conventions:
 
 ## Git workflow
 
+The repository lives on Forgejo at
+`ssh://git@git.gelado.org:12500/igelado/mett.git`
+(web: https://git.gelado.org/igelado/mett).
+
 1. Develop each feature on its own branch named `<username>/<feature>` (for
    example `igelado/msgraph-auth`), created from `main`. Commit to that
    branch, never directly to `main`.
-2. When the feature is complete, push the branch and open a merge request
-   (MR) on GitLab.
-3. Make sure all tests pass, and wait for code review.
-4. Address every error and review concern on the same branch.
-5. Then merge the MR into `main` and delete the feature branch.
+2. After each commit, run a Codex review against `main` and fix every valid
+   finding (explain why any finding doesn't apply) until a review comes back
+   clean.
+3. When the feature is complete, push the branch and open a pull request
+   (PR) into `main`. Post the clean Codex review result as a PR comment.
+4. Make sure all checks pass, and wait for code review.
+5. Address every error and review comment on the same branch. Reply to each
+   review comment and resolve its conversation.
+6. Then merge the PR into `main` and delete the feature branch.
 
-While an MR waits for CI or review (CodeRabbit can take a while), start the
-next feature on its own branch instead of waiting. Return to the waiting MR
-when its results arrive, and don't merge it before its review is complete.
-If review comments arrive after an MR was merged, fix them in a follow-up MR
-and reply in each thread with the fix.
+While a PR waits for checks or review, start the next feature on its own
+branch instead of waiting. Return to the waiting PR when its results arrive,
+and don't merge it before its review is complete. If review comments arrive
+after a PR was merged, fix them in a follow-up PR and reply in each
+conversation with the fix.
 
-GitLab enforces this workflow:
+Forgejo enforces this workflow:
 
-- `main` is protected. Nobody can push to it directly or force-push, and only
-  Maintainers can merge.
-- An MR can be merged only if its pipeline succeeds. Skipped pipelines don't
-  count as successful.
-- The source branch is deleted after merge by default.
-- An MR can be merged only when all review threads are resolved.
-- CI is defined in `.gitlab-ci.yml`. Its jobs run on the shared Linux Docker
-  runners (`os/linux`, `type/docker`, `size/medium`). Add new checks there,
-  so that they gate merging.
-- CodeRabbit reviews every MR automatically, configured in
-  `.coderabbit.yaml`. Its comments are review threads, so they must be
-  resolved before merging.
+- `main` is protected. Nobody can push to it directly or force-push.
+- A PR can be merged only if its required checks (the `docs` and `rust` jobs)
+  succeed.
+- The head branch is deleted after merge by default.
+- CI is defined in `.forgejo/workflows/ci.yml` and runs with Forgejo Actions
+  on every push. Add new checks there, and add them to the required checks
+  of the `main` protection rule, so that they gate merging.
+
+Forgejo can't require resolved conversations, so check by hand that every
+review conversation is resolved before merging.
 
 ## Locally generated files
 
