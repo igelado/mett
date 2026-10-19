@@ -262,6 +262,8 @@ impl<S: MailStore> CachedStore<S> {
             }
         };
         let mut lost = 0;
+        // How many of the folder's messages are here, once counted.
+        let mut here: Option<u64> = None;
         loop {
             let changes = match self.inner.sync_folder(folder, state.as_ref()).await {
                 // The server forgot where the sync stood: start over,
@@ -269,11 +271,14 @@ impl<S: MailStore> CachedStore<S> {
                 Err(Error::StaleSync) if state.is_some() => {
                     self.with_cache(|db| db.start_over(folder))?;
                     state = None;
+                    here = None;
                     continue;
                 }
                 changes => changes?,
             };
-            if !self.with_cache(|db| db.apply(folder, state.as_ref(), &changes))? {
+            let Some(more_here) =
+                self.with_cache(|db| db.apply(folder, state.as_ref(), &changes))?
+            else {
                 // Another mett sharing the cache synced the folder
                 // meanwhile: go on from where it left it (what came since
                 // may be in neither's changes). Should it keep winning, its
@@ -288,21 +293,33 @@ impl<S: MailStore> CachedStore<S> {
                     }
                     break;
                 }
+                // What is here changed meanwhile: it is counted again.
+                here = None;
                 match self.with_cache(|db| db.synced(folder))? {
                     Some(synced) if synced.state.is_some() => state = synced.state,
                     _ => {
                         self.with_cache(|db| db.start_over(folder))?;
                         state = None;
+                        here = None;
                     }
                 }
                 continue;
-            }
+            };
             // How many are here, which only grows as a first sync goes on,
-            // however often it is cut short and taken up again.
+            // however often it is cut short and taken up again. Counted
+            // once, for a sync of more than one batch (a quick one has
+            // nothing to tell), then kept up batch by batch.
             if let Some(progress) = &self.progress
-                && let Ok(here) = self.with_cache(|db| db.count(folder))
+                && (changes.more || here.is_some())
             {
-                progress(folder, here);
+                let now = match here {
+                    Some(here) => Some(here.saturating_add_signed(more_here)),
+                    None => self.with_cache(|db| db.count(folder)).ok(),
+                };
+                if let Some(now) = now {
+                    progress(folder, now);
+                }
+                here = now;
             }
             let FolderChanges {
                 state: next, more, ..

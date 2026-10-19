@@ -610,7 +610,7 @@ async fn a_message_changed_on_the_server_is_fetched_again() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn syncs_tell_how_far_they_have_got() {
+async fn quick_syncs_have_nothing_to_tell() {
     let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let progress = {
         let told = std::sync::Arc::clone(&told);
@@ -620,5 +620,6 @@ async fn syncs_tell_how_far_they_have_got() {
     };
     let store = cached(mailbox(3)).unwrap().with_progress(progress);
     listing(&store, 10).await;
-    assert_eq!(*told.lock().unwrap(), [("in".to_owned(), 3)]);
+    // One batch: done at once. (Longer ones are counted in db.rs's tests.)
+    assert!(told.lock().unwrap().is_empty());
 }
