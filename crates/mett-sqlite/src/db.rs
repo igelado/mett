@@ -154,6 +154,16 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Whose it is, if it says (whatever its schema): another account's
+        // is left alone, even if it is out of date.
+        let owner: Option<String> = tx
+            .query_row("SELECT id FROM account", [], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(owner) = owner.filter(|owner| owner != account.as_str()) {
+            return Err(OpenError::Account(owner));
+        }
         let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version != SCHEMA_VERSION {
             tx.execute_batch(
@@ -172,12 +182,8 @@ impl Db {
         let owner: Option<String> = tx
             .query_row("SELECT id FROM account", [], |r| r.get(0))
             .optional()?;
-        match owner {
-            None => {
-                tx.execute("INSERT INTO account (id) VALUES (?1)", [account.as_str()])?;
-            }
-            Some(owner) if owner != account.as_str() => return Err(OpenError::Account(owner)),
-            Some(_) => {}
+        if owner.is_none() {
+            tx.execute("INSERT INTO account (id) VALUES (?1)", [account.as_str()])?;
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -446,6 +452,16 @@ impl Db {
             tx.execute("INSERT OR IGNORE INTO listed (what) VALUES (?1)", [name])
                 .map_err(failed)?;
         }
+        // A listing of the folders below one replaces those kept there.
+        match listing {
+            Listing::Below(None) => tx.execute("DELETE FROM folder_info WHERE parent IS NULL", []),
+            Listing::Below(Some(parent)) => tx.execute(
+                "DELETE FROM folder_info WHERE parent = ?1",
+                [parent.as_str()],
+            ),
+            _ => Ok(0),
+        }
+        .map_err(failed)?;
         for (ord, folder) in folders.iter().enumerate() {
             let stored = serde_json::to_string(&StoredFolder::from(folder)).map_err(failed)?;
             // A folder looked up alone keeps its place among the others
@@ -786,6 +802,11 @@ mod tests {
         db.keep_folders(&[folder("a"), folder("c")], Listing::All)
             .unwrap();
         assert_eq!(all(&db), ["a", "c"]);
+        // A listing below a folder replaces those kept there.
+        let mut below_a = folder("d");
+        below_a.parent = Some(FolderId::new("a"));
+        db.keep_folders(std::slice::from_ref(&below_a), Listing::Some)
+            .unwrap();
         // An empty listing below a folder is a listing too.
         let a = FolderId::new("a");
         db.keep_folders(&[], Listing::Below(Some(&a))).unwrap();

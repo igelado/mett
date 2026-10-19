@@ -521,6 +521,12 @@ async fn a_cache_is_one_accounts() {
     let bob = mett_core::AccountId::new("bob@contoso.com");
     let refused = Cache::open(&path, &bob).err().unwrap().to_string();
     assert!(refused.contains("alice@contoso.com"), "{refused}");
+    // Even if its schema is out of date.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    assert!(Cache::open(&path, &bob).is_err());
     let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
     assert_eq!(store.inner().syncs(), 0);
     let page = store
