@@ -201,6 +201,18 @@ impl App {
                     Vec::new()
                 }
             }
+            // In the index, a collapsed thread that shows as unread (mail
+            // folded into it is) is read whole.
+            Action::ToggleNew
+                if self.screen() == &Screen::Index
+                    && let Some(unread) = self.folded_thread_unread() =>
+            {
+                let mut effects = Vec::new();
+                for id in unread {
+                    effects.extend(self.update_flags(id, FlagsUpdate::read(true)));
+                }
+                effects
+            }
             Action::FlagMessage | Action::ToggleNew => {
                 let Some((id, flags)) =
                     selected.and_then(|id| self.summary(&id).map(|summary| (id, summary.flags)))
@@ -669,7 +681,7 @@ impl App {
         self.folded.clear();
         self.threads.clear();
         self.threaded_count = 0;
-        self.collapsed.clear();
+        self.chosen.clear();
         self.collapse_all = false;
         self.positions.clear();
         self.limit = None;

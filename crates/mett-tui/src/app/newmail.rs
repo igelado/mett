@@ -466,6 +466,7 @@ impl App {
             }
         }
         reorder |= !arrived.is_empty();
+        self.open_for_new_mail(&arrived);
         if !arrived.is_empty() {
             let mut placing = self.placing();
             for message in arrived {
@@ -598,11 +599,17 @@ impl App {
         let Some(known) = self.known_before_refresh.take() else {
             return;
         };
-        let arrived = self
+        let arrived: Vec<MessageSummary> = self
             .folder_messages()
-            .any(|m| !m.flags.read && !known.contains(&m.id));
-        if arrived {
+            .filter(|m| !m.flags.read && !known.contains(&m.id))
+            .cloned()
+            .collect();
+        if !arrived.is_empty() {
             self.announce(NEW_MAIL);
+            // Its threads open, as for mail a check takes in.
+            if self.open_for_new_mail(&arrived) {
+                self.arrange();
+            }
         }
     }
 

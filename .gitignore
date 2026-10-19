@@ -7,6 +7,8 @@ graphify-out/
 
 # Claude Code per-user settings and instructions
 .claude/settings.local.json
+# Worktrees of parallel Claude Code agents
+.claude/worktrees/
 CLAUDE.md
 
 # Editor and OS files
