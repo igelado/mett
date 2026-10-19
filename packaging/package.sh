@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Builds mett's release packages for each architecture given (x86_64,
 # aarch64): a Debian/Ubuntu package (.deb), an Arch Linux package
 # (.pkg.tar.zst) and a plain tarball, all in dist/, with their SHA-256 sums.
@@ -8,7 +8,9 @@
 #
 # Needs: cargo-zigbuild (and zig), the Rust musl targets, dpkg-deb, bsdtar
 # (libarchive-tools), zstd, gzip and sha256sum. See docs/RELEASING.md.
-set -eu
+# pipefail: an archiver that fails fails the build, even piped into a
+# compressor that doesn't.
+set -euo pipefail
 
 usage() {
     echo "usage: $0 x86_64|aarch64..." >&2
