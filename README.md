@@ -16,6 +16,19 @@ Early stage. mett can sign in to an Office365 account and browse a folder,
 mutt-style: a message index and a pager. Composing, replying and folder
 management are still to come.
 
+## Install
+
+Each [release](https://git.gelado.org/igelado/mett/releases) has packages
+for x86_64 and aarch64:
+
+- **Debian, Ubuntu:** `sudo apt install ./mett_<version>-1_<amd64|arm64>.deb`
+- **Arch Linux:** `sudo pacman -U mett-<version>-1-<x86_64|aarch64>.pkg.tar.zst`
+- **Other Linux:** the `.tar.gz` holds the `mett` binary, which needs
+  nothing else.
+
+To build from source, use `cargo install --path crates/mett-tui`.
+[docs/RELEASING.md](docs/RELEASING.md) explains how releases are made.
+
 ## Quick start
 
 1. Register an app for mett in Microsoft Entra ID; see
@@ -52,4 +65,10 @@ Graph, `set use_ews`; see
 - [docs/CONFIG-OFFICE365.md](docs/CONFIG-OFFICE365.md): configuring mett.
 - [docs/MUTTRC.md](docs/MUTTRC.md): the mutt configuration format mett
   builds on.
+- [docs/RELEASING.md](docs/RELEASING.md): how releases are made.
 - Each crate's `README.md` explains what it does and how to test it.
+
+## License
+
+mett is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
+or [MIT license](LICENSE-MIT), at your option.
