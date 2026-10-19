@@ -52,6 +52,10 @@ install_files() {
     for doc in README.md docs/CONFIG-OFFICE365.md docs/MUTTRC.md; do
         install -Dm644 "$doc" "$1/usr/share/doc/mett/$(basename "$doc")"
     done
+    # The guides' links into the source tree (../crates/..., ../LICENSE...)
+    # point at this version's online.
+    sed -i "s#](\.\./#]($homepage/src/tag/v$version/#g" \
+        "$1/usr/share/doc/mett/CONFIG-OFFICE365.md" "$1/usr/share/doc/mett/MUTTRC.md"
 }
 
 # Dates every file below $1 to the commit.
