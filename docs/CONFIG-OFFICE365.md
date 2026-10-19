@@ -195,10 +195,9 @@ Graph:
 - **Folders:** EWS has no name for Outlook's Archive folder, so `@archive`
   can't be opened; the other well-known folders work. Folders below one are
   listed by name.
-- **Sending:** replies and forwards still go through a server draft, but
+- **Sending:** replies, forwards and messages with attachments go through a
+  server draft (Exchange takes attachments only on a saved message), but
   `copy` applies to them too: EWS can send a draft without keeping a copy.
-  Attachments go with the request that sends or saves a new message,
-  whatever their size, within the server's limits.
 - **Directory search:** `<query>` resolves names against the directory and
   the user's contacts (`ResolveNames`), rather than the People API.
 - **Retirement:** Microsoft is retiring EWS in Exchange Online, starting in

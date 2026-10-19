@@ -264,6 +264,7 @@ pub fn auth_settings(config: &Config, url: &MailboxUrl) -> Result<AuthSettings, 
                 .split_whitespace()
                 .map(str::to_owned)
                 .collect();
+            settings.graph_url = endpoint(config, "msgraph_endpoint")?;
         }
         // EWS takes one scope, of the cloud's Exchange Online. Graph doesn't
         // take its tokens, so they tell who signed in themselves.
@@ -275,7 +276,6 @@ pub fn auth_settings(config: &Config, url: &MailboxUrl) -> Result<AuthSettings, 
             settings.identity = IdentityCheck::AccessToken;
         }
     }
-    settings.graph_url = endpoint(config, "msgraph_endpoint")?;
     Ok(settings)
 }
 
@@ -488,6 +488,11 @@ mod tests {
                 .unwrap_err()
                 .contains("ews_url")
         );
+        // EWS never goes to Graph's endpoint.
+        assert!(
+            settings("set msgraph_client_id=a use_ews msgraph_endpoint=http://proxy.example/\n")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -500,6 +505,16 @@ mod tests {
         assert!(!Api::Ews.always_copies(&reply));
         assert!(Api::Ews.needs_server_draft(&reply));
         assert!(!Api::Ews.needs_server_draft(&Draft::default()));
+        let attached = Draft {
+            attachments: vec![mett_core::OutgoingAttachment {
+                name: "a.txt".into(),
+                content_type: "text/plain".into(),
+                data: b"a".to_vec(),
+            }],
+            ..Draft::default()
+        };
+        assert!(Api::Ews.needs_server_draft(&attached));
+        assert!(!Api::Ews.always_copies(&attached));
     }
 
     #[test]

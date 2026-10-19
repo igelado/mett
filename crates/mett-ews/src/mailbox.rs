@@ -77,8 +77,12 @@ const ROOT: &str = "msgfolderroot";
 /// A [`MailStore`] backed by Exchange Web Services.
 ///
 /// Messages are dated and sorted by when they were sent; unsent drafts use
-/// their creation date, as with Microsoft Graph. Listings are paged by
-/// offset. Folders below one are listed in name order.
+/// their creation date, as with Microsoft Graph. As with Graph, a listing
+/// sorts by one date, then the other, so in a folder that mixes unsent
+/// drafts with other mail, the drafts are grouped together rather than
+/// interleaved by date. Drafts normally live only in the Drafts folder,
+/// where they all sort by creation date. Listings are paged by offset.
+/// Folders below one are listed in name order.
 pub struct EwsMailStore<A> {
     http: reqwest::Client,
     /// The EWS endpoint, for example
@@ -718,12 +722,20 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
                 addresses.push(address.to_owned());
             }
         };
-        // Only the account's own entry: a name can resolve to others too.
-        for person in resolved.iter().filter(|r| {
+        // The account's own entry: the one with its name among its
+        // addresses, or the only one found (the account's name, its UPN,
+        // need not be an address of its own). A name can resolve to others
+        // too.
+        let own = |r: &&Resolved| {
             r.addresses
                 .iter()
                 .any(|a| a.eq_ignore_ascii_case(self.account.as_str()))
-        }) {
+        };
+        let mine: Vec<&Resolved> = match resolved.iter().filter(own).collect::<Vec<_>>() {
+            mine if mine.is_empty() && resolved.len() == 1 => resolved.iter().collect(),
+            mine => mine,
+        };
+        for person in mine {
             for address in &person.addresses {
                 add(address);
             }
@@ -1002,7 +1014,7 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
             return saved;
         }
         // A plain draft is created with its content in one request.
-        let body = create_item("SaveOnly", Some("drafts"), &message_xml(draft, true));
+        let body = create_item("SaveOnly", Some("drafts"), &message_xml(draft));
         let xml = self.call(&body, About::MAILBOX).await?;
         created_id(&xml)
     }
@@ -1037,21 +1049,18 @@ impl<A: Authenticator> MailSender for EwsMailStore<A> {
         // behind.
         if !needs_server_draft(draft) && !self.has_kept(draft) {
             let body = if draft.save_copy {
-                create_item(
-                    "SendAndSaveCopy",
-                    Some("sentitems"),
-                    &message_xml(draft, true),
-                )
+                create_item("SendAndSaveCopy", Some("sentitems"), &message_xml(draft))
             } else {
-                create_item("SendOnly", None, &message_xml(draft, true))
+                create_item("SendOnly", None, &message_xml(draft))
             };
             let xml = self.hand_over(&body, About::MAILBOX).await?;
             return only_message(&parse(&xml)?, About::MAILBOX).map(drop);
         }
         // Replies and forwards go through a server draft, so that Exchange
         // threads them under the original and forwards keep its
-        // attachments. Failing before the send request leaves nothing
-        // sent, whatever became of the draft.
+        // attachments, and so do messages with attachments, which Exchange
+        // takes only on a saved message. Failing before the send request
+        // leaves nothing sent, whatever became of the draft.
         let (id, base) = self.server_draft(draft).await.map_err(unsent)?;
         let sent = self.send_draft(&id, draft.save_copy).await;
         match &sent {
@@ -1130,7 +1139,7 @@ impl<A: Authenticator> EwsMailStore<A> {
                     About::message(original.as_str()),
                 )
             }
-            None => (message_xml(draft, false), About::MAILBOX),
+            None => (message_xml(draft), About::MAILBOX),
         };
         let body = create_item("SaveOnly", Some("drafts"), &item);
         let created = match self.call_with(&body, about, unsent).await {
@@ -1480,10 +1489,11 @@ fn unsent(e: Error) -> Error {
     }
 }
 
-/// Whether `draft` goes through a server draft: it answers a message. A
-/// failed attempt to send such a message may leave its draft behind.
+/// Whether `draft` goes through a server draft: it answers a message, or
+/// has attachments, which Exchange takes only on a saved message. A failed
+/// attempt to send such a message may leave its draft behind.
 pub fn needs_server_draft(draft: &Draft) -> bool {
-    draft.origin.is_some()
+    draft.origin.is_some() || !draft.attachments.is_empty()
 }
 
 /// An unexpected response to `operation`.
@@ -1607,21 +1617,15 @@ fn file_attachment_xml(file: &OutgoingAttachment) -> String {
     )
 }
 
-/// A `Message` element with `draft`'s content, and its attachments if
-/// `attachments`. The elements follow the order the schema requires.
-fn message_xml(draft: &Draft, attachments: bool) -> String {
+/// A `Message` element with `draft`'s content, but its attachments (which
+/// Exchange takes only on a saved message). The elements follow the order
+/// the schema requires.
+fn message_xml(draft: &Draft) -> String {
     let mut xml = format!(
         "<t:Message><t:Subject>{}</t:Subject><t:Body BodyType=\"Text\">{}</t:Body>",
         escape(&draft.subject),
         escape(&draft.body)
     );
-    if attachments && !draft.attachments.is_empty() {
-        xml.push_str("<t:Attachments>");
-        for file in &draft.attachments {
-            xml.push_str(&file_attachment_xml(file));
-        }
-        xml.push_str("</t:Attachments>");
-    }
     for (element, list) in [
         ("ToRecipients", &draft.to),
         ("CcRecipients", &draft.cc),
@@ -2000,18 +2004,12 @@ mod tests {
             bcc: vec![Address::new("b@x.org")],
             subject: "<hi>".into(),
             body: "text".into(),
-            attachments: vec![OutgoingAttachment {
-                name: "a.txt".into(),
-                content_type: "text/plain".into(),
-                data: b"hello".to_vec(),
-            }],
             ..Draft::default()
         };
-        let xml = message_xml(&draft, true);
+        let xml = message_xml(&draft);
         let order: Vec<usize> = [
             "<t:Subject>",
             "<t:Body",
-            "<t:Attachments>",
             "<t:ToRecipients>",
             "<t:BccRecipients>",
             "<t:From>",
@@ -2022,7 +2020,6 @@ mod tests {
         assert!(order.is_sorted(), "{xml}");
         assert!(xml.contains("<t:Subject>&lt;hi&gt;</t:Subject>"));
         assert!(xml.contains("<t:Name>A &amp; B</t:Name>"));
-        assert!(xml.contains("<t:Content>aGVsbG8=</t:Content>"));
         assert!(!xml.contains("CcRecipients"));
     }
 }

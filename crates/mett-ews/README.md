@@ -11,10 +11,12 @@ Exchange Server, as an alternative to Microsoft Graph (`mett-msgraph`):
   for the fields), fetches messages (with Exchange converting HTML bodies to
   text), updates read and flagged state, moves, copies and deletes
   messages, and fetches attachments. It also implements `MailSender`: new
-  mail goes out with one `CreateItem`, while replies and forwards are
-  created as drafts (`ReplyToItem`, `ForwardItem`), filled in, given their
-  attachments and sent with `SendItem`, so that Outlook threads them and
-  forwards keep their attachments. Postponed messages are saved in Drafts;
+  mail without attachments goes out with one `CreateItem`, while replies,
+  forwards and messages with attachments are created as drafts
+  (`ReplyToItem`, `ForwardItem`), filled in, given their attachments
+  (`CreateAttachment`) and sent with `SendItem`, so that Outlook threads
+  them, forwards keep their attachments, and attachments are on a saved
+  message, as Exchange requires. Postponed messages are saved in Drafts;
   a recalled one is updated in place and sent as itself, and is never
   deleted when an attempt fails. A draft whose send has no clear outcome is
   kept for the next attempt, as with Graph.

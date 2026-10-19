@@ -555,14 +555,34 @@ async fn lists_and_fetches_attachments() {
 }
 
 #[tokio::test]
-async fn new_mail_is_sent_in_one_request() {
+async fn new_mail_with_attachments_is_saved_before_it_is_sent() {
     let server = MockServer::start().await;
-    ews("MessageDisposition=\"SendAndSaveCopy\"")
+    ews("MessageDisposition=\"SaveOnly\"")
+        .and(body_string_contains(
+            "<t:DistinguishedFolderId Id=\"drafts\"/>",
+        ))
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:CreateAttachment><m:ParentItemId Id=\"draft\"/>")
+        .and(body_string_contains("<t:Content>aGk=</t:Content>"))
+        .respond_with(success(
+            "CreateAttachment",
+            "<m:Attachments><t:FileAttachment><t:AttachmentId Id=\"a1\"/></t:FileAttachment>\
+             </m:Attachments>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:SendItem SaveItemToFolder=\"true\">")
         .and(body_string_contains(
             "<t:DistinguishedFolderId Id=\"sentitems\"/>",
         ))
-        .and(body_string_contains("<t:Content>aGk=</t:Content>"))
-        .respond_with(success("CreateItem", "<m:Items/>"))
+        .respond_with(success("SendItem", ""))
         .expect(1)
         .mount(&server)
         .await;
@@ -575,6 +595,27 @@ async fn new_mail_is_sent_in_one_request() {
             content_type: "text/plain".into(),
             data: b"hi".to_vec(),
         }],
+        save_copy: true,
+        ..Draft::default()
+    };
+    store(&server).send(&draft).await.unwrap();
+    let created = &requests(&server).await[0];
+    assert!(!created.contains("<t:Attachments>"), "{created}");
+}
+
+#[tokio::test]
+async fn new_mail_with_a_copy_is_sent_in_one_request() {
+    let server = MockServer::start().await;
+    ews("MessageDisposition=\"SendAndSaveCopy\"")
+        .and(body_string_contains(
+            "<t:DistinguishedFolderId Id=\"sentitems\"/>",
+        ))
+        .respond_with(success("CreateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let draft = Draft {
+        to: vec![Address::new("bob@contoso.com")],
         save_copy: true,
         ..Draft::default()
     };
@@ -762,6 +803,24 @@ async fn nobody_found_is_no_error() {
         .mount(&server)
         .await;
     assert_eq!(store(&server).search_people("zzz").await.unwrap(), []);
+}
+
+#[tokio::test]
+async fn own_addresses_need_not_include_the_account_name() {
+    let server = MockServer::start().await;
+    ews("<m:ResolveNames ReturnFullContactData=\"true\"")
+        .respond_with(success(
+            "ResolveNames",
+            "<m:ResolutionSet><t:Resolution><t:Mailbox><t:Name>Alice</t:Name>\
+             <t:EmailAddress>alice.example@contoso.com</t:EmailAddress><t:RoutingType>SMTP</t:RoutingType>\
+             </t:Mailbox></t:Resolution></m:ResolutionSet>",
+        ))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        store(&server).own_addresses().await.unwrap(),
+        ["alice@contoso.com", "alice.example@contoso.com"]
+    );
 }
 
 #[tokio::test]
