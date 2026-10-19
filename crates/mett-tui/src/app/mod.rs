@@ -1275,7 +1275,14 @@ impl App {
         let Some(open) = self.folder.as_ref().filter(|f| &f.id == folder) else {
             return;
         };
-        if self.listing.is_some() && self.status.starts_with("Loading ") {
+        // Only before its first page comes: the sync comes before it, and
+        // the pages tell how far they have got themselves.
+        let first_page = self.listing.is_some()
+            && self
+                .listing_page
+                .as_ref()
+                .is_some_and(|page| page.cursor().is_none());
+        if first_page && self.status.starts_with("Loading ") {
             self.status = format!("Loading {}: {taken} messages synced...", open.name);
         }
     }
@@ -2658,6 +2665,9 @@ mod tests {
             next: Some(PageCursor::new("p2")),
         };
         respond(&mut app, list, Event::MessagesListed(Ok(page)));
+        assert_eq!(app.status, "Loading Inbox: 3 messages...");
+        // The sync's news, come late, doesn't take it back.
+        app.update(syncing(600));
         assert_eq!(app.status, "Loading Inbox: 3 messages...");
         // Not once loaded.
         app.status = "Mail sent.".into();

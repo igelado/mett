@@ -270,6 +270,7 @@ impl<S: MailStore> CachedStore<S> {
                 Err(Error::StaleSync) if state.is_some() => {
                     self.with_cache(|db| db.start_over(folder))?;
                     state = None;
+                    taken = 0;
                     continue;
                 }
                 changes => changes?,
