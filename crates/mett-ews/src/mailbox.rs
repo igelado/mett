@@ -123,6 +123,11 @@ pub struct EwsMailStore<A> {
 /// to 30): then [`MailStore::watch`] returns, to be called again.
 const WATCH_MINUTES: u64 = 5;
 
+/// Whether `buffer` holds part of an envelope (more than white space).
+fn unread(buffer: &[u8]) -> bool {
+    buffer.iter().any(|b| !b.is_ascii_whitespace())
+}
+
 /// How long after a change the stream is read for more, before what
 /// changed is told.
 const BURST: Duration = Duration::from_secs(1);
@@ -1160,7 +1165,10 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
                 }
             };
             match self.stream_events(&id).await? {
-                Some(changed) => return Ok(changed),
+                // Part of an envelope was left unread: any folder may have
+                // changed.
+                Some((_, true)) => return Ok(folders.to_vec()),
+                Some((changed, false)) => return Ok(changed),
                 // Gone (expired, say): subscribe again.
                 None => *subscription = None,
             }
@@ -1226,9 +1234,10 @@ impl<A: Authenticator> EwsMailStore<A> {
     }
 
     /// Reads the events of subscription `id` until some say folders
-    /// changed (those), or the server closes the stream (none). `None` if
-    /// the subscription is gone.
-    async fn stream_events(&self, id: &str) -> Result<Option<Vec<FolderId>>> {
+    /// changed (those), or the server closes the stream (none), and
+    /// whether part of an envelope was left unread. `None` if the
+    /// subscription is gone.
+    async fn stream_events(&self, id: &str) -> Result<Option<(Vec<FolderId>, bool)>> {
         use crate::stream::{Streamed, read_envelope, take_envelopes};
 
         let body = format!(
@@ -1244,7 +1253,7 @@ impl<A: Authenticator> EwsMailStore<A> {
         if !response.status().is_success() {
             return Self::checked(response, About::MAILBOX)
                 .await
-                .map(|_| Some(Vec::new()));
+                .map(|_| Some((Vec::new(), false)));
         }
         let mut buffer = Vec::new();
         let mut changed: Vec<FolderId> = Vec::new();
@@ -1258,7 +1267,7 @@ impl<A: Authenticator> EwsMailStore<A> {
                 None => response.chunk().await,
                 Some(until) => match tokio::time::timeout_at(until, response.chunk()).await {
                     Ok(next) => next,
-                    Err(_) => return Ok(Some(changed)),
+                    Err(_) => return Ok(Some((changed, unread(&buffer)))),
                 },
             };
             let Some(chunk) = next.map_err(|e| Error::Network(e.to_string()))? else {
@@ -1275,7 +1284,7 @@ impl<A: Authenticator> EwsMailStore<A> {
                             }
                         }
                     }
-                    Streamed::Closed => return Ok(Some(changed)),
+                    Streamed::Closed => return Ok(Some((changed, false))),
                     Streamed::Unsubscribed => return Ok(None),
                 }
             }
@@ -1288,7 +1297,7 @@ impl<A: Authenticator> EwsMailStore<A> {
                 "EWS ended the stream of changes before telling anything".into(),
             ));
         }
-        Ok(Some(changed))
+        Ok(Some((changed, unread(&buffer))))
     }
 }
 

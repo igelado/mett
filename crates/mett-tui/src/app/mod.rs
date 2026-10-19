@@ -993,7 +993,16 @@ impl App {
         match msg {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
-            Msg::SignIn(event) => self.on_sign_in(event),
+            Msg::SignIn(event) => {
+                let mut effects = self.on_sign_in(event);
+                // Signed in (or not): watching, and the checks it asked
+                // for, go on.
+                if self.sign_in.is_none() {
+                    effects.extend(self.watch());
+                    effects.extend(self.recheck());
+                }
+                effects
+            }
             Msg::Key(key) => self.on_key_press(key),
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
