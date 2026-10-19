@@ -178,6 +178,13 @@ impl App {
     /// changes, if the mailbox can tell, and mail is checked for, and isn't
     /// being watched already.
     pub(super) fn watch(&mut self) -> Vec<Effect> {
+        // Checks turned off: so is the watch.
+        if self.sync_interval.is_none() {
+            return match self.watching.take() {
+                Some(old) => vec![self.request(Request::Cancel(old))],
+                None => Vec::new(),
+            };
+        }
         if !self.can_watch
             || self.watch_retry
             || self.sync_interval.is_none()
@@ -240,7 +247,11 @@ impl App {
             None => self.can_watch = false,
             Some(Ok(changed)) => {
                 // Only those that changed are checked.
-                if !changed.is_empty() && !self.poll_paused && self.sign_in.is_none() {
+                if !changed.is_empty()
+                    && self.sync_interval.is_some()
+                    && !self.poll_paused
+                    && self.sign_in.is_none()
+                {
                     if self
                         .folder
                         .as_ref()
@@ -1267,6 +1278,16 @@ mod tests {
             )),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn turning_checks_off_ends_the_watch() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        app.sync_interval = None;
+        let sent = requests(&app.watch());
+        assert!(matches!(sent[..], [(_, Request::Cancel(id))] if id == watch));
+        assert!(app.watching.is_none());
     }
 
     #[test]
