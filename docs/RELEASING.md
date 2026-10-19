@@ -22,7 +22,10 @@ whose zig linker builds both architectures on any runner.
 The packages install `/usr/bin/mett` and the documentation in
 `/usr/share/doc/mett/`; the Arch package also installs the licenses in
 `/usr/share/licenses/mett/`, and the Debian package states them in its
-`copyright` file.
+`copyright` file. As the binary links its dependencies in, every package
+also has `THIRD-PARTY-NOTICES`: the license files of each crate it is
+built from (as `cargo tree` lists them; `packaging/notices.py`), and
+musl's copyright.
 
 ## Making a release
 
