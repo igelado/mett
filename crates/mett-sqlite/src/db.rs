@@ -264,14 +264,16 @@ impl Db {
 
     /// Takes in a batch of `folder`'s changes, synced from the state
     /// `from`, and where its sync stands after them, and returns how many
-    /// more of its messages are here (as [`Db::count`] counts them) now;
-    /// unless another mett (sharing the cache) took in changes since
-    /// `from`: then nothing is done, and this is `None`.
+    /// more of its messages are here (as [`Db::count`] counts them) now, if
+    /// asked to `count` (else 0); unless another mett (sharing the cache)
+    /// took in changes since `from`: then nothing is done, and this is
+    /// `None`.
     pub fn apply(
         &mut self,
         folder: &FolderId,
         from: Option<&SyncState>,
         changes: &FolderChanges,
+        count: bool,
     ) -> Result<Option<i64>, Error> {
         let tx = self
             .conn
@@ -293,6 +295,9 @@ impl Db {
         }
         // Whether a message counts already, as one of the folder's seen.
         let counted = |id: &str| -> Result<bool, Error> {
+            if !count {
+                return Ok(false);
+            }
             Ok(tx
                 .query_row(
                     "SELECT folder = ?2 AND seen FROM messages WHERE id = ?1",
@@ -305,7 +310,7 @@ impl Db {
         };
         let mut more = 0;
         for summary in &changes.changed {
-            if !counted(summary.id.as_str())? {
+            if count && !counted(summary.id.as_str())? {
                 more += 1;
             }
             let mut summary = summary.clone();
@@ -945,16 +950,20 @@ mod tests {
             more: false,
         };
         db.start_over(&inbox).unwrap();
-        assert!(db.apply(&inbox, None, &changes("s1")).unwrap().is_some());
+        assert!(
+            db.apply(&inbox, None, &changes("s1"), true)
+                .unwrap()
+                .is_some()
+        );
         // Another mett took in s1 → s2; this one's s1 → s2' comes late.
         let s1 = SyncState::new("s1");
         assert!(
-            db.apply(&inbox, Some(&s1), &changes("s2"))
+            db.apply(&inbox, Some(&s1), &changes("s2"), true)
                 .unwrap()
                 .is_some()
         );
         assert!(
-            db.apply(&inbox, Some(&s1), &changes("s2'"))
+            db.apply(&inbox, Some(&s1), &changes("s2'"), true)
                 .unwrap()
                 .is_none()
         );
@@ -968,7 +977,11 @@ mod tests {
             ..changes("s3")
         };
         let s2 = SyncState::new("s2");
-        assert!(db.apply(&inbox, Some(&s2), &unfinished).unwrap().is_some());
+        assert!(
+            db.apply(&inbox, Some(&s2), &unfinished, true)
+                .unwrap()
+                .is_some()
+        );
         let synced = db.synced(&inbox).unwrap().unwrap();
         assert!(!synced.complete && synced.snapshot);
     }
@@ -987,7 +1000,7 @@ mod tests {
             state: SyncState::new("s1"),
             more: false,
         };
-        assert!(db.apply(&inbox, None, &changes).unwrap().is_some());
+        assert!(db.apply(&inbox, None, &changes, true).unwrap().is_some());
         let changed = db.changed(&inbox, before, None, 10).unwrap();
         assert_eq!(changed.len(), 1);
         assert!(
@@ -1013,7 +1026,7 @@ mod tests {
             state: SyncState::new("s1"),
             more: false,
         };
-        assert!(db.apply(&inbox, None, &changes).unwrap().is_some());
+        assert!(db.apply(&inbox, None, &changes, true).unwrap().is_some());
         // Fetched before the sync brought the newer summary: not kept.
         db.keep_body(&message).unwrap();
         assert_eq!(db.message(&message.summary.id).unwrap(), None);
@@ -1036,7 +1049,7 @@ mod tests {
         };
         db.start_over(&inbox).unwrap();
         assert_eq!(
-            db.apply(&inbox, None, &changes(&["a", "b", "c"], "s1", false))
+            db.apply(&inbox, None, &changes(&["a", "b", "c"], "s1", false), true)
                 .unwrap(),
             Some(3),
             "each batch says how many more are here"
@@ -1045,7 +1058,7 @@ mod tests {
         // Changed again, they are no more.
         let s1 = SyncState::new("s1");
         assert_eq!(
-            db.apply(&inbox, Some(&s1), &changes(&["a"], "s2", false))
+            db.apply(&inbox, Some(&s1), &changes(&["a"], "s2", false), true)
                 .unwrap(),
             Some(0)
         );
@@ -1054,7 +1067,7 @@ mod tests {
         assert_eq!(db.count(&inbox).unwrap(), 0);
         // Seen again, it counts again.
         assert_eq!(
-            db.apply(&inbox, None, &changes(&["a"], "t1", true))
+            db.apply(&inbox, None, &changes(&["a"], "t1", true), true)
                 .unwrap(),
             Some(1)
         );
@@ -1077,7 +1090,7 @@ mod tests {
             state: SyncState::new("s1"),
             more: false,
         };
-        assert!(db.apply(&inbox, None, &changes).unwrap().is_some());
+        assert!(db.apply(&inbox, None, &changes, true).unwrap().is_some());
         let page = db.page(&inbox, None, 10).unwrap();
         let ids: Vec<&str> = page.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
@@ -1125,7 +1138,7 @@ mod tests {
             state: SyncState::new("s1"),
             more: false,
         };
-        assert!(db.apply(&b, None, &mail).unwrap().is_some());
+        assert!(db.apply(&b, None, &mail, true).unwrap().is_some());
         db.keep_folders(&[folder("a"), folder("c")], Listing::All)
             .unwrap();
         assert_eq!(all(&db), ["a", "c"]);

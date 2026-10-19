@@ -277,8 +277,9 @@ impl<S: MailStore> CachedStore<S> {
                 }
                 changes => changes?,
             };
-            let Some(more_here) =
-                self.with_cache(|db| db.apply(folder, state.as_ref(), &changes))?
+            let Some(more_here) = self.with_cache(|db| {
+                db.apply(folder, state.as_ref(), &changes, self.progress.is_some())
+            })?
             else {
                 // Another mett sharing the cache synced the folder
                 // meanwhile: go on from where it left it (what came since

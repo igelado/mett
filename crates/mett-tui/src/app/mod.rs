@@ -1740,7 +1740,7 @@ impl App {
                             self.status = format!(
                                 "Loading {}: {} messages...",
                                 folder.name,
-                                self.folder_messages().count()
+                                self.total_messages()
                             );
                         }
                         effects = self.list(Page::after(cursor, self.page_size));
