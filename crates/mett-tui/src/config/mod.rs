@@ -603,7 +603,7 @@ impl Config {
     fn flush_warnings(&mut self, at: &str) {
         for old in self.expanded_renamed.take() {
             // Warns (once) as using the old name does.
-            self.find(old);
+            let _ = self.find(old);
         }
         let pending = std::mem::take(&mut self.pending);
         self.warnings
