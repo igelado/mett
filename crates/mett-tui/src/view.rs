@@ -191,15 +191,21 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
             } else {
                 colors.message
             };
-            frame.render_widget(Paragraph::new(app.status.as_str()).style(style), message);
-            // The wait for a throttling server, at the end of the line, so
-            // that it doesn't hide what the line says.
-            if let Some(notice) = app.throttled_notice() {
+            // The wait for a throttling server, at the end of the line, in
+            // its own room, so that it doesn't hide what the line says.
+            let notice = app.throttled_notice();
+            let [text, end] = Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(notice.as_deref().map_or(0, |n| n.width() as u16 + 1)),
+            ])
+            .areas(message);
+            frame.render_widget(Paragraph::new(app.status.as_str()).style(style), text);
+            if let Some(notice) = notice {
                 frame.render_widget(
                     Paragraph::new(notice)
                         .style(colors.message)
                         .alignment(ratatui::layout::Alignment::Right),
-                    message,
+                    end,
                 );
             }
         }
@@ -1059,6 +1065,18 @@ mod tests {
         );
         let line = screen(&app).pop().unwrap();
         assert!(line.starts_with("Mail sent."), "{line}");
+        // An error keeps its own color, and its room.
+        colored(&mut app, &["color error brightred default"]);
+        app.status = "x".repeat(100);
+        app.error = Some(app.status.clone());
+        let error = styles(&app);
+        let row = HEIGHT - 1;
+        assert_eq!(error[(0, row)].fg, ratatui::style::Color::LightRed);
+        assert_eq!(
+            error[(WIDTH - 1, row)].fg,
+            ratatui::style::Color::Reset,
+            "the notice isn't an error"
+        );
         assert!(
             line.ends_with("Throttled by the server: retry 1/5 in 12s"),
             "{line}"

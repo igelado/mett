@@ -650,7 +650,10 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     if app.saving() || (unsaved && app.sign_in.is_some()) {
         app.status = "Saving changes...".into();
         stale = true;
-        let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
+        // A save the server throttled before the user quit waits that much
+        // longer.
+        let mut deadline =
+            tokio::time::Instant::now() + SAVE_TIMEOUT + app.save_wait().unwrap_or_default();
         loop {
             // A failed save's sign-in failure is sent before the save's own
             // response; take it in first, so the window opens and the

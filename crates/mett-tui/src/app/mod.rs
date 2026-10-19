@@ -2431,6 +2431,15 @@ impl App {
 
     /// Whether changes to the mailbox are still being saved. mett waits
     /// for them before exiting, so they aren't lost.
+    /// The longest wait of a save the server throttled, if one is waiting.
+    pub fn save_wait(&self) -> Option<Duration> {
+        self.throttled
+            .iter()
+            .filter(|(id, _)| self.saves(**id))
+            .map(|(_, (left, _))| *left)
+            .max()
+    }
+
     /// Whether request `id` saves a change (one [`App::saving`] waits for).
     pub fn saves(&self, id: RequestId) -> bool {
         self.writing
@@ -2644,6 +2653,8 @@ mod tests {
             app.throttled_notice().as_deref(),
             Some("Throttled by the server: retry 1/5 in 20s")
         );
+        // None of them saves anything.
+        assert_eq!(app.save_wait(), None);
     }
 
     /// `n` messages, newest first, as Graph lists them.
