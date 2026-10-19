@@ -60,6 +60,14 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Whether response code `code` says the subscription is gone.
+pub(crate) fn subscription_gone(code: &str) -> bool {
+    matches!(
+        code,
+        "ErrorInvalidSubscription" | "ErrorSubscriptionNotFound" | "ErrorExpiredSubscription"
+    )
+}
+
 /// Reads one envelope of a `GetStreamingEvents` response.
 pub(crate) fn read_envelope(envelope: &[u8]) -> Result<Streamed, Error> {
     // What separates envelopes (white space) comes before the next one,
@@ -71,10 +79,7 @@ pub(crate) fn read_envelope(envelope: &[u8]) -> Result<Streamed, Error> {
     let about = About::MAILBOX;
     let mut changed: Vec<FolderId> = Vec::new();
     for message in response_messages(&doc, about)? {
-        if matches!(
-            response_code(message).as_str(),
-            "ErrorInvalidSubscription" | "ErrorSubscriptionNotFound" | "ErrorExpiredSubscription"
-        ) {
+        if subscription_gone(&response_code(message)) {
             return Ok(Streamed::Unsubscribed);
         }
         check(message, about)?;

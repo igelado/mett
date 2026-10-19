@@ -1334,17 +1334,24 @@ async fn a_canceled_watch_keeps_the_subscription_it_made() {
     assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
 }
 
-#[tokio::test]
-async fn changes_read_before_a_broken_stream_are_kept() {
+/// A store on a server whose stream of events tells of new mail in the
+/// Inbox, then stays open for `hold`, and breaks: wiremock can't break
+/// one.
+async fn store_breaking_streams(hold: Duration) -> EwsMailStore<StaticAuth> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // A server whose stream of events breaks after telling of new mail:
-    // wiremock can't break one.
+    let mail = Arc::new(streamed(
+        "NoError",
+        "<m:Notifications><m:Notification>\
+         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/>\
+         </t:NewMailEvent></m:Notification></m:Notifications>",
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
+            let mail = mail.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buffer = [0; 4096];
@@ -1382,16 +1389,11 @@ async fn changes_read_before_a_broken_stream_are_kept() {
                      </s:Body></s:Envelope>"
                         .to_owned()
                 } else {
-                    streamed(
-                        "NoError",
-                        "<m:Notifications><m:Notification>\
-                         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/>\
-                         </t:NewMailEvent></m:Notification></m:Notifications>",
-                    )
+                    mail.to_string()
                 };
                 let chunked = !body.contains("<m:Subscribe>");
                 let response = if chunked {
-                    // One chunk, and no end: the connection just drops.
+                    // One chunk, and no end.
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\
                          Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{envelope}\r\n",
@@ -1407,23 +1409,81 @@ async fn changes_read_before_a_broken_stream_are_kept() {
                 socket.write_all(response.as_bytes()).await.unwrap();
                 if chunked {
                     socket.flush().await.unwrap();
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(hold).await;
                     drop(socket);
                 }
             });
         }
     });
     let url = Url::parse(&format!("http://{address}{ENDPOINT}")).unwrap();
-    let store = EwsMailStore::new(
+    EwsMailStore::new(
         reqwest::Client::new(),
         url,
         "alice@contoso.com".into(),
         Arc::new(StaticAuth),
-    );
+    )
+}
+
+#[tokio::test]
+async fn changes_read_before_a_broken_stream_are_kept() {
+    let store = store_breaking_streams(Duration::from_millis(50)).await;
     // What came after the mail is lost: any folder watched may have
     // changed.
     let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
     assert_eq!(store.watch(&folders).await.unwrap(), folders);
+}
+
+#[tokio::test]
+async fn changes_read_by_a_canceled_watch_are_told_by_the_next() {
+    // Canceled while reading the rest of the burst.
+    let store = store_breaking_streams(Duration::from_secs(5)).await;
+    let inbox = [FolderId::new("inbox-id")];
+    let canceled = tokio::time::timeout(Duration::from_millis(500), store.watch(&inbox)).await;
+    assert!(canceled.is_err());
+    // EWS won't tell again.
+    let told = tokio::time::timeout(Duration::from_millis(100), store.watch(&inbox)).await;
+    assert_eq!(told.expect("told at once").unwrap(), inbox);
+}
+
+#[tokio::test]
+async fn subscriptions_that_could_not_be_ended_are_ended_later() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"inbox-id\"/>"))
+        .respond_with(subscribed("sub1"))
+        .mount(&server)
+        .await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"work-id\"/>"))
+        .respond_with(subscribed("sub2"))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(failure("Unsubscribe", "ErrorInternalServerError"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Gone already: as good as ended.
+    ews("<m:Unsubscribe><m:SubscriptionId>sub2</m:SubscriptionId>")
+        .respond_with(failure("Unsubscribe", "ErrorSubscriptionNotFound"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(new_mail("inbox-id"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    store.watch(&[FolderId::new("inbox-id")]).await.unwrap();
+    // sub1 can't be ended now: it is, the next time.
+    store.watch(&[FolderId::new("work-id")]).await.unwrap();
+    assert!(store.watch(&[]).await.is_ok());
+    assert!(store.watch(&[]).await.is_ok());
 }
 
 #[tokio::test]

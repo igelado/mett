@@ -85,8 +85,19 @@ const SYNC_BATCH: u32 = 512;
 /// The distinguished folder at the root of the mail folders.
 const ROOT: &str = "msgfolderroot";
 
-/// A streaming subscription's ID, and the folders it watches.
-type Subscription = (String, Vec<FolderId>);
+/// The streaming subscriptions mett made.
+#[derive(Debug, Default)]
+struct Subscriptions {
+    /// The one watching folders (its ID), and which.
+    current: Option<(String, Vec<FolderId>)>,
+    /// Those still to end: ending them failed, and is tried again before
+    /// another is made (up to [`STALE_KEPT`]).
+    stale: Vec<String>,
+}
+
+/// How many subscriptions that couldn't be ended are kept to try again:
+/// older ones are left to expire.
+const STALE_KEPT: usize = 8;
 
 /// A [`MailStore`] backed by Exchange Web Services.
 ///
@@ -113,9 +124,12 @@ pub struct EwsMailStore<A> {
     uploads: Mutex<HashMap<DraftKey, Vec<Upload>>>,
     /// One watch at a time.
     watching: tokio::sync::Mutex<()>,
-    /// The streaming subscription watching folders, and which. Shared with
-    /// the task that changes it, which a canceled watch doesn't stop.
-    subscription: Arc<tokio::sync::Mutex<Option<Subscription>>>,
+    /// The streaming subscriptions. Shared with the task that changes
+    /// them, which a canceled watch doesn't stop.
+    subscriptions: Arc<tokio::sync::Mutex<Subscriptions>>,
+    /// Folders a watch read had changed, until it says so: a watch
+    /// canceled first leaves them to the next (EWS doesn't tell again).
+    unreported: Mutex<Vec<FolderId>>,
 }
 
 /// How long a stream of notifications stays open, in minutes (EWS takes 1
@@ -254,7 +268,8 @@ impl<A: Authenticator> EwsMailStore<A> {
             kept: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
             watching: tokio::sync::Mutex::new(()),
-            subscription: Arc::new(tokio::sync::Mutex::new(None)),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(Subscriptions::default())),
+            unreported: Mutex::new(Vec::new()),
         }
     }
 
@@ -1198,10 +1213,17 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
             self.unsubscribed().await?;
             return Ok(Vec::new());
         }
+        let unreported = std::mem::take(&mut *self.unreported.lock().expect("lock"));
+        if !unreported.is_empty() {
+            return Ok(unreported);
+        }
         for _ in 0..2 {
             let id = self.subscribed(folders).await?;
             let started = tokio::time::Instant::now();
-            match self.stream_events(&id).await? {
+            let streamed = self.stream_events(&id).await;
+            // Told now (or lost to an error), whatever comes of it.
+            self.unreported.lock().expect("lock").clear();
+            match streamed? {
                 // Part of an envelope was left unread: any folder may have
                 // changed.
                 Some((_, true)) => return Ok(folders.to_vec()),
@@ -1213,9 +1235,13 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
                 Some((changed, false)) => return Ok(changed),
                 // Gone (expired, say): subscribe again.
                 None => {
-                    let mut subscription = self.subscription.lock().await;
-                    if subscription.as_ref().is_some_and(|(gone, _)| *gone == id) {
-                        *subscription = None;
+                    let mut subscriptions = self.subscriptions.lock().await;
+                    if subscriptions
+                        .current
+                        .as_ref()
+                        .is_some_and(|(gone, _)| *gone == id)
+                    {
+                        subscriptions.current = None;
                     }
                 }
             }
@@ -1281,7 +1307,28 @@ impl<A: Authenticator> Connection<A> {
         let xml = self
             .call_with(&body, About::MAILBOX, |e| e, Duration::ZERO)
             .await?;
-        only_message(&parse(&xml)?, About::MAILBOX).map(drop)
+        let doc = parse(&xml)?;
+        match response_messages(&doc, About::MAILBOX)?.first() {
+            // Gone already (expired, say): as good as ended.
+            Some(message) if crate::stream::subscription_gone(&response_code(*message)) => Ok(()),
+            _ => only_message(&doc, About::MAILBOX).map(drop),
+        }
+    }
+
+    /// Ends the subscriptions in `stale`, keeping those it couldn't (up
+    /// to [`STALE_KEPT`], the newest) to try again later.
+    async fn end_stale(&self, stale: &mut Vec<String>) -> Result<()> {
+        let mut result = Ok(());
+        let mut kept = Vec::new();
+        for id in std::mem::take(stale) {
+            if let Err(e) = self.unsubscribe(&id).await {
+                kept.push(id);
+                result = Err(e);
+            }
+        }
+        kept.drain(..kept.len().saturating_sub(STALE_KEPT));
+        *stale = kept;
+        result
     }
 }
 
@@ -1293,21 +1340,23 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
     /// Exchange's limit.
     async fn subscribed(&self, folders: &[FolderId]) -> Result<String> {
         let conn = self.conn.clone();
-        let subscription = Arc::clone(&self.subscription);
+        let subscriptions = Arc::clone(&self.subscriptions);
         let folders = folders.to_vec();
         tokio::spawn(async move {
-            let mut subscription = subscription.lock().await;
-            if let Some((id, watched)) = &*subscription
+            let mut subscriptions = subscriptions.lock().await;
+            if let Some((id, watched)) = &subscriptions.current
                 && *watched == folders
             {
                 return Ok(id.clone());
             }
-            // Other folders now: the old subscription goes.
-            if let Some((old, _)) = subscription.take() {
-                let _ = conn.unsubscribe(&old).await;
+            // Other folders now: the old subscription goes, with those
+            // that couldn't be ended before (if not now, later).
+            if let Some((old, _)) = subscriptions.current.take() {
+                subscriptions.stale.push(old);
             }
+            let _ = conn.end_stale(&mut subscriptions.stale).await;
             let id = conn.subscribe(&folders).await?;
-            *subscription = Some((id.clone(), folders));
+            subscriptions.current = Some((id.clone(), folders));
             Ok(id)
         })
         .await
@@ -1318,13 +1367,13 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
     /// [`Self::subscribed`]'s.
     async fn unsubscribed(&self) -> Result<()> {
         let conn = self.conn.clone();
-        let subscription = Arc::clone(&self.subscription);
+        let subscriptions = Arc::clone(&self.subscriptions);
         tokio::spawn(async move {
-            let mut subscription = subscription.lock().await;
-            match subscription.take() {
-                Some((id, _)) => conn.unsubscribe(&id).await,
-                None => Ok(()),
+            let mut subscriptions = subscriptions.lock().await;
+            if let Some((id, _)) = subscriptions.current.take() {
+                subscriptions.stale.push(id);
             }
+            conn.end_stale(&mut subscriptions.stale).await
         })
         .await
         .map_err(|e| {
@@ -1390,7 +1439,11 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                 };
                 match streamed {
                     Streamed::Changed(folders) => {
+                        let mut unreported = self.unreported.lock().expect("lock");
                         for folder in folders {
+                            if !unreported.contains(&folder) {
+                                unreported.push(folder.clone());
+                            }
                             if !changed.contains(&folder) {
                                 changed.push(folder);
                             }

@@ -182,7 +182,9 @@ impl App {
         if self.sync_interval.is_none() {
             return self.unwatch();
         }
-        if !self.can_watch
+        // Quitting: nothing new starts.
+        if self.quit
+            || !self.can_watch
             || self.watch_retry
             || self.sync_interval.is_none()
             || self.poll_paused
@@ -297,7 +299,7 @@ impl App {
     /// way allow: those still busy (whose check may predate the change)
     /// are checked once it ends.
     pub(super) fn recheck(&mut self) -> Vec<Effect> {
-        if self.sync_interval.is_none() || self.poll_paused || self.sign_in.is_some() {
+        if self.quit || self.sync_interval.is_none() || self.poll_paused || self.sign_in.is_some() {
             return Vec::new();
         }
         let mut effects = Vec::new();
@@ -1393,6 +1395,18 @@ mod tests {
         let unwatch = effect_id(&effects[1]);
         assert!(respond(&mut app, unwatch, Event::Watched(Some(Ok(Vec::new())))).is_empty());
         assert!(!app.unwatching());
+    }
+
+    #[test]
+    fn nothing_is_watched_nor_checked_after_quitting() {
+        let (mut app, _) = app();
+        app.quit = true;
+        let effects = app.unwatch();
+        assert!(app.unwatching(), "{effects:?}");
+        // Say, a sign-in a save needed ends: no watch starts again.
+        app.recheck_folder = true;
+        assert!(app.watch().is_empty());
+        assert!(app.recheck().is_empty());
     }
 
     #[test]
