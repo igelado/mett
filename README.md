@@ -27,12 +27,12 @@ management are still to come.
    set from = $my_me realname = "Your Name"
    set folder = msgraph://$my_me/
    set spoolfile = =@inbox
-   set msgraph_client_id = <your app's client ID>
+   set office365_client_id = <your app's client ID>
    ```
 
 3. Run mett. The first time, it opens your browser to sign in and shows the
    sign-in link in a window, in case the browser doesn't open (use
-   `set msgraph_auth_flow = device-code` over SSH, and mett shows a code to
+   `set office365_auth_flow = device-code` over SSH, and mett shows a code to
    enter instead):
 
    ```sh

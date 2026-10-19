@@ -153,6 +153,9 @@ pub struct Config {
     /// Ignored commands and variables already warned about: each is
     /// reported once, where it first appears.
     warned: std::collections::HashSet<String>,
+    /// Old names of renamed variables that expansions (`$name`) used, to
+    /// warn about once the command has run (expanding only reads).
+    expanded_renamed: std::cell::RefCell<Vec<&'static str>>,
     /// Variables given a value by `set`, `unset` or `toggle`, as opposed
     /// to their defaults.
     assigned: std::collections::HashSet<&'static str>,
@@ -189,6 +192,7 @@ impl Config {
             warnings: Vec::new(),
             pending: Vec::new(),
             warned: Default::default(),
+            expanded_renamed: Default::default(),
             assigned: Default::default(),
             answers: Vec::new(),
             home,
@@ -561,6 +565,9 @@ impl Config {
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
                         let path = self.resolve_source(&path, origin.file);
+                        // This line's warnings are this line's, not the
+                        // sourced file's.
+                        self.flush_warnings(&at);
                         self.source(&path, origin.depth + 1);
                     }),
                     _ => Err("source: expected one file name".to_owned()),
@@ -587,6 +594,16 @@ impl Config {
         };
         if let Err(message) = result {
             self.errors.push(format!("{at}: {message}"));
+        }
+        self.flush_warnings(&at);
+    }
+
+    /// Reports the warnings of the command at `at`, those about the old
+    /// names its expansions used too.
+    fn flush_warnings(&mut self, at: &str) {
+        for old in self.expanded_renamed.take() {
+            // Warns (once) as using the old name does.
+            let _ = self.find(old);
         }
         let pending = std::mem::take(&mut self.pending);
         self.warnings
@@ -803,7 +820,7 @@ impl Config {
         } else if let Some(name) = arg.strip_prefix("no").filter(|n| is_bool(n)) {
             self.unset(name)
         } else {
-            match vars::find(arg) {
+            match self.find(arg) {
                 Some(var) if var.kind == Kind::Bool => {
                     self.store(var.name, Value::Bool(true));
                     Ok(())
@@ -826,7 +843,7 @@ impl Config {
                 None => return Err(format!("{name}: unknown variable")),
             }
         } else {
-            let Some(var) = vars::find(name) else {
+            let Some(var) = self.find(name) else {
                 return self.unknown_variable(name);
             };
             match self.values.get(var.name) {
@@ -846,7 +863,7 @@ impl Config {
             self.user.insert(name.to_owned(), value);
             return Ok(());
         }
-        let Some(var) = vars::find(name) else {
+        let Some(var) = self.find(name) else {
             return self.unknown_variable(name);
         };
         let value = self.expand(value)?;
@@ -866,7 +883,7 @@ impl Config {
             self.user.remove(name);
             return Ok(());
         }
-        let Some(var) = vars::find(name) else {
+        let Some(var) = self.find(name) else {
             return self.unknown_variable(name);
         };
         let value = match var.kind {
@@ -880,7 +897,7 @@ impl Config {
     }
 
     fn toggle(&mut self, name: &str) -> Result<(), String> {
-        match vars::find(name) {
+        match self.find(name) {
             Some(var) if var.kind == Kind::Bool => {
                 let current = self.values.get(var.name) == Some(&Value::Bool(true));
                 self.store(var.name, Value::Bool(!current));
@@ -911,7 +928,7 @@ impl Config {
             self.user.remove(name);
             return Ok(());
         }
-        match vars::find(name) {
+        match self.find(name) {
             Some(var) => {
                 self.reset(var);
                 Ok(())
@@ -925,6 +942,20 @@ impl Config {
             vars::parse(var, var.default, self.home.as_deref()).expect("defaults are valid");
         self.values.insert(var.name, value);
         self.assigned.remove(var.name);
+    }
+
+    /// The known variable `name`, or the one a renamed variable's old name
+    /// stands for now, with a warning (once) to use the new name.
+    fn find(&mut self, name: &str) -> Option<&'static vars::Var> {
+        if let Some(new) = vars::renamed(name) {
+            self.warn_once(
+                "variable",
+                name,
+                format!("{name} is now {new}; use that name"),
+            );
+            return vars::find(new);
+        }
+        vars::find(name)
     }
 
     /// Unknown variables are reported, but don't stop the configuration
@@ -961,7 +992,8 @@ impl Config {
 /// Whether `name` takes the `no` and `inv` prefixes: booleans and
 /// quad-options do.
 fn is_bool(name: &str) -> bool {
-    vars::find(name).is_some_and(|v| matches!(v.kind, Kind::Bool | Kind::Quad))
+    vars::find(vars::renamed(name).unwrap_or(name))
+        .is_some_and(|v| matches!(v.kind, Kind::Bool | Kind::Quad))
 }
 
 /// Expansion for the lexer: configuration variables first, then the
@@ -972,7 +1004,16 @@ struct Expand<'a> {
 
 impl Expander for Expand<'_> {
     fn variable(&self, name: &str) -> Option<String> {
-        if let Some(value) = self.config.values.get(name) {
+        // `$msgraph_tenant` still stands for `office365_tenant` (with a
+        // warning, once the command has run).
+        let known = match vars::renamed_entry(name) {
+            Some((old, new)) => {
+                self.config.expanded_renamed.borrow_mut().push(old);
+                new
+            }
+            None => name,
+        };
+        if let Some(value) = self.config.values.get(known) {
             return Some(match value {
                 Value::Str(s) => s.clone(),
                 other => other.to_string(),
@@ -1059,21 +1100,21 @@ mod tests {
     fn sets_variables_in_every_mutt_form() {
         let config = load(
             "set from=alice@contoso.com realname = \"Alice Example\"\n\
-             set msgraph_page_size=25 nouse_from\n\
-             set msgraph_focused_inbox; toggle msgraph_query_directory\n\
+             set office365_page_size=25 nouse_from\n\
+             set office365_focused_inbox; toggle office365_query_directory\n\
              set signature=~/.sig\n",
         );
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         assert_eq!(config.string("from"), "alice@contoso.com");
         assert_eq!(config.string("realname"), "Alice Example");
-        assert_eq!(config.get("msgraph_page_size"), Some(&Value::Number(25)));
+        assert_eq!(config.get("office365_page_size"), Some(&Value::Number(25)));
         assert_eq!(config.get("use_from"), Some(&Value::Bool(false)));
         assert_eq!(
-            config.get("msgraph_focused_inbox"),
+            config.get("office365_focused_inbox"),
             Some(&Value::Bool(true))
         );
         assert_eq!(
-            config.get("msgraph_query_directory"),
+            config.get("office365_query_directory"),
             Some(&Value::Bool(false))
         );
         assert_eq!(config.string("signature"), "/home/a/.sig");
@@ -1106,10 +1147,10 @@ mod tests {
     #[test]
     fn unsets_and_resets() {
         let config = load(
-            "set msgraph_cloud=china timeout=5\n\
-             reset msgraph_cloud\nunset timeout\nset &use_from\n",
+            "set office365_cloud=china timeout=5\n\
+             reset office365_cloud\nunset timeout\nset &use_from\n",
         );
-        assert_eq!(config.string("msgraph_cloud"), "global");
+        assert_eq!(config.string("office365_cloud"), "global");
         assert_eq!(config.get("timeout"), Some(&Value::Number(0)));
         assert_eq!(config.get("use_from"), Some(&Value::Bool(true)));
     }
@@ -1130,8 +1171,8 @@ mod tests {
 
     #[test]
     fn runs_backticks() {
-        let config = load("set msgraph_client_id=`printf 'abc-123'`\n");
-        assert_eq!(config.string("msgraph_client_id"), "abc-123");
+        let config = load("set office365_client_id=`printf 'abc-123'`\n");
+        assert_eq!(config.string("office365_client_id"), "abc-123");
     }
 
     #[test]
@@ -1251,6 +1292,25 @@ mod tests {
     }
 
     #[test]
+    fn an_old_name_in_a_source_path_is_warned_about_where_it_is() {
+        let dir = std::env::temp_dir().join(format!("mett-renamed-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(
+            dir.join("mettrc"),
+            "set office365_tenant=sub\nsource $msgraph_tenant/rc\n",
+        )
+        .unwrap();
+        fs::write(dir.join("sub/rc"), "set realname=Me\n").unwrap();
+        let mut config = Config::new(None);
+        config.load_file(&dir.join("mettrc"));
+        assert_eq!(config.string("realname"), "Me");
+        let at = format!("{}:2: ", dir.join("mettrc").display());
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].starts_with(&at), "{:?}", config.warnings);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn sources_files_relative_to_the_sourcing_file() {
         let dir = std::env::temp_dir().join(format!("mett-config-{}", std::process::id()));
         fs::create_dir_all(dir.join("sub")).unwrap();
@@ -1285,11 +1345,11 @@ mod tests {
 
     #[test]
     fn empty_values_and_bare_assignments_follow_mutt() {
-        let config = load("set realname=\"\" msgraph_focused_inbox\nset spoolfile= =@inbox\n");
+        let config = load("set realname=\"\" office365_focused_inbox\nset spoolfile= =@inbox\n");
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         assert_eq!(config.string("realname"), "");
         assert_eq!(
-            config.get("msgraph_focused_inbox"),
+            config.get("office365_focused_inbox"),
             Some(&Value::Bool(true))
         );
         assert_eq!(config.string("spoolfile"), "=@inbox");
@@ -1306,6 +1366,55 @@ mod tests {
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
         assert!(!marker.exists(), "an ignored backtick ran");
+    }
+
+    #[test]
+    fn old_names_of_renamed_variables_still_work_with_a_warning() {
+        let mut config = load(
+            "set msgraph_client_id=abc msgraph_tenant=contoso.com\n\
+             set msgraph_client_id=def nomsgraph_query_directory\n\
+             toggle msgraph_focused_inbox\n\
+             set my_t=$msgraph_tenant\n",
+        );
+        assert_eq!(config.string("office365_client_id"), "def");
+        assert_eq!(config.string("office365_tenant"), "contoso.com");
+        assert!(!config.flag("office365_query_directory"));
+        assert!(config.flag("office365_focused_inbox"));
+        assert!(config.was_set("office365_client_id"));
+        assert_eq!(
+            config.run_line("set ?my_t").unwrap(),
+            ["my_t=\"contoso.com\""]
+        );
+        // Once for each old name, saying the new one.
+        let renamed: Vec<&String> = config
+            .warnings
+            .iter()
+            .filter(|w| w.contains(" is now "))
+            .collect();
+        assert_eq!(renamed.len(), 4, "{:?}", config.warnings);
+        assert!(
+            renamed[0].contains("msgraph_client_id is now office365_client_id"),
+            "{renamed:?}"
+        );
+        // The dump has the new names only.
+        let dump = config.dump();
+        assert!(
+            dump.contains(&"set office365_client_id=\"def\"".to_owned()),
+            "{dump:?}"
+        );
+        assert!(!dump.iter().any(|line| line.contains("msgraph_client_id")));
+        // At the prompt too, and `reset` goes back to the default.
+        let answer = config.run_line("reset msgraph_client_id").unwrap();
+        assert!(answer[0].contains("office365_client_id"), "{answer:?}");
+        assert_eq!(config.string("office365_client_id"), "");
+        // An old name in an expansion warns too.
+        let config = load("set my_c=$msgraph_cloud\n");
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].contains("msgraph_cloud is now office365_cloud"));
+        // Graph's own settings keep their names.
+        let config = load("set msgraph_scopes=Mail.Read\n");
+        assert_eq!(config.string("msgraph_scopes"), "Mail.Read");
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
     #[test]

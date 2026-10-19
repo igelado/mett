@@ -286,18 +286,18 @@ fn settings_keeping(
             .map_err(|e| format!("trash: {e}"))?,
         ),
     };
-    let page_size = match config.get("msgraph_page_size") {
+    let page_size = match config.get("office365_page_size") {
         Some(config::Value::Number(n)) if *n > 0 => {
-            u32::try_from(*n).map_err(|_| format!("msgraph_page_size {n} is too large"))?
+            u32::try_from(*n).map_err(|_| format!("office365_page_size {n} is too large"))?
         }
-        _ => return Err("msgraph_page_size must be a positive number".into()),
+        _ => return Err("office365_page_size must be a positive number".into()),
     };
-    let sync_interval = match config.get("msgraph_sync_interval") {
+    let sync_interval = match config.get("office365_sync_interval") {
         Some(config::Value::Number(0)) => None,
         Some(config::Value::Number(n)) if *n > 0 => {
             Some(std::time::Duration::from_secs(n.unsigned_abs()))
         }
-        _ => return Err("msgraph_sync_interval must be 0 (off) or a number of seconds".into()),
+        _ => return Err("office365_sync_interval must be 0 (off) or a number of seconds".into()),
     };
     let folder = config.string("folder");
     let mailboxes = config
@@ -367,7 +367,7 @@ fn settings_keeping(
         alias_file,
         query: app::QuerySettings {
             command: config.string("query_command").to_owned(),
-            directory: config.flag("msgraph_query_directory"),
+            directory: config.flag("office365_query_directory"),
         },
         home: config.home().map(str::to_owned),
         page_size,
@@ -1191,12 +1191,13 @@ fn run_command(
             changed
                 .iter()
                 .filter(|name| {
-                    (name.starts_with("msgraph_")
+                    (name.starts_with("office365_")
+                        || name.starts_with("msgraph_")
                         || ["use_ews", "ews_url", "header_cache"].contains(*name))
                         && ![
-                            "msgraph_page_size",
-                            "msgraph_sync_interval",
-                            "msgraph_query_directory",
+                            "office365_page_size",
+                            "office365_sync_interval",
+                            "office365_query_directory",
                         ]
                         .contains(*name)
                 })
@@ -1600,14 +1601,14 @@ mod tests {
     #[test]
     fn mailbox_settings_wait_for_a_restart() {
         let mut demo = Commanded::demo("/home/alice");
-        let done = demo.run("set msgraph_client_id=abc msgraph_page_size=10");
+        let done = demo.run("set office365_client_id=abc office365_page_size=10");
         assert_eq!(
             done.outcome,
             Ok(vec![
-                "msgraph_client_id: takes effect when mett starts again".to_owned()
+                "office365_client_id: takes effect when mett starts again".to_owned()
             ])
         );
-        assert_eq!(demo.config.string("msgraph_client_id"), "abc", "kept");
+        assert_eq!(demo.config.string("office365_client_id"), "abc", "kept");
         // Unsetting the cache keeps its empty value, but stops caching.
         let done = demo.run("unset header_cache");
         assert_eq!(
@@ -1668,7 +1669,7 @@ mod tests {
         for line in [
             "set folder=msgraph://a@b.c/Work signature=\"\"",
             "mailboxes =Old msgraph://a@b.c/Workshops -label Mine msgraph://a@b.c/@inbox",
-            "set msgraph_sync_interval=0",
+            "set office365_sync_interval=0",
         ] {
             config.run_line(line).unwrap();
         }

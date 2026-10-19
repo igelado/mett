@@ -351,7 +351,7 @@ variables. The extensions are proposed in
 belongs in `mett-tui`. The values specific to Microsoft Graph are passed to
 `mett-msgraph` as a typed settings struct, and the EWS endpoint to
 `mett-ews` as a URL, so that the adapters never parse muttrc themselves. mett ships no Azure AD app registration: each user provides
-their own through `msgraph_client_id`.
+their own through `office365_client_id`.
 
 ## 9. Testing strategy
 

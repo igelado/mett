@@ -1,4 +1,5 @@
-//! Sign-in settings: the `msgraph_*` variables from `mettrc`.
+//! Sign-in settings: the `office365_*` (and `msgraph_*`) variables from
+//! `mettrc`.
 //!
 //! See `docs/CONFIG-OFFICE365.md` §4. Parsing `mettrc` belongs to
 //! `mett-tui`; this crate only receives the typed result.
@@ -23,7 +24,7 @@ pub const DEFAULT_SCOPES: &[&str] = &[
 /// sent as they are, without a resource prefix.
 const OIDC_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access"];
 
-/// The Microsoft cloud that hosts the tenant (`msgraph_cloud`).
+/// The Microsoft cloud that hosts the tenant (`office365_cloud`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Cloud {
     /// The global Microsoft cloud.
@@ -106,13 +107,13 @@ impl FromStr for Cloud {
     }
 }
 
-/// How the user signs in interactively (`msgraph_auth_flow`).
+/// How the user signs in interactively (`office365_auth_flow`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthFlow {
     /// Authorization code with PKCE, through the system browser and a
     /// loopback redirect on `redirect_port` (`0` picks a free port).
     AuthCode {
-        /// `msgraph_redirect_port`.
+        /// `office365_redirect_port`.
         redirect_port: u16,
     },
     /// Device code, for headless or SSH sessions.
@@ -142,13 +143,13 @@ pub enum IdentityCheck {
 pub struct AuthSettings {
     /// The account, as its user principal name.
     pub account: AccountId,
-    /// `msgraph_client_id`: the user's own app registration.
+    /// `office365_client_id`: the user's own app registration.
     pub client_id: String,
-    /// `msgraph_tenant`. `None` means the domain of [`AuthSettings::account`].
+    /// `office365_tenant`. `None` means the domain of [`AuthSettings::account`].
     pub tenant: Option<String>,
-    /// `msgraph_cloud`.
+    /// `office365_cloud`.
     pub cloud: Cloud,
-    /// `msgraph_auth_flow` and `msgraph_redirect_port`.
+    /// `office365_auth_flow` and `office365_redirect_port`.
     pub flow: AuthFlow,
     /// `msgraph_scopes`, unqualified (for example `Mail.Read`).
     pub scopes: Vec<String>,
@@ -176,7 +177,7 @@ impl AuthSettings {
         }
     }
 
-    /// The tenant to sign in through: `msgraph_tenant` if set, otherwise the
+    /// The tenant to sign in through: `office365_tenant` if set, otherwise the
     /// domain of the account (`alice@contoso.com` → `contoso.com`).
     pub fn tenant(&self) -> &str {
         match &self.tenant {
