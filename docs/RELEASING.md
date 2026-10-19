@@ -57,7 +57,7 @@ without releasing, build them locally: install the tools and run the
 script:
 
 ```sh
-pip install cargo-zigbuild        # also installs zig
+pipx install cargo-zigbuild       # also installs zig (pip refuses outside a venv on Debian)
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 sudo apt install libarchive-tools zstd    # bsdtar, zstd; dpkg-deb comes with Debian
 packaging/package.sh x86_64 aarch64
