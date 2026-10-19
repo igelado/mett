@@ -18,6 +18,8 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 mett-core = { workspace = true, features = ["mock"] }
+# To break a cache from outside.
+rusqlite.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [lints]

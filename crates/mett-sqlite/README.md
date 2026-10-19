@@ -15,13 +15,17 @@ of each folder listed, and each message read, in a database file: mutt's
   the sync stood, the folder is synced from the start, keeping what is
   cached until the sync says it is gone.
 - **Listing:** the index pages, the messages changed since a time, and the
-  unread mail of the `mailboxes` come from the cache. Offline, a folder
-  that was synced to the end is listed as it was.
+  unread mail of the `mailboxes` come from the cache. The folders are kept
+  as last seen too, so offline, a folder seen before is found, and one
+  synced to the end is listed, as it was.
 - **Messages:** a message's body is kept once it is read, and goes with
   its message. Drafts' bodies aren't kept, as drafts change.
 - **Changes:** flags, moves and deletions go to the server first; the
-  cache follows at once, and the next sync confirms them. The server is
-  always the source of truth.
+  cache follows at once, and the next sync confirms them. What mett puts
+  elsewhere (a move, a copy, a draft, a sent message) makes folders sync
+  again at once. The server is always the source of truth.
+- **Failures:** if the cache fails (a full disk, say), mett leaves it
+  alone for the rest of the session and asks the server for everything.
 - **Privacy:** the cache holds mail, so its directory is created with mode
   `0700` and its file with mode `0600`.
 

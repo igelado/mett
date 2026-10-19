@@ -5,15 +5,15 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Address, Body, BodyKind, Error, Flags, FlagsUpdate, FolderChanges, FolderId, Message,
-    MessageId, MessageSummary, SyncState, ThreadPosition,
+    Address, Body, BodyKind, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId, Message,
+    MessageId, MessageSummary, SyncState, ThreadPosition, WellKnownFolder,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
     CREATE TABLE folders (
@@ -38,6 +38,18 @@ const SCHEMA: &str = "
         extras TEXT,
         -- Whether the sync that started over reported it.
         seen INTEGER NOT NULL DEFAULT 1
+    );
+    -- The folders as last seen, to find them offline.
+    CREATE TABLE folder_info (
+        id TEXT PRIMARY KEY,
+        parent TEXT,
+        -- Where it was in the last listing that had it.
+        ord INTEGER NOT NULL,
+        folder TEXT NOT NULL
+    );
+    CREATE TABLE well_known (
+        name TEXT PRIMARY KEY,
+        id TEXT NOT NULL
     );
     CREATE INDEX messages_by_date ON messages (folder, received DESC, id);
     CREATE INDEX messages_by_change ON messages (folder, modified DESC);
@@ -80,7 +92,9 @@ impl Db {
                 "DROP INDEX IF EXISTS messages_by_date;
                  DROP INDEX IF EXISTS messages_by_change;
                  DROP TABLE IF EXISTS messages;
-                 DROP TABLE IF EXISTS folders;",
+                 DROP TABLE IF EXISTS folders;
+                 DROP TABLE IF EXISTS folder_info;
+                 DROP TABLE IF EXISTS well_known;",
             )?;
             conn.execute_batch(SCHEMA)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -129,7 +143,8 @@ impl Db {
         let tx = self.conn.transaction().map_err(failed)?;
         for summary in &changes.changed {
             let stored = serde_json::to_string(&StoredSummary::from(summary)).map_err(failed)?;
-            // A draft may change in its body too: its body is fetched again.
+            // Only a draft's body can change (Graph and EWS let only
+            // drafts' be edited): a draft's is fetched again.
             tx.execute(
                 "INSERT INTO messages (id, folder, received, modified, unread, summary, seen)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
@@ -329,6 +344,89 @@ impl Db {
         Ok(())
     }
 
+    /// Keeps `folders`, as a listing gave them, in its order.
+    pub fn keep_folders(&mut self, folders: &[Folder]) -> Result<(), Error> {
+        let tx = self.conn.transaction().map_err(failed)?;
+        for (ord, folder) in folders.iter().enumerate() {
+            let stored = serde_json::to_string(&StoredFolder::from(folder)).map_err(failed)?;
+            tx.execute(
+                "INSERT INTO folder_info (id, parent, ord, folder) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (id) DO UPDATE SET
+                    parent = excluded.parent, ord = excluded.ord, folder = excluded.folder",
+                params![
+                    folder.id.as_str(),
+                    folder.parent.as_ref().map(FolderId::as_str),
+                    sql(ord as u64),
+                    stored
+                ],
+            )
+            .map_err(failed)?;
+            if let Some(which) = folder.well_known {
+                tx.execute(
+                    "INSERT INTO well_known (name, id) VALUES (?1, ?2)
+                     ON CONFLICT (name) DO UPDATE SET id = excluded.id",
+                    [which.as_str(), folder.id.as_str()],
+                )
+                .map_err(failed)?;
+            }
+        }
+        tx.commit().map_err(failed)
+    }
+
+    /// Folder `id`, as last seen.
+    pub fn folder_info(&self, id: &FolderId) -> Result<Option<Folder>, Error> {
+        Ok(self
+            .folders(
+                "SELECT folder FROM folder_info WHERE id = ?1",
+                [id.as_str()],
+            )?
+            .pop())
+    }
+
+    /// The folder with the role `which`, as last seen.
+    pub fn well_known(&self, which: WellKnownFolder) -> Result<Option<Folder>, Error> {
+        Ok(self
+            .folders(
+                "SELECT folder FROM folder_info
+                 WHERE id = (SELECT id FROM well_known WHERE name = ?1)",
+                [which.as_str()],
+            )?
+            .pop())
+    }
+
+    /// The folders directly below `parent` (without one, the top-level
+    /// ones), or every folder with `all`, as last seen.
+    pub fn folders_below(
+        &self,
+        parent: Option<&FolderId>,
+        all: bool,
+    ) -> Result<Vec<Folder>, Error> {
+        match (all, parent) {
+            (true, _) => self.folders("SELECT folder FROM folder_info ORDER BY ord", []),
+            (false, None) => self.folders(
+                "SELECT folder FROM folder_info WHERE parent IS NULL ORDER BY ord",
+                [],
+            ),
+            (false, Some(parent)) => self.folders(
+                "SELECT folder FROM folder_info WHERE parent = ?1 ORDER BY ord",
+                [parent.as_str()],
+            ),
+        }
+    }
+
+    fn folders(&self, query: &str, params: impl rusqlite::Params) -> Result<Vec<Folder>, Error> {
+        let mut statement = self.conn.prepare(query).map_err(failed)?;
+        let rows = statement
+            .query_map(params, |r| r.get::<_, String>(0))
+            .map_err(failed)?;
+        rows.map(|row| {
+            let stored: StoredFolder =
+                serde_json::from_str(&row.map_err(failed)?).map_err(failed)?;
+            Ok(stored.into())
+        })
+        .collect()
+    }
+
     /// Forgets message `id`.
     pub fn remove(&self, id: &MessageId) -> Result<(), Error> {
         self.conn
@@ -351,6 +449,43 @@ fn time(millis: i64) -> Result<DateTime<Utc>, Error> {
 /// An optional time, as stored.
 fn maybe_time(millis: Option<i64>) -> Result<Option<DateTime<Utc>>, Error> {
     millis.map(time).transpose()
+}
+
+/// A [`Folder`], as stored.
+#[derive(Serialize, Deserialize)]
+struct StoredFolder {
+    id: String,
+    parent: Option<String>,
+    name: String,
+    well_known: Option<String>,
+    unread: u32,
+    total: u32,
+}
+
+impl From<&Folder> for StoredFolder {
+    fn from(f: &Folder) -> Self {
+        Self {
+            id: f.id.to_string(),
+            parent: f.parent.as_ref().map(ToString::to_string),
+            name: f.name.clone(),
+            well_known: f.well_known.map(|w| w.as_str().to_owned()),
+            unread: f.unread_count,
+            total: f.total_count,
+        }
+    }
+}
+
+impl From<StoredFolder> for Folder {
+    fn from(f: StoredFolder) -> Self {
+        Self {
+            id: FolderId::new(f.id),
+            parent: f.parent.map(FolderId::new),
+            name: f.name,
+            well_known: f.well_known.and_then(|w| w.parse().ok()),
+            unread_count: f.unread,
+            total_count: f.total,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

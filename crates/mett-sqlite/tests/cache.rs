@@ -122,18 +122,24 @@ async fn changes_made_here_show_at_once() {
         .update_flags(&MessageId::new("m2"), FlagsUpdate::flagged(true))
         .await
         .unwrap();
-    store
-        .move_message(&MessageId::new("m1"), &FolderId::new("arc"))
-        .await
-        .unwrap();
     // Without syncing again.
     let page = store
         .list_messages(&inbox(), Page::first(10))
         .await
         .unwrap();
-    assert_eq!(ids(&page.messages), ["m2", "m0"]);
     assert!(page.messages[0].flags.flagged);
     assert_eq!(store.inner().syncs(), 1);
+    // A move brings mail into another folder: folders sync again.
+    store
+        .move_message(&MessageId::new("m1"), &FolderId::new("arc"))
+        .await
+        .unwrap();
+    let page = store
+        .list_messages(&inbox(), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(ids(&page.messages), ["m2", "m0"]);
+    assert_eq!(store.inner().syncs(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -214,4 +220,217 @@ async fn the_cache_is_private_and_lasts() {
         .unwrap();
     assert_eq!(ids(&page.messages), ["m1", "m0"]);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn what_mett_copies_shows_at_once() {
+    let store = cached(mailbox(2)).unwrap();
+    let archive = FolderId::new("arc");
+    listing(&store, 10).await;
+    let page = store
+        .list_messages(&archive, Page::first(10))
+        .await
+        .unwrap();
+    assert!(page.messages.is_empty());
+    // Copied just after its folder was synced.
+    let copy = store
+        .copy_message(&MessageId::new("m1"), &archive)
+        .await
+        .unwrap();
+    let page = store
+        .list_messages(&archive, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(page.messages[0].id, copy);
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_cache_that_fails_is_left_for_the_server() {
+    let dir = std::env::temp_dir().join(format!("mett-sqlite-broken-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("cache.sqlite");
+    let store = CachedStore::new(mailbox(2), Some(Cache::open(&path).unwrap()));
+    listing(&store, 10).await;
+    // Something breaks the cache under mett.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE messages")
+        .unwrap();
+    later().await;
+    assert_eq!(listing(&store, 10).await, ["m1", "m0"], "from the server");
+    let syncs = store.inner().syncs();
+    later().await;
+    listing(&store, 10).await;
+    assert_eq!(store.inner().syncs(), syncs, "the cache is left alone");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The in-memory store, which can be taken offline: every call then fails
+/// for want of a network.
+struct Flaky {
+    inner: MemoryStore,
+    down: std::sync::atomic::AtomicBool,
+}
+
+impl Flaky {
+    fn up(&self) -> mett_core::Result<()> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(Error::Network("offline".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl MailStore for Flaky {
+    async fn list_folders(&self) -> mett_core::Result<Vec<mett_core::Folder>> {
+        self.up()?;
+        self.inner.list_folders().await
+    }
+    async fn child_folders(
+        &self,
+        parent: Option<&FolderId>,
+    ) -> mett_core::Result<Vec<mett_core::Folder>> {
+        self.up()?;
+        self.inner.child_folders(parent).await
+    }
+    async fn folder(&self, id: &FolderId) -> mett_core::Result<mett_core::Folder> {
+        self.up()?;
+        self.inner.folder(id).await
+    }
+    async fn recent_unread(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> mett_core::Result<Vec<(MessageId, DateTime<Utc>)>> {
+        self.up()?;
+        self.inner.recent_unread(folder, since).await
+    }
+    async fn well_known_folder(
+        &self,
+        which: WellKnownFolder,
+    ) -> mett_core::Result<mett_core::Folder> {
+        self.up()?;
+        self.inner.well_known_folder(which).await
+    }
+    async fn list_messages(
+        &self,
+        folder: &FolderId,
+        page: Page,
+    ) -> mett_core::Result<mett_core::MessagePage> {
+        self.up()?;
+        self.inner.list_messages(folder, page).await
+    }
+    async fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        page: Page,
+    ) -> mett_core::Result<mett_core::MessagePage> {
+        self.up()?;
+        self.inner.changed_messages(folder, since, page).await
+    }
+    async fn fetch_message(&self, id: &MessageId) -> mett_core::Result<mett_core::Message> {
+        self.up()?;
+        self.inner.fetch_message(id).await
+    }
+    async fn list_attachments(
+        &self,
+        message: &MessageId,
+    ) -> mett_core::Result<Vec<mett_core::Attachment>> {
+        self.up()?;
+        self.inner.list_attachments(message).await
+    }
+    async fn fetch_attachment(
+        &self,
+        message: &MessageId,
+        attachment: &mett_core::AttachmentId,
+    ) -> mett_core::Result<Vec<u8>> {
+        self.up()?;
+        self.inner.fetch_attachment(message, attachment).await
+    }
+    async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> mett_core::Result<()> {
+        self.up()?;
+        self.inner.update_flags(id, update).await
+    }
+    async fn move_message(&self, id: &MessageId, to: &FolderId) -> mett_core::Result<MessageId> {
+        self.up()?;
+        self.inner.move_message(id, to).await
+    }
+    async fn copy_message(&self, id: &MessageId, to: &FolderId) -> mett_core::Result<MessageId> {
+        self.up()?;
+        self.inner.copy_message(id, to).await
+    }
+    async fn delete_message(&self, id: &MessageId) -> mett_core::Result<()> {
+        self.up()?;
+        self.inner.delete_message(id).await
+    }
+    async fn save_draft(&self, draft: &mett_core::Draft) -> mett_core::Result<MessageId> {
+        self.up()?;
+        self.inner.save_draft(draft).await
+    }
+    fn can_sync(&self) -> bool {
+        true
+    }
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&mett_core::SyncState>,
+    ) -> mett_core::Result<mett_core::FolderChanges> {
+        self.up()?;
+        self.inner.sync_folder(folder, state).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn offline_the_folders_seen_are_listed_as_they_were() {
+    let flaky = Flaky {
+        inner: mailbox(2),
+        down: false.into(),
+    };
+    let store = CachedStore::new(flaky, Some(Cache::in_memory().unwrap()));
+    let inbox = store
+        .well_known_folder(WellKnownFolder::Inbox)
+        .await
+        .unwrap();
+    store.child_folders(None).await.unwrap();
+    store
+        .list_messages(&inbox.id, Page::first(10))
+        .await
+        .unwrap();
+    let id = MessageId::new("m1");
+    store.fetch_message(&id).await.unwrap();
+
+    store
+        .inner()
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    later().await;
+    // Opening the Inbox finds it, and lists it, as it was.
+    let found = store
+        .well_known_folder(WellKnownFolder::Inbox)
+        .await
+        .unwrap();
+    assert_eq!(found, inbox);
+    assert_eq!(store.folder(&inbox.id).await.unwrap(), inbox);
+    let below: Vec<String> = store
+        .child_folders(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(below, ["Inbox", "Archive"]);
+    let page = store
+        .list_messages(&inbox.id, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(ids(&page.messages), ["m1", "m0"]);
+    assert!(store.fetch_message(&id).await.is_ok(), "read before");
+    // What was never seen still needs the network.
+    assert!(matches!(
+        store.folder(&FolderId::new("nowhere")).await,
+        Err(Error::Network(_))
+    ));
 }

@@ -3,14 +3,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
     Address, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderChanges, FolderId,
-    MailSender, MailStore, Message, MessageId, MessagePage, Page, PageCursor, RECENT_UNREAD,
-    Result, SyncState, WellKnownFolder,
+    MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, Page, PageCursor,
+    RECENT_UNREAD, Result, SyncState, WellKnownFolder,
 };
 use tokio::time::Instant;
 
@@ -41,10 +42,20 @@ pub struct CacheError {
 pub struct CachedStore<S> {
     inner: S,
     db: Option<Mutex<Db>>,
-    /// When each folder was last synced, which also keeps two syncs of one
-    /// folder from running at once.
-    synced: Mutex<HashMap<FolderId, Arc<tokio::sync::Mutex<Option<Instant>>>>>,
+    /// Set when the cache fails (a full disk, say): from then on,
+    /// everything goes to `S`.
+    broken: AtomicBool,
+    /// How many changes mett made that a sync may bring in elsewhere (a
+    /// copy, a draft): any folder synced before one is synced again.
+    writes: AtomicU64,
+    /// When each folder was last synced, and how many changes mett had
+    /// made then. Its lock also keeps two syncs of one folder from running
+    /// at once.
+    synced: Mutex<HashMap<FolderId, Arc<tokio::sync::Mutex<LastSync>>>>,
 }
+
+/// When a folder was last synced, and how many changes mett had made then.
+type LastSync = Option<(Instant, u64)>;
 
 /// A cache database, for a [`CachedStore`].
 pub struct Cache(Db);
@@ -76,6 +87,8 @@ impl<S> CachedStore<S> {
         Self {
             inner,
             db: cache.map(|Cache(db)| Mutex::new(db)),
+            broken: AtomicBool::new(false),
+            writes: AtomicU64::new(0),
             synced: Mutex::new(HashMap::new()),
         }
     }
@@ -120,17 +133,35 @@ fn private_file(path: &Path) -> std::io::Result<()> {
 }
 
 impl<S: MailStore> CachedStore<S> {
-    /// The cache, if there is one and the backend can keep it up to date.
-    fn cache(&self) -> Option<MutexGuard<'_, Db>> {
-        self.db
-            .as_ref()
-            .filter(|_| self.inner.can_sync())
-            .map(|db| db.lock().unwrap_or_else(|e| e.into_inner()))
+    /// Whether folders are cached: there is a cache, it works, and the
+    /// backend can keep it up to date.
+    fn caching(&self) -> bool {
+        self.db.is_some() && !self.broken() && self.inner.can_sync()
     }
 
-    /// Whether folders are cached.
-    fn caching(&self) -> bool {
-        self.db.is_some() && self.inner.can_sync()
+    /// Whether the cache failed, and is no longer used.
+    fn broken(&self) -> bool {
+        self.broken.load(Ordering::SeqCst)
+    }
+
+    /// Runs `f` on the cache. If it fails, the cache is no longer used.
+    fn with_cache<T>(&self, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
+        let db = self
+            .db
+            .as_ref()
+            .filter(|_| self.caching())
+            .ok_or_else(|| Error::Backend("cache: not caching".into()))?;
+        let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+        let done = f(&mut db);
+        if done.is_err() {
+            self.broken.store(true, Ordering::SeqCst);
+        }
+        done
+    }
+
+    /// Notes a change mett made that a sync may bring in elsewhere.
+    fn wrote(&self) {
+        self.writes.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Brings `folder`'s cache up to date, unless it just was. Each batch
@@ -145,7 +176,8 @@ impl<S: MailStore> CachedStore<S> {
                 .or_default(),
         );
         let mut last = lock.lock().await;
-        if last.is_some_and(|at| at.elapsed() < FRESH) {
+        let writes = self.writes.load(Ordering::SeqCst);
+        if last.is_some_and(|(at, then)| at.elapsed() < FRESH && then == writes) {
             return Ok(());
         }
         let mut state = match self.with_cache(|db| db.synced(folder))? {
@@ -175,16 +207,8 @@ impl<S: MailStore> CachedStore<S> {
                 break;
             }
         }
-        *last = Some(Instant::now());
+        *last = Some((Instant::now(), writes));
         Ok(())
-    }
-
-    /// Runs `f` on the cache.
-    fn with_cache<T>(&self, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
-        let mut db = self
-            .cache()
-            .ok_or_else(|| Error::Backend("cache: not caching".into()))?;
-        f(&mut db)
     }
 
     /// Whether `folder` is all in the cache.
@@ -202,7 +226,7 @@ impl<S: MailStore> CachedStore<S> {
         folder: &FolderId,
         page: &Page,
         what: &str,
-        query: impl FnOnce(&Db, u64, u64) -> Result<Vec<mett_core::MessageSummary>>,
+        query: impl FnOnce(&Db, u64, u64) -> Result<Vec<MessageSummary>>,
     ) -> Result<MessagePage> {
         let offset = match page.cursor() {
             None => 0,
@@ -217,6 +241,73 @@ impl<S: MailStore> CachedStore<S> {
             messages,
             next: more.then(|| cursor(offset + size, what, folder)),
         })
+    }
+
+    async fn list_cached(&self, folder: &FolderId, page: &Page) -> Result<MessagePage> {
+        if page.cursor().is_none() {
+            match self.sync(folder).await {
+                // Offline, a folder all here is listed as it was.
+                Err(Error::Network(_)) if self.complete(folder) => {}
+                synced => synced?,
+            }
+        }
+        self.cached_page(folder, page, "all", |db, offset, limit| {
+            db.page(folder, offset, limit)
+        })
+    }
+
+    async fn changed_cached(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        page: &Page,
+    ) -> Result<MessagePage> {
+        if page.cursor().is_none() {
+            self.sync(folder).await?;
+        }
+        let what = since.timestamp_millis().to_string();
+        self.cached_page(folder, page, &what, |db, offset, limit| {
+            db.changed(folder, since, offset, limit)
+        })
+    }
+
+    async fn recent_unread_cached(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
+        self.sync(folder).await?;
+        // Without `since`, the last few tell.
+        let limit = if since.is_some() { RECENT_UNREAD } else { 50 };
+        let since = since.unwrap_or(DateTime::UNIX_EPOCH);
+        self.with_cache(|db| db.recent_unread(folder, since, limit as u64))
+    }
+
+    /// Keeps what the server said of folders, to find them offline.
+    fn note_folders(&self, folders: &Result<Vec<Folder>>) {
+        if let Ok(folders) = folders
+            && self.caching()
+        {
+            let _ = self.with_cache(|db| db.keep_folders(folders));
+        }
+    }
+
+    /// `online`, or offline (a network failure), what `recall` finds in the
+    /// cache, as last seen.
+    fn or_as_seen<T>(
+        &self,
+        online: Result<T>,
+        recall: impl FnOnce(&Db) -> Result<Option<T>>,
+    ) -> Result<T> {
+        match online {
+            Err(Error::Network(e)) => {
+                match self.caching().then(|| self.with_cache(|db| recall(db))) {
+                    Some(Ok(Some(seen))) => Ok(seen),
+                    _ => Err(Error::Network(e)),
+                }
+            }
+            online => online,
+        }
     }
 }
 
@@ -242,6 +333,8 @@ fn parse_cursor(cursor: &PageCursor, folder: &FolderId, what: &str) -> Result<u6
     offset.parse().map_err(|_| bad())
 }
 
+// Reads go to the cache while it works; if it fails, the cache is no
+// longer used, and they go to the server (`broken`).
 impl<S: MailStore> MailStore for CachedStore<S> {
     async fn own_addresses(&self) -> Result<Vec<String>> {
         self.inner.own_addresses().await
@@ -252,15 +345,32 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 
     async fn list_folders(&self) -> Result<Vec<Folder>> {
-        self.inner.list_folders().await
+        let listed = self.inner.list_folders().await;
+        self.note_folders(&listed);
+        self.or_as_seen(listed, |db| {
+            db.folders_below(None, true)
+                .map(|all| Some(all).filter(|all| !all.is_empty()))
+        })
     }
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
-        self.inner.child_folders(parent).await
+        let listed = self.inner.child_folders(parent).await;
+        self.note_folders(&listed);
+        self.or_as_seen(listed, |db| {
+            db.folders_below(parent, false)
+                .map(|below| Some(below).filter(|below| !below.is_empty()))
+        })
     }
 
     async fn folder(&self, id: &FolderId) -> Result<Folder> {
-        self.inner.folder(id).await
+        let found = self.inner.folder(id).await;
+        self.note_folders(
+            &found
+                .as_ref()
+                .map(|f| vec![f.clone()])
+                .map_err(Clone::clone),
+        );
+        self.or_as_seen(found, |db| db.folder_info(id))
     }
 
     async fn recent_unread(
@@ -268,34 +378,34 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         folder: &FolderId,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
-        if !self.caching() {
-            return self.inner.recent_unread(folder, since).await;
+        if self.caching() {
+            match self.recent_unread_cached(folder, since).await {
+                Err(_) if self.broken() => {}
+                found => return found,
+            }
         }
-        self.sync(folder).await?;
-        // Without `since`, the last few tell.
-        let limit = if since.is_some() { RECENT_UNREAD } else { 50 };
-        let since = since.unwrap_or(DateTime::UNIX_EPOCH);
-        self.with_cache(|db| db.recent_unread(folder, since, limit as u64))
+        self.inner.recent_unread(folder, since).await
     }
 
     async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
-        self.inner.well_known_folder(which).await
+        let found = self.inner.well_known_folder(which).await;
+        self.note_folders(
+            &found
+                .as_ref()
+                .map(|f| vec![f.clone()])
+                .map_err(Clone::clone),
+        );
+        self.or_as_seen(found, |db| db.well_known(which))
     }
 
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
-        if !self.caching() {
-            return self.inner.list_messages(folder, page).await;
-        }
-        if page.cursor().is_none() {
-            match self.sync(folder).await {
-                // Offline, a folder all here is listed as it was.
-                Err(Error::Network(_)) if self.complete(folder) => {}
-                synced => synced?,
+        if self.caching() {
+            match self.list_cached(folder, &page).await {
+                Err(_) if self.broken() => {}
+                listed => return listed,
             }
         }
-        self.cached_page(folder, &page, "all", |db, offset, limit| {
-            db.page(folder, offset, limit)
-        })
+        self.inner.list_messages(folder, page).await
     }
 
     async fn changed_messages(
@@ -304,28 +414,26 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         since: DateTime<Utc>,
         page: Page,
     ) -> Result<MessagePage> {
-        if !self.caching() {
-            return self.inner.changed_messages(folder, since, page).await;
+        if self.caching() {
+            match self.changed_cached(folder, since, &page).await {
+                Err(_) if self.broken() => {}
+                listed => return listed,
+            }
         }
-        if page.cursor().is_none() {
-            self.sync(folder).await?;
-        }
-        let what = since.timestamp_millis().to_string();
-        self.cached_page(folder, &page, &what, |db, offset, limit| {
-            db.changed(folder, since, offset, limit)
-        })
+        self.inner.changed_messages(folder, since, page).await
     }
 
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
-        if !self.caching() {
-            return self.inner.fetch_message(id).await;
-        }
-        if let Some(message) = self.with_cache(|db| db.message(id))? {
+        if self.caching()
+            && let Ok(Some(message)) = self.with_cache(|db| db.message(id))
+        {
             return Ok(message);
         }
         let message = self.inner.fetch_message(id).await?;
-        // Failing to keep it costs only fetching it again.
-        let _ = self.with_cache(|db| db.keep_body(&message));
+        if self.caching() {
+            // Failing to keep it costs only fetching it again.
+            let _ = self.with_cache(|db| db.keep_body(&message));
+        }
         Ok(message)
     }
 
@@ -358,7 +466,9 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 
     async fn move_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
-        let moved = self.inner.move_message(id, to).await?;
+        let moved = self.inner.move_message(id, to).await;
+        self.wrote();
+        let moved = moved?;
         // Its new folder's sync brings it in there.
         if self.caching() {
             let _ = self.with_cache(|db| db.remove(id));
@@ -367,7 +477,9 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 
     async fn copy_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
-        self.inner.copy_message(id, to).await
+        let copied = self.inner.copy_message(id, to).await;
+        self.wrote();
+        copied
     }
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
@@ -379,7 +491,9 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
-        self.inner.save_draft(draft).await
+        let saved = self.inner.save_draft(draft).await;
+        self.wrote();
+        saved
     }
 
     fn can_sync(&self) -> bool {
@@ -395,13 +509,19 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 }
 
-impl<S: MailSender> MailSender for CachedStore<S> {
+// Sending puts mail in Sent Items, and may leave a draft: folders are
+// synced again.
+impl<S: MailSender + MailStore> MailSender for CachedStore<S> {
     async fn send(&self, draft: &Draft) -> Result<()> {
-        self.inner.send(draft).await
+        let sent = self.inner.send(draft).await;
+        self.wrote();
+        sent
     }
 
     async fn discard_kept(&self, draft: &Draft) -> Result<()> {
-        self.inner.discard_kept(draft).await
+        let discarded = self.inner.discard_kept(draft).await;
+        self.wrote();
+        discarded
     }
 
     fn keeps_draft(&self, draft: &Draft) -> bool {
