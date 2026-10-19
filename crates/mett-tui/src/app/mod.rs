@@ -1178,6 +1178,8 @@ impl App {
                 // how the request that needed the sign-in went. But a
                 // cancellation that came too late didn't happen.
                 self.sign_in = None;
+                // Signed in: watching can go on.
+                self.watch_paused = false;
                 if std::mem::take(&mut self.cancelled) && self.status == "Sign-in cancelled." {
                     self.status.clear();
                 }

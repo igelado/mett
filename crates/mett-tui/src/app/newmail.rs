@@ -222,8 +222,9 @@ impl App {
         if let Some(old) = self.watching.take() {
             effects.push(self.request(Request::Cancel(old)));
         }
+        // Tried again unless its sign-in failed, until the user signs in.
         if self.can_watch
-            && (!self.watched.is_empty() || self.unwatch_failed)
+            && (!self.watched.is_empty() || self.unwatch_failed && !self.watch_paused)
             && self.unwatching.is_none()
         {
             self.watched.clear();
@@ -270,12 +271,21 @@ impl App {
         if self.unwatching == Some(id) {
             self.unwatching = None;
             // Tried again later (a watch would end it too), unless
-            // quitting.
-            if matches!(result, Some(Err(_))) && !self.quit {
-                self.unwatch_failed = true;
-                return vec![Effect::Later(WATCH_RETRY, Timer::Watch)];
-            }
-            return Vec::new();
+            // quitting; after a failed sign-in, once the user signs in, not
+            // to ask them again unbidden.
+            return match result {
+                Some(Err(_)) if self.quit => Vec::new(),
+                Some(Err(Error::Auth(_))) => {
+                    self.unwatch_failed = true;
+                    self.watch_paused = true;
+                    Vec::new()
+                }
+                Some(Err(_)) => {
+                    self.unwatch_failed = true;
+                    vec![Effect::Later(WATCH_RETRY, Timer::Watch)]
+                }
+                _ => Vec::new(),
+            };
         }
         if self.watching != Some(id) {
             // A watch replaced as it ended: what it said changed is not
@@ -1498,6 +1508,54 @@ mod tests {
         assert!(
             !sent.iter().any(|(_, r)| matches!(r, Request::Watch(_))),
             "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn ending_a_watch_whose_sign_in_failed_waits_for_the_user() {
+        let (mut app, _) = app();
+        app.sync_interval = None;
+        let effects = app.watch();
+        let unwatch = effect_id(&effects[1]);
+        let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        assert!(respond(&mut app, unwatch, denied).is_empty());
+        // Not on the timer, nor when the sign-in window closes.
+        assert!(app.update(Msg::Timer(Timer::Watch)).is_empty());
+        let account = mett_core::AccountId::from("alice@contoso.com");
+        let cancelled = crate::SignInEvent::Finished {
+            account: account.clone(),
+            outcome: Err("cancelled".into()),
+        };
+        assert!(requests(&app.update(Msg::SignIn(cancelled))).is_empty());
+        // Signed in: tried again.
+        let signed_in = crate::SignInEvent::Finished {
+            account,
+            outcome: Ok(()),
+        };
+        let effects = app.update(Msg::SignIn(signed_in));
+        let sent = requests(&effects);
+        assert!(
+            matches!(&sent[..], [(_, Request::Watch(f))] if f.is_empty()),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_watch_paused_goes_on_once_signed_in() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        respond(&mut app, watch, denied);
+        let signed_in = crate::SignInEvent::Finished {
+            account: "alice@contoso.com".into(),
+            outcome: Ok(()),
+        };
+        let effects = app.update(Msg::SignIn(signed_in));
+        assert!(
+            requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::Watch(f) if !f.is_empty())),
+            "{effects:?}"
         );
     }
 
