@@ -30,7 +30,9 @@ of each folder listed, and each message read, in a database file: mutt's
   `0700` and its file with mode `0600`.
 
 A cache of another schema version is dropped and filled again: it holds
-nothing the server doesn't.
+nothing the server doesn't. A cache holds one account's mailbox: another
+account's mett doesn't use it (with a warning), as the account's own mett
+may have it open.
 
 ## Automated tests
 

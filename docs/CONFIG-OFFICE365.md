@@ -286,7 +286,7 @@ and recalled from, the account's Drafts folder.
 | `=b`, `=B`, `=h` patterns | Translated to Graph `$search` where possible. Anything else is evaluated locally on cached messages. |
 | `my_hdr Importance: high` | Sets the Graph `importance` property. |
 | Threads (`sort=threads`) | Built from Graph's `conversationId` (which messages are one thread) and `conversationIndex` (which message each answers), rather than `References`/`In-Reply-To`, which Graph lists only message by message. A message whose parent isn't in the folder hangs from its thread's first message. |
-| `header_cache` | Where the local cache is: a SQLite database per account, `$XDG_CACHE_HOME/mett/<account>.sqlite` by default (`~/.cache/mett/...`). A directory holds a file per account; another path names the file. `unset header_cache` caches nothing. It holds each folder's index, kept up to date by syncing (only what changed since the last time comes from the server), and the messages read. Takes effect when mett starts. |
+| `header_cache` | Where the local cache is: a SQLite database per account, `$XDG_CACHE_HOME/mett/<account>.sqlite` by default (`~/.cache/mett/...`). A directory holds a file per account; another path names the file, which then serves one account only (another account's mett runs without a cache, with a warning). `unset header_cache` caches nothing. It holds each folder's index, kept up to date by syncing (only what changed since the last time comes from the server), and the messages read. Takes effect when mett starts. |
 | `message_cachedir` | Not used: messages read are kept in the `header_cache` database. |
 | `trash` | Deleting a message moves it to `trash`. With `trash` unset, mett deletes permanently, after the usual confirmation. |
 

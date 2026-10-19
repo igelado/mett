@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
     -- Whose mailbox this is.
@@ -53,6 +53,9 @@ const SCHEMA: &str = "
         name TEXT PRIMARY KEY,
         id TEXT NOT NULL
     );
+    -- The folder listings seen: `*` for all folders, `below:<id>` for
+    -- those below a folder (`below:` for the top-level ones).
+    CREATE TABLE listed (what TEXT PRIMARY KEY);
     CREATE INDEX messages_by_date ON messages (folder, received DESC, id);
     CREATE INDEX messages_by_change ON messages (folder, modified DESC);
 ";
@@ -80,6 +83,41 @@ pub(crate) fn comes_after(key: &Key, after: &Key) -> bool {
     key.0 < after.0 || (key.0 == after.0 && key.1 > after.1)
 }
 
+/// Why the cache could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OpenError {
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    /// It holds another account's mailbox.
+    #[error("it holds the mailbox of {0}; give each account its own header_cache")]
+    Account(String),
+}
+
+/// Which folders a listing gave.
+#[derive(Clone, Copy)]
+pub(crate) enum Listing<'a> {
+    /// All of them.
+    All,
+    /// Those directly below a folder (without one, the top-level ones).
+    Below(Option<&'a FolderId>),
+    /// Some, such as one looked up.
+    Some,
+}
+
+impl Listing<'_> {
+    /// How the `listed` table names this listing.
+    fn name(self) -> Option<String> {
+        match self {
+            Self::All => Some("*".into()),
+            Self::Below(parent) => Some(format!(
+                "below:{}",
+                parent.map(FolderId::as_str).unwrap_or_default()
+            )),
+            Self::Some => None,
+        }
+    }
+}
+
 /// Where a folder's sync stands.
 pub(crate) struct Synced {
     pub state: Option<SyncState>,
@@ -99,19 +137,20 @@ fn failed(e: impl std::fmt::Display) -> Error {
 impl Db {
     /// Opens (creating it if needed) the cache of `account`'s mailbox at
     /// `path`.
-    pub fn open(path: &Path, account: &AccountId) -> rusqlite::Result<Self> {
+    pub fn open(path: &Path, account: &AccountId) -> Result<Self, OpenError> {
         Self::ready(Connection::open(path)?, account)
     }
 
     /// A cache in memory, for tests.
-    pub fn in_memory(account: &AccountId) -> rusqlite::Result<Self> {
+    pub fn in_memory(account: &AccountId) -> Result<Self, OpenError> {
         Self::ready(Connection::open_in_memory()?, account)
     }
 
     /// Readies the cache for `account`: one of another schema version is
-    /// made afresh, and one of another account emptied. Another mett may
-    /// open it at once: this is one transaction, which waits for the other.
-    fn ready(mut conn: Connection, account: &AccountId) -> rusqlite::Result<Self> {
+    /// made afresh. One of another account isn't used: that account's mett
+    /// may have it open. Another mett may open it at once: this is one
+    /// transaction, which waits for the other.
+    fn ready(mut conn: Connection, account: &AccountId) -> Result<Self, OpenError> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -124,6 +163,7 @@ impl Db {
                  DROP TABLE IF EXISTS folders;
                  DROP TABLE IF EXISTS folder_info;
                  DROP TABLE IF EXISTS well_known;
+                 DROP TABLE IF EXISTS listed;
                  DROP TABLE IF EXISTS account;",
             )?;
             tx.execute_batch(SCHEMA)?;
@@ -132,12 +172,12 @@ impl Db {
         let owner: Option<String> = tx
             .query_row("SELECT id FROM account", [], |r| r.get(0))
             .optional()?;
-        if owner.as_deref() != Some(account.as_str()) {
-            tx.execute_batch(
-                "DELETE FROM messages; DELETE FROM folders; DELETE FROM folder_info;
-                 DELETE FROM well_known; DELETE FROM account;",
-            )?;
-            tx.execute("INSERT INTO account (id) VALUES (?1)", [account.as_str()])?;
+        match owner {
+            None => {
+                tx.execute("INSERT INTO account (id) VALUES (?1)", [account.as_str()])?;
+            }
+            Some(owner) if owner != account.as_str() => return Err(OpenError::Account(owner)),
+            Some(_) => {}
         }
         tx.commit()?;
         Ok(Self { conn })
@@ -392,24 +432,38 @@ impl Db {
         Ok(())
     }
 
-    /// Keeps `folders`, as a listing gave them, in its order. A listing of
-    /// them `all` replaces what was kept.
-    pub fn keep_folders(&mut self, folders: &[Folder], all: bool) -> Result<(), Error> {
+    /// Keeps `folders`, as `listing` gave them, in its order. A listing of
+    /// them all replaces what was kept.
+    pub fn keep_folders(&mut self, folders: &[Folder], listing: Listing<'_>) -> Result<(), Error> {
         let tx = self.conn.transaction().map_err(failed)?;
-        if all {
-            tx.execute_batch("DELETE FROM folder_info; DELETE FROM well_known;")
+        if matches!(listing, Listing::All) {
+            tx.execute_batch(
+                "DELETE FROM folder_info; DELETE FROM well_known; DELETE FROM listed;",
+            )
+            .map_err(failed)?;
+        }
+        if let Some(name) = listing.name() {
+            tx.execute("INSERT OR IGNORE INTO listed (what) VALUES (?1)", [name])
                 .map_err(failed)?;
         }
         for (ord, folder) in folders.iter().enumerate() {
             let stored = serde_json::to_string(&StoredFolder::from(folder)).map_err(failed)?;
+            // A folder looked up alone keeps its place among the others
+            // (a new one goes last).
+            let ord = match listing {
+                Listing::Some => None,
+                _ => Some(sql(ord as u64)),
+            };
             tx.execute(
-                "INSERT INTO folder_info (id, parent, ord, folder) VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO folder_info (id, parent, ord, folder) VALUES (?1, ?2,
+                    COALESCE(?3, (SELECT COALESCE(MAX(ord) + 1, 0) FROM folder_info)), ?4)
                  ON CONFLICT (id) DO UPDATE SET
-                    parent = excluded.parent, ord = excluded.ord, folder = excluded.folder",
+                    parent = excluded.parent, folder = excluded.folder,
+                    ord = COALESCE(?3, ord)",
                 params![
                     folder.id.as_str(),
                     folder.parent.as_ref().map(FolderId::as_str),
-                    sql(ord as u64),
+                    ord,
                     stored
                 ],
             )
@@ -447,24 +501,36 @@ impl Db {
             .pop())
     }
 
-    /// The folders directly below `parent` (without one, the top-level
-    /// ones), or every folder with `all`, as last seen.
-    pub fn folders_below(
-        &self,
-        parent: Option<&FolderId>,
-        all: bool,
-    ) -> Result<Vec<Folder>, Error> {
-        match (all, parent) {
-            (true, _) => self.folders("SELECT folder FROM folder_info ORDER BY ord", []),
-            (false, None) => self.folders(
+    /// The folders `listing` gives (but [`Listing::Some`]), as last seen,
+    /// if such a listing was seen (one of them all tells those below any
+    /// folder).
+    pub fn folders_listed(&self, listing: Listing<'_>) -> Result<Option<Vec<Folder>>, Error> {
+        let Some(name) = listing.name() else {
+            return Ok(None);
+        };
+        let seen: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM listed WHERE what IN (?1, '*'))",
+                [name],
+                |r| r.get(0),
+            )
+            .map_err(failed)?;
+        if !seen {
+            return Ok(None);
+        }
+        let folders = match listing {
+            Listing::Below(None) => self.folders(
                 "SELECT folder FROM folder_info WHERE parent IS NULL ORDER BY ord",
                 [],
             ),
-            (false, Some(parent)) => self.folders(
+            Listing::Below(Some(parent)) => self.folders(
                 "SELECT folder FROM folder_info WHERE parent = ?1 ORDER BY ord",
                 [parent.as_str()],
             ),
-        }
+            _ => self.folders("SELECT folder FROM folder_info ORDER BY ord", []),
+        }?;
+        Ok(Some(folders))
     }
 
     fn folders(&self, query: &str, params: impl rusqlite::Params) -> Result<Vec<Folder>, Error> {
@@ -698,18 +764,34 @@ mod tests {
     #[test]
     fn a_listing_of_all_folders_replaces_those_kept() {
         let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
-        db.keep_folders(&[folder("a"), folder("b")], true).unwrap();
+        let all = |db: &Db| -> Vec<String> {
+            db.folders_listed(Listing::All)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.id.to_string())
+                .collect()
+        };
+        assert_eq!(
+            db.folders_listed(Listing::All).unwrap(),
+            None,
+            "never listed"
+        );
+        db.keep_folders(&[folder("a"), folder("b")], Listing::All)
+            .unwrap();
         // One folder alone (opened) is added to the others.
-        db.keep_folders(&[folder("c")], false).unwrap();
-        assert_eq!(db.folders_below(None, true).unwrap().len(), 3);
+        db.keep_folders(&[folder("c")], Listing::Some).unwrap();
+        assert_eq!(all(&db), ["a", "b", "c"]);
         // A listing of them all, without b (deleted), leaves it out.
-        db.keep_folders(&[folder("a"), folder("c")], true).unwrap();
-        let ids: Vec<String> = db
-            .folders_below(None, true)
-            .unwrap()
-            .into_iter()
-            .map(|f| f.id.to_string())
-            .collect();
-        assert_eq!(ids, ["a", "c"]);
+        db.keep_folders(&[folder("a"), folder("c")], Listing::All)
+            .unwrap();
+        assert_eq!(all(&db), ["a", "c"]);
+        // An empty listing below a folder is a listing too.
+        let a = FolderId::new("a");
+        db.keep_folders(&[], Listing::Below(Some(&a))).unwrap();
+        assert_eq!(
+            db.folders_listed(Listing::Below(Some(&a))).unwrap(),
+            Some(vec![])
+        );
     }
 }

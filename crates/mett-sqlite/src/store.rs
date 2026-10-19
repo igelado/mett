@@ -15,7 +15,7 @@ use mett_core::{
 };
 use tokio::time::Instant;
 
-use crate::db::{Db, Key, comes_after, modified_key, received_key};
+use crate::db::{Db, Key, Listing, comes_after, modified_key, received_key};
 
 /// A folder synced this recently isn't synced again: the calls of one
 /// request (a check for new mail lists a folder and its changes) share a
@@ -321,13 +321,13 @@ impl<S: MailStore> CachedStore<S> {
         self.with_cache(|db| db.recent_unread(folder, since, limit as u64))
     }
 
-    /// Keeps what the server said of folders (`all` of them, or some), to
-    /// find them offline.
-    fn note_folders(&self, folders: &Result<Vec<Folder>>, all: bool) {
+    /// Keeps what the server said of folders (as `listing`), to find them
+    /// offline.
+    fn note_folders(&self, folders: &Result<Vec<Folder>>, listing: Listing<'_>) {
         if let Ok(folders) = folders
             && self.caching()
         {
-            let _ = self.with_cache(|db| db.keep_folders(folders, all));
+            let _ = self.with_cache(|db| db.keep_folders(folders, listing));
         }
     }
 
@@ -397,20 +397,14 @@ impl<S: MailStore> MailStore for CachedStore<S> {
 
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let listed = self.inner.list_folders().await;
-        self.note_folders(&listed, true);
-        self.or_as_seen(listed, |db| {
-            db.folders_below(None, true)
-                .map(|all| Some(all).filter(|all| !all.is_empty()))
-        })
+        self.note_folders(&listed, Listing::All);
+        self.or_as_seen(listed, |db| db.folders_listed(Listing::All))
     }
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
         let listed = self.inner.child_folders(parent).await;
-        self.note_folders(&listed, false);
-        self.or_as_seen(listed, |db| {
-            db.folders_below(parent, false)
-                .map(|below| Some(below).filter(|below| !below.is_empty()))
-        })
+        self.note_folders(&listed, Listing::Below(parent));
+        self.or_as_seen(listed, |db| db.folders_listed(Listing::Below(parent)))
     }
 
     async fn folder(&self, id: &FolderId) -> Result<Folder> {
@@ -420,7 +414,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 .as_ref()
                 .map(|f| vec![f.clone()])
                 .map_err(Clone::clone),
-            false,
+            Listing::Some,
         );
         self.or_as_seen(found, |db| db.folder_info(id))
     }
@@ -446,7 +440,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 .as_ref()
                 .map(|f| vec![f.clone()])
                 .map_err(Clone::clone),
-            false,
+            Listing::Some,
         );
         self.or_as_seen(found, |db| db.well_known(which))
     }

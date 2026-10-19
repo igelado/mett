@@ -409,6 +409,13 @@ async fn offline_the_folders_seen_are_listed_as_they_were() {
         .await
         .unwrap();
     store.child_folders(None).await.unwrap();
+    assert!(
+        store
+            .child_folders(Some(&inbox.id))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     store
         .list_messages(&inbox.id, Page::first(10))
         .await
@@ -436,6 +443,14 @@ async fn offline_the_folders_seen_are_listed_as_they_were() {
         .map(|f| f.name)
         .collect();
     assert_eq!(below, ["Inbox", "Archive"]);
+    // Known to have none below it.
+    assert!(
+        store
+            .child_folders(Some(&inbox.id))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let page = store
         .list_messages(&inbox.id, Page::first(10))
         .await
@@ -501,22 +516,17 @@ async fn a_cache_is_one_accounts() {
         let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
         listing(&store, 10).await;
     }
-    // Bob's mailbox, offline, finds nothing of Alice's.
+    // Bob's mett doesn't use (nor empty) Alice's cache: hers may have it
+    // open.
     let bob = mett_core::AccountId::new("bob@contoso.com");
-    let flaky = Flaky {
-        inner: mailbox(0),
-        down: true.into(),
-    };
-    let store = CachedStore::new(flaky, Some(Cache::open(&path, &bob).unwrap()));
-    assert!(matches!(
-        store.well_known_folder(WellKnownFolder::Inbox).await,
-        Err(Error::Network(_))
-    ));
-    assert!(
-        store
-            .list_messages(&inbox(), Page::first(10))
-            .await
-            .is_err()
-    );
+    let refused = Cache::open(&path, &bob).err().unwrap().to_string();
+    assert!(refused.contains("alice@contoso.com"), "{refused}");
+    let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
+    assert_eq!(store.inner().syncs(), 0);
+    let page = store
+        .list_messages(&inbox(), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(ids(&page.messages), ["m1", "m0"], "still Alice's");
     std::fs::remove_dir_all(&dir).unwrap();
 }
