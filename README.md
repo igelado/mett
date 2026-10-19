@@ -30,12 +30,12 @@ for x86_64 and aarch64:
 
 ### From source
 
-mett needs Rust 1.89 or later and a C compiler (for the SQLite it builds
-in); nothing else.
+mett needs Rust 1.89 or later, a C compiler (for the SQLite it builds
+in) and Git; nothing else.
 
 1. Install Rust with [rustup](https://rustup.rs/) (or `rustup update` an
-   older one), and a C compiler: `sudo apt install build-essential` on
-   Debian and Ubuntu, `sudo pacman -S base-devel` on Arch.
+   older one), then a C compiler and Git: `sudo apt install build-essential
+   git` on Debian and Ubuntu, `sudo pacman -S base-devel git` on Arch.
 2. Get the source and install the `mett` binary:
 
    ```sh
@@ -46,12 +46,14 @@ in); nothing else.
 
    It goes to `~/.cargo/bin/mett`; rustup puts that directory on your
    `PATH`. For another place, add `--root <dir>` (say `--root ~/.local`
-   for `~/.local/bin/mett`).
+   for `~/.local/bin/mett`), and make sure `<dir>/bin` is on your `PATH`
+   too.
 3. Check it: `mett -v` prints the version, and `mett --demo` opens a
    sample mailbox.
 
 To update, `git pull` in the checkout and run the same `cargo install`
-again. `cargo uninstall mett-tui` removes it. The documentation isn't
+again. `cargo uninstall mett-tui` removes it (with the same `--root`, if
+you gave one). The documentation isn't
 installed this way: it is in the checkout's `docs/`.
 
 ## Quick start
