@@ -312,23 +312,38 @@ impl App {
             .any(|m| !m.flags.read && self.threads.get(&m.id).is_some_and(|t| &t.root == root))
     }
 
-    /// Mail arrived in the threads of `arrived`: those the user collapsed
-    /// are opened if it is unread (as mutt's `uncollapse_new`).
-    pub(super) fn open_for_new_mail(&mut self, arrived: &[MessageSummary]) {
-        for message in arrived.iter().filter(|m| !m.flags.read) {
+    /// Mail arrived in the threads of `arrived`: those that would be
+    /// collapsed (the user collapsed them, or every thread) are opened if
+    /// it is unread, and stay open once it is read (as mutt's
+    /// `uncollapse_new`). Returns whether any was.
+    pub(super) fn open_for_new_mail<'a>(
+        &mut self,
+        arrived: impl IntoIterator<Item = &'a MessageSummary>,
+    ) -> bool {
+        let mut opened = false;
+        for message in arrived.into_iter().filter(|m| !m.flags.read) {
             if let Some(thread) = &message.thread {
                 let key = format!("conversation {}", thread.conversation);
-                if self.chosen.get(&key) == Some(&true) {
-                    self.chosen.remove(&key);
+                let collapsed = self.chosen.get(&key).copied().unwrap_or(self.collapse_all);
+                if collapsed {
+                    self.chosen.insert(key, false);
+                    opened = true;
                 }
             }
         }
+        opened
     }
 
     /// If the selected entry is a collapsed thread with unread mail folded
     /// into it, opens it at its first unread message, which is selected.
     pub(super) fn open_at_folded_unread(&mut self) {
-        let Some(root) = self.messages.get(self.selected).map(|m| m.id.clone()) else {
+        // (Its first message unread is its first unread message.)
+        let Some(root) = self
+            .messages
+            .get(self.selected)
+            .filter(|m| m.flags.read)
+            .map(|m| m.id.clone())
+        else {
             return;
         };
         if self.thread_of(&root).is_none_or(|t| t.folded == 0) {
@@ -541,8 +556,10 @@ impl App {
                     .threads
                     .get(root)
                     .map_or_else(|| format!("message {root}"), |t| t.key.clone());
-                // As it shows now: collapsed if mail is folded into it.
-                let collapsed = self.threads.get(root).is_some_and(|t| t.folded > 0);
+                // As it shows now: collapsed if mail is folded into it;
+                // with none (yet), as chosen.
+                let collapsed = self.threads.get(root).is_some_and(|t| t.folded > 0)
+                    || self.is_collapsed(&key, self.thread_unread(root));
                 self.set_collapsed(key, !collapsed);
                 self.selected = start;
                 if !self.refold(start) {
@@ -759,6 +776,12 @@ mod tests {
         let (_, request) = sent(&act(&mut app, Action::DisplayMessage));
         assert_eq!(request, Request::FetchMessage("a2".into()));
         assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0", "└─>b1"]);
+        // Its first message unread, that is its first unread message.
+        let mut app = app_with_unread(&["a0", "a2"]);
+        select(&mut app, "a0");
+        act(&mut app, Action::CollapseThread);
+        let (_, request) = sent(&act(&mut app, Action::DisplayMessage));
+        assert_eq!(request, Request::FetchMessage("a0".into()));
         // Without unread mail, it opens at its first message, collapsed.
         let mut app = app_with_unread(&[]);
         select(&mut app, "a0");
@@ -779,9 +802,33 @@ mod tests {
         app.arrange();
         assert_eq!(shown(&app)[0], "a0 (2)");
         read.flags.read = false;
-        app.open_for_new_mail(&[read]);
+        app.open_for_new_mail(std::slice::from_ref(&read));
         app.arrange();
         assert_eq!(shown(&app)[..3], ["a0", "├─>a1", "└─>a2"]);
+        // It stays open once the mail is read.
+        for m in app.messages.iter_mut() {
+            m.flags.read = true;
+        }
+        app.arrange();
+        assert_eq!(shown(&app)[..3], ["a0", "├─>a1", "└─>a2"]);
+        // So does one collapsing every thread had collapsed.
+        let mut app = app_with_unread(&[]);
+        act(&mut app, Action::CollapseAll);
+        assert!(app.open_for_new_mail(&[read]));
+        app.arrange();
+        assert_eq!(shown(&app)[..3], ["a0", "├─>a1", "└─>a2"]);
+    }
+
+    #[test]
+    fn collapsing_a_thread_with_nothing_to_fold_can_be_undone() {
+        // A thread of one message (its replies not listed yet, say).
+        let messages = vec![message("c0", 1, "c", &[0])];
+        let mut app = opened(sorted("threads"), 24, messages, None).0;
+        let key = "conversation c".to_owned();
+        act(&mut app, Action::CollapseThread);
+        assert_eq!(app.chosen.get(&key), Some(&true));
+        act(&mut app, Action::CollapseThread);
+        assert_eq!(app.chosen.get(&key), Some(&false), "undone");
     }
 
     #[test]
