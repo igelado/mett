@@ -192,8 +192,13 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
                 colors.message
             };
             // The wait for a throttling server, at the end of the line, in
-            // its own room, so that it doesn't hide what the line says.
-            let notice = app.throttled_notice();
+            // its own room, so that it doesn't hide what the line says: at
+            // most half of it, shortened (or left out) to fit.
+            let notice = app.throttled_notices().and_then(|notices| {
+                notices
+                    .into_iter()
+                    .find(|n| n.width() < usize::from(message.width / 2))
+            });
             let [text, end] = Layout::horizontal([
                 Constraint::Fill(1),
                 Constraint::Length(notice.as_deref().map_or(0, |n| n.width() as u16 + 1)),
@@ -1063,8 +1068,14 @@ mod tests {
                 attempt: 1,
             },
         );
-        let line = screen(&app).pop().unwrap();
+        let line = sized_screen(&app, 100, HEIGHT).pop().unwrap();
         assert!(line.starts_with("Mail sent."), "{line}");
+        // A narrow line has room for a short one, then for none.
+        let narrow = sized_screen(&app, 40, HEIGHT).pop().unwrap();
+        assert!(narrow.starts_with("Mail sent."), "{narrow}");
+        assert!(narrow.ends_with("Throttled: 12s"), "{narrow}");
+        let tiny = sized_screen(&app, 20, HEIGHT).pop().unwrap();
+        assert_eq!(tiny, "Mail sent.");
         // An error keeps its own color, and its room.
         colored(&mut app, &["color error brightred default"]);
         app.status = "x".repeat(100);

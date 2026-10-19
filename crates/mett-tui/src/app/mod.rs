@@ -1286,14 +1286,23 @@ impl App {
 
     /// What the message line says while requests wait for a throttling
     /// server: the longest wait, and the highest retry.
+    #[cfg(test)]
     pub fn throttled_notice(&self) -> Option<String> {
+        self.throttled_notices().map(|[long, _]| long)
+    }
+
+    /// [`App::throttled_notice`], and a shorter one for a narrow line.
+    pub fn throttled_notices(&self) -> Option<[String; 2]> {
         let left = self.throttled.values().map(|(left, _)| *left).max()?;
         let attempt = self.throttled.values().map(|(_, attempt)| *attempt).max()?;
-        Some(format!(
-            "Throttled by the server: retry {attempt}/{} in {}s",
-            crate::worker::THROTTLED_RETRIES,
-            left.as_secs()
-        ))
+        let seconds = left.as_secs();
+        Some([
+            format!(
+                "Throttled by the server: retry {attempt}/{} in {seconds}s",
+                crate::worker::THROTTLED_RETRIES,
+            ),
+            format!("Throttled: {seconds}s"),
+        ])
     }
 
     fn retry_if_requested(&mut self, id: RequestId) -> Vec<Effect> {

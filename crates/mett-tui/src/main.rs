@@ -742,8 +742,11 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             // Nothing is edited, nor configured, any more.
             let _ = carry_out(&mut app, effects);
             // The wait starts again once the user is done signing in.
+            // (Still with what a throttled save has left to wait.)
             if window_was_open || app.sign_in.is_some() {
-                deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
+                deadline = tokio::time::Instant::now()
+                    + SAVE_TIMEOUT
+                    + app.save_wait().unwrap_or_default();
             }
         }
         if app.saving() {
