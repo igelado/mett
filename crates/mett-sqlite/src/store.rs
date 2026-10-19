@@ -202,7 +202,19 @@ impl<S: MailStore> CachedStore<S> {
                 }
                 changes => changes?,
             };
-            self.with_cache(|db| db.apply(folder, &changes))?;
+            if !self.with_cache(|db| db.apply(folder, state.as_ref(), &changes))? {
+                // Another mett sharing the cache synced the folder
+                // meanwhile: go on from where it left it.
+                match self.with_cache(|db| db.synced(folder))? {
+                    Some(synced) if synced.complete => break,
+                    Some(synced) if synced.state.is_some() => state = synced.state,
+                    _ => {
+                        self.with_cache(|db| db.start_over(folder))?;
+                        state = None;
+                    }
+                }
+                continue;
+            }
             let FolderChanges {
                 state: next, more, ..
             } = changes;

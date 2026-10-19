@@ -224,10 +224,32 @@ impl Db {
         tx.commit().map_err(failed)
     }
 
-    /// Takes in a batch of `folder`'s changes, and where its sync stands
-    /// after them.
-    pub fn apply(&mut self, folder: &FolderId, changes: &FolderChanges) -> Result<(), Error> {
-        let tx = self.conn.transaction().map_err(failed)?;
+    /// Takes in a batch of `folder`'s changes, synced from the state
+    /// `from`, and where its sync stands after them, unless another mett
+    /// (sharing the cache) took in changes since `from`: then nothing is
+    /// done, and this is `false`.
+    pub fn apply(
+        &mut self,
+        folder: &FolderId,
+        from: Option<&SyncState>,
+        changes: &FolderChanges,
+    ) -> Result<bool, Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(failed)?;
+        let now: Option<String> = tx
+            .query_row(
+                "SELECT state FROM folders WHERE id = ?1",
+                [folder.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(failed)?
+            .flatten();
+        if now.as_deref() != from.map(SyncState::as_str) {
+            return Ok(false);
+        }
         for summary in &changes.changed {
             let stored = serde_json::to_string(&StoredSummary::from(summary)).map_err(failed)?;
             // Only a draft's body can change (Graph and EWS let only
@@ -279,7 +301,8 @@ impl Db {
             )
             .map_err(failed)?;
         }
-        tx.commit().map_err(failed)
+        tx.commit().map_err(failed)?;
+        Ok(true)
     }
 
     /// Up to `limit` of `folder`'s summaries, newest first (by
@@ -452,16 +475,35 @@ impl Db {
             tx.execute("INSERT OR IGNORE INTO listed (what) VALUES (?1)", [name])
                 .map_err(failed)?;
         }
-        // A listing of the folders below one replaces those kept there.
-        match listing {
-            Listing::Below(None) => tx.execute("DELETE FROM folder_info WHERE parent IS NULL", []),
-            Listing::Below(Some(parent)) => tx.execute(
-                "DELETE FROM folder_info WHERE parent = ?1",
-                [parent.as_str()],
-            ),
-            _ => Ok(0),
+        // A listing of the folders below one replaces those kept there:
+        // those it leaves out are gone, with the folders below them.
+        if let Listing::Below(parent) = listing {
+            let mut gone: Vec<String> = {
+                let mut statement = tx
+                    .prepare("SELECT id FROM folder_info WHERE parent IS ?1")
+                    .map_err(failed)?;
+                let rows = statement
+                    .query_map([parent.map(FolderId::as_str)], |r| r.get::<_, String>(0))
+                    .map_err(failed)?;
+                rows.collect::<rusqlite::Result<_>>().map_err(failed)?
+            };
+            gone.retain(|id| !folders.iter().any(|f| f.id.as_str() == id));
+            while let Some(id) = gone.pop() {
+                let mut statement = tx
+                    .prepare("SELECT id FROM folder_info WHERE parent = ?1")
+                    .map_err(failed)?;
+                let below = statement
+                    .query_map([&id], |r| r.get::<_, String>(0))
+                    .map_err(failed)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(failed)?;
+                gone.extend(below);
+                tx.execute("DELETE FROM folder_info WHERE id = ?1", [&id])
+                    .map_err(failed)?;
+                tx.execute("DELETE FROM well_known WHERE id = ?1", [&id])
+                    .map_err(failed)?;
+            }
         }
-        .map_err(failed)?;
         for (ord, folder) in folders.iter().enumerate() {
             let stored = serde_json::to_string(&StoredFolder::from(folder)).map_err(failed)?;
             // A folder looked up alone keeps its place among the others
@@ -778,6 +820,26 @@ mod tests {
     }
 
     #[test]
+    fn changes_from_a_state_another_mett_moved_on_from_are_not_taken() {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        let inbox = FolderId::new("in");
+        let changes = |state: &str| FolderChanges {
+            changed: Vec::new(),
+            removed: Vec::new(),
+            state: SyncState::new(state),
+            more: false,
+        };
+        db.start_over(&inbox).unwrap();
+        assert!(db.apply(&inbox, None, &changes("s1")).unwrap());
+        // Another mett took in s1 → s2; this one's s1 → s2' comes late.
+        let s1 = SyncState::new("s1");
+        assert!(db.apply(&inbox, Some(&s1), &changes("s2")).unwrap());
+        assert!(!db.apply(&inbox, Some(&s1), &changes("s2'")).unwrap());
+        let synced = db.synced(&inbox).unwrap().unwrap();
+        assert_eq!(synced.state, Some(SyncState::new("s2")));
+    }
+
+    #[test]
     fn a_listing_of_all_folders_replaces_those_kept() {
         let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
         let all = |db: &Db| -> Vec<String> {
@@ -802,11 +864,13 @@ mod tests {
         db.keep_folders(&[folder("a"), folder("c")], Listing::All)
             .unwrap();
         assert_eq!(all(&db), ["a", "c"]);
-        // A listing below a folder replaces those kept there.
+        // A listing below a folder replaces those kept there, and those
+        // below them.
         let mut below_a = folder("d");
         below_a.parent = Some(FolderId::new("a"));
-        db.keep_folders(std::slice::from_ref(&below_a), Listing::Some)
-            .unwrap();
+        let mut below_d = folder("e");
+        below_d.parent = Some(FolderId::new("d"));
+        db.keep_folders(&[below_a, below_d], Listing::Some).unwrap();
         // An empty listing below a folder is a listing too.
         let a = FolderId::new("a");
         db.keep_folders(&[], Listing::Below(Some(&a))).unwrap();
@@ -814,5 +878,6 @@ mod tests {
             db.folders_listed(Listing::Below(Some(&a))).unwrap(),
             Some(vec![])
         );
+        assert_eq!(all(&db), ["a", "c"], "e went with d");
     }
 }
