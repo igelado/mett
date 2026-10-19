@@ -31,6 +31,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The slowest upload a request with attachments is given time for.
 const BYTES_PER_SECOND: usize = 64 * 1024;
 
+/// Upper bound on a request whose response may be large (an attachment's
+/// content), which its own size doesn't tell.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// The most items or folders EWS returns per request.
 const MAX_PAGE_SIZE: u32 = 1000;
 
@@ -237,7 +241,13 @@ impl<A: Authenticator> EwsMailStore<A> {
     /// Calls the EWS operation in `body` for `about` (the object it
     /// concerns, named in a "not found" error) and returns the response.
     async fn call(&self, body: &str, about: About<'_>) -> Result<String> {
-        self.call_with(body, about, |e| e).await
+        self.call_with(body, about, |e| e, Duration::ZERO).await
+    }
+
+    /// Like [`Self::call`], for an operation whose response may be large:
+    /// it is given [`DOWNLOAD_TIMEOUT`].
+    async fn download(&self, body: &str, about: About<'_>) -> Result<String> {
+        self.call_with(body, about, |e| e, DOWNLOAD_TIMEOUT).await
     }
 
     /// Calls an operation that hands a message over to be sent. Failing
@@ -245,20 +255,23 @@ impl<A: Authenticator> EwsMailStore<A> {
     /// unsent, which [`Error::NotSent`] says; only a lost response to the
     /// request itself leaves it in doubt.
     async fn hand_over(&self, body: &str, about: About<'_>) -> Result<String> {
-        self.call_with(body, about, unsent).await
+        self.call_with(body, about, unsent, Duration::ZERO).await
     }
 
     /// Like [`Self::call`], passing errors from before the request is made
-    /// through `before`.
+    /// through `before`. The request is given time to go up, and `download`
+    /// (at least [`REQUEST_TIMEOUT`]) for the rest.
     async fn call_with(
         &self,
         body: &str,
         about: About<'_>,
         before: fn(Error) -> Error,
+        download: Duration,
     ) -> Result<String> {
         let xml = envelope(body);
+        let timeout = timeout_for(xml.len(), download);
         let token = self.auth.access_token().await.map_err(before)?;
-        let response = self.attempt(&xml, &token).await?;
+        let response = self.attempt(&xml, &token, timeout).await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Self::checked(response, about).await;
         }
@@ -269,7 +282,7 @@ impl<A: Authenticator> EwsMailStore<A> {
         if fresh == token {
             return Self::checked(response, about).await;
         }
-        let response = self.attempt(&xml, &fresh).await?;
+        let response = self.attempt(&xml, &fresh, timeout).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             // Rejected too: don't let the next request reuse it.
             self.auth.token_rejected(&fresh).await;
@@ -277,9 +290,12 @@ impl<A: Authenticator> EwsMailStore<A> {
         Self::checked(response, about).await
     }
 
-    async fn attempt(&self, xml: &str, token: &AccessToken) -> Result<reqwest::Response> {
-        let timeout = REQUEST_TIMEOUT
-            + Duration::from_secs(u64::try_from(xml.len() / BYTES_PER_SECOND).unwrap_or(u64::MAX));
+    async fn attempt(
+        &self,
+        xml: &str,
+        token: &AccessToken,
+        timeout: Duration,
+    ) -> Result<reqwest::Response> {
         self.http
             .post(self.url.clone())
             .bearer_auth(token.secret())
@@ -944,7 +960,7 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
              </m:GetAttachment>",
             escape(attachment.as_str())
         );
-        let xml = self.call(&body, about).await?;
+        let xml = self.download(&body, about).await?;
         let doc = parse(&xml)?;
         let response = only_message(&doc, about)?;
         let found = descendant(response, "Attachments")
@@ -1063,7 +1079,12 @@ impl<A: Authenticator> MailSender for EwsMailStore<A> {
         // takes only on a saved message. Failing before the send request
         // leaves nothing sent, whatever became of the draft.
         let (id, base) = self.server_draft(draft).await.map_err(unsent)?;
-        let sent = self.send_draft(&id, draft.save_copy).await;
+        // Sending takes the draft as it is now, which its change key says.
+        let change_key = match self.change_key(&id).await {
+            Ok(change_key) => change_key,
+            Err(e) => return Err(unsent(self.give_up(draft, id, base, e).await)),
+        };
+        let sent = self.send_draft(&id, &change_key, draft.save_copy).await;
         match &sent {
             // The response was lost or EWS failed: the message may have
             // gone out anyway. Keep the draft, so nothing is lost if it
@@ -1143,7 +1164,7 @@ impl<A: Authenticator> EwsMailStore<A> {
             None => (message_xml(draft), About::MAILBOX),
         };
         let body = create_item("SaveOnly", Some("drafts"), &item);
-        let created = match self.call_with(&body, about, unsent).await {
+        let created = match self.call_with(&body, about, unsent, Duration::ZERO).await {
             Ok(xml) => created_id(&xml),
             Err(Error::Network(e)) => Err(Error::Network(format!(
                 "{e}; a draft of it may be left in Drafts"
@@ -1425,9 +1446,22 @@ impl<A: Authenticator> EwsMailStore<A> {
         self.update_item(id, &updates).await
     }
 
-    /// Sends the server draft `id`, keeping a copy in Sent Items if
-    /// `save_copy`.
-    async fn send_draft(&self, id: &MessageId, save_copy: bool) -> Result<()> {
+    /// The current change key of item `id`, which sending it takes.
+    async fn change_key(&self, id: &MessageId) -> Result<String> {
+        let about = About::message(id.as_str());
+        let xml = self.get_items(&[id.to_string()], &[], false, about).await?;
+        let doc = parse(&xml)?;
+        let message = only_message(&doc, about)?;
+        first_item(message)
+            .and_then(|item| child(item, "ItemId"))
+            .and_then(|item| item.attribute("ChangeKey"))
+            .map(str::to_owned)
+            .ok_or_else(|| unexpected("GetItem", "no ChangeKey"))
+    }
+
+    /// Sends the server draft `id`, as of `change_key`, keeping a copy in
+    /// Sent Items if `save_copy`.
+    async fn send_draft(&self, id: &MessageId, change_key: &str, save_copy: bool) -> Result<()> {
         let about = About::message(id.as_str());
         let saved = if save_copy {
             "<m:SavedItemFolderId><t:DistinguishedFolderId Id=\"sentitems\"/></m:SavedItemFolderId>"
@@ -1435,9 +1469,10 @@ impl<A: Authenticator> EwsMailStore<A> {
             ""
         };
         let body = format!(
-            "<m:SendItem SaveItemToFolder=\"{save_copy}\"><m:ItemIds>{}</m:ItemIds>{saved}\
-             </m:SendItem>",
-            item_id_xml(id.as_str())
+            "<m:SendItem SaveItemToFolder=\"{save_copy}\"><m:ItemIds>\
+             <t:ItemId Id=\"{}\" ChangeKey=\"{}\"/></m:ItemIds>{saved}</m:SendItem>",
+            escape(id.as_str()),
+            escape(change_key)
         );
         let xml = self.hand_over(&body, about).await?;
         only_message(&parse(&xml)?, about).map(drop)
@@ -1477,6 +1512,13 @@ impl<A: Authenticator> EwsMailStore<A> {
     }
 }
 
+/// How long a request of `size` bytes may take: time for it to go up, and
+/// `download` (at least [`REQUEST_TIMEOUT`]) for the rest.
+fn timeout_for(size: usize, download: Duration) -> Duration {
+    let upload = u64::try_from(size / BYTES_PER_SECOND).unwrap_or(u64::MAX);
+    download.max(REQUEST_TIMEOUT) + Duration::from_secs(upload)
+}
+
 /// Whether `id` is the postponed message `draft` recalls.
 fn is_recalled(draft: &Draft, id: &MessageId) -> bool {
     matches!(&draft.origin, Some(DraftOrigin::Recalled(recalled)) if recalled == id)
@@ -1490,11 +1532,15 @@ fn unsent(e: Error) -> Error {
     }
 }
 
-/// Whether `draft` goes through a server draft: it answers a message, or
-/// has attachments, which Exchange takes only on a saved message. A failed
-/// attempt to send such a message may leave its draft behind.
+/// Whether `draft` goes through a server draft: it answers a message, has
+/// attachments, which Exchange takes only on a saved message, or is sent
+/// from a given address without a copy, which Exchange doesn't send in one
+/// request for a delegate. A failed attempt to send such a message may leave
+/// its draft behind.
 pub fn needs_server_draft(draft: &Draft) -> bool {
-    draft.origin.is_some() || !draft.attachments.is_empty()
+    draft.origin.is_some()
+        || !draft.attachments.is_empty()
+        || (draft.from.is_some() && !draft.save_copy)
 }
 
 /// An unexpected response to `operation`.
@@ -1986,6 +2032,16 @@ mod tests {
         ];
         let ids: Vec<String> = mail_folders(folders).into_iter().map(|f| f.id).collect();
         assert_eq!(ids, ["inbox", "plain"]);
+    }
+
+    #[test]
+    fn large_requests_and_downloads_get_more_time() {
+        assert_eq!(timeout_for(100, Duration::ZERO), REQUEST_TIMEOUT);
+        assert_eq!(
+            timeout_for(10 * BYTES_PER_SECOND, Duration::ZERO),
+            REQUEST_TIMEOUT + Duration::from_secs(10)
+        );
+        assert_eq!(timeout_for(100, DOWNLOAD_TIMEOUT), DOWNLOAD_TIMEOUT);
     }
 
     #[test]

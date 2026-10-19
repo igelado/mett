@@ -196,8 +196,10 @@ Graph:
   can't be opened; the other well-known folders work. Folders below one are
   listed by name.
 - **Sending:** replies, forwards and messages with attachments go through a
-  server draft (Exchange takes attachments only on a saved message), but
-  `copy` applies to them too: EWS can send a draft without keeping a copy.
+  server draft (Exchange takes attachments only on a saved message), as
+  does a message from another `From:` address without a copy (Exchange
+  doesn't send one for a delegate in one request). `copy` applies to them
+  too: EWS can send a draft without keeping a copy.
 - **Directory search:** `<query>` resolves names against the directory and
   the user's contacts (`ResolveNames`), rather than the People API.
 - **Retirement:** Microsoft is retiring EWS in Exchange Online, starting in

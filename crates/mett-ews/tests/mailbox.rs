@@ -159,6 +159,18 @@ fn found_items(ids: &[&str], last: bool, next: u32) -> ResponseTemplate {
     )
 }
 
+/// The draft "draft", with the change key "ck2", as sending it looks it up.
+async fn change_key(server: &MockServer) {
+    ews("<m:GetItem>")
+        .and(body_string_contains("Id=\"draft\""))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\" ChangeKey=\"ck2\"/></t:Message></m:Items>",
+        ))
+        .mount(server)
+        .await;
+}
+
 /// The bodies of the requests `server` received.
 async fn requests(server: &MockServer) -> Vec<String> {
     server
@@ -576,6 +588,7 @@ async fn lists_and_fetches_attachments() {
 #[tokio::test]
 async fn new_mail_with_attachments_is_saved_before_it_is_sent() {
     let server = MockServer::start().await;
+    change_key(&server).await;
     ews("MessageDisposition=\"SaveOnly\"")
         .and(body_string_contains(
             "<t:DistinguishedFolderId Id=\"drafts\"/>",
@@ -672,6 +685,7 @@ fn reply() -> Draft {
 #[tokio::test]
 async fn replies_go_through_a_server_draft() {
     let server = MockServer::start().await;
+    change_key(&server).await;
     ews("<t:ReplyToItem><t:ReferenceItemId Id=\"orig\"/>")
         .and(body_string_contains("MessageDisposition=\"SaveOnly\""))
         .respond_with(success(
@@ -693,6 +707,9 @@ async fn replies_go_through_a_server_draft() {
         .mount(&server)
         .await;
     ews("<m:SendItem SaveItemToFolder=\"false\">")
+        .and(body_string_contains(
+            "<t:ItemId Id=\"draft\" ChangeKey=\"ck2\"/>",
+        ))
         .respond_with(success("SendItem", ""))
         .expect(1)
         .mount(&server)
@@ -701,8 +718,65 @@ async fn replies_go_through_a_server_draft() {
 }
 
 #[tokio::test]
+async fn mail_from_another_address_without_a_copy_is_saved_first() {
+    let server = MockServer::start().await;
+    change_key(&server).await;
+    ews("MessageDisposition=\"SaveOnly\"")
+        .and(body_string_contains("<t:From>"))
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:SendItem SaveItemToFolder=\"false\">")
+        .respond_with(success("SendItem", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let draft = Draft {
+        from: Some(Address::new("team@contoso.com")),
+        to: vec![Address::new("bob@contoso.com")],
+        ..Draft::default()
+    };
+    store(&server).send(&draft).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_draft_gone_before_it_is_sent_was_not_sent() {
+    let server = MockServer::start().await;
+    ews("<t:ReplyToItem>")
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .mount(&server)
+        .await;
+    ews("<m:UpdateItem")
+        .respond_with(success("UpdateItem", "<m:Items/>"))
+        .mount(&server)
+        .await;
+    ews("<m:GetItem>")
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    ews("<m:SendItem")
+        .respond_with(success("SendItem", ""))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let e = store.send(&reply()).await.unwrap_err();
+    assert!(matches!(e, Error::NotSent(_)), "{e:?}");
+    // Kept, for the next attempt to send.
+    assert!(store.keeps_draft(&reply()));
+}
+
+#[tokio::test]
 async fn a_lost_send_keeps_the_draft_for_the_next_attempt() {
     let server = MockServer::start().await;
+    change_key(&server).await;
     ews("<t:ReplyToItem>")
         .respond_with(success(
             "CreateItem",
@@ -742,6 +816,7 @@ async fn a_lost_send_keeps_the_draft_for_the_next_attempt() {
 #[tokio::test]
 async fn a_refused_send_deletes_its_draft() {
     let server = MockServer::start().await;
+    change_key(&server).await;
     ews("<t:ReplyToItem>")
         .respond_with(success(
             "CreateItem",

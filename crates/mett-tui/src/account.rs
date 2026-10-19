@@ -514,6 +514,15 @@ mod tests {
             ..Draft::default()
         };
         assert!(Api::Ews.needs_server_draft(&attached));
+        let delegated = Draft {
+            from: Some(Address::new("team@contoso.com")),
+            ..Draft::default()
+        };
+        assert!(Api::Ews.needs_server_draft(&delegated));
+        assert!(!Api::Ews.needs_server_draft(&Draft {
+            save_copy: true,
+            ..delegated
+        }));
         assert!(!Api::Ews.always_copies(&attached));
     }
 
