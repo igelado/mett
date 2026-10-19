@@ -162,6 +162,9 @@ async fn keeps_the_messages_read() {
     listing(&store, 10).await;
     let id = MessageId::new("m1");
     let fetched = store.fetch_message(&id).await.unwrap();
+    // Unchanged, it is kept across syncs.
+    later().await;
+    listing(&store, 10).await;
     // Gone from the server, it is still here until the next sync.
     store.inner().delete_message(&id).await.unwrap();
     assert_eq!(store.fetch_message(&id).await.unwrap(), fetched);
@@ -564,4 +567,23 @@ async fn a_cache_is_one_accounts() {
         .unwrap();
     assert_eq!(ids(&page.messages), ["m1", "m0"], "still Alice's");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_message_changed_on_the_server_is_fetched_again() {
+    let store = cached(mailbox(1)).unwrap();
+    listing(&store, 10).await;
+    let id = MessageId::new("m0");
+    store.fetch_message(&id).await.unwrap();
+    // Changed elsewhere: its body may be new.
+    store
+        .inner()
+        .update_flags(&id, FlagsUpdate::flagged(true))
+        .await
+        .unwrap();
+    later().await;
+    listing(&store, 10).await;
+    // Gone from the server now, it can't come from the cache.
+    store.inner().delete_message(&id).await.unwrap();
+    assert!(store.fetch_message(&id).await.is_err());
 }

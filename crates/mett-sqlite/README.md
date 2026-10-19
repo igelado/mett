@@ -19,7 +19,8 @@ of each folder listed, and each message read, in a database file: mutt's
   as last seen too, so offline, a folder seen before is found, and one
   synced to the end is listed, as it was.
 - **Messages:** a message's body is kept once it is read, and goes with
-  its message. Drafts' bodies aren't kept, as drafts change.
+  its message. One that changes on the server (EWS lets bodies be edited)
+  is fetched again; drafts' bodies aren't kept, as drafts change.
 - **Changes:** flags, moves and deletions go to the server first; the
   cache follows at once, and the next sync confirms them. What mett puts
   elsewhere (a move, a copy, a draft, a sent message) makes folders sync
@@ -27,7 +28,10 @@ of each folder listed, and each message read, in a database file: mutt's
 - **Failures:** if the cache fails (a full disk, say), mett leaves it
   alone for the rest of the session and asks the server for everything.
 - **Privacy:** the cache holds mail, so its directory is created with mode
-  `0700` and its file with mode `0600`.
+  `0700` and its file with mode `0600` (an existing one is made so). A
+  directory others can write to, a symbolic link, or a database that isn't
+  mett's cache is refused. Only Unix permissions keep it private, so
+  elsewhere mett doesn't cache.
 
 A cache of another schema version is dropped and filled again: it holds
 nothing the server doesn't. A cache holds one account's mailbox: another

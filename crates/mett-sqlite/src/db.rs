@@ -279,8 +279,9 @@ impl Db {
             let mut summary = summary.clone();
             summary.modified.get_or_insert(synced_at);
             let stored = serde_json::to_string(&StoredSummary::from(&summary)).map_err(failed)?;
-            // Only a draft's body can change (Graph and EWS let only
-            // drafts' be edited): a draft's is fetched again.
+            // A message whose change date moved may have a new body (EWS
+            // lets bodies be edited), and a draft's may change without
+            // one: either is fetched again.
             tx.execute(
                 "INSERT INTO messages (id, folder, received, modified, unread, summary, seen)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
@@ -288,7 +289,8 @@ impl Db {
                     folder = excluded.folder, received = excluded.received,
                     modified = excluded.modified, unread = excluded.unread,
                     summary = excluded.summary, seen = 1,
-                    extras = CASE WHEN ?7 THEN NULL ELSE extras END",
+                    extras = CASE WHEN ?7 OR modified IS NOT excluded.modified
+                        THEN NULL ELSE extras END",
                 params![
                     summary.id.as_str(),
                     folder.as_str(),

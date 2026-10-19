@@ -144,10 +144,15 @@ fn private_file(path: &Path) -> std::io::Result<()> {
             file.set_permissions(permissions)?;
         }
     }
+    // Elsewhere, mett can't make sure only its owner can read it.
     #[cfg(not(unix))]
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
+    {
+        let _ = path;
+        return Err(std::io::Error::other(
+            "the cache can be kept private only on Unix",
+        ));
     }
+    #[cfg(unix)]
     Ok(())
 }
 
