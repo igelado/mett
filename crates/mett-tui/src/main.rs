@@ -694,6 +694,17 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     Some(_) => continue,
                 },
                 response = response_rx.recv() => match response {
+                    // A save the server throttled is tried again after the
+                    // wait it asked for: wait for it that much longer.
+                    Some(response)
+                        if matches!(response.event, worker::Event::Throttled { .. }) =>
+                    {
+                        if let worker::Event::Throttled { wait, .. } = response.event {
+                            deadline =
+                                deadline.max(tokio::time::Instant::now() + wait + SAVE_TIMEOUT);
+                        }
+                        Msg::Response(response)
+                    }
                     // Only save results matter now. Anything else (say, a
                     // late message fetch) could start new work that would
                     // never be sent.
@@ -714,6 +725,9 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     None => break,
                 },
                 Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
+                // The countdown of a throttled save goes on; other timers
+                // would start new work.
+                Some(timer @ app::Timer::Throttled(_)) = timer_rx.recv() => Msg::Timer(timer),
                 // The user may take a while to sign in; the wait only
                 // counts while they don't have to.
                 () = tokio::time::sleep_until(deadline), if app.sign_in.is_none() => break,
