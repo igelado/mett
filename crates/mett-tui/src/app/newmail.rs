@@ -180,10 +180,7 @@ impl App {
     pub(super) fn watch(&mut self) -> Vec<Effect> {
         // Checks turned off: so is the watch.
         if self.sync_interval.is_none() {
-            return match self.watching.take() {
-                Some(old) => vec![self.request(Request::Cancel(old))],
-                None => Vec::new(),
-            };
+            return self.unwatch();
         }
         if !self.can_watch
             || self.watch_retry
@@ -209,6 +206,28 @@ impl App {
         self.watched = folders;
         effects.push(watch);
         effects
+    }
+
+    /// Stops watching (say, on quitting): the watch under way ends, and
+    /// so does what the mailbox keeps on the server for it (an EWS
+    /// subscription), rather than linger there until it expires.
+    pub fn unwatch(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if let Some(old) = self.watching.take() {
+            effects.push(self.request(Request::Cancel(old)));
+        }
+        if self.can_watch && !self.watched.is_empty() {
+            self.watched.clear();
+            let unwatch = self.request(Request::Watch(Vec::new()));
+            self.unwatching = Some(effect_id(&unwatch));
+            effects.push(unwatch);
+        }
+        effects
+    }
+
+    /// Whether watching is being stopped ([`Self::unwatch`]).
+    pub fn unwatching(&self) -> bool {
+        self.unwatching.is_some()
     }
 
     /// The folders to watch: the open folder, and the `mailboxes` found.
@@ -238,6 +257,9 @@ impl App {
         id: RequestId,
         result: Option<mett_core::Result<Vec<mett_core::FolderId>>>,
     ) -> Vec<Effect> {
+        if self.unwatching == Some(id) {
+            self.unwatching = None;
+        }
         if self.watching != Some(id) {
             return Vec::new();
         }
@@ -1356,9 +1378,21 @@ mod tests {
         let (mut app, _) = app();
         let watch = app.watching.expect("watched");
         app.sync_interval = None;
-        let sent = requests(&app.watch());
-        assert!(matches!(sent[..], [(_, Request::Cancel(id))] if id == watch));
+        // The watch ends, and so does what the mailbox keeps for it.
+        let effects = app.watch();
+        let sent = requests(&effects);
+        assert!(
+            matches!(&sent[..], [(_, Request::Cancel(id)), (_, Request::Watch(f))]
+                if *id == watch && f.is_empty()),
+            "{sent:?}"
+        );
         assert!(app.watching.is_none());
+        assert!(app.unwatching());
+        // Once.
+        assert!(app.watch().is_empty());
+        let unwatch = effect_id(&effects[1]);
+        assert!(respond(&mut app, unwatch, Event::Watched(Some(Ok(Vec::new())))).is_empty());
+        assert!(!app.unwatching());
     }
 
     #[test]

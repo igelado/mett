@@ -759,6 +759,9 @@ pub struct App {
     /// which folders it watches.
     watching: Option<RequestId>,
     watched: Vec<mett_core::FolderId>,
+    /// The request ending what the mailbox keeps for watching, while it
+    /// is under way.
+    unwatching: Option<RequestId>,
     /// What a watch said changed and is still to be checked (a check under
     /// way when it said may predate the change): the open folder, and the
     /// folders of `mailboxes` (the open one among them, for its counts).
@@ -919,6 +922,7 @@ impl App {
             sidebar: Sidebar::default(),
             api: settings.api,
             watching: None,
+            unwatching: None,
             watched: Vec::new(),
             recheck_folder: false,
             recheck_mailboxes: Vec::new(),

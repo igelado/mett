@@ -131,6 +131,10 @@ fn unread(buffer: &[u8]) -> bool {
 /// changed is told.
 const BURST: Duration = Duration::from_secs(1);
 
+/// A stream closed this soon with nothing to tell was cut short: watched
+/// again at once, it could be cut again and again.
+const CUT_SHORT: Duration = Duration::from_secs(60);
+
 /// A composed message, as backends tell its attempts apart: what it answers
 /// or recalls, and its [`Draft::attempt`].
 type DraftKey = (Option<DraftOrigin>, u64);
@@ -1190,12 +1194,22 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
     /// [`WATCH_MINUTES`].
     async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
         let _watching = self.watching.lock().await;
+        if folders.is_empty() {
+            self.unsubscribed().await?;
+            return Ok(Vec::new());
+        }
         for _ in 0..2 {
             let id = self.subscribed(folders).await?;
+            let started = tokio::time::Instant::now();
             match self.stream_events(&id).await? {
                 // Part of an envelope was left unread: any folder may have
                 // changed.
                 Some((_, true)) => return Ok(folders.to_vec()),
+                Some((changed, false)) if changed.is_empty() && started.elapsed() < CUT_SHORT => {
+                    return Err(Error::Network(
+                        "EWS closed the stream of changes at once".into(),
+                    ));
+                }
                 Some((changed, false)) => return Ok(changed),
                 // Gone (expired, say): subscribe again.
                 None => {
@@ -1300,6 +1314,26 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
         .map_err(|e| Error::Backend(format!("subscribing to the folders' changes failed: {e}")))?
     }
 
+    /// Ends the subscription kept, if any, in a task of its own like
+    /// [`Self::subscribed`]'s.
+    async fn unsubscribed(&self) -> Result<()> {
+        let conn = self.conn.clone();
+        let subscription = Arc::clone(&self.subscription);
+        tokio::spawn(async move {
+            let mut subscription = subscription.lock().await;
+            match subscription.take() {
+                Some((id, _)) => conn.unsubscribe(&id).await,
+                None => Ok(()),
+            }
+        })
+        .await
+        .map_err(|e| {
+            Error::Backend(format!(
+                "unsubscribing from the folders' changes failed: {e}"
+            ))
+        })?
+    }
+
     /// Reads the events of subscription `id` until some say folders
     /// changed (those), or the server closes the stream (none), and
     /// whether part of an envelope was left unread. `None` if the
@@ -1347,7 +1381,14 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             buffer.extend_from_slice(&chunk);
             for envelope in take_envelopes(&mut buffer) {
                 told = true;
-                match read_envelope(&envelope)? {
+                // What changed was told already: an error after it, or
+                // the subscription's end, doesn't lose it.
+                let streamed = match read_envelope(&envelope) {
+                    Ok(streamed) => streamed,
+                    Err(_) if !changed.is_empty() => return Ok(Some((changed, true))),
+                    Err(e) => return Err(e),
+                };
+                match streamed {
                     Streamed::Changed(folders) => {
                         for folder in folders {
                             if !changed.contains(&folder) {
@@ -1356,7 +1397,8 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                         }
                     }
                     Streamed::Closed => return Ok(Some((changed, false))),
-                    Streamed::Unsubscribed => return Ok(None),
+                    Streamed::Unsubscribed if changed.is_empty() => return Ok(None),
+                    Streamed::Unsubscribed => return Ok(Some((changed, false))),
                 }
             }
             if !changed.is_empty() && until.is_none() {

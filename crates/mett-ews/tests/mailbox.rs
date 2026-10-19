@@ -1150,6 +1150,20 @@ fn streamed(code: &str, rest: &str) -> String {
     )
 }
 
+/// A stream telling of new mail in `folder`.
+fn new_mail(folder: &str) -> ResponseTemplate {
+    let mail = streamed(
+        "NoError",
+        &format!(
+            "<m:Notifications><m:Notification>\
+             <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"{folder}\"/>\
+             </t:NewMailEvent></m:Notification></m:Notifications>\
+             <m:ConnectionStatus>Closed</m:ConnectionStatus>"
+        ),
+    );
+    ResponseTemplate::new(200).set_body_raw(mail, "text/xml")
+}
+
 /// A subscription answered with ID `id`.
 fn subscribed(id: &str) -> ResponseTemplate {
     success(
@@ -1220,17 +1234,11 @@ async fn an_expired_subscription_is_made_again() {
         .mount(&server)
         .await;
     ews("<t:SubscriptionId>sub2</t:SubscriptionId>")
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
-            "text/xml",
-        ))
+        .respond_with(new_mail("inbox-id"))
         .mount(&server)
         .await;
-    let changed = store(&server)
-        .watch(&[FolderId::new("inbox-id")])
-        .await
-        .unwrap();
-    assert!(changed.is_empty(), "closed: watch again");
+    let inbox = [FolderId::new("inbox-id")];
+    assert_eq!(store(&server).watch(&inbox).await.unwrap(), inbox);
 }
 
 #[tokio::test]
@@ -1274,10 +1282,7 @@ async fn watching_other_folders_ends_the_old_subscription() {
         .mount(&server)
         .await;
     ews("<m:GetStreamingEvents>")
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
-            "text/xml",
-        ))
+        .respond_with(new_mail("inbox-id"))
         .mount(&server)
         .await;
     let store = store(&server);
@@ -1317,10 +1322,7 @@ async fn a_canceled_watch_keeps_the_subscription_it_made() {
         .mount(&server)
         .await;
     ews("<t:SubscriptionId>sub1</t:SubscriptionId>")
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
-            "text/xml",
-        ))
+        .respond_with(new_mail("inbox-id"))
         .mount(&server)
         .await;
     let store = store(&server);
@@ -1329,7 +1331,7 @@ async fn a_canceled_watch_keeps_the_subscription_it_made() {
     // and kept for the next watch, which makes no other.
     let canceled = tokio::time::timeout(Duration::from_millis(50), store.watch(&inbox)).await;
     assert!(canceled.is_err());
-    assert!(store.watch(&inbox).await.unwrap().is_empty());
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
 }
 
 #[tokio::test]
@@ -1422,4 +1424,86 @@ async fn changes_read_before_a_broken_stream_are_kept() {
     // changed.
     let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
     assert_eq!(store.watch(&folders).await.unwrap(), folders);
+}
+
+#[tokio::test]
+async fn a_stream_closed_at_once_is_an_error() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
+            "text/xml",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Watched again at once, it could be cut short again and again: the
+    // caller waits a while.
+    let e = store(&server)
+        .watch(&[FolderId::new("inbox-id")])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, mett_core::Error::Network(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn changes_told_before_the_subscription_ends_are_kept() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    let mail = streamed(
+        "NoError",
+        "<m:Notifications><m:Notification>\
+         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/>\
+         </t:NewMailEvent></m:Notification></m:Notifications>",
+    );
+    let gone = streamed("ErrorSubscriptionNotFound", "");
+    let busy = streamed("ErrorServerBusy", "");
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(format!("{mail}{gone}"), "text/xml"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(format!("{mail}{busy}"), "text/xml"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let inbox = FolderId::new("inbox-id");
+    let folders = [inbox.clone(), FolderId::new("work-id")];
+    // The subscription ended after the mail came: the mail is told.
+    assert_eq!(store.watch(&folders).await.unwrap(), [inbox]);
+    // An error after it: what else changed is unknown.
+    assert_eq!(store.watch(&folders).await.unwrap(), folders);
+}
+
+#[tokio::test]
+async fn watching_no_folders_ends_the_subscription() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(new_mail("inbox-id"))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    // Nothing to end yet.
+    assert!(store.watch(&[]).await.unwrap().is_empty());
+    store.watch(&[FolderId::new("inbox-id")]).await.unwrap();
+    assert!(store.watch(&[]).await.unwrap().is_empty());
+    // Ended once.
+    assert!(store.watch(&[]).await.unwrap().is_empty());
 }

@@ -208,7 +208,8 @@ Graph:
   too: EWS can send a draft without keeping a copy.
 - **New mail by push:** EWS tells mett as soon as the open folder or a
   `mailboxes` folder changes (streaming notifications), and mett checks it
-  at once; the timer's checks go on as a fallback. Graph can only push to
+  at once; the timer's checks go on as a fallback. The subscription ends
+  when checks are turned off and when mett quits. Graph can only push to
   a public web address, so with Graph mett checks on the timer only.
 - **Directory search:** `<query>` resolves names against the directory and
   the user's contacts (`ResolveNames`), rather than the People API.
