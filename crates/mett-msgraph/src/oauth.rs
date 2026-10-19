@@ -89,6 +89,29 @@ pub(crate) async fn user_principal_name(
     Ok(me.user_principal_name)
 }
 
+/// Returns the user principal name in `token`'s `upn` claim. The token is
+/// not verified: it came straight from the identity platform, over TLS.
+pub(crate) fn token_user_principal_name(token: &AccessToken) -> Result<String, FlowError> {
+    use base64::Engine;
+
+    #[derive(Deserialize)]
+    struct Claims {
+        upn: Option<String>,
+    }
+    let bad = |why: &str| FlowError::Other(format!("could not read the access token: {why}"));
+    let payload = token
+        .secret()
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| bad("it is not a JWT"))?;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .map_err(|_| bad("its claims are not base64"))?;
+    let claims: Claims =
+        serde_json::from_slice(&json).map_err(|_| bad("its claims are not JSON"))?;
+    claims.upn.ok_or_else(|| bad("it has no upn claim"))
+}
+
 /// Why a sign-in request failed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FlowError {

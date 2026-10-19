@@ -1,12 +1,19 @@
 //! Connecting to an Office365 account from the configuration: building the
-//! sign-in settings and token store from the `msgraph_*` variables
-//! (`docs/CONFIG-OFFICE365.md` §4).
+//! sign-in settings and token store from the `msgraph_*` variables, and the
+//! mailbox, through Microsoft Graph or Exchange Web Services (`use_ews`,
+//! `ews_url`) (`docs/CONFIG-OFFICE365.md` §4).
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+use mett_core::{
+    Address, Attachment, AttachmentId, Draft, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
+    Message, MessageId, MessagePage, Page, Result as PortResult, WellKnownFolder,
+};
+use mett_ews::EwsMailStore;
 use mett_msgraph::{
-    AuthFlow, AuthSettings, FileStore, GraphAuthenticator, GraphMailStore, KeyringStore,
-    TokenStore, TokenStoreError,
+    AuthFlow, AuthSettings, FileStore, GraphAuthenticator, GraphMailStore, IdentityCheck,
+    KeyringStore, TokenStore, TokenStoreError,
 };
 use url::Url;
 
@@ -14,9 +21,170 @@ use crate::config::mailbox::MailboxUrl;
 use crate::config::{Config, Value};
 use crate::signin::TuiPrompter;
 
+/// Signs in to an Office365 account, prompting through the TUI's sign-in
+/// window.
+type Auth = GraphAuthenticator<AnyStore, TuiPrompter>;
+
+/// The API an account is reached through (`use_ews`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Api {
+    /// Microsoft Graph.
+    #[default]
+    Graph,
+    /// Exchange Web Services.
+    Ews,
+}
+
+impl Api {
+    /// The API `config` chooses.
+    pub fn from_config(config: &Config) -> Self {
+        if config.flag("use_ews") {
+            Self::Ews
+        } else {
+            Self::Graph
+        }
+    }
+
+    /// Whether sending `draft` goes through a server draft, which a failed
+    /// attempt may leave behind.
+    pub fn needs_server_draft(self, draft: &Draft) -> bool {
+        match self {
+            Self::Graph => mett_msgraph::needs_server_draft(draft),
+            Self::Ews => mett_ews::needs_server_draft(draft),
+        }
+    }
+
+    /// Whether sending `draft` keeps a copy in Sent Items whatever `copy`
+    /// says: Graph always keeps one of what it sends through a server
+    /// draft.
+    pub fn always_copies(self, draft: &Draft) -> bool {
+        match self {
+            Self::Graph => mett_msgraph::needs_server_draft(draft),
+            Self::Ews => false,
+        }
+    }
+}
+
 /// An Office365 mailbox. It signs in when first used, prompting through
 /// the TUI's sign-in window.
-pub type Mailbox = GraphMailStore<GraphAuthenticator<AnyStore, TuiPrompter>>;
+pub enum Mailbox {
+    /// Through Microsoft Graph.
+    Graph(GraphMailStore<Auth>),
+    /// Through Exchange Web Services.
+    Ews(EwsMailStore<Auth>),
+}
+
+/// `$body`, with `$store` bound to the mailbox's store, whichever API it
+/// uses.
+macro_rules! either {
+    ($mailbox:expr, $store:ident => $body:expr) => {
+        match $mailbox {
+            Mailbox::Graph($store) => $body,
+            Mailbox::Ews($store) => $body,
+        }
+    };
+}
+
+impl MailStore for Mailbox {
+    async fn own_addresses(&self) -> PortResult<Vec<String>> {
+        either!(self, s => s.own_addresses().await)
+    }
+
+    async fn search_people(&self, text: &str) -> PortResult<Vec<Address>> {
+        either!(self, s => s.search_people(text).await)
+    }
+
+    async fn list_folders(&self) -> PortResult<Vec<Folder>> {
+        either!(self, s => s.list_folders().await)
+    }
+
+    async fn child_folders(&self, parent: Option<&FolderId>) -> PortResult<Vec<Folder>> {
+        either!(self, s => s.child_folders(parent).await)
+    }
+
+    async fn folder(&self, id: &FolderId) -> PortResult<Folder> {
+        either!(self, s => s.folder(id).await)
+    }
+
+    async fn recent_unread(
+        &self,
+        folder: &FolderId,
+        since: Option<DateTime<Utc>>,
+    ) -> PortResult<Vec<(MessageId, DateTime<Utc>)>> {
+        either!(self, s => s.recent_unread(folder, since).await)
+    }
+
+    async fn well_known_folder(&self, which: WellKnownFolder) -> PortResult<Folder> {
+        either!(self, s => s.well_known_folder(which).await)
+    }
+
+    async fn list_messages(&self, folder: &FolderId, page: Page) -> PortResult<MessagePage> {
+        either!(self, s => s.list_messages(folder, page).await)
+    }
+
+    async fn changed_messages(
+        &self,
+        folder: &FolderId,
+        since: DateTime<Utc>,
+        page: Page,
+    ) -> PortResult<MessagePage> {
+        either!(self, s => s.changed_messages(folder, since, page).await)
+    }
+
+    async fn fetch_message(&self, id: &MessageId) -> PortResult<Message> {
+        either!(self, s => s.fetch_message(id).await)
+    }
+
+    async fn message_folder(&self, id: &MessageId) -> PortResult<FolderId> {
+        either!(self, s => s.message_folder(id).await)
+    }
+
+    async fn list_attachments(&self, message: &MessageId) -> PortResult<Vec<Attachment>> {
+        either!(self, s => s.list_attachments(message).await)
+    }
+
+    async fn fetch_attachment(
+        &self,
+        message: &MessageId,
+        attachment: &AttachmentId,
+    ) -> PortResult<Vec<u8>> {
+        either!(self, s => s.fetch_attachment(message, attachment).await)
+    }
+
+    async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> PortResult<()> {
+        either!(self, s => s.update_flags(id, update).await)
+    }
+
+    async fn move_message(&self, id: &MessageId, to: &FolderId) -> PortResult<MessageId> {
+        either!(self, s => s.move_message(id, to).await)
+    }
+
+    async fn copy_message(&self, id: &MessageId, to: &FolderId) -> PortResult<MessageId> {
+        either!(self, s => s.copy_message(id, to).await)
+    }
+
+    async fn delete_message(&self, id: &MessageId) -> PortResult<()> {
+        either!(self, s => s.delete_message(id).await)
+    }
+
+    async fn save_draft(&self, draft: &Draft) -> PortResult<MessageId> {
+        either!(self, s => s.save_draft(draft).await)
+    }
+}
+
+impl MailSender for Mailbox {
+    async fn send(&self, draft: &Draft) -> PortResult<()> {
+        either!(self, s => s.send(draft).await)
+    }
+
+    async fn discard_kept(&self, draft: &Draft) -> PortResult<()> {
+        either!(self, s => s.discard_kept(draft).await)
+    }
+
+    fn keeps_draft(&self, draft: &Draft) -> bool {
+        either!(self, s => s.keeps_draft(draft))
+    }
+}
 
 /// The token store chosen by `msgraph_token_store`.
 pub enum AnyStore {
@@ -89,29 +257,58 @@ pub fn auth_settings(config: &Config, url: &MailboxUrl) -> Result<AuthSettings, 
             ));
         }
     };
-    settings.scopes = config
-        .string("msgraph_scopes")
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect();
-    let endpoint = config.string("msgraph_endpoint");
-    if !endpoint.is_empty() {
-        let url = Url::parse(endpoint).map_err(|e| format!("msgraph_endpoint: {e}"))?;
-        if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
-            return Err(format!(
-                "msgraph_endpoint: {endpoint:?} is not an http(s) URL"
-            ));
+    match Api::from_config(config) {
+        Api::Graph => {
+            settings.scopes = config
+                .string("msgraph_scopes")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
         }
-        // The access token and mail travel to this endpoint, so it must be
-        // encrypted; plain HTTP is only for local test servers.
-        if url.scheme() == "http" && !is_loopback(&url) {
-            return Err(format!(
-                "msgraph_endpoint: {endpoint:?} must use https (http is only allowed on this machine)"
-            ));
+        // EWS takes one scope, of the cloud's Exchange Online. Graph doesn't
+        // take its tokens, so they tell who signed in themselves.
+        Api::Ews => {
+            settings.scopes = vec![
+                format!("{}EWS.AccessAsUser.All", settings.cloud.exchange_url()),
+                "offline_access".into(),
+            ];
+            settings.identity = IdentityCheck::AccessToken;
         }
-        settings.graph_url = Some(url);
     }
+    settings.graph_url = endpoint(config, "msgraph_endpoint")?;
     Ok(settings)
+}
+
+/// The endpoint the variable `name` sets, if any. The access token and
+/// mail travel to it, so it must use HTTPS; plain HTTP is only for local
+/// test servers.
+fn endpoint(config: &Config, name: &str) -> Result<Option<Url>, String> {
+    let endpoint = config.string(name);
+    if endpoint.is_empty() {
+        return Ok(None);
+    }
+    let url = Url::parse(endpoint).map_err(|e| format!("{name}: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+        return Err(format!("{name}: {endpoint:?} is not an http(s) URL"));
+    }
+    if url.scheme() == "http" && !is_loopback(&url) {
+        return Err(format!(
+            "{name}: {endpoint:?} must use https (http is only allowed on this machine)"
+        ));
+    }
+    Ok(Some(url))
+}
+
+/// The EWS endpoint: `ews_url`, or Exchange Online's in the account's
+/// cloud.
+pub fn ews_url(config: &Config, settings: &AuthSettings) -> Result<Url, String> {
+    Ok(endpoint(config, "ews_url")?.unwrap_or_else(|| {
+        settings
+            .cloud
+            .exchange_url()
+            .join("EWS/Exchange.asmx")
+            .expect("static path is valid")
+    }))
 }
 
 /// Whether `url` points at this machine.
@@ -163,7 +360,15 @@ pub fn mailbox(
         Arc::new(store),
         prompter,
     ));
-    Ok(GraphMailStore::new(http, &settings, auth))
+    Ok(match Api::from_config(config) {
+        Api::Graph => Mailbox::Graph(GraphMailStore::new(http, &settings, auth)),
+        Api::Ews => Mailbox::Ews(EwsMailStore::new(
+            http,
+            ews_url(config, &settings)?,
+            url.account.clone(),
+            auth,
+        )),
+    })
 }
 
 #[cfg(test)]
@@ -243,6 +448,58 @@ mod tests {
             ));
             assert!(auth_settings(&config, &url()).is_ok(), "{local}");
         }
+    }
+
+    #[test]
+    fn ews_asks_for_exchange_online_and_trusts_its_token() {
+        let config = config("set msgraph_client_id=abc use_ews msgraph_cloud=usgov\n");
+        let settings = auth_settings(&config, &url()).unwrap();
+        assert_eq!(
+            settings.scopes,
+            [
+                "https://outlook.office365.us/EWS.AccessAsUser.All",
+                "offline_access"
+            ]
+        );
+        assert_eq!(settings.identity, IdentityCheck::AccessToken);
+        assert_eq!(
+            ews_url(&config, &settings).unwrap().as_str(),
+            "https://outlook.office365.us/EWS/Exchange.asmx"
+        );
+        let graph = auth_settings(&self::config("set msgraph_client_id=abc\n"), &url()).unwrap();
+        assert_eq!(graph.identity, IdentityCheck::Graph);
+    }
+
+    #[test]
+    fn ews_url_overrides_the_endpoint() {
+        let settings = |s: &str| {
+            let config = config(s);
+            let auth = auth_settings(&config, &url()).unwrap();
+            ews_url(&config, &auth)
+        };
+        assert_eq!(
+            settings("set msgraph_client_id=a use_ews ews_url=https://mail.contoso.com/EWS/Exchange.asmx\n")
+                .unwrap()
+                .as_str(),
+            "https://mail.contoso.com/EWS/Exchange.asmx"
+        );
+        assert!(
+            settings("set msgraph_client_id=a ews_url=http://mail.contoso.com/\n")
+                .unwrap_err()
+                .contains("ews_url")
+        );
+    }
+
+    #[test]
+    fn only_graph_always_copies() {
+        let reply = Draft {
+            origin: Some(mett_core::DraftOrigin::Reply(MessageId::new("m"))),
+            ..Draft::default()
+        };
+        assert!(Api::Graph.always_copies(&reply));
+        assert!(!Api::Ews.always_copies(&reply));
+        assert!(Api::Ews.needs_server_draft(&reply));
+        assert!(!Api::Ews.needs_server_draft(&Draft::default()));
     }
 
     #[test]

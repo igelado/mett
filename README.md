@@ -42,6 +42,10 @@ management are still to come.
 `cargo run -p mett-tui -- --demo` shows the interface on a sample mailbox
 without an account.
 
+To reach the account through Exchange Web Services instead of Microsoft
+Graph, `set use_ews`; see
+[crates/mett-ews/README.md](crates/mett-ews/README.md).
+
 ## Documentation
 
 - [docs/DESIGN.md](docs/DESIGN.md): architecture and design patterns.

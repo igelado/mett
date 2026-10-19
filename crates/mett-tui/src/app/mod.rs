@@ -106,6 +106,9 @@ pub struct Settings {
     pub query: QuerySettings,
     /// The sidebar's settings.
     pub sidebar: SidebarSettings,
+    /// The API the account is reached through. Like the account, it stays
+    /// as mett started.
+    pub api: crate::account::Api,
 }
 
 /// mutt's `spoolfile`, `mbox` and `record`, as set: the mailboxes that
@@ -140,6 +143,7 @@ impl Default for Settings {
             alias_file: None,
             query: QuerySettings::default(),
             sidebar: SidebarSettings::default(),
+            api: crate::account::Api::default(),
         }
     }
 }
@@ -728,6 +732,8 @@ pub struct App {
     listed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The sidebar.
     sidebar: Sidebar,
+    /// The API the account is reached through.
+    api: crate::account::Api,
 }
 
 impl App {
@@ -866,6 +872,7 @@ impl App {
             poll_epoch: 0,
             listed_at: None,
             sidebar: Sidebar::default(),
+            api: settings.api,
         };
         app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();

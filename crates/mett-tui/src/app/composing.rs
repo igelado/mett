@@ -661,14 +661,16 @@ impl App {
     /// Sends the compose menu's message, asking first whether to keep a
     /// copy (`copy`). Graph always keeps a copy of what it sends through a
     /// server draft (replies, forwards, messages with large attachments),
-    /// so `copy` only applies to other mail.
+    /// so there `copy` only applies to other mail.
     fn send_or_ask_copy(&mut self) -> Vec<Effect> {
         let Some(Screen::Compose(compose)) = self.screens.last() else {
             return Vec::new();
         };
         // A server draft kept from an earlier attempt is what is sent,
         // even if the message would now go without one.
-        if mett_msgraph::needs_server_draft(&compose.draft) || compose.kept_draft {
+        if self.api.always_copies(&compose.draft)
+            || (compose.kept_draft && self.api == crate::account::Api::Graph)
+        {
             return self.answer(Question::Copy, true);
         }
         let prompt = "Save a copy of this message?";
@@ -904,7 +906,7 @@ impl App {
                 }
                 // Replies, forwards and messages with large attachments go
                 // through a server draft, as does one the store kept.
-                compose.left_draft |= kept || mett_msgraph::needs_server_draft(&compose.draft);
+                compose.left_draft |= kept || self.api.needs_server_draft(&compose.draft);
                 // A lost response doesn't mean nothing happened.
                 let failure = match (delivery, &e) {
                     (Some(Delivery::Send), mett_core::Error::Network(_)) if saved_copy => format!(

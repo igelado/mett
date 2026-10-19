@@ -357,6 +357,7 @@ fn settings_keeping(
         page_size,
         mailboxes,
         sidebar,
+        api: account::Api::from_config(config),
         display,
         ordering,
         sync_interval,
@@ -1144,7 +1145,7 @@ fn run_command(
             changed
                 .iter()
                 .filter(|name| {
-                    name.starts_with("msgraph_")
+                    (name.starts_with("msgraph_") || ["use_ews", "ews_url"].contains(*name))
                         && ![
                             "msgraph_page_size",
                             "msgraph_sync_interval",
