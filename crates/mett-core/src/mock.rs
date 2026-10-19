@@ -520,7 +520,8 @@ impl MailStore for MemoryStore {
         }
         store.folder(folder)?;
         store.syncs += 1;
-        let epoch = store.sync_epoch.to_string();
+        // A state is only good for its own folder, from this epoch.
+        let epoch = format!("{} {folder}", store.sync_epoch);
         let mut before: HashMap<&str, &str> = HashMap::new();
         if let Some(state) = state {
             let mut lines = state.as_str().lines();
@@ -713,12 +714,19 @@ mod tests {
         assert_eq!(changed, ["m1"]);
         assert_eq!(some.removed, [MessageId::new("m2")]);
 
+        // Another folder's state is no good here.
+        assert!(matches!(
+            store
+                .sync_folder(&FolderId::new("arc"), Some(&some.state))
+                .await,
+            Err(Error::StaleSync)
+        ));
         store.forget_syncs();
         assert!(matches!(
             store.sync_folder(&inbox, Some(&some.state)).await,
             Err(Error::StaleSync)
         ));
-        assert_eq!(store.syncs(), 4);
+        assert_eq!(store.syncs(), 5);
     }
 
     fn store() -> MemoryStore {

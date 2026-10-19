@@ -909,19 +909,24 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             state: SyncState::new(String::new()),
             more: page.next_link.is_some(),
         };
-        for entry in page.value {
-            let removed = entry.get("@removed").is_some();
-            let message: GraphMessage = match serde_json::from_value(entry.clone()) {
-                Ok(message) if !removed => message,
-                _ => {
-                    let id = entry
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| Error::Backend("delta entry without an id".into()))?;
-                    changes.removed.push(MessageId::new(id));
-                    continue;
-                }
-            };
+        for mut entry in page.value {
+            if entry.get("@removed").is_some() {
+                let id = entry
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::Backend("delta entry without an id".into()))?;
+                changes.removed.push(MessageId::new(id));
+                continue;
+            }
+            // Delta entries are in the folder synced, whether or not they
+            // say so.
+            if let Some(fields) = entry.as_object_mut() {
+                fields
+                    .entry("parentFolderId")
+                    .or_insert_with(|| serde_json::Value::from(folder.as_str()));
+            }
+            let message: GraphMessage = serde_json::from_value(entry)
+                .map_err(|e| Error::Backend(format!("unexpected delta entry from Graph: {e}")))?;
             changes.changed.push(message.into_summary()?);
         }
         let link = page

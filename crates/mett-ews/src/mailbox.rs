@@ -1050,7 +1050,10 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
             .into_iter()
             .next()
             .ok_or_else(|| unexpected("SyncFolderItems", "no response"))?;
-        if response_code(message) == "ErrorInvalidSyncStateData" {
+        if matches!(
+            response_code(message).as_str(),
+            "ErrorInvalidSyncStateData" | "ErrorSyncStateNotFound"
+        ) {
             return Err(Error::StaleSync);
         }
         check(message, about)?;

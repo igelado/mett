@@ -1090,14 +1090,16 @@ async fn a_sync_goes_on_from_its_state() {
 
 #[tokio::test]
 async fn a_stale_sync_state_starts_over() {
-    let server = MockServer::start().await;
-    ews("<m:SyncFolderItems>")
-        .respond_with(failure("SyncFolderItems", "ErrorInvalidSyncStateData"))
-        .mount(&server)
-        .await;
-    let e = store(&server)
-        .sync_folder(&FolderId::new("inbox-id"), Some(&SyncState::new("old")))
-        .await
-        .unwrap_err();
-    assert!(matches!(e, Error::StaleSync), "{e:?}");
+    for code in ["ErrorInvalidSyncStateData", "ErrorSyncStateNotFound"] {
+        let server = MockServer::start().await;
+        ews("<m:SyncFolderItems>")
+            .respond_with(failure("SyncFolderItems", code))
+            .mount(&server)
+            .await;
+        let e = store(&server)
+            .sync_folder(&FolderId::new("inbox-id"), Some(&SyncState::new("old")))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::StaleSync), "{code}: {e:?}");
+    }
 }

@@ -2858,6 +2858,12 @@ async fn syncs_a_folder_with_delta_links() {
             "value": [
                 message("m2", "2026-10-14T11:00:00Z"),
                 { "id": "m0", "@removed": { "reason": "deleted" } },
+                // An entry that leaves out its folder is in this one.
+                {
+                    "id": "m3",
+                    "subject": "Partial",
+                    "sentDateTime": "2026-10-14T12:00:00Z",
+                },
             ],
             "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/inbox-id/messages/delta?$deltatoken=d1"),
         })))
@@ -2871,6 +2877,7 @@ async fn syncs_a_folder_with_delta_links() {
     assert!(first.more);
     let second = store.sync_folder(&inbox, Some(&first.state)).await.unwrap();
     assert_eq!(second.changed[0].id, MessageId::new("m2"));
+    assert_eq!(second.changed[1].folder, inbox);
     assert_eq!(second.removed, [MessageId::new("m0")]);
     assert!(!second.more);
     assert!(second.state.as_str().ends_with("$deltatoken=d1"));
