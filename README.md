@@ -27,12 +27,12 @@ for x86_64 and aarch64:
   nothing else.
 
 To build from source, use `cargo install --path crates/mett-tui`.
-[docs/RELEASING.md](docs/RELEASING.md) explains how releases are made.
+[docs/RELEASING.md](https://git.gelado.org/igelado/mett/src/branch/main/docs/RELEASING.md) explains how releases are made.
 
 ## Quick start
 
 1. Register an app for mett in Microsoft Entra ID; see
-   [crates/mett-msgraph/README.md](crates/mett-msgraph/README.md#1-register-an-app).
+   [mett-msgraph's README](https://git.gelado.org/igelado/mett/src/branch/main/crates/mett-msgraph/README.md#1-register-an-app).
 2. Create `~/.config/mett/mettrc`:
 
    ```muttrc
@@ -43,32 +43,33 @@ To build from source, use `cargo install --path crates/mett-tui`.
    set office365_client_id = <your app's client ID>
    ```
 
-3. Run mett. The first time, it opens your browser to sign in and shows the
-   sign-in link in a window, in case the browser doesn't open (use
-   `set office365_auth_flow = device-code` over SSH, and mett shows a code to
-   enter instead):
+3. Run `mett` (installed from a package), or `cargo run -p mett-tui` (in a
+   checkout of the source). The first time, it opens your browser to sign
+   in and shows the sign-in link in a window, in case the browser doesn't
+   open (use `set office365_auth_flow = device-code` over SSH, and mett shows
+   a code to enter instead).
 
-   ```sh
-   cargo run -p mett-tui
-   ```
-
-`cargo run -p mett-tui -- --demo` shows the interface on a sample mailbox
-without an account.
+`mett --demo` shows the interface on a sample mailbox without an account.
 
 To reach the account through Exchange Web Services instead of Microsoft
 Graph, `set use_ews`; see
-[crates/mett-ews/README.md](crates/mett-ews/README.md).
+[mett-ews's README](https://git.gelado.org/igelado/mett/src/branch/main/crates/mett-ews/README.md).
 
 ## Documentation
 
-- [docs/DESIGN.md](docs/DESIGN.md): architecture and design patterns.
-- [docs/CONFIG-OFFICE365.md](docs/CONFIG-OFFICE365.md): configuring mett.
-- [docs/MUTTRC.md](docs/MUTTRC.md): the mutt configuration format mett
-  builds on.
-- [docs/RELEASING.md](docs/RELEASING.md): how releases are made.
+The packages install `CONFIG-OFFICE365.md` and `MUTTRC.md` in
+`/usr/share/doc/mett/`. In the source:
+
+- [docs/DESIGN.md](https://git.gelado.org/igelado/mett/src/branch/main/docs/DESIGN.md): architecture and design patterns.
+- [docs/CONFIG-OFFICE365.md](https://git.gelado.org/igelado/mett/src/branch/main/docs/CONFIG-OFFICE365.md): configuring
+  mett.
+- [docs/MUTTRC.md](https://git.gelado.org/igelado/mett/src/branch/main/docs/MUTTRC.md): the mutt configuration format
+  mett builds on.
+- [docs/RELEASING.md](https://git.gelado.org/igelado/mett/src/branch/main/docs/RELEASING.md): how releases are made.
 - Each crate's `README.md` explains what it does and how to test it.
 
 ## License
 
-mett is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
-or [MIT license](LICENSE-MIT), at your option.
+mett is licensed under either of
+[Apache License, Version 2.0](https://git.gelado.org/igelado/mett/src/branch/main/LICENSE-APACHE) or
+[MIT license](https://git.gelado.org/igelado/mett/src/branch/main/LICENSE-MIT), at your option.

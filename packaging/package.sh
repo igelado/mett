@@ -28,6 +28,8 @@ SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 export SOURCE_DATE_EPOCH
 dist=$root/dist
 work=$root/target/packaging
+# Only this build's packages are in dist/, to sum and publish.
+rm -rf "$dist"
 mkdir -p "$dist"
 
 for tool in cargo-zigbuild dpkg-deb bsdtar zstd gzip sha256sum; do
@@ -39,7 +41,8 @@ done
 deb_version=$(echo "$version" | sed 's/-/~/')-$release
 arch_version=$(echo "$version" | sed 's/-//')
 
-# Copies the files every package installs below $1.
+# Copies the files every package installs below $1. The README links to
+# the rest of the documentation online.
 install_files() {
     install -Dm755 "$binary" "$1/usr/bin/mett"
     for doc in README.md docs/CONFIG-OFFICE365.md docs/MUTTRC.md; do
