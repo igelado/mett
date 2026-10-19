@@ -262,8 +262,9 @@ impl<S: MailStore> CachedStore<S> {
             }
         };
         let mut lost = 0;
-        // How many of the folder's messages are here, once counted.
-        let mut here: Option<u64> = None;
+        // How many of the folder's messages are here, once counted, and how
+        // many changes mett had made then.
+        let mut here: Option<(u64, u64)> = None;
         loop {
             let changes = match self.inner.sync_folder(folder, state.as_ref()).await {
                 // The server forgot where the sync stood: start over,
@@ -309,17 +310,23 @@ impl<S: MailStore> CachedStore<S> {
             // however often it is cut short and taken up again. Counted
             // once, for a sync of more than one batch (a quick one has
             // nothing to tell), then kept up batch by batch.
+            // A change mett made meanwhile (a message deleted, say) means
+            // counting again. (Another mett's isn't seen: the count, only
+            // told, may then be off by as much until the sync ends.)
             if let Some(progress) = &self.progress
                 && (changes.more || here.is_some())
             {
+                let writes = self.writes.load(Ordering::SeqCst);
                 let now = match here {
-                    Some(here) => Some(here.saturating_add_signed(more_here)),
-                    None => self.with_cache(|db| db.count(folder)).ok(),
+                    Some((here, then)) if then == writes => {
+                        Some(here.saturating_add_signed(more_here))
+                    }
+                    _ => self.with_cache(|db| db.count(folder)).ok(),
                 };
                 if let Some(now) = now {
                     progress(folder, now);
                 }
-                here = now;
+                here = now.map(|now| (now, writes));
             }
             let FolderChanges {
                 state: next, more, ..
