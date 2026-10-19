@@ -39,7 +39,8 @@ The packages install `/usr/bin/mett` and the documentation in
    ```
 
 3. The `release` workflow checks that the tag is the version in
-   `Cargo.toml`, builds the packages, and publishes them as the tag's
+   `Cargo.toml` and that it is on `main` (only what was merged is
+   released), builds the packages, and publishes them as the tag's
    release on Forgejo (https://git.gelado.org/igelado/mett/releases). A
    version with a pre-release part (`v0.2.0-rc.1`) is published as a
    pre-release.

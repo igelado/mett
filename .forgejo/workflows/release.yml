@@ -21,6 +21,9 @@ jobs:
           apt-get update && apt-get install -y --no-install-recommends
           nodejs python3-pip libarchive-tools zstd jq
       - uses: https://code.forgejo.org/actions/checkout@v4
+        with:
+          # The whole history, to tell whether the tag is on main.
+          fetch-depth: 0
       - uses: https://code.forgejo.org/actions/cache@v4
         with:
           path: |
@@ -40,6 +43,18 @@ jobs:
           version=$(packaging/version.sh)
           if [ "$TAG" != "v$version" ]; then
             echo "tag $TAG doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+      # Only what was merged (reviewed, checked) is released.
+      - name: The tag is on main
+        if: forgejo.event_name == 'push'
+        env:
+          TAG: ${{ forgejo.ref_name }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$TAG^{commit}" FETCH_HEAD; then
+            echo "tag $TAG isn't on main: tag the merge on main"
             exit 1
           fi
       - run: packaging/package.sh x86_64 aarch64

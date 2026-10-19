@@ -162,7 +162,7 @@ for arch in "$@"; do
     target=$arch-unknown-linux-musl
     echo "Building mett $version for $arch"
     cargo zigbuild --release --locked -p mett-tui --target "$target"
-    binary=target/$target/release/mett
+    binary=${CARGO_TARGET_DIR:-target}/$target/release/mett
     deb
     pacman
     tarball
