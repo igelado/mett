@@ -1,7 +1,7 @@
 //! The variables mett knows, with their types and defaults.
 //!
-//! These are the mutt variables mett uses and the `msgraph_*` variables
-//! from `docs/CONFIG-OFFICE365.md` §4. Unknown variables produce a warning,
+//! These are the mutt variables mett uses and the `msgraph_*`, `use_ews`
+//! and `ews_url` variables from `docs/CONFIG-OFFICE365.md` §4. Unknown variables produce a warning,
 //! not an error (principle 4 of that document).
 
 use std::fmt;
@@ -133,6 +133,7 @@ pub const VARS: &[Var] = &[
     ),
     var("delete", Kind::Quad, "ask-yes"),
     var("editor", Kind::Path, ""),
+    var("ews_url", Kind::String, ""),
     var("fast_reply", Kind::Bool, "no"),
     var("folder", Kind::Path, "~/Mail"),
     var("forward_format", Kind::String, "[%a: %s]"),
@@ -201,6 +202,7 @@ pub const VARS: &[Var] = &[
     var("timeout", Kind::Number, "600"),
     var("tmpdir", Kind::Path, ""),
     var("trash", Kind::Path, ""),
+    var("use_ews", Kind::Bool, "no"),
     var("use_from", Kind::Bool, "yes"),
     var("wrap", Kind::Number, "0"),
 ];

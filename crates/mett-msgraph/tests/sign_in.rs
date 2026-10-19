@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use mett_core::{AccountId, Authenticator, Error};
 use mett_msgraph::{
-    AuthFlow, AuthSettings, Cancelled, GraphAuthenticator, MemoryStore, Prompter, SignInPrompt,
-    TokenStore,
+    AuthFlow, AuthSettings, Cancelled, GraphAuthenticator, IdentityCheck, MemoryStore, Prompter,
+    SignInPrompt, TokenStore,
 };
 use serde_json::json;
 use url::Url;
@@ -1281,4 +1281,73 @@ async fn concurrent_retries_share_a_failed_confirmation() {
     let (a, b) = tokio::join!(auth.access_token(), auth.access_token());
     assert!(a.is_err() && b.is_err());
     assert_eq!(*outcomes.0.lock().unwrap(), [false, false]);
+}
+
+/// An unsigned JWT whose claims are `claims`, as the identity platform
+/// issues for resources other than Graph.
+fn jwt(claims: serde_json::Value) -> String {
+    use base64::Engine;
+
+    let part = |value: &serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+    };
+    format!("{}.{}.sig", part(&json!({"alg": "none"})), part(&claims))
+}
+
+/// Settings that confirm the user from the access token, not Graph.
+fn token_identity(server: &MockServer) -> AuthSettings {
+    AuthSettings {
+        identity: IdentityCheck::AccessToken,
+        ..settings(server, AuthFlow::DeviceCode)
+    }
+}
+
+#[tokio::test]
+async fn confirms_the_user_from_the_access_token_when_asked() {
+    let server = MockServer::start().await;
+    let access = jwt(json!({"upn": "Alice@contoso.com"}));
+    token_request("grant_type=refresh_token")
+        .respond_with(tokens(&access, "r1"))
+        .mount(&server)
+        .await;
+    let store = store_with("r0");
+    let auth = authenticator(token_identity(&server), &store, no_prompts());
+    assert_eq!(auth.access_token().await.unwrap().secret(), access);
+    assert_eq!(stored(&store).as_deref(), Some("r1"));
+    // Graph was never asked.
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().all(|r| r.url.path() != "/v1.0/me"));
+}
+
+#[tokio::test]
+async fn rejects_an_access_token_for_another_user() {
+    let server = MockServer::start().await;
+    device_sign_in(&server, &jwt(json!({"upn": "mallory@contoso.com"}))).await;
+    let store = Arc::new(MemoryStore::default());
+    let auth = authenticator(token_identity(&server), &store, |_| {});
+    let err = auth.access_token().await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Auth(msg) if msg.contains("signed in as mallory@contoso.com")),
+        "{err}"
+    );
+    assert_eq!(stored(&store), None);
+}
+
+#[tokio::test]
+async fn an_access_token_without_a_user_is_not_trusted() {
+    let server = MockServer::start().await;
+    for access in [jwt(json!({"name": "Alice"})), "opaque".to_owned()] {
+        token_request("grant_type=refresh_token")
+            .respond_with(tokens(&access, "r1"))
+            .mount(&server)
+            .await;
+        let store = store_with("r0");
+        let auth = authenticator(token_identity(&server), &store, no_prompts());
+        let err = auth.access_token().await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Auth(msg) if msg.contains("could not confirm")),
+            "{err}"
+        );
+        server.reset().await;
+    }
 }

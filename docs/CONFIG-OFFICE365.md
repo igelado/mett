@@ -8,9 +8,11 @@ through the spoolfile's account and postpones it to that account's Drafts
 (§5.2, without `record` and `postponed`). Folders of that account can be
 opened, browsed, and used to save or copy messages, and purged messages go
 to `trash` (§6). The open folder and the `mailboxes` of that account are
-checked for new mail every `msgraph_sync_interval` seconds (§4.4). The
+checked for new mail every `msgraph_sync_interval` seconds (§4.5). The
 index, pager and status bar follow `index_format`, `pager_format` and
 `status_format`, and `color` and `mono` set the colors.
+With `use_ews`, the account is reached through Exchange Web Services
+instead of Microsoft Graph (§4.4).
 Everything else is still a proposal.
 
 This document proposes how mett is configured. mett adopts the muttrc
@@ -24,7 +26,8 @@ needed to use an Office365 account through Microsoft Graph.
    as in mutt. Users can reuse most of an existing muttrc.
 2. **Extend, don't fork.** New behaviour is added through:
    - a new mailbox URL scheme (§3),
-   - new variables with a `msgraph_` prefix (§4),
+   - new variables with a `msgraph_` prefix, or `ews_` for Exchange Web
+     Services (§4),
    - new meanings for existing mutt concepts where they map naturally (§6).
 
    No new commands are added unless no existing mechanism fits.
@@ -111,9 +114,11 @@ mailboxes     =@inbox =@inbox/@focused "=Inbox/Projects/mett"
 
 ## 4. New variables
 
-All new variables use the `msgraph_` prefix, following the `imap_`/`smtp_`
-convention. Like other mutt variables, they can be set per account from an
-`account-hook`.
+New variables are prefixed with the protocol they configure, following the
+`imap_`/`smtp_` convention: `msgraph_` for Microsoft Graph and the sign-in
+(which Exchange Web Services share), `ews_` for Exchange Web Services. The
+switch between the two is `use_ews`, like mutt's `use_*` switches. Like
+other mutt variables, they can be set per account from an `account-hook`.
 
 ### 4.1 Application and tenant
 
@@ -170,7 +175,38 @@ instructions and troubleshooting.
 | `msgraph_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. `file` is supported only on Unix, where file permissions keep the tokens private. |
 | `msgraph_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. Several accounts may share one file; each keeps its own token. |
 
-### 4.4 Behaviour
+### 4.4 Exchange Web Services
+
+mett reaches an account through Microsoft Graph unless `use_ews` is set,
+in which case it uses Exchange Web Services (EWS) instead
+([crates/mett-ews](../crates/mett-ews/README.md)). The account is still
+named by a `msgraph://` URL, and signs in with the same app registration
+and the §4.1–4.3 variables, except `msgraph_scopes` and
+`msgraph_endpoint`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `use_ews` | boolean | `no` | Reach the account through EWS. mett then asks for the delegated Exchange Online permission `EWS.AccessAsUser.All` (and `offline_access`) of the cloud's Exchange Online, instead of `msgraph_scopes`, and confirms who signed in from the access token's `upn` claim, as Graph doesn't take EWS tokens. |
+| `ews_url` | string | *(Exchange Online's, from `msgraph_cloud`)* | The EWS endpoint, for example `https://outlook.office365.com/EWS/Exchange.asmx`. Must be `https`, except on this machine. |
+
+`use_ews` and `ews_url` take effect when mett starts. Differences from
+Graph:
+
+- **Folders:** EWS has no name for Outlook's Archive folder, so `@archive`
+  can't be opened; the other well-known folders work. Folders below one are
+  listed by name.
+- **Sending:** replies, forwards and messages with attachments go through a
+  server draft (Exchange takes attachments only on a saved message), as
+  does a message from another `From:` address without a copy (Exchange
+  doesn't send one for a delegate in one request). `copy` applies to them
+  too: EWS can send a draft without keeping a copy.
+- **Directory search:** `<query>` resolves names against the directory and
+  the user's contacts (`ResolveNames`), rather than the People API.
+- **Retirement:** Microsoft is retiring EWS in Exchange Online, starting in
+  October 2026. Tenants may have it turned off; Graph is the default for that
+  reason.
+
+### 4.5 Behaviour
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|

@@ -70,6 +70,18 @@ impl Cloud {
         };
         Url::parse(url).expect("static URL is valid")
     }
+
+    /// The Exchange Online resource, which hosts Exchange Web Services and
+    /// prefixes their scope (`EWS.AccessAsUser.All`).
+    pub fn exchange_url(self) -> Url {
+        let url = match self {
+            Self::Global => "https://outlook.office365.com/",
+            Self::UsGov => "https://outlook.office365.us/",
+            Self::UsGovDod => "https://webmail.apps.mil/",
+            Self::China => "https://partner.outlook.cn/",
+        };
+        Url::parse(url).expect("static URL is valid")
+    }
 }
 
 impl fmt::Display for Cloud {
@@ -113,6 +125,18 @@ impl Default for AuthFlow {
     }
 }
 
+/// How the authenticator confirms which user a sign-in was for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdentityCheck {
+    /// Microsoft Graph's `/me` says (it needs `User.Read`).
+    #[default]
+    Graph,
+    /// The access token's `upn` claim says. For tokens that Graph doesn't
+    /// take, such as those for Exchange Web Services; the token comes
+    /// straight from the identity platform, so its claims can be trusted.
+    AccessToken,
+}
+
 /// Everything needed to sign in to one account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthSettings {
@@ -128,6 +152,8 @@ pub struct AuthSettings {
     pub flow: AuthFlow,
     /// `msgraph_scopes`, unqualified (for example `Mail.Read`).
     pub scopes: Vec<String>,
+    /// How to confirm the user a sign-in was for.
+    pub identity: IdentityCheck,
     /// Overrides the login endpoint of [`AuthSettings::cloud`]. Used by tests.
     pub login_url: Option<Url>,
     /// Overrides the Graph endpoint of [`AuthSettings::cloud`]. Used by tests.
@@ -144,6 +170,7 @@ impl AuthSettings {
             cloud: Cloud::default(),
             flow: AuthFlow::default(),
             scopes: DEFAULT_SCOPES.iter().map(|s| (*s).to_owned()).collect(),
+            identity: IdentityCheck::default(),
             login_url: None,
             graph_url: None,
         }
@@ -268,6 +295,21 @@ mod tests {
         assert_eq!(
             s.graph_api("me").as_str(),
             "https://microsoftgraph.chinacloudapi.cn/v1.0/me"
+        );
+    }
+
+    #[test]
+    fn qualified_scopes_are_kept() {
+        let s = AuthSettings {
+            scopes: vec![
+                format!("{}EWS.AccessAsUser.All", Cloud::Global.exchange_url()),
+                "offline_access".into(),
+            ],
+            ..settings()
+        };
+        assert_eq!(
+            s.scope_param(),
+            "https://outlook.office365.com/EWS.AccessAsUser.All offline_access"
         );
     }
 

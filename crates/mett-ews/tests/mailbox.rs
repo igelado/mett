@@ -1,0 +1,1003 @@
+//! EwsMailStore against a mock Exchange Web Services endpoint.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use chrono::{DateTime, TimeDelta, Utc};
+use mett_core::{
+    AccessToken, Address, AttachmentKind, Authenticator, BodyKind, Draft, DraftOrigin, Error,
+    FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page,
+    WellKnownFolder,
+};
+use mett_ews::EwsMailStore;
+use url::Url;
+use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::{Mock, MockBuilder, MockServer, Request, ResponseTemplate};
+
+/// Hands out a fixed token.
+struct StaticAuth;
+
+impl Authenticator for StaticAuth {
+    async fn access_token(&self) -> mett_core::Result<AccessToken> {
+        Ok(AccessToken::new("tok", Utc::now() + TimeDelta::hours(1)))
+    }
+}
+
+const ENDPOINT: &str = "/EWS/Exchange.asmx";
+
+fn store(server: &MockServer) -> EwsMailStore<StaticAuth> {
+    store_with(server, Arc::new(StaticAuth))
+}
+
+fn store_with<A: Authenticator>(server: &MockServer, auth: Arc<A>) -> EwsMailStore<A> {
+    let url = Url::parse(&format!("{}{ENDPOINT}", server.uri())).unwrap();
+    EwsMailStore::new(
+        reqwest::Client::new(),
+        url,
+        "alice@contoso.com".into(),
+        auth,
+    )
+}
+
+/// Calls of the EWS operation whose request contains `text`.
+fn ews(text: &str) -> MockBuilder {
+    Mock::given(method("POST"))
+        .and(path(ENDPOINT))
+        .and(body_string_contains(text))
+}
+
+/// A successful response holding `body` (the operation's response
+/// element).
+fn soap(body: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_raw(
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+             <s:Body xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\" \
+             xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">{body}\
+             </s:Body></s:Envelope>"
+        ),
+        "text/xml; charset=utf-8",
+    )
+}
+
+/// A response of `operation` with `messages` (response message bodies).
+fn responses(operation: &str, messages: &[String]) -> ResponseTemplate {
+    let messages: String = messages
+        .iter()
+        .map(|m| {
+            format!(
+                "<m:{operation}ResponseMessage ResponseClass=\"Success\">\
+                 <m:ResponseCode>NoError</m:ResponseCode>{m}</m:{operation}ResponseMessage>"
+            )
+        })
+        .collect();
+    soap(&format!(
+        "<m:{operation}Response><m:ResponseMessages>{messages}</m:ResponseMessages>\
+         </m:{operation}Response>"
+    ))
+}
+
+/// A response of `operation` with one successful message holding `body`.
+fn success(operation: &str, body: &str) -> ResponseTemplate {
+    responses(operation, &[body.to_owned()])
+}
+
+/// A response of `operation` that failed with `code`.
+fn failure(operation: &str, code: &str) -> ResponseTemplate {
+    soap(&format!(
+        "<m:{operation}Response><m:ResponseMessages>\
+         <m:{operation}ResponseMessage ResponseClass=\"Error\">\
+         <m:MessageText>It failed.</m:MessageText><m:ResponseCode>{code}</m:ResponseCode>\
+         </m:{operation}ResponseMessage></m:ResponseMessages></m:{operation}Response>"
+    ))
+}
+
+/// The folder roles: the root and the Inbox; the other well-known folders
+/// are missing.
+fn roles() -> ResponseTemplate {
+    let found =
+        |id: &str| format!("<m:Folders><t:Folder><t:FolderId Id=\"{id}\"/></t:Folder></m:Folders>");
+    let missing = "<m:GetFolderResponseMessage ResponseClass=\"Error\">\
+                   <m:ResponseCode>ErrorFolderNotFound</m:ResponseCode>\
+                   </m:GetFolderResponseMessage>";
+    soap(&format!(
+        "<m:GetFolderResponse><m:ResponseMessages>\
+         <m:GetFolderResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode>{}\
+         </m:GetFolderResponseMessage>\
+         <m:GetFolderResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode>{}\
+         </m:GetFolderResponseMessage>{}\
+         </m:ResponseMessages></m:GetFolderResponse>",
+        found("root"),
+        found("inbox-id"),
+        missing.repeat(5),
+    ))
+}
+
+/// A folder element.
+fn folder(element: &str, id: &str, parent: &str, name: &str, class: &str) -> String {
+    format!(
+        "<t:{element}><t:FolderId Id=\"{id}\"/><t:ParentFolderId Id=\"{parent}\"/>\
+         <t:FolderClass>{class}</t:FolderClass><t:DisplayName>{name}</t:DisplayName>\
+         <t:TotalCount>10</t:TotalCount><t:ChildFolderCount>0</t:ChildFolderCount>\
+         <t:UnreadCount>2</t:UnreadCount></t:{element}>"
+    )
+}
+
+/// A message element with summary fields.
+fn message(id: &str, subject: &str, sent: &str) -> String {
+    format!(
+        "<t:Message><t:ItemId Id=\"{id}\" ChangeKey=\"ck\"/><t:ParentFolderId Id=\"inbox-id\"/>\
+         <t:Subject>{subject}</t:Subject><t:DateTimeReceived>{sent}</t:DateTimeReceived>\
+         <t:HasAttachments>false</t:HasAttachments><t:DateTimeSent>{sent}</t:DateTimeSent>\
+         <t:DateTimeCreated>{sent}</t:DateTimeCreated><t:IsDraft>false</t:IsDraft>\
+         <t:LastModifiedTime>{sent}</t:LastModifiedTime>\
+         <t:ConversationId Id=\"conv\"/>\
+         <t:ToRecipients><t:Mailbox><t:Name>Alice</t:Name><t:EmailAddress>alice@contoso.com</t:EmailAddress>\
+         <t:RoutingType>SMTP</t:RoutingType></t:Mailbox></t:ToRecipients>\
+         <t:IsRead>false</t:IsRead>\
+         <t:From><t:Mailbox><t:Name>Bob</t:Name><t:EmailAddress>bob@contoso.com</t:EmailAddress>\
+         </t:Mailbox></t:From><t:Flag><t:FlagStatus>Flagged</t:FlagStatus></t:Flag>\
+         <t:ConversationIndex>AQHZAAAAAAAAAAAAAAAAAAAAAAAAAA==</t:ConversationIndex>\
+         </t:Message>"
+    )
+}
+
+/// A `FindItem` page with the items `ids`.
+fn found_items(ids: &[&str], last: bool, next: u32) -> ResponseTemplate {
+    let items: String = ids
+        .iter()
+        .map(|id| format!("<t:Message><t:ItemId Id=\"{id}\"/></t:Message>"))
+        .collect();
+    success(
+        "FindItem",
+        &format!(
+            "<m:RootFolder IndexedPagingOffset=\"{next}\" TotalItemsInView=\"99\" \
+             IncludesLastItemInRange=\"{last}\"><t:Items>{items}</t:Items></m:RootFolder>"
+        ),
+    )
+}
+
+/// The draft "draft", with the change key "ck2", as sending it looks it up.
+async fn change_key(server: &MockServer) {
+    ews("<m:GetItem>")
+        .and(body_string_contains("Id=\"draft\""))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\" ChangeKey=\"ck2\"/></t:Message></m:Items>",
+        ))
+        .mount(server)
+        .await;
+}
+
+/// The bodies of the requests `server` received.
+async fn requests(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r: &Request| String::from_utf8_lossy(&r.body).into_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn sends_soap_with_the_token_and_the_mailbox_to_route_by() {
+    let server = MockServer::start().await;
+    ews("<m:GetFolder>")
+        .and(header("authorization", "Bearer tok"))
+        .and(header("x-anchormailbox", "alice@contoso.com"))
+        .and(header("content-type", "text/xml; charset=utf-8"))
+        .respond_with(roles())
+        .mount(&server)
+        .await;
+    ews("<m:FindFolder")
+        .respond_with(success(
+            "FindFolder",
+            "<m:RootFolder IncludesLastItemInRange=\"true\"><t:Folders/></m:RootFolder>",
+        ))
+        .mount(&server)
+        .await;
+    assert_eq!(store(&server).list_folders().await.unwrap(), []);
+}
+
+#[tokio::test]
+async fn lists_the_mail_folders_as_a_tree() {
+    let server = MockServer::start().await;
+    ews("<m:GetFolder>")
+        .respond_with(roles())
+        .mount(&server)
+        .await;
+    let folders = [
+        folder("Folder", "inbox-id", "root", "Inbox", "IPF.Note"),
+        folder(
+            "CalendarFolder",
+            "cal",
+            "root",
+            "Calendar",
+            "IPF.Appointment",
+        ),
+        folder("Folder", "proj", "inbox-id", "Projects", "IPF.Note"),
+        folder("Folder", "arch", "root", "Archive", "IPF.Note"),
+        folder("SearchFolder", "s", "root", "Search", "IPF.Note"),
+    ]
+    .concat();
+    ews("Traversal=\"Deep\"")
+        .respond_with(success(
+            "FindFolder",
+            &format!(
+                "<m:RootFolder IndexedPagingOffset=\"5\" IncludesLastItemInRange=\"true\">\
+                 <t:Folders>{folders}</t:Folders></m:RootFolder>"
+            ),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let listed = store(&server).list_folders().await.unwrap();
+    let names: Vec<&str> = listed.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["Archive", "Inbox", "Projects"]);
+    let inbox = &listed[1];
+    assert_eq!(inbox.well_known, Some(WellKnownFolder::Inbox));
+    assert_eq!(inbox.parent, None, "top-level folders have no parent");
+    assert_eq!((inbox.unread_count, inbox.total_count), (2, 10));
+    assert_eq!(listed[2].parent, Some(FolderId::new("inbox-id")));
+}
+
+#[tokio::test]
+async fn folder_listings_follow_every_page() {
+    let server = MockServer::start().await;
+    ews("<m:GetFolder>")
+        .respond_with(roles())
+        .mount(&server)
+        .await;
+    ews("Offset=\"0\"")
+        .respond_with(success(
+            "FindFolder",
+            &format!(
+                "<m:RootFolder IndexedPagingOffset=\"1\" IncludesLastItemInRange=\"false\">\
+                 <t:Folders>{}</t:Folders></m:RootFolder>",
+                folder("Folder", "a", "root", "A", "IPF.Note")
+            ),
+        ))
+        .mount(&server)
+        .await;
+    ews("Offset=\"1\"")
+        .respond_with(success(
+            "FindFolder",
+            &format!(
+                "<m:RootFolder IndexedPagingOffset=\"2\" IncludesLastItemInRange=\"true\">\
+                 <t:Folders>{}</t:Folders></m:RootFolder>",
+                folder("Folder", "b", "root", "B", "IPF.Note")
+            ),
+        ))
+        .mount(&server)
+        .await;
+    let listed = store(&server).child_folders(None).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    let sent = requests(&server).await;
+    assert!(sent.iter().any(|r| r.contains("Traversal=\"Shallow\"")));
+}
+
+#[tokio::test]
+async fn the_archive_folder_has_no_distinguished_name() {
+    let server = MockServer::start().await;
+    let e = store(&server)
+        .well_known_folder(WellKnownFolder::Archive)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::NotFound { .. }), "{e:?}");
+}
+
+#[tokio::test]
+async fn lists_messages_newest_first_a_page_at_a_time() {
+    let server = MockServer::start().await;
+    ews("<m:FindItem")
+        .and(body_string_contains("Offset=\"0\""))
+        .respond_with(found_items(&["m1", "gone", "m2"], false, 3))
+        .mount(&server)
+        .await;
+    ews("<m:FindItem")
+        .and(body_string_contains("Offset=\"3\""))
+        .respond_with(found_items(&["m3"], true, 4))
+        .mount(&server)
+        .await;
+    let gone = "<m:GetItemResponseMessage ResponseClass=\"Error\">\
+                <m:ResponseCode>ErrorItemNotFound</m:ResponseCode></m:GetItemResponseMessage>";
+    ews("<m:GetItem>")
+        .and(body_string_contains("Id=\"m1\""))
+        .respond_with(soap(&format!(
+            "<m:GetItemResponse><m:ResponseMessages>\
+             <m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode>\
+             <m:Items>{}</m:Items></m:GetItemResponseMessage>{gone}\
+             <m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode>\
+             <m:Items>{}</m:Items></m:GetItemResponseMessage>\
+             </m:ResponseMessages></m:GetItemResponse>",
+            message("m1", "First", "2026-10-19T10:00:00Z"),
+            message("m2", "Second &amp; more", "2026-10-18T10:00:00Z"),
+        )))
+        .mount(&server)
+        .await;
+    ews("<m:GetItem>")
+        .and(body_string_contains("Id=\"m3\""))
+        .respond_with(success(
+            "GetItem",
+            &format!(
+                "<m:Items>{}</m:Items>",
+                message("m3", "Third", "2026-10-17T10:00:00Z")
+            ),
+        ))
+        .mount(&server)
+        .await;
+
+    let store = store(&server);
+    let folder = FolderId::new("inbox-id");
+    let first = store.list_messages(&folder, Page::first(3)).await.unwrap();
+    assert_eq!(
+        first.messages.len(),
+        2,
+        "the one gone meanwhile is left out"
+    );
+    let m1 = &first.messages[0];
+    assert_eq!(m1.subject, "First");
+    assert_eq!(
+        m1.from,
+        Some(Address::new("bob@contoso.com").with_name("Bob"))
+    );
+    assert_eq!(
+        m1.to,
+        [Address::new("alice@contoso.com").with_name("Alice")]
+    );
+    assert!(!m1.flags.read);
+    assert!(m1.flags.flagged);
+    assert!(!m1.draft);
+    assert_eq!(m1.received.to_rfc3339(), "2026-10-19T10:00:00+00:00");
+    let thread = m1.thread.as_ref().unwrap();
+    assert_eq!(thread.conversation, "conv");
+    assert_eq!(thread.path.len(), 1);
+    assert_eq!(first.messages[1].subject, "Second & more");
+
+    let next = first.next.expect("more to come");
+    let second = store
+        .list_messages(&folder, Page::after(next.clone(), 3))
+        .await
+        .unwrap();
+    assert_eq!(second.messages[0].subject, "Third");
+    assert_eq!(second.next, None);
+    // A cursor is only good for its own listing.
+    assert!(
+        store
+            .changed_messages(&folder, Utc::now(), Page::after(next, 3))
+            .await
+            .is_err()
+    );
+
+    let sent = requests(&server).await;
+    let find = sent.iter().find(|r| r.contains("<m:FindItem")).unwrap();
+    assert!(
+        find.contains("item:DateTimeSent"),
+        "sorted by the sent date: {find}"
+    );
+}
+
+#[tokio::test]
+async fn recent_unread_mail_is_found_by_when_it_changed() {
+    let server = MockServer::start().await;
+    ews("<m:FindItem")
+        .and(body_string_contains("message:IsRead"))
+        .and(body_string_contains("2026-10-19T08:00:00Z"))
+        .respond_with(success(
+            "FindItem",
+            "<m:RootFolder IncludesLastItemInRange=\"true\"><t:Items>\
+             <t:Message><t:ItemId Id=\"m1\"/><t:LastModifiedTime>2026-10-19T09:00:00Z</t:LastModifiedTime></t:Message>\
+             </t:Items></m:RootFolder>",
+        ))
+        .mount(&server)
+        .await;
+    let since = DateTime::parse_from_rfc3339("2026-10-19T08:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let recent = store(&server)
+        .recent_unread(&FolderId::new("inbox-id"), Some(since))
+        .await
+        .unwrap();
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].0, MessageId::new("m1"));
+    assert_eq!(recent[0].1.to_rfc3339(), "2026-10-19T09:00:00+00:00");
+}
+
+#[tokio::test]
+async fn fetches_messages_with_text_bodies() {
+    let server = MockServer::start().await;
+    let full = message("m1", "Hi", "2026-10-19T10:00:00Z").replace(
+        "</t:Message>",
+        "<t:Body BodyType=\"Text\">Hello &lt;there&gt;</t:Body>\
+         <t:CcRecipients><t:Mailbox><t:EmailAddress>carol@contoso.com</t:EmailAddress></t:Mailbox></t:CcRecipients>\
+         <t:InternetMessageId>&lt;id@contoso.com&gt;</t:InternetMessageId></t:Message>",
+    );
+    ews("<t:BodyType>Text</t:BodyType>")
+        .respond_with(success("GetItem", &format!("<m:Items>{full}</m:Items>")))
+        .mount(&server)
+        .await;
+    let message = store(&server)
+        .fetch_message(&MessageId::new("m1"))
+        .await
+        .unwrap();
+    assert_eq!(message.body.kind, BodyKind::Text);
+    assert_eq!(message.body.content, "Hello <there>");
+    assert_eq!(message.cc, [Address::new("carol@contoso.com")]);
+    assert_eq!(
+        message.internet_message_id.as_deref(),
+        Some("<id@contoso.com>")
+    );
+}
+
+#[tokio::test]
+async fn missing_messages_are_not_found() {
+    let server = MockServer::start().await;
+    ews("<m:GetItem>")
+        .respond_with(failure("GetItem", "ErrorItemNotFound"))
+        .mount(&server)
+        .await;
+    let e = store(&server)
+        .fetch_message(&MessageId::new("m1"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            Error::NotFound {
+                kind: "message",
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
+async fn busy_servers_throttle() {
+    let server = MockServer::start().await;
+    let fault = "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+                 <s:Fault><faultcode>a:ErrorServerBusy</faultcode><faultstring>Busy</faultstring>\
+                 <detail><e:ResponseCode xmlns:e=\"errors\">ErrorServerBusy</e:ResponseCode>\
+                 <e:MessageXml xmlns:e=\"errors\"><t:Value xmlns:t=\"types\" \
+                 Name=\"BackOffMilliseconds\">3000</t:Value></e:MessageXml></detail>\
+                 </s:Fault></s:Body></s:Envelope>";
+    ews("<m:GetItem>")
+        .respond_with(ResponseTemplate::new(500).set_body_raw(fault, "text/xml"))
+        .mount(&server)
+        .await;
+    let e = store(&server)
+        .message_folder(&MessageId::new("m1"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Throttled { retry_after: Some(d) } if d == Duration::from_secs(3)),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_send_refused_with_a_fault_was_not_sent() {
+    let server = MockServer::start().await;
+    let fault = "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body>\
+                 <s:Fault><faultcode>a:ErrorInvalidRecipients</faultcode>\
+                 <faultstring>No recipients.</faultstring><detail>\
+                 <e:ResponseCode xmlns:e=\"errors\">ErrorInvalidRecipients</e:ResponseCode>\
+                 </detail></s:Fault></s:Body></s:Envelope>";
+    ews("<m:CreateItem")
+        .respond_with(ResponseTemplate::new(500).set_body_raw(fault, "text/xml"))
+        .mount(&server)
+        .await;
+    let e = store(&server).send(&Draft::default()).await.unwrap_err();
+    assert!(
+        matches!(e, Error::Backend(ref m) if m.contains("ErrorInvalidRecipients")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
+async fn updates_read_and_flagged_state() {
+    let server = MockServer::start().await;
+    ews("<m:UpdateItem")
+        .and(body_string_contains("<t:IsRead>true</t:IsRead>"))
+        .and(body_string_contains(
+            "<t:FlagStatus>NotFlagged</t:FlagStatus>",
+        ))
+        .respond_with(success("UpdateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .update_flags(
+            &MessageId::new("m1"),
+            FlagsUpdate {
+                read: Some(true),
+                flagged: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn moves_return_the_new_id() {
+    let server = MockServer::start().await;
+    ews("<m:MoveItem")
+        .and(body_string_contains("<t:FolderId Id=\"trash\"/>"))
+        .respond_with(success(
+            "MoveItem",
+            "<m:Items><t:Message><t:ItemId Id=\"moved\"/></t:Message></m:Items>",
+        ))
+        .mount(&server)
+        .await;
+    let id = store(&server)
+        .move_message(&MessageId::new("m1"), &FolderId::new("trash"))
+        .await
+        .unwrap();
+    assert_eq!(id, MessageId::new("moved"));
+}
+
+#[tokio::test]
+async fn lists_and_fetches_attachments() {
+    let server = MockServer::start().await;
+    ews("item:Attachments")
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:Message><t:ItemId Id=\"m1\"/><t:Attachments>\
+             <t:FileAttachment><t:AttachmentId Id=\"a1\"/><t:Name>notes.txt</t:Name>\
+             <t:ContentType>text/plain</t:ContentType><t:Size>5</t:Size><t:IsInline>false</t:IsInline>\
+             </t:FileAttachment>\
+             <t:ItemAttachment><t:AttachmentId Id=\"a2\"/><t:Name>Fwd</t:Name><t:Size>900</t:Size>\
+             </t:ItemAttachment></t:Attachments></t:Message></m:Items>",
+        ))
+        .mount(&server)
+        .await;
+    ews("<m:GetAttachment>")
+        .and(body_string_contains("Id=\"a1\""))
+        .respond_with(success(
+            "GetAttachment",
+            "<m:Attachments><t:FileAttachment><t:AttachmentId Id=\"a1\" RootItemId=\"m1\"/>\
+             <t:Name>notes.txt</t:Name><t:Content>aGVsbG8=</t:Content></t:FileAttachment>\
+             </m:Attachments>",
+        ))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let message = MessageId::new("m1");
+    let listed = store.list_attachments(&message).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].name, "notes.txt");
+    assert_eq!(listed[0].size, 5);
+    assert_eq!(listed[1].kind, AttachmentKind::Item);
+    assert_eq!(listed[1].content_type, "message/rfc822");
+    let content = store
+        .fetch_attachment(&message, &listed[0].id)
+        .await
+        .unwrap();
+    assert_eq!(content, b"hello");
+    // Another message's attachment isn't this one's.
+    let e = store
+        .fetch_attachment(&MessageId::new("m2"), &listed[0].id)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::NotFound { .. }), "{e:?}");
+}
+
+#[tokio::test]
+async fn new_mail_with_attachments_is_saved_before_it_is_sent() {
+    let server = MockServer::start().await;
+    change_key(&server).await;
+    ews("MessageDisposition=\"SaveOnly\"")
+        .and(body_string_contains(
+            "<t:DistinguishedFolderId Id=\"drafts\"/>",
+        ))
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:CreateAttachment><m:ParentItemId Id=\"draft\"/>")
+        .and(body_string_contains("<t:Content>aGk=</t:Content>"))
+        .respond_with(success(
+            "CreateAttachment",
+            "<m:Attachments><t:FileAttachment><t:AttachmentId Id=\"a1\"/></t:FileAttachment>\
+             </m:Attachments>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:SendItem SaveItemToFolder=\"true\">")
+        .and(body_string_contains(
+            "<t:DistinguishedFolderId Id=\"sentitems\"/>",
+        ))
+        .respond_with(success("SendItem", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let draft = Draft {
+        to: vec![Address::new("bob@contoso.com")],
+        subject: "Hi".into(),
+        body: "Hello".into(),
+        attachments: vec![OutgoingAttachment {
+            name: "hi.txt".into(),
+            content_type: "text/plain".into(),
+            data: b"hi".to_vec(),
+        }],
+        save_copy: true,
+        ..Draft::default()
+    };
+    store(&server).send(&draft).await.unwrap();
+    let created = &requests(&server).await[0];
+    assert!(!created.contains("<t:Attachments>"), "{created}");
+}
+
+#[tokio::test]
+async fn new_mail_with_a_copy_is_sent_in_one_request() {
+    let server = MockServer::start().await;
+    ews("MessageDisposition=\"SendAndSaveCopy\"")
+        .and(body_string_contains(
+            "<t:DistinguishedFolderId Id=\"sentitems\"/>",
+        ))
+        .respond_with(success("CreateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let draft = Draft {
+        to: vec![Address::new("bob@contoso.com")],
+        save_copy: true,
+        ..Draft::default()
+    };
+    store(&server).send(&draft).await.unwrap();
+}
+
+#[tokio::test]
+async fn new_mail_without_a_copy_is_only_sent() {
+    let server = MockServer::start().await;
+    ews("MessageDisposition=\"SendOnly\"")
+        .respond_with(success("CreateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let draft = Draft {
+        to: vec![Address::new("bob@contoso.com")],
+        ..Draft::default()
+    };
+    store(&server).send(&draft).await.unwrap();
+    assert!(!requests(&server).await[0].contains("SavedItemFolderId"));
+}
+
+fn reply() -> Draft {
+    Draft {
+        to: vec![Address::new("bob@contoso.com")],
+        subject: "Re: Hi".into(),
+        body: "Thanks".into(),
+        origin: Some(DraftOrigin::Reply(MessageId::new("orig"))),
+        save_copy: false,
+        attempt: 7,
+        ..Draft::default()
+    }
+}
+
+#[tokio::test]
+async fn replies_go_through_a_server_draft() {
+    let server = MockServer::start().await;
+    change_key(&server).await;
+    ews("<t:ReplyToItem><t:ReferenceItemId Id=\"orig\"/>")
+        .and(body_string_contains("MessageDisposition=\"SaveOnly\""))
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:UpdateItem")
+        .and(body_string_contains(
+            "<t:Body BodyType=\"Text\">Thanks</t:Body>",
+        ))
+        .and(body_string_contains(
+            "<t:DeleteItemField><t:FieldURI FieldURI=\"message:CcRecipients\"/>",
+        ))
+        .respond_with(success("UpdateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:SendItem SaveItemToFolder=\"false\">")
+        .and(body_string_contains(
+            "<t:ItemId Id=\"draft\" ChangeKey=\"ck2\"/>",
+        ))
+        .respond_with(success("SendItem", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server).send(&reply()).await.unwrap();
+}
+
+#[tokio::test]
+async fn mail_from_another_address_without_a_copy_is_saved_first() {
+    let server = MockServer::start().await;
+    change_key(&server).await;
+    ews("MessageDisposition=\"SaveOnly\"")
+        .and(body_string_contains("<t:From>"))
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:SendItem SaveItemToFolder=\"false\">")
+        .respond_with(success("SendItem", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let draft = Draft {
+        from: Some(Address::new("team@contoso.com")),
+        to: vec![Address::new("bob@contoso.com")],
+        ..Draft::default()
+    };
+    store(&server).send(&draft).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_draft_gone_before_it_is_sent_was_not_sent() {
+    let server = MockServer::start().await;
+    ews("<t:ReplyToItem>")
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .mount(&server)
+        .await;
+    ews("<m:UpdateItem")
+        .respond_with(success("UpdateItem", "<m:Items/>"))
+        .mount(&server)
+        .await;
+    ews("<m:GetItem>")
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    ews("<m:SendItem")
+        .respond_with(success("SendItem", ""))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let e = store.send(&reply()).await.unwrap_err();
+    assert!(matches!(e, Error::NotSent(_)), "{e:?}");
+    // Kept, for the next attempt to send.
+    assert!(store.keeps_draft(&reply()));
+}
+
+#[tokio::test]
+async fn a_lost_send_keeps_the_draft_for_the_next_attempt() {
+    let server = MockServer::start().await;
+    change_key(&server).await;
+    ews("<t:ReplyToItem>")
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:UpdateItem")
+        .respond_with(success("UpdateItem", "<m:Items/>"))
+        .mount(&server)
+        .await;
+    ews("<m:SendItem")
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    ews("<m:DeleteItem")
+        .and(body_string_contains("Id=\"draft\""))
+        .respond_with(success("DeleteItem", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let draft = reply();
+    let e = store.send(&draft).await.unwrap_err();
+    assert!(
+        matches!(e, Error::Network(ref m) if m.contains("Drafts")),
+        "{e:?}"
+    );
+    assert!(store.keeps_draft(&draft));
+    // Trying again updates the same draft rather than making another.
+    assert!(store.send(&draft).await.is_err());
+    store.discard_kept(&draft).await.unwrap();
+    assert!(!store.keeps_draft(&draft));
+}
+
+#[tokio::test]
+async fn a_refused_send_deletes_its_draft() {
+    let server = MockServer::start().await;
+    change_key(&server).await;
+    ews("<t:ReplyToItem>")
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"draft\"/></t:Message></m:Items>",
+        ))
+        .mount(&server)
+        .await;
+    ews("<m:UpdateItem")
+        .respond_with(success("UpdateItem", "<m:Items/>"))
+        .mount(&server)
+        .await;
+    ews("<m:SendItem")
+        .respond_with(failure("SendItem", "ErrorQuotaExceeded"))
+        .mount(&server)
+        .await;
+    ews("<m:DeleteItem")
+        .respond_with(success("DeleteItem", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let e = store.send(&reply()).await.unwrap_err();
+    assert!(
+        matches!(e, Error::Backend(ref m) if m.contains("ErrorQuotaExceeded")),
+        "{e:?}"
+    );
+    assert!(!store.keeps_draft(&reply()));
+}
+
+#[tokio::test]
+async fn postponing_saves_a_draft() {
+    let server = MockServer::start().await;
+    ews("MessageDisposition=\"SaveOnly\"")
+        .and(body_string_contains(
+            "<t:DistinguishedFolderId Id=\"drafts\"/>",
+        ))
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"saved\"/></t:Message></m:Items>",
+        ))
+        .mount(&server)
+        .await;
+    let id = store(&server).save_draft(&Draft::default()).await.unwrap();
+    assert_eq!(id, MessageId::new("saved"));
+}
+
+#[tokio::test]
+async fn searches_the_directory() {
+    let server = MockServer::start().await;
+    ews("<m:ResolveNames")
+        .and(body_string_contains("SearchScope=\"ActiveDirectoryContacts\""))
+        .respond_with(soap(
+            "<m:ResolveNamesResponse><m:ResponseMessages>\
+             <m:ResolveNamesResponseMessage ResponseClass=\"Warning\">\
+             <m:ResponseCode>ErrorNameResolutionMultipleResults</m:ResponseCode>\
+             <m:ResolutionSet TotalItemsInView=\"2\">\
+             <t:Resolution><t:Mailbox><t:Name>Bob One</t:Name><t:EmailAddress>bob1@contoso.com</t:EmailAddress>\
+             <t:RoutingType>SMTP</t:RoutingType></t:Mailbox></t:Resolution>\
+             <t:Resolution><t:Mailbox><t:Name>Bob List</t:Name><t:EmailAddress>/o=Org/cn=bobs</t:EmailAddress>\
+             <t:RoutingType>EX</t:RoutingType></t:Mailbox></t:Resolution>\
+             </m:ResolutionSet></m:ResolveNamesResponseMessage>\
+             </m:ResponseMessages></m:ResolveNamesResponse>",
+        ))
+        .mount(&server)
+        .await;
+    let found = store(&server).search_people("bob").await.unwrap();
+    assert_eq!(
+        found,
+        [Address::new("bob1@contoso.com").with_name("Bob One")]
+    );
+}
+
+#[tokio::test]
+async fn nobody_found_is_no_error() {
+    let server = MockServer::start().await;
+    ews("<m:ResolveNames")
+        .respond_with(failure("ResolveNames", "ErrorNameResolutionNoResults"))
+        .mount(&server)
+        .await;
+    assert_eq!(store(&server).search_people("zzz").await.unwrap(), []);
+}
+
+#[tokio::test]
+async fn own_addresses_need_not_include_the_account_name() {
+    let server = MockServer::start().await;
+    ews("<m:ResolveNames ReturnFullContactData=\"true\"")
+        .respond_with(success(
+            "ResolveNames",
+            "<m:ResolutionSet><t:Resolution><t:Mailbox><t:Name>Alice</t:Name>\
+             <t:EmailAddress>alice.example@contoso.com</t:EmailAddress><t:RoutingType>SMTP</t:RoutingType>\
+             </t:Mailbox></t:Resolution></m:ResolutionSet>",
+        ))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        store(&server).own_addresses().await.unwrap(),
+        ["alice@contoso.com", "alice.example@contoso.com"]
+    );
+}
+
+#[tokio::test]
+async fn own_addresses_include_the_aliases() {
+    let server = MockServer::start().await;
+    ews("<m:ResolveNames ReturnFullContactData=\"true\"")
+        .respond_with(success(
+            "ResolveNames",
+            "<m:ResolutionSet><t:Resolution><t:Mailbox><t:Name>Alice</t:Name>\
+             <t:EmailAddress>alice@contoso.com</t:EmailAddress><t:RoutingType>SMTP</t:RoutingType>\
+             </t:Mailbox><t:Contact><t:EmailAddresses>\
+             <t:Entry Key=\"EmailAddress1\">SMTP:alice@contoso.com</t:Entry>\
+             <t:Entry Key=\"EmailAddress2\">smtp:a.example@contoso.com</t:Entry>\
+             <t:Entry Key=\"EmailAddress3\">X500:/o=Org</t:Entry>\
+             </t:EmailAddresses></t:Contact></t:Resolution></m:ResolutionSet>",
+        ))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        store(&server).own_addresses().await.unwrap(),
+        ["alice@contoso.com", "a.example@contoso.com"]
+    );
+}
+
+/// Hands out "old" until it is rejected, then "new".
+#[derive(Default)]
+struct RotatingAuth {
+    rejected: AtomicBool,
+}
+
+impl Authenticator for RotatingAuth {
+    async fn access_token(&self) -> mett_core::Result<AccessToken> {
+        let secret = if self.rejected.load(Ordering::SeqCst) {
+            "new"
+        } else {
+            "old"
+        };
+        Ok(AccessToken::new(secret, DateTime::<Utc>::MAX_UTC))
+    }
+
+    async fn token_rejected(&self, token: &AccessToken) {
+        assert_eq!(token.secret(), "old");
+        self.rejected.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_token_is_replaced_once() {
+    let server = MockServer::start().await;
+    ews("<m:GetItem>")
+        .and(header("authorization", "Bearer old"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetItem>")
+        .and(header("authorization", "Bearer new"))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:Message><t:ItemId Id=\"m1\"/><t:ParentFolderId Id=\"f\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store_with(&server, Arc::new(RotatingAuth::default()));
+    let folder = store.message_folder(&MessageId::new("m1")).await.unwrap();
+    assert_eq!(folder, FolderId::new("f"));
+}
+
+#[tokio::test]
+async fn failing_before_handing_over_leaves_mail_unsent() {
+    struct Offline;
+    impl Authenticator for Offline {
+        async fn access_token(&self) -> mett_core::Result<AccessToken> {
+            Err(Error::Network("offline".into()))
+        }
+    }
+    let server = MockServer::start().await;
+    let store = store_with(&server, Arc::new(Offline));
+    let draft = Draft {
+        to: vec![Address::new("bob@contoso.com")],
+        ..Draft::default()
+    };
+    let e = store.send(&draft).await.unwrap_err();
+    assert!(matches!(e, Error::NotSent(_)), "{e:?}");
+}

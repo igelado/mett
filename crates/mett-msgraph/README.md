@@ -5,7 +5,9 @@ against Microsoft Graph:
 
 - **`GraphAuthenticator`** implements the `Authenticator` port with OAuth2
   (authorization code with PKCE, or device code). It stores refresh tokens,
-  and checks that the signed-in user is the configured account.
+  and checks that the signed-in user is the configured account (with
+  Graph's `/me`, or for tokens of another resource, such as Exchange Web
+  Services, from the access token's `upn` claim).
 - **`GraphMailStore`** implements the `MailStore` port on the signed-in
   user's mailbox (`/me`). It lists folders (the whole tree a level at a
   time, a few listings at once, or just the folders below one) and messages

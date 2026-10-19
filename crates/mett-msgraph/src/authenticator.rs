@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::oauth::{self, FlowError, Tokens};
 use crate::prompt::Prompter;
-use crate::settings::{AuthFlow, AuthSettings};
+use crate::settings::{AuthFlow, AuthSettings, IdentityCheck};
 use crate::token_store::{TokenStore, TokenStoreError};
 
 /// Access tokens this close to expiry are refreshed before use.
@@ -146,7 +146,13 @@ impl<S: TokenStore, P: Prompter> GraphAuthenticator<S, P> {
     /// under this account's name.
     async fn check_identity(&self, tokens: &Tokens) -> Identity {
         let expected = self.settings.account.as_str();
-        match oauth::user_principal_name(&self.http, &self.settings, &tokens.access).await {
+        let user = match self.settings.identity {
+            IdentityCheck::Graph => {
+                oauth::user_principal_name(&self.http, &self.settings, &tokens.access).await
+            }
+            IdentityCheck::AccessToken => oauth::token_user_principal_name(&tokens.access),
+        };
+        match user {
             Ok(user) if user.eq_ignore_ascii_case(expected) => Identity::Confirmed,
             Ok(user) => Identity::Mismatch(mett_core::Error::Auth(format!(
                 "signed in as {user}, but the account is {expected}"

@@ -53,7 +53,8 @@ I/O and talks to the UI over channels.
 │  mett-core: domain model + ports (traits)      │
 │  MailStore, Authenticator, MailSender, …       │
 ├───────────────┬──────────────┬─────────────────┤
-│ mett-msgraph  │ cache crate¹ │ mock (tests)    │
+│ mett-msgraph, │ cache crate¹ │ mock (tests)    │
+│ mett-ews      │              │                 │
 └───────────────┴──────────────┴─────────────────┘
 ```
 
@@ -67,6 +68,7 @@ a crate may only depend on crates below it in the diagram.
 |----------------|--------------------------------------------------------------------|--------------------------------|
 | `mett-core`    | Domain model (messages, folders, threads, drafts) and port traits. | none (no I/O crates)           |
 | `mett-msgraph` | Microsoft Graph adapter: HTTP, OAuth2, paging, throttling, delta.  | `mett-core`                    |
+| `mett-ews`     | Exchange Web Services adapter: SOAP, paging, throttling.           | `mett-core`                    |
 | cache crate¹   | Local cache and sync state.                                        | `mett-core`                    |
 | `mett-tui`     | The binary: TUI, key bindings, configuration, worker wiring.       | `mett-core`, adapters          |
 
@@ -94,7 +96,12 @@ the application depends on, for example:
 - `Renderer`: turn a message body (for example HTML) into terminal text.
 
 Adapters implement these ports. `mett-msgraph` implements them against
-Microsoft Graph, and a mock implementation is used in tests.
+Microsoft Graph, `mett-ews` against Exchange Web Services, and a mock
+implementation is used in tests. `mett-ews` has no sign-in of its own: it
+takes any `Authenticator`, and `mett-tui` gives it `mett-msgraph`'s, asking
+for an Exchange Online token. `mett-tui` picks the adapter at startup
+(`use_ews`); an enum of the two implements the ports by delegating, so the
+worker stays generic over a single type.
 
 - **Pros:**
   - The core and UI can be tested without network access.
@@ -329,8 +336,8 @@ for Office365 with a `msgraph://` mailbox URL scheme and `msgraph_*`
 variables. The extensions are proposed in
 [CONFIG-OFFICE365.md](CONFIG-OFFICE365.md). Parsing the configuration
 belongs in `mett-tui`. The values specific to Microsoft Graph are passed to
-`mett-msgraph` as a typed settings struct, so that the adapter never parses
-muttrc itself. mett ships no Azure AD app registration: each user provides
+`mett-msgraph` as a typed settings struct, and the EWS endpoint to
+`mett-ews` as a URL, so that the adapters never parse muttrc themselves. mett ships no Azure AD app registration: each user provides
 their own through `msgraph_client_id`.
 
 ## 9. Testing strategy
@@ -339,7 +346,8 @@ their own through `msgraph_client_id`.
   - `update` functions, driven by `Action`s and `Event`s.
   - Domain logic in `mett-core`.
 - **Adapter tests:**
-  - `mett-msgraph` against recorded or mocked HTTP responses.
+  - `mett-msgraph` and `mett-ews` against recorded or mocked HTTP
+    responses.
   - The cache crate against a temporary store.
 - **UI snapshot tests:** render `view` into a `ratatui` test backend and
   compare the result against stored snapshots.
