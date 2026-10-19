@@ -1,4 +1,4 @@
-//! Where refresh tokens are kept between runs (`msgraph_token_store`).
+//! Where refresh tokens are kept between runs (`office365_token_store`).
 //!
 //! Only the refresh token is stored. Access tokens are short-lived and are
 //! obtained from it on start-up.
@@ -69,7 +69,7 @@ pub trait TokenStore: Send + Sync + 'static {
     }
 }
 
-/// Stores refresh tokens in the OS keyring (`msgraph_token_store = keyring`).
+/// Stores refresh tokens in the OS keyring (`office365_token_store = keyring`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct KeyringStore;
 
@@ -114,10 +114,10 @@ impl TokenStore for KeyringStore {
 }
 
 /// Stores refresh tokens in a file readable only by the user
-/// (`msgraph_token_store = file`).
+/// (`office365_token_store = file`).
 ///
 /// The file maps accounts to tokens, so accounts that share a
-/// `msgraph_token_file` keep separate tokens. Updates hold an exclusive lock
+/// `office365_token_file` keep separate tokens. Updates hold an exclusive lock
 /// on a `.lock` file next to it, so concurrent updates (from this or other
 /// processes) don't lose each other's changes.
 ///
@@ -135,12 +135,12 @@ struct TokenFile {
 }
 
 impl FileStore {
-    /// A store backed by `path` (`msgraph_token_file`).
+    /// A store backed by `path` (`office365_token_file`).
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    /// The default `msgraph_token_file` for `account`:
+    /// The default `office365_token_file` for `account`:
     /// `$XDG_STATE_HOME/mett/<account>.tokens`, where `XDG_STATE_HOME`
     /// defaults to `~/.local/state` when it is unset or relative. Returns
     /// `None` if there is neither a usable `XDG_STATE_HOME` nor a `HOME`.

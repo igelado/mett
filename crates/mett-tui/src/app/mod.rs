@@ -100,7 +100,7 @@ pub struct Settings {
     pub display: crate::expando::Display,
     /// How the index is ordered.
     pub ordering: Ordering,
-    /// How often to check for new mail (`msgraph_sync_interval`), or
+    /// How often to check for new mail (`office365_sync_interval`), or
     /// `None` not to.
     pub sync_interval: Option<std::time::Duration>,
     /// The home directory, for `~` in file names.

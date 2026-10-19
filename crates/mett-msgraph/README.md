@@ -20,7 +20,8 @@ against Microsoft Graph:
   saved as drafts in the Drafts folder; a recalled one is updated in place
   and sent as itself, and is never deleted when an attempt fails.
 
-The configuration it implements (`msgraph_*` variables) is described in
+The configuration it implements (`office365_*` and `msgraph_*` variables)
+is described in
 [docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md) §4.
 
 ## Automated tests

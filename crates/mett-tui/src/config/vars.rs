@@ -1,8 +1,9 @@
 //! The variables mett knows, with their types and defaults.
 //!
-//! These are the mutt variables mett uses and the `msgraph_*`, `use_ews`
-//! and `ews_url` variables from `docs/CONFIG-OFFICE365.md` §4. Unknown variables produce a warning,
-//! not an error (principle 4 of that document).
+//! These are the mutt variables mett uses and the `office365_*`,
+//! `msgraph_*`, `use_ews` and `ews_url` variables from
+//! `docs/CONFIG-OFFICE365.md` §4. Unknown variables produce a warning, not
+//! an error (principle 4 of that document).
 
 use std::fmt;
 
@@ -145,24 +146,24 @@ pub const VARS: &[Var] = &[
     var("mail_check", Kind::Number, "5"),
     var("mbox", Kind::Path, "~/mbox"),
     var("metoo", Kind::Bool, "no"),
-    var("msgraph_auth_flow", Kind::String, "auth-code"),
-    var("msgraph_client_id", Kind::String, ""),
-    var("msgraph_cloud", Kind::String, "global"),
     var("msgraph_endpoint", Kind::String, ""),
-    var("msgraph_focused_inbox", Kind::Bool, "no"),
-    var("msgraph_oauth_refresh_command", Kind::String, ""),
-    var("msgraph_page_size", Kind::Number, "50"),
-    var("msgraph_query_directory", Kind::Bool, "yes"),
-    var("msgraph_redirect_port", Kind::Number, "0"),
     var(
         "msgraph_scopes",
         Kind::String,
         "Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access",
     ),
-    var("msgraph_sync_interval", Kind::Number, "60"),
-    var("msgraph_tenant", Kind::String, ""),
-    var("msgraph_token_file", Kind::Path, ""),
-    var("msgraph_token_store", Kind::String, "keyring"),
+    var("office365_auth_flow", Kind::String, "auth-code"),
+    var("office365_client_id", Kind::String, ""),
+    var("office365_cloud", Kind::String, "global"),
+    var("office365_focused_inbox", Kind::Bool, "no"),
+    var("office365_oauth_refresh_command", Kind::String, ""),
+    var("office365_page_size", Kind::Number, "50"),
+    var("office365_query_directory", Kind::Bool, "yes"),
+    var("office365_redirect_port", Kind::Number, "0"),
+    var("office365_sync_interval", Kind::Number, "60"),
+    var("office365_tenant", Kind::String, ""),
+    var("office365_token_file", Kind::Path, ""),
+    var("office365_token_store", Kind::String, "keyring"),
     var(
         "pager_format",
         Kind::String,
@@ -207,6 +208,35 @@ pub const VARS: &[Var] = &[
     var("use_from", Kind::Bool, "yes"),
     var("wrap", Kind::Number, "0"),
 ];
+
+/// Variables mett renamed, by their old names, sorted: the `msgraph_`
+/// settings that Microsoft Graph and Exchange Web Services share are
+/// `office365_` ones now. The old names still work, with a warning.
+const RENAMED: &[(&str, &str)] = &[
+    ("msgraph_auth_flow", "office365_auth_flow"),
+    ("msgraph_client_id", "office365_client_id"),
+    ("msgraph_cloud", "office365_cloud"),
+    ("msgraph_focused_inbox", "office365_focused_inbox"),
+    (
+        "msgraph_oauth_refresh_command",
+        "office365_oauth_refresh_command",
+    ),
+    ("msgraph_page_size", "office365_page_size"),
+    ("msgraph_query_directory", "office365_query_directory"),
+    ("msgraph_redirect_port", "office365_redirect_port"),
+    ("msgraph_sync_interval", "office365_sync_interval"),
+    ("msgraph_tenant", "office365_tenant"),
+    ("msgraph_token_file", "office365_token_file"),
+    ("msgraph_token_store", "office365_token_store"),
+];
+
+/// The name a renamed variable has now, if `name` is an old one.
+pub fn renamed(name: &str) -> Option<&'static str> {
+    RENAMED
+        .binary_search_by(|(old, _)| (*old).cmp(name))
+        .ok()
+        .map(|i| RENAMED[i].1)
+}
 
 /// Looks up a known variable.
 pub fn find(name: &str) -> Option<&'static Var> {
@@ -270,8 +300,21 @@ mod tests {
         for var in VARS {
             assert!(parse(var, var.default, Some("/h")).is_ok(), "{}", var.name);
         }
-        assert_eq!(find("msgraph_cloud").unwrap().default, "global");
+        assert_eq!(find("office365_cloud").unwrap().default, "global");
         assert!(find("no_such_variable").is_none());
+    }
+
+    #[test]
+    fn renamed_variables_are_sorted_and_known_by_their_new_names() {
+        for pair in RENAMED.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "{} is out of order", pair[1].0);
+        }
+        for (old, new) in RENAMED {
+            assert!(find(old).is_none(), "{old} is still a variable");
+            assert!(find(new).is_some(), "{new} isn't a variable");
+            assert_eq!(renamed(old), Some(*new));
+        }
+        assert_eq!(renamed("msgraph_scopes"), None, "Graph's own");
     }
 
     #[test]

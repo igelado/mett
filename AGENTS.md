@@ -25,7 +25,7 @@ where to store things, or similar project-wide conventions:
   the existing format is not enough (see `docs/CONFIG-OFFICE365.md`).
 - mett reads its own `mettrc` files, never mutt's muttrc files.
 - mett ships no Azure AD app registration. Users provide their own app
-  (`msgraph_client_id`).
+  (`office365_client_id`).
 
 ## Naming
 

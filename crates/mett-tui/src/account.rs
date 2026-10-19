@@ -1,5 +1,5 @@
 //! Connecting to an Office365 account from the configuration: building the
-//! sign-in settings and token store from the `msgraph_*` variables, and the
+//! sign-in settings and token store from the `office365_*` variables, and the
 //! mailbox, through Microsoft Graph or Exchange Web Services (`use_ews`,
 //! `ews_url`) (`docs/CONFIG-OFFICE365.md` §4).
 
@@ -261,11 +261,11 @@ impl MailSender for Mailbox {
     }
 }
 
-/// The token store chosen by `msgraph_token_store`.
+/// The token store chosen by `office365_token_store`.
 pub enum AnyStore {
     /// The OS keyring.
     Keyring(KeyringStore),
-    /// A file (`msgraph_token_file`).
+    /// A file (`office365_token_file`).
     File(FileStore),
 }
 
@@ -303,32 +303,32 @@ impl TokenStore for AnyStore {
 
 /// The sign-in settings for the account in `url`.
 pub fn auth_settings(config: &Config, url: &MailboxUrl) -> Result<AuthSettings, String> {
-    let client_id = config.string("msgraph_client_id");
+    let client_id = config.string("office365_client_id");
     if client_id.is_empty() {
         return Err(
-            "msgraph_client_id is not set; see crates/mett-msgraph/README.md to register an app"
+            "office365_client_id is not set; see crates/mett-msgraph/README.md to register an app"
                 .into(),
         );
     }
     let mut settings = AuthSettings::new(url.account.clone(), client_id);
-    let tenant = config.string("msgraph_tenant");
+    let tenant = config.string("office365_tenant");
     settings.tenant = (!tenant.is_empty()).then(|| tenant.to_owned());
     settings.cloud = config
-        .string("msgraph_cloud")
+        .string("office365_cloud")
         .parse()
-        .map_err(|e| format!("msgraph_cloud: {e}"))?;
-    settings.flow = match config.string("msgraph_auth_flow") {
+        .map_err(|e| format!("office365_cloud: {e}"))?;
+    settings.flow = match config.string("office365_auth_flow") {
         "auth-code" => AuthFlow::AuthCode {
-            redirect_port: match config.get("msgraph_redirect_port") {
+            redirect_port: match config.get("office365_redirect_port") {
                 Some(Value::Number(port)) => u16::try_from(*port)
-                    .map_err(|_| format!("msgraph_redirect_port: {port} is not a port"))?,
+                    .map_err(|_| format!("office365_redirect_port: {port} is not a port"))?,
                 _ => 0,
             },
         },
         "device-code" => AuthFlow::DeviceCode,
         other => {
             return Err(format!(
-                "msgraph_auth_flow: expected auth-code or device-code, got {other:?}"
+                "office365_auth_flow: expected auth-code or device-code, got {other:?}"
             ));
         }
     };
@@ -396,21 +396,21 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
-/// The token store chosen by `msgraph_token_store`.
+/// The token store chosen by `office365_token_store`.
 pub fn token_store(config: &Config, url: &MailboxUrl) -> Result<AnyStore, String> {
-    match config.string("msgraph_token_store") {
+    match config.string("office365_token_store") {
         "keyring" => Ok(AnyStore::Keyring(KeyringStore)),
         "file" => {
-            let path = match config.string("msgraph_token_file") {
+            let path = match config.string("office365_token_file") {
                 "" => FileStore::default_path(&url.account).ok_or(
-                    "msgraph_token_file is not set and there is no home directory for the default",
+                    "office365_token_file is not set and there is no home directory for the default",
                 )?,
                 path => path.into(),
             };
             Ok(AnyStore::File(FileStore::new(path)))
         }
         other => Err(format!(
-            "msgraph_token_store: expected keyring or file, got {other:?}"
+            "office365_token_store: expected keyring or file, got {other:?}"
         )),
     }
 }
@@ -423,8 +423,8 @@ pub fn mailbox(
     url: &MailboxUrl,
     prompter: TuiPrompter,
 ) -> Result<Mailbox, String> {
-    if !config.string("msgraph_oauth_refresh_command").is_empty() {
-        return Err("msgraph_oauth_refresh_command is not supported yet".into());
+    if !config.string("office365_oauth_refresh_command").is_empty() {
+        return Err("office365_oauth_refresh_command is not supported yet".into());
     }
     let settings = auth_settings(config, url)?;
     let store = token_store(config, url)?;
@@ -466,9 +466,9 @@ mod tests {
     }
 
     #[test]
-    fn builds_sign_in_settings_from_msgraph_variables() {
+    fn builds_sign_in_settings_from_office365_variables() {
         let config = config(
-            "set msgraph_client_id=abc msgraph_cloud=usgov msgraph_auth_flow=device-code\n\
+            "set office365_client_id=abc office365_cloud=usgov office365_auth_flow=device-code\n\
              set msgraph_scopes='Mail.Read offline_access' msgraph_endpoint=https://proxy.example/\n",
         );
         let settings = auth_settings(&config, &url()).unwrap();
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn defaults_follow_the_documentation() {
-        let settings = auth_settings(&config("set msgraph_client_id=abc\n"), &url()).unwrap();
+        let settings = auth_settings(&config("set office365_client_id=abc\n"), &url()).unwrap();
         assert_eq!(settings.cloud, Cloud::Global);
         assert_eq!(settings.flow, AuthFlow::AuthCode { redirect_port: 0 });
         assert!(settings.scopes.contains(&"Mail.ReadWrite".to_owned()));
@@ -498,18 +498,20 @@ mod tests {
         assert!(
             auth_settings(&config(""), &url())
                 .unwrap_err()
-                .contains("msgraph_client_id")
+                .contains("office365_client_id")
         );
         let bad = |s: &str| auth_settings(&config(s), &url()).unwrap_err();
-        assert!(bad("set msgraph_client_id=a msgraph_cloud=mars\n").contains("msgraph_cloud"));
-        assert!(bad("set msgraph_client_id=a msgraph_auth_flow=magic\n").contains("auth_flow"));
-        assert!(bad("set msgraph_client_id=a msgraph_redirect_port=70000\n").contains("port"));
         assert!(
-            bad("set msgraph_client_id=a msgraph_endpoint=mailto:x@example.com\n")
+            bad("set office365_client_id=a office365_cloud=mars\n").contains("office365_cloud")
+        );
+        assert!(bad("set office365_client_id=a office365_auth_flow=magic\n").contains("auth_flow"));
+        assert!(bad("set office365_client_id=a office365_redirect_port=70000\n").contains("port"));
+        assert!(
+            bad("set office365_client_id=a msgraph_endpoint=mailto:x@example.com\n")
                 .contains("not an http(s) URL")
         );
         assert!(
-            bad("set msgraph_client_id=a msgraph_endpoint=http://proxy.example/\n")
+            bad("set office365_client_id=a msgraph_endpoint=http://proxy.example/\n")
                 .contains("must use https")
         );
         // Plain HTTP is fine for a local test server.
@@ -519,7 +521,7 @@ mod tests {
             "http://[::1]/",
         ] {
             let config = config(&format!(
-                "set msgraph_client_id=a msgraph_endpoint={local}\n"
+                "set office365_client_id=a msgraph_endpoint={local}\n"
             ));
             assert!(auth_settings(&config, &url()).is_ok(), "{local}");
         }
@@ -527,7 +529,7 @@ mod tests {
 
     #[test]
     fn ews_asks_for_exchange_online_and_trusts_its_token() {
-        let config = config("set msgraph_client_id=abc use_ews msgraph_cloud=usgov\n");
+        let config = config("set office365_client_id=abc use_ews office365_cloud=usgov\n");
         let settings = auth_settings(&config, &url()).unwrap();
         assert_eq!(
             settings.scopes,
@@ -541,7 +543,7 @@ mod tests {
             ews_url(&config, &settings).unwrap().as_str(),
             "https://outlook.office365.us/EWS/Exchange.asmx"
         );
-        let graph = auth_settings(&self::config("set msgraph_client_id=abc\n"), &url()).unwrap();
+        let graph = auth_settings(&self::config("set office365_client_id=abc\n"), &url()).unwrap();
         assert_eq!(graph.identity, IdentityCheck::Graph);
     }
 
@@ -553,19 +555,19 @@ mod tests {
             ews_url(&config, &auth)
         };
         assert_eq!(
-            settings("set msgraph_client_id=a use_ews ews_url=https://mail.contoso.com/EWS/Exchange.asmx\n")
+            settings("set office365_client_id=a use_ews ews_url=https://mail.contoso.com/EWS/Exchange.asmx\n")
                 .unwrap()
                 .as_str(),
             "https://mail.contoso.com/EWS/Exchange.asmx"
         );
         assert!(
-            settings("set msgraph_client_id=a ews_url=http://mail.contoso.com/\n")
+            settings("set office365_client_id=a ews_url=http://mail.contoso.com/\n")
                 .unwrap_err()
                 .contains("ews_url")
         );
         // EWS never goes to Graph's endpoint.
         assert!(
-            settings("set msgraph_client_id=a use_ews msgraph_endpoint=http://proxy.example/\n")
+            settings("set office365_client_id=a use_ews msgraph_endpoint=http://proxy.example/\n")
                 .is_ok()
         );
     }
@@ -647,11 +649,11 @@ mod tests {
         ));
         assert!(matches!(
             token_store(
-                &config("set msgraph_token_store=file msgraph_token_file=~/t\n"),
+                &config("set office365_token_store=file office365_token_file=~/t\n"),
                 &url()
             ),
             Ok(AnyStore::File(_))
         ));
-        assert!(token_store(&config("set msgraph_token_store=vault\n"), &url()).is_err());
+        assert!(token_store(&config("set office365_token_store=vault\n"), &url()).is_err());
     }
 }

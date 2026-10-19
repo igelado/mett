@@ -3,12 +3,12 @@
 Status: **partly implemented.** mett reads mettrc files (§1) with `set`,
 `unset`, `toggle`, `reset` and `source`, and opens the `msgraph://` folder
 in `spoolfile` (§3, without the Focused Inbox views), signing in with the
-§4.1–4.3 variables (except `msgraph_oauth_refresh_command`). It sends mail
+§4.1–4.3 variables (except `office365_oauth_refresh_command`). It sends mail
 through the spoolfile's account and postpones it to that account's Drafts
 (§5.2, without `record` and `postponed`). Folders of that account can be
 opened, browsed, and used to save or copy messages, and purged messages go
 to `trash` (§6). The open folder and the `mailboxes` of that account are
-checked for new mail every `msgraph_sync_interval` seconds (§4.5). The
+checked for new mail every `office365_sync_interval` seconds (§4.5). The
 index, pager and status bar follow `index_format`, `pager_format` and
 `status_format`, and `color` and `mono` set the colors.
 With `use_ews`, the account is reached through Exchange Web Services
@@ -26,8 +26,8 @@ needed to use an Office365 account through Microsoft Graph.
    as in mutt. Users can reuse most of an existing muttrc.
 2. **Extend, don't fork.** New behaviour is added through:
    - a new mailbox URL scheme (§3),
-   - new variables with a `msgraph_` prefix, or `ews_` for Exchange Web
-     Services (§4),
+   - new variables with an `office365_` prefix, or `msgraph_` and `ews_`
+     for what is Microsoft Graph's or Exchange Web Services' own (§4),
    - new meanings for existing mutt concepts where they map naturally (§6).
 
    No new commands are added unless no existing mechanism fits.
@@ -39,7 +39,7 @@ needed to use an Office365 account through Microsoft Graph.
    reported once as warnings and otherwise ignored. A muttrc that a mettrc
    `source`s therefore doesn't stop mett from starting.
 5. **mett has its own files.** mett reads a `mettrc`, never mutt's muttrc
-   files, so mutt never sees the `msgraph_*` variables. The search order
+   files, so mutt never sees the `office365_*` variables. The search order
    mirrors mutt's:
 
    | Kind | Locations, in search order |
@@ -57,7 +57,7 @@ needed to use an Office365 account through Microsoft Graph.
    bindings and colors with mutt, a mettrc can `source` a muttrc.
 6. **Users bring their own Azure AD app.** mett ships no app registration
    and no default client ID. Each user or organisation registers an
-   application in Microsoft Entra ID (Azure AD) and sets `msgraph_client_id`
+   application in Microsoft Entra ID (Azure AD) and sets `office365_client_id`
    (§4.1).
 
 ## 2. Where plain muttrc falls short
@@ -114,20 +114,26 @@ mailboxes     =@inbox =@inbox/@focused "=Inbox/Projects/mett"
 
 ## 4. New variables
 
-New variables are prefixed with the protocol they configure, following the
-`imap_`/`smtp_` convention: `msgraph_` for Microsoft Graph and the sign-in
-(which Exchange Web Services share), `ews_` for Exchange Web Services. The
-switch between the two is `use_ews`, like mutt's `use_*` switches. Like
-other mutt variables, they can be set per account from an `account-hook`.
+New variables are prefixed with what they configure, following the
+`imap_`/`smtp_` convention: `office365_` for what Microsoft Graph and
+Exchange Web Services share (the sign-in, the token store, paging and
+checking for new mail), `msgraph_` for what is Graph's own (its scopes and
+endpoint), `ews_` for what is EWS's own. The switch between the two is
+`use_ews`, like mutt's `use_*` switches. Like other mutt variables, they can
+be set per account from an `account-hook`.
+
+The shared variables were once `msgraph_` ones too: their old names
+(`msgraph_client_id`, `msgraph_tenant` and so on) still work, with a
+warning to use the new name.
 
 ### 4.1 Application and tenant
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `msgraph_client_id` | string | *(none, required)* | Application (client) ID of the user's Entra ID (Azure AD) app registration. mett refuses to open a `msgraph://` account without it. |
-| `msgraph_tenant` | string | *(domain of the account)* | Tenant used to sign in: a domain, a tenant GUID, `organizations`, `common` or `consumers`. The default, for example `contoso.com` for `msgraph://alice@contoso.com/`, works for both single-tenant and multi-tenant apps, provided the domain is verified in the tenant. Single-tenant apps can't use `organizations` or `common`, because Entra ID rejects them (error AADSTS50194). |
-| `msgraph_cloud` | string | `global` | `global`, `usgov`, `usgov-dod` or `china`. Selects the login and Graph endpoints. |
-| `msgraph_endpoint` | string | *(from `msgraph_cloud`)* | Overrides the Graph base URL, for testing or proxies. Must be `https`, except on this machine (`localhost`, loopback addresses). |
+| `office365_client_id` | string | *(none, required)* | Application (client) ID of the user's Entra ID (Azure AD) app registration. mett refuses to open a `msgraph://` account without it. |
+| `office365_tenant` | string | *(domain of the account)* | Tenant used to sign in: a domain, a tenant GUID, `organizations`, `common` or `consumers`. The default, for example `contoso.com` for `msgraph://alice@contoso.com/`, works for both single-tenant and multi-tenant apps, provided the domain is verified in the tenant. Single-tenant apps can't use `organizations` or `common`, because Entra ID rejects them (error AADSTS50194). |
+| `office365_cloud` | string | `global` | `global`, `usgov`, `usgov-dod` or `china`. Selects the login and Graph endpoints. |
+| `msgraph_endpoint` | string | *(from `office365_cloud`)* | Overrides the Graph base URL, for testing or proxies. Must be `https`, except on this machine (`localhost`, loopback addresses). |
 
 #### Registering the app
 
@@ -135,13 +141,13 @@ The app registration needs:
 
 - **Platform:** *Mobile and desktop applications*, with the redirect URI
   `http://localhost`. Entra ID accepts any port on a loopback redirect, which
-  `msgraph_redirect_port` relies on.
+  `office365_redirect_port` relies on.
 - **Allow public client flows:** enabled. This is required for
   `device-code`, and mett never uses a client secret.
 - **Supported account types:** single tenant is enough for one organisation.
   Choose multi-tenant only if the same registration serves several tenants.
   A single-tenant app signs in only through its own tenant, which is what
-  the default `msgraph_tenant` provides.
+  the default `office365_tenant` provides.
 - **API permissions:** the delegated Microsoft Graph permissions listed in
   `msgraph_scopes`. An administrator may need to grant consent, depending on
   the tenant's policy.
@@ -163,17 +169,17 @@ instructions and troubleshooting.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `msgraph_auth_flow` | string | `auth-code` | `auth-code` (authorization code with PKCE, through the system browser and a loopback redirect) or `device-code` (for headless or SSH sessions). |
-| `msgraph_redirect_port` | number | `0` | Loopback port for `auth-code`. `0` picks a free port. |
-| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`msgraph_query_directory`) and can be dropped when that is off. `User.Read` is required: after every sign-in and token refresh, mett reads the user principal name from Graph's `/me` and rejects the tokens unless it is this account. |
-| `msgraph_oauth_refresh_command` | string | `""` | When set, mett runs this command to obtain an access token instead of using its built-in OAuth2. This mirrors `imap_oauth_refresh_command`, so existing helper scripts can be reused. *Not supported yet: mett refuses to start when it is set.* |
+| `office365_auth_flow` | string | `auth-code` | `auth-code` (authorization code with PKCE, through the system browser and a loopback redirect) or `device-code` (for headless or SSH sessions). |
+| `office365_redirect_port` | number | `0` | Loopback port for `auth-code`. `0` picks a free port. |
+| `msgraph_scopes` | string | `Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access` | Space-separated OAuth2 scopes. `User.ReadBasic.All` is needed only for directory search (`office365_query_directory`) and can be dropped when that is off. `User.Read` is required: after every sign-in and token refresh, mett reads the user principal name from Graph's `/me` and rejects the tokens unless it is this account. |
+| `office365_oauth_refresh_command` | string | `""` | When set, mett runs this command to obtain an access token instead of using its built-in OAuth2. This mirrors `imap_oauth_refresh_command`, so existing helper scripts can be reused. *Not supported yet: mett refuses to start when it is set.* |
 
 ### 4.3 Token storage
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `msgraph_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. `file` is supported only on Unix, where file permissions keep the tokens private. |
-| `msgraph_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. Several accounts may share one file; each keeps its own token. |
+| `office365_token_store` | string | `keyring` | `keyring` (the OS secret service) or `file`. `file` is supported only on Unix, where file permissions keep the tokens private. |
+| `office365_token_file` | path | `$XDG_STATE_HOME/mett/<account>.tokens` (`~/.local/state/mett/<account>.tokens` when `XDG_STATE_HOME` is unset) | Used when the store is `file`. Created with mode `0600`. Several accounts may share one file; each keeps its own token. |
 
 ### 4.4 Exchange Web Services
 
@@ -187,7 +193,7 @@ and the §4.1–4.3 variables, except `msgraph_scopes` and
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `use_ews` | boolean | `no` | Reach the account through EWS. mett then asks for the delegated Exchange Online permission `EWS.AccessAsUser.All` (and `offline_access`) of the cloud's Exchange Online, instead of `msgraph_scopes`, and confirms who signed in from the access token's `upn` claim, as Graph doesn't take EWS tokens. |
-| `ews_url` | string | *(Exchange Online's, from `msgraph_cloud`)* | The EWS endpoint, for example `https://outlook.office365.com/EWS/Exchange.asmx`. Must be `https`, except on this machine. |
+| `ews_url` | string | *(Exchange Online's, from `office365_cloud`)* | The EWS endpoint, for example `https://outlook.office365.com/EWS/Exchange.asmx`. Must be `https`, except on this machine. |
 
 `use_ews` and `ews_url` take effect when mett starts. Differences from
 Graph:
@@ -210,10 +216,10 @@ Graph:
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `msgraph_focused_inbox` | boolean | `no` | When set, `=@inbox` opens the Focused view, and a status-line indicator lets the user switch to Other. |
-| `msgraph_query_directory` | boolean | `yes` | When `query_command` is unset, `<query>` searches the people the user works with (People API, `People.Read`) and the whole organisation directory (`User.ReadBasic.All`). |
-| `msgraph_page_size` | number | `50` | Number of messages fetched per Graph request. |
-| `msgraph_sync_interval` | number | `60` | Seconds between checks for new mail; `0` turns them off. This plays the role of `mail_check`, which mett uses only for local mailboxes. *Implemented so far:* each check lists the newest page of the open folder again (taking in what arrived, changed or went among those messages) and the messages changed since the last check (`lastModifiedDateTime`, which also finds mail delivered late or moved in with an old date), and reads the counts of the `mailboxes` and their unread messages that arrived or changed since the user last saw them (by `lastModifiedDateTime`, which a message moved in also gets); a mailbox has new mail when one of those is unread mail the user didn't see when they last had it open, newer than what they saw (before that, when it has unread mail). |
+| `office365_focused_inbox` | boolean | `no` | When set, `=@inbox` opens the Focused view, and a status-line indicator lets the user switch to Other. |
+| `office365_query_directory` | boolean | `yes` | When `query_command` is unset, `<query>` searches the people the user works with (People API, `People.Read`) and the whole organisation directory (`User.ReadBasic.All`). |
+| `office365_page_size` | number | `50` | Number of messages fetched per Graph request. |
+| `office365_sync_interval` | number | `60` | Seconds between checks for new mail; `0` turns them off. This plays the role of `mail_check`, which mett uses only for local mailboxes. *Implemented so far:* each check lists the newest page of the open folder again (taking in what arrived, changed or went among those messages) and the messages changed since the last check (`lastModifiedDateTime`, which also finds mail delivered late or moved in with an old date), and reads the counts of the `mailboxes` and their unread messages that arrived or changed since the user last saw them (by `lastModifiedDateTime`, which a message moved in also gets); a mailbox has new mail when one of those is unread mail the user didn't see when they last had it open, newer than what they saw (before that, when it has unread mail). |
 
 ## 5. Accounts and sending
 
@@ -228,7 +234,7 @@ URL names, and its settings come from hooks.
   background. mutt does the equivalent when it polls `mailboxes`.
 - **Connection settings (`account-hook`):** for each account, mett applies
   the `account-hook`s whose regex matches its URL to a private copy of the
-  `msgraph_*` variables, and gives that copy to the worker. mutt is
+  `office365_*`, `msgraph_*` and `ews_*` variables, and gives that copy to the worker. mutt is
   single-threaded, so it applies the hook to its global variables just before
   each connection. mett's worker serves several accounts at once, so each
   account needs its own copy. The result is the same as in mutt, but settings
@@ -304,9 +310,9 @@ set record    = "=@sentitems"
 set postponed = "=@drafts"
 set trash     = "=@deleteditems"
 
-set msgraph_client_id     = "00000000-0000-0000-0000-000000000000"
-set msgraph_tenant        = "contoso.com"
-set msgraph_focused_inbox = yes
+set office365_client_id     = "00000000-0000-0000-0000-000000000000"
+set office365_tenant        = "contoso.com"
+set office365_focused_inbox = yes
 
 mailboxes =@inbox =@inbox/@other =@archive "=Inbox/Projects/mett"
 ```
@@ -316,8 +322,8 @@ mailboxes =@inbox =@inbox/@other =@archive "=Inbox/Projects/mett"
 This uses the usual mutt `account-hook` and `folder-hook` idiom:
 
 ```muttrc
-account-hook msgraph://alice@contoso.com/ 'set msgraph_client_id = "11111111-1111-1111-1111-111111111111"; set msgraph_tenant = "contoso.com"'
-account-hook msgraph://alice@fabrikam.com/ 'set msgraph_client_id = "22222222-2222-2222-2222-222222222222"; set msgraph_tenant = "fabrikam.com"; set msgraph_auth_flow = "device-code"'
+account-hook msgraph://alice@contoso.com/ 'set office365_client_id = "11111111-1111-1111-1111-111111111111"; set office365_tenant = "contoso.com"'
+account-hook msgraph://alice@fabrikam.com/ 'set office365_client_id = "22222222-2222-2222-2222-222222222222"; set office365_tenant = "fabrikam.com"; set office365_auth_flow = "device-code"'
 
 folder-hook msgraph://alice@contoso.com/  'set from = "alice@contoso.com";  set record = "msgraph://alice@contoso.com/@sentitems"'
 folder-hook msgraph://alice@fabrikam.com/ 'set from = "alice@fabrikam.com"; set record = "msgraph://alice@fabrikam.com/@sentitems"'

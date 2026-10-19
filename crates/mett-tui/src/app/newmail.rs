@@ -1,5 +1,5 @@
 //! New mail, as in mutt: the open folder is checked every
-//! `msgraph_sync_interval` seconds, and messages that arrived are added to
+//! `office365_sync_interval` seconds, and messages that arrived are added to
 //! the index; the folders named by `mailboxes` are checked too, and the
 //! user is told which have new mail.
 

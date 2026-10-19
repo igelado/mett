@@ -61,7 +61,7 @@ pub(super) enum Purpose {
 pub struct QuerySettings {
     /// `query_command`, if set.
     pub command: String,
-    /// `msgraph_query_directory`: search the directory without one.
+    /// `office365_query_directory`: search the directory without one.
     pub directory: bool,
 }
 
