@@ -227,12 +227,13 @@ impl<S: MailStore> CachedStore<S> {
         Ok(())
     }
 
-    /// Whether `folder` is all in the cache.
-    fn complete(&self, folder: &FolderId) -> bool {
+    /// Whether `folder` was ever all in the cache: offline, it can be
+    /// listed as it was then (or since).
+    fn has_snapshot(&self, folder: &FolderId) -> bool {
         self.with_cache(|db| db.synced(folder))
             .ok()
             .flatten()
-            .is_some_and(|synced| synced.complete)
+            .is_some_and(|synced| synced.snapshot)
     }
 
     /// A page of `folder`'s summaries from the cache, from `query` (`what`
@@ -263,17 +264,20 @@ impl<S: MailStore> CachedStore<S> {
         Ok(MessagePage { messages, next })
     }
 
-    /// Goes on, from the server, with a listing the cache began before it
-    /// failed: its pages from the start, without what came up to `after`
-    /// in the cache's order (`key`).
+    /// Goes on, from the server, with a listing (`what` of `folder`) the
+    /// cache began before it failed: from `page` of the server's (its first,
+    /// then the next), without what came up to `after` in the cache's order
+    /// (`key`), on every page.
     async fn resume<F: Future<Output = Result<MessagePage>>>(
         &self,
-        size: u32,
+        folder: &FolderId,
+        what: &str,
+        mut page: Page,
         after: &Key,
         key: fn(&MessageSummary) -> Key,
         list: impl Fn(Page) -> F,
     ) -> Result<MessagePage> {
-        let mut page = Page::first(size);
+        let size = page.size();
         loop {
             let listed = list(page).await?;
             let rest: Vec<MessageSummary> = listed
@@ -286,18 +290,46 @@ impl<S: MailStore> CachedStore<S> {
                 next => {
                     return Ok(MessagePage {
                         messages: rest,
-                        next,
+                        next: next.map(|next| resumed(after, what, folder, &next)),
                     });
                 }
             }
         }
     }
 
+    /// Goes on with a listing the cache began, from the server, if `page`
+    /// is of one: `None` otherwise.
+    async fn resume_listing<F: Future<Output = Result<MessagePage>>>(
+        &self,
+        folder: &FolderId,
+        what: &str,
+        page: &Page,
+        key: fn(&MessageSummary) -> Key,
+        list: impl Fn(Page) -> F,
+    ) -> Option<Result<MessagePage>> {
+        let cursor = page.cursor()?;
+        let size = page.size();
+        let (after, from) = if is_cached(cursor) {
+            match parse_cursor(cursor, folder, what) {
+                Ok(after) => (after, Page::first(size)),
+                Err(e) => return Some(Err(e)),
+            }
+        } else if is_resumed(cursor) {
+            match parse_resumed(cursor, folder, what) {
+                Ok((after, next)) => (after, Page::after(next, size)),
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            return None;
+        };
+        Some(self.resume(folder, what, from, &after, key, list).await)
+    }
+
     async fn list_cached(&self, folder: &FolderId, page: &Page) -> Result<MessagePage> {
         if page.cursor().is_none() {
             match self.sync(folder).await {
-                // Offline, a folder all here is listed as it was.
-                Err(Error::Network(_)) if self.complete(folder) => {}
+                // Offline, a folder that was all here is listed as it was.
+                Err(Error::Network(_)) if self.has_snapshot(folder) => {}
                 synced => synced?,
             }
         }
@@ -371,6 +403,35 @@ fn cursor((at, id): &Key, what: &str, folder: &FolderId) -> PageCursor {
 /// Whether `cursor` is the cache's.
 fn is_cached(cursor: &PageCursor) -> bool {
     cursor.as_str().starts_with("cache\t")
+}
+
+/// A cursor of a listing the cache began, resumed from the server: the
+/// key of the last message the cache listed, and the server's cursor.
+fn resumed((at, id): &Key, what: &str, folder: &FolderId, next: &PageCursor) -> PageCursor {
+    PageCursor::new(format!("resumed\t{what}\t{at}\t{id}\t{folder}\t{next}"))
+}
+
+/// Whether `cursor` is of a listing resumed from the server ([`resumed`]).
+fn is_resumed(cursor: &PageCursor) -> bool {
+    cursor.as_str().starts_with("resumed\t")
+}
+
+/// The key and the server's cursor in `cursor` ([`resumed`]), which must be
+/// for `what` of `folder`.
+fn parse_resumed(cursor: &PageCursor, folder: &FolderId, what: &str) -> Result<(Key, PageCursor)> {
+    let bad = || {
+        Error::Backend(format!(
+            "page cursor is not for this listing of folder {folder}"
+        ))
+    };
+    let rest = cursor.as_str().strip_prefix("resumed\t").ok_or_else(bad)?;
+    let (key, next) = rest
+        .match_indices('\t')
+        .nth(3)
+        .map(|(at, _)| (&rest[..at], &rest[at + 1..]))
+        .ok_or_else(bad)?;
+    let after = parse_cursor(&PageCursor::new(format!("cache\t{key}")), folder, what)?;
+    Ok((after, PageCursor::new(next)))
 }
 
 /// The key in `cursor`, which must be for `what` of `folder`.
@@ -464,15 +525,15 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 listed => return listed,
             }
         }
-        if let Some(cursor) = page.cursor().filter(|c| is_cached(c)) {
-            let after = parse_cursor(cursor, folder, "all")?;
-            return self
-                .resume(page.size(), &after, received_key, |page| {
-                    self.inner.list_messages(folder, page)
-                })
-                .await;
+        let resumed = self
+            .resume_listing(folder, "all", &page, received_key, |page| {
+                self.inner.list_messages(folder, page)
+            })
+            .await;
+        match resumed {
+            Some(listed) => listed,
+            None => self.inner.list_messages(folder, page).await,
         }
-        self.inner.list_messages(folder, page).await
     }
 
     async fn changed_messages(
@@ -487,15 +548,16 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 listed => return listed,
             }
         }
-        if let Some(cursor) = page.cursor().filter(|c| is_cached(c)) {
-            let after = parse_cursor(cursor, folder, &since.timestamp_millis().to_string())?;
-            return self
-                .resume(page.size(), &after, modified_key, |page| {
-                    self.inner.changed_messages(folder, since, page)
-                })
-                .await;
+        let what = since.timestamp_millis().to_string();
+        let resumed = self
+            .resume_listing(folder, &what, &page, modified_key, |page| {
+                self.inner.changed_messages(folder, since, page)
+            })
+            .await;
+        match resumed {
+            Some(listed) => listed,
+            None => self.inner.changed_messages(folder, since, page).await,
         }
-        self.inner.changed_messages(folder, since, page).await
     }
 
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {

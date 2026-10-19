@@ -492,17 +492,26 @@ async fn a_cache_that_fails_mid_listing_goes_on_from_the_server() {
     let dir = std::env::temp_dir().join(format!("mett-sqlite-resume-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("cache.sqlite");
-    let store = CachedStore::new(mailbox(4), Some(Cache::open(&path, &alice()).unwrap()));
+    let store = CachedStore::new(mailbox(6), Some(Cache::open(&path, &alice()).unwrap()));
     let first = store.list_messages(&inbox(), Page::first(2)).await.unwrap();
+    assert_eq!(ids(&first.messages), ["m5", "m4"]);
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute_batch("DROP TABLE messages")
         .unwrap();
-    let second = store
-        .list_messages(&inbox(), Page::after(first.next.unwrap(), 2))
-        .await
-        .unwrap();
-    assert_eq!(ids(&second.messages), ["m1", "m0"]);
+    // The rest comes from the server, page by page, without what the
+    // cache listed.
+    let mut rest = Vec::new();
+    let mut next = first.next;
+    while let Some(cursor) = next {
+        let page = store
+            .list_messages(&inbox(), Page::after(cursor, 2))
+            .await
+            .unwrap();
+        rest.extend(ids(&page.messages).into_iter().map(str::to_owned));
+        next = page.next;
+    }
+    assert_eq!(rest, ["m3", "m2", "m1", "m0"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

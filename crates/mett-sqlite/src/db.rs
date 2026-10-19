@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
     -- Whose mailbox this is.
@@ -24,6 +24,9 @@ const SCHEMA: &str = "
         state TEXT,
         -- Whether the sync reached the end: the folder is all here.
         complete INTEGER NOT NULL DEFAULT 0,
+        -- Whether a sync ever reached the end: the folder is here as it
+        -- was then, at least, to list offline.
+        snapshot INTEGER NOT NULL DEFAULT 0,
         -- Whether the sync started over: what it doesn't report again is
         -- gone, once it is complete.
         scratch INTEGER NOT NULL DEFAULT 0
@@ -122,6 +125,8 @@ impl Listing<'_> {
 pub(crate) struct Synced {
     pub state: Option<SyncState>,
     pub complete: bool,
+    /// Whether a sync of it ever completed: it can be listed offline.
+    pub snapshot: bool,
 }
 
 /// The cache database.
@@ -193,12 +198,13 @@ impl Db {
     pub fn synced(&self, folder: &FolderId) -> Result<Option<Synced>, Error> {
         self.conn
             .query_row(
-                "SELECT state, complete FROM folders WHERE id = ?1",
+                "SELECT state, complete, snapshot FROM folders WHERE id = ?1",
                 [folder.as_str()],
                 |r| {
                     Ok(Synced {
                         state: r.get::<_, Option<String>>(0)?.map(SyncState::new),
                         complete: r.get(1)?,
+                        snapshot: r.get(2)?,
                     })
                 },
             )
@@ -300,7 +306,7 @@ impl Db {
             )
             .map_err(failed)?;
             tx.execute(
-                "UPDATE folders SET scratch = 0 WHERE id = ?1",
+                "UPDATE folders SET scratch = 0, snapshot = 1 WHERE id = ?1",
                 [folder.as_str()],
             )
             .map_err(failed)?;
@@ -509,6 +515,21 @@ impl Db {
             }
         }
         for (ord, folder) in folders.iter().enumerate() {
+            // A lookup that doesn't tell a folder's role (Graph's, before it
+            // knows them all) leaves the role known.
+            let mut folder = folder.clone();
+            if folder.well_known.is_none() && !matches!(listing, Listing::All) {
+                folder.well_known = tx
+                    .query_row(
+                        "SELECT name FROM well_known WHERE id = ?1",
+                        [folder.id.as_str()],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(failed)?
+                    .and_then(|name| name.parse().ok());
+            }
+            let folder = &folder;
             let stored = serde_json::to_string(&StoredFolder::from(folder)).map_err(failed)?;
             // A folder looked up alone keeps its place among the others
             // (a new one goes last).
@@ -841,6 +862,17 @@ mod tests {
         assert!(!db.apply(&inbox, Some(&s1), &changes("s2'")).unwrap());
         let synced = db.synced(&inbox).unwrap().unwrap();
         assert_eq!(synced.state, Some(SyncState::new("s2")));
+        // Once all here, it can be listed offline, even while a later sync
+        // is cut short.
+        assert!(synced.complete && synced.snapshot);
+        let unfinished = FolderChanges {
+            more: true,
+            ..changes("s3")
+        };
+        let s2 = SyncState::new("s2");
+        assert!(db.apply(&inbox, Some(&s2), &unfinished).unwrap());
+        let synced = db.synced(&inbox).unwrap().unwrap();
+        assert!(!synced.complete && synced.snapshot);
     }
 
     #[test]
@@ -860,7 +892,22 @@ mod tests {
         assert!(db.apply(&inbox, None, &changes).unwrap());
         let changed = db.changed(&inbox, before, None, 10).unwrap();
         assert_eq!(changed.len(), 1);
-        assert!(changed[0].modified.is_some_and(|m| m >= before));
+        assert!(
+            changed[0]
+                .modified
+                .is_some_and(|m| m.timestamp_millis() >= before.timestamp_millis())
+        );
+    }
+
+    #[test]
+    fn a_lookup_without_a_role_keeps_the_one_known() {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        let mut inbox = folder("in");
+        inbox.well_known = Some(WellKnownFolder::Inbox);
+        db.keep_folders(std::slice::from_ref(&inbox), Listing::Some)
+            .unwrap();
+        db.keep_folders(&[folder("in")], Listing::Some).unwrap();
+        assert_eq!(db.well_known(WellKnownFolder::Inbox).unwrap(), Some(inbox));
     }
 
     #[test]
