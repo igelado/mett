@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 /// again: it holds nothing the server doesn't.
 const SCHEMA_VERSION: i64 = 5;
 
+/// Marks mett's caches (SQLite's `application_id`): "mett".
+const APPLICATION_ID: i64 = 0x6D65_7474;
+
 const SCHEMA: &str = "
     -- Whose mailbox this is.
     CREATE TABLE account (id TEXT NOT NULL);
@@ -94,6 +97,9 @@ pub(crate) enum OpenError {
     /// It holds another account's mailbox.
     #[error("it holds the mailbox of {0}; give each account its own header_cache")]
     Account(String),
+    /// It is another program's database.
+    #[error("it is a database, but not mett's cache")]
+    Foreign,
 }
 
 /// Which folders a listing gave.
@@ -159,6 +165,17 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A database of something else is never touched: only a new one
+        // becomes a cache.
+        let id: i64 = tx.pragma_query_value(None, "application_id", |r| r.get(0))?;
+        if id != APPLICATION_ID {
+            let tables: i64 =
+                tx.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))?;
+            if tables > 0 {
+                return Err(OpenError::Foreign);
+            }
+            tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+        }
         // Whose it is, if it says (whatever its schema): another account's
         // is left alone, even if it is out of date.
         let owner: Option<String> = tx

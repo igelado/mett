@@ -228,6 +228,18 @@ async fn the_cache_is_private_and_lasts() {
     let link = dir.join("link.sqlite");
     std::os::unix::fs::symlink(&path, &link).unwrap();
     assert!(Cache::open(&link, &alice()).is_err());
+    // Nor another program's database, which is left as it was.
+    let other = dir.join("other.sqlite");
+    rusqlite::Connection::open(&other)
+        .unwrap()
+        .execute_batch("CREATE TABLE messages (x); INSERT INTO messages VALUES (1);")
+        .unwrap();
+    assert!(Cache::open(&other, &alice()).is_err());
+    let kept: i64 = rusqlite::Connection::open(&other)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kept, 1);
     // One made readable by others is made private again.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     drop(Cache::open(&path, &alice()).unwrap());
