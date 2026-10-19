@@ -2,7 +2,8 @@
 #
 # Pushing a tag vX.Y.Z builds the Debian/Ubuntu, Arch Linux and tarball
 # packages for x86_64 and aarch64, and publishes them as that tag's release.
-# Running it by hand (workflow_dispatch) only builds them, as an artifact.
+# Running it by hand (workflow_dispatch) only builds them, to check that
+# they build, and publishes nothing.
 
 name: release
 on:
@@ -46,9 +47,6 @@ jobs:
           FORGEJO_REPOSITORY: ${{ forgejo.repository }}
           FORGEJO_TOKEN: ${{ forgejo.token }}
         run: packaging/release.sh "${{ forgejo.ref_name }}"
-      - name: Keep the packages
+      - name: List the packages
         if: forgejo.event_name == 'workflow_dispatch'
-        uses: https://code.forgejo.org/actions/upload-artifact@v3
-        with:
-          name: packages
-          path: dist/
+        run: ls -l dist/

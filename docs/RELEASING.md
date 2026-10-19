@@ -50,9 +50,11 @@ the release and replaces files of the same name.
 ## Building the packages without releasing
 
 From the Forgejo web interface (**Actions** › **release** › **Run
-workflow**), the workflow builds the packages from a branch and keeps them
-as the run's artifact, publishing nothing. To build them locally instead,
-install the tools and run the script:
+workflow**), the workflow builds the packages from a branch, to check that
+they build, and publishes nothing. (It doesn't keep them as an artifact:
+git.gelado.org's artifact storage fails uploads.) To get the packages
+without releasing, build them locally: install the tools and run the
+script:
 
 ```sh
 pip install cargo-zigbuild        # also installs zig
