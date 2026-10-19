@@ -120,6 +120,17 @@ fn private_file(path: &Path) -> std::io::Result<()> {
                 .recursive(true)
                 .mode(0o700)
                 .create(dir)?;
+            // Others who can write to the directory could put another file
+            // in the cache's place.
+            if std::fs::metadata(dir)?.permissions().mode() & 0o022 != 0 {
+                return Err(std::io::Error::other(format!(
+                    "{} is writable by others; use a private directory",
+                    dir.display()
+                )));
+            }
+        }
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(std::io::Error::other("it is a symbolic link"));
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -174,8 +185,9 @@ impl<S: MailStore> CachedStore<S> {
 
     /// Brings `folder`'s cache up to date, unless it just was. Each batch
     /// of changes is kept as it comes, so a sync cut short carries on
-    /// where it stopped.
-    async fn sync(&self, folder: &FolderId) -> Result<()> {
+    /// where it stopped. `false` if the cache can't tell the folder yet
+    /// (another mett sharing it is still filling it): the server has to.
+    async fn sync(&self, folder: &FolderId) -> Result<bool> {
         let lock = Arc::clone(
             self.synced
                 .lock()
@@ -186,7 +198,7 @@ impl<S: MailStore> CachedStore<S> {
         let mut last = lock.lock().await;
         let writes = self.writes.load(Ordering::SeqCst);
         if last.is_some_and(|(at, then)| at.elapsed() < FRESH && then == writes) {
-            return Ok(());
+            return Ok(true);
         }
         let mut state = match self.with_cache(|db| db.synced(folder))? {
             Some(synced) if synced.state.is_some() => synced.state,
@@ -214,6 +226,12 @@ impl<S: MailStore> CachedStore<S> {
                 // syncs keep the folder up to date.
                 lost += 1;
                 if lost > LOST_RACES {
+                    let complete = self
+                        .with_cache(|db| db.synced(folder))?
+                        .is_some_and(|synced| synced.complete);
+                    if !complete {
+                        return Ok(false);
+                    }
                     break;
                 }
                 match self.with_cache(|db| db.synced(folder))? {
@@ -234,7 +252,7 @@ impl<S: MailStore> CachedStore<S> {
             }
         }
         *last = Some((Instant::now(), writes));
-        Ok(())
+        Ok(true)
     }
 
     /// Whether `folder` was ever all in the cache: offline, it can be
@@ -336,11 +354,19 @@ impl<S: MailStore> CachedStore<S> {
     }
 
     async fn list_cached(&self, folder: &FolderId, page: &Page) -> Result<MessagePage> {
+        // A listing the server began (the cache couldn't tell the folder)
+        // goes on there.
+        if page.cursor().is_some_and(|c| !is_cached(c)) {
+            return self.inner.list_messages(folder, page.clone()).await;
+        }
         if page.cursor().is_none() {
             match self.sync(folder).await {
                 // Offline, a folder that was all here is listed as it was.
                 Err(Error::Network(_)) if self.has_snapshot(folder) => {}
-                synced => synced?,
+                Ok(false) => return self.inner.list_messages(folder, page.clone()).await,
+                synced => {
+                    synced?;
+                }
             }
         }
         self.cached_page(folder, page, "all", received_key, |db, after, limit| {
@@ -354,8 +380,13 @@ impl<S: MailStore> CachedStore<S> {
         since: DateTime<Utc>,
         page: &Page,
     ) -> Result<MessagePage> {
-        if page.cursor().is_none() {
-            self.sync(folder).await?;
+        if page.cursor().is_some_and(|c| !is_cached(c))
+            || (page.cursor().is_none() && !self.sync(folder).await?)
+        {
+            return self
+                .inner
+                .changed_messages(folder, since, page.clone())
+                .await;
         }
         let what = since.timestamp_millis().to_string();
         self.cached_page(folder, page, &what, modified_key, |db, after, limit| {
@@ -368,7 +399,9 @@ impl<S: MailStore> CachedStore<S> {
         folder: &FolderId,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
-        self.sync(folder).await?;
+        if !self.sync(folder).await? {
+            return self.inner.recent_unread(folder, since).await;
+        }
         // Without `since`, the last few tell.
         let limit = if since.is_some() { RECENT_UNREAD } else { 50 };
         let since = since.unwrap_or(DateTime::UNIX_EPOCH);
