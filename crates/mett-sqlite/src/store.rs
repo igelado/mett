@@ -22,6 +22,10 @@ use crate::db::{Db, Key, Listing, comes_after, modified_key, received_key};
 /// sync.
 const FRESH: Duration = Duration::from_secs(2);
 
+/// How many times a sync goes on after another mett sharing the cache
+/// took in changes first.
+const LOST_RACES: u32 = 3;
+
 /// Why the cache could not be opened.
 #[derive(Debug, thiserror::Error)]
 #[error("cache {path}: {source}")]
@@ -191,6 +195,7 @@ impl<S: MailStore> CachedStore<S> {
                 None
             }
         };
+        let mut lost = 0;
         loop {
             let changes = match self.inner.sync_folder(folder, state.as_ref()).await {
                 // The server forgot where the sync stood: start over,
@@ -204,9 +209,14 @@ impl<S: MailStore> CachedStore<S> {
             };
             if !self.with_cache(|db| db.apply(folder, state.as_ref(), &changes))? {
                 // Another mett sharing the cache synced the folder
-                // meanwhile: go on from where it left it.
+                // meanwhile: go on from where it left it (what came since
+                // may be in neither's changes). Should it keep winning, its
+                // syncs keep the folder up to date.
+                lost += 1;
+                if lost > LOST_RACES {
+                    break;
+                }
                 match self.with_cache(|db| db.synced(folder))? {
-                    Some(synced) if synced.complete => break,
                     Some(synced) if synced.state.is_some() => state = synced.state,
                     _ => {
                         self.with_cache(|db| db.start_over(folder))?;
