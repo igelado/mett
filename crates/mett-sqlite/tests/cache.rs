@@ -13,7 +13,7 @@ use mett_sqlite::{Cache, CachedStore};
 fn cached(
     inner: MemoryStore,
 ) -> std::result::Result<CachedStore<MemoryStore>, mett_sqlite::CacheError> {
-    Ok(CachedStore::new(inner, Some(Cache::in_memory()?)))
+    Ok(CachedStore::new(inner, Some(Cache::in_memory(&alice())?)))
 }
 
 fn at(minutes: i64) -> DateTime<Utc> {
@@ -34,6 +34,10 @@ fn mailbox(n: i64) -> MemoryStore {
         store = store.with_message(mock::message(&format!("m{i}"), "in", "hi", at(i)));
     }
     store
+}
+
+fn alice() -> mett_core::AccountId {
+    mett_core::AccountId::new("alice@contoso.com")
 }
 
 fn inbox() -> FolderId {
@@ -200,7 +204,7 @@ async fn the_cache_is_private_and_lasts() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("cache").join("alice@contoso.com.sqlite");
     {
-        let store = CachedStore::new(mailbox(2), Some(Cache::open(&path).unwrap()));
+        let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
         listing(&store, 10).await;
     }
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -208,12 +212,12 @@ async fn the_cache_is_private_and_lasts() {
     assert_eq!(mode(path.parent().unwrap()), 0o700);
     // One made readable by others is made private again.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    drop(Cache::open(&path).unwrap());
+    drop(Cache::open(&path, &alice()).unwrap());
     assert_eq!(mode(&path), 0o600);
     // Opened again, the folder goes on from where its sync stood: the
     // mock store's state still tells nothing changed.
     let inner = mailbox(2);
-    let store = CachedStore::new(inner, Some(Cache::open(&path).unwrap()));
+    let store = CachedStore::new(inner, Some(Cache::open(&path, &alice()).unwrap()));
     let page = store
         .list_messages(&inbox(), Page::first(10))
         .await
@@ -250,7 +254,7 @@ async fn a_cache_that_fails_is_left_for_the_server() {
     let dir = std::env::temp_dir().join(format!("mett-sqlite-broken-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("cache.sqlite");
-    let store = CachedStore::new(mailbox(2), Some(Cache::open(&path).unwrap()));
+    let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
     listing(&store, 10).await;
     // Something breaks the cache under mett.
     rusqlite::Connection::open(&path)
@@ -389,7 +393,7 @@ async fn offline_the_folders_seen_are_listed_as_they_were() {
         inner: mailbox(2),
         down: false.into(),
     };
-    let store = CachedStore::new(flaky, Some(Cache::in_memory().unwrap()));
+    let store = CachedStore::new(flaky, Some(Cache::in_memory(&alice()).unwrap()));
     let inbox = store
         .well_known_folder(WellKnownFolder::Inbox)
         .await
@@ -433,4 +437,76 @@ async fn offline_the_folders_seen_are_listed_as_they_were() {
         store.folder(&FolderId::new("nowhere")).await,
         Err(Error::Network(_))
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn pages_go_on_after_the_last_message_listed() {
+    let store = cached(mailbox(4)).unwrap();
+    let first = store.list_messages(&inbox(), Page::first(2)).await.unwrap();
+    assert_eq!(ids(&first.messages), ["m3", "m2"]);
+    // Mail arrives, and a check for new mail syncs it, before the next
+    // page: it doesn't shift what comes next.
+    store
+        .inner()
+        .deliver(mock::message("m9", "in", "new", at(9)), at(9));
+    later().await;
+    store
+        .changed_messages(&inbox(), at(0), Page::first(10))
+        .await
+        .unwrap();
+    let second = store
+        .list_messages(&inbox(), Page::after(first.next.unwrap(), 2))
+        .await
+        .unwrap();
+    assert_eq!(ids(&second.messages), ["m1", "m0"]);
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_cache_that_fails_mid_listing_goes_on_from_the_server() {
+    let dir = std::env::temp_dir().join(format!("mett-sqlite-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("cache.sqlite");
+    let store = CachedStore::new(mailbox(4), Some(Cache::open(&path, &alice()).unwrap()));
+    let first = store.list_messages(&inbox(), Page::first(2)).await.unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE messages")
+        .unwrap();
+    let second = store
+        .list_messages(&inbox(), Page::after(first.next.unwrap(), 2))
+        .await
+        .unwrap();
+    assert_eq!(ids(&second.messages), ["m1", "m0"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn a_cache_is_one_accounts() {
+    let dir = std::env::temp_dir().join(format!("mett-sqlite-accounts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("cache.sqlite");
+    {
+        let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
+        listing(&store, 10).await;
+    }
+    // Bob's mailbox, offline, finds nothing of Alice's.
+    let bob = mett_core::AccountId::new("bob@contoso.com");
+    let flaky = Flaky {
+        inner: mailbox(0),
+        down: true.into(),
+    };
+    let store = CachedStore::new(flaky, Some(Cache::open(&path, &bob).unwrap()));
+    assert!(matches!(
+        store.well_known_folder(WellKnownFolder::Inbox).await,
+        Err(Error::Network(_))
+    ));
+    assert!(
+        store
+            .list_messages(&inbox(), Page::first(10))
+            .await
+            .is_err()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

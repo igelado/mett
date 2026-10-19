@@ -5,17 +5,19 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Address, Body, BodyKind, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId, Message,
-    MessageId, MessageSummary, SyncState, ThreadPosition, WellKnownFolder,
+    AccountId, Address, Body, BodyKind, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId,
+    Message, MessageId, MessageSummary, SyncState, ThreadPosition, WellKnownFolder,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
+    -- Whose mailbox this is.
+    CREATE TABLE account (id TEXT NOT NULL);
     CREATE TABLE folders (
         id TEXT PRIMARY KEY,
         -- Where the folder's sync stands, once it has started.
@@ -55,6 +57,29 @@ const SCHEMA: &str = "
     CREATE INDEX messages_by_change ON messages (folder, modified DESC);
 ";
 
+/// Where a message is in a listing: its date there, in milliseconds, and
+/// its ID (listings go by date, newest first, then by ID).
+pub(crate) type Key = (i64, String);
+
+/// `summary`'s key in a listing by date ([`Db::page`]).
+pub(crate) fn received_key(summary: &MessageSummary) -> Key {
+    (summary.received.timestamp_millis(), summary.id.to_string())
+}
+
+/// `summary`'s key in a listing by change ([`Db::changed`]).
+pub(crate) fn modified_key(summary: &MessageSummary) -> Key {
+    (
+        summary.modified.map_or(i64::MIN, |m| m.timestamp_millis()),
+        summary.id.to_string(),
+    )
+}
+
+/// Whether the message of key `key` comes after the one of `after` in a
+/// listing.
+pub(crate) fn comes_after(key: &Key, after: &Key) -> bool {
+    key.0 < after.0 || (key.0 == after.0 && key.1 > after.1)
+}
+
 /// Where a folder's sync stands.
 pub(crate) struct Synced {
     pub state: Option<SyncState>,
@@ -72,33 +97,49 @@ fn failed(e: impl std::fmt::Display) -> Error {
 }
 
 impl Db {
-    /// Opens (creating it if needed) the cache at `path`.
-    pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        Self::ready(Connection::open(path)?)
+    /// Opens (creating it if needed) the cache of `account`'s mailbox at
+    /// `path`.
+    pub fn open(path: &Path, account: &AccountId) -> rusqlite::Result<Self> {
+        Self::ready(Connection::open(path)?, account)
     }
 
     /// A cache in memory, for tests.
-    pub fn in_memory() -> rusqlite::Result<Self> {
-        Self::ready(Connection::open_in_memory()?)
+    pub fn in_memory(account: &AccountId) -> rusqlite::Result<Self> {
+        Self::ready(Connection::open_in_memory()?, account)
     }
 
-    fn ready(conn: Connection) -> rusqlite::Result<Self> {
-        // Another mett may use the same cache: wait for it rather than fail.
+    /// Readies the cache for `account`: one of another schema version is
+    /// made afresh, and one of another account emptied. Another mett may
+    /// open it at once: this is one transaction, which waits for the other.
+    fn ready(mut conn: Connection, account: &AccountId) -> rusqlite::Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version != SCHEMA_VERSION {
-            conn.execute_batch(
+            tx.execute_batch(
                 "DROP INDEX IF EXISTS messages_by_date;
                  DROP INDEX IF EXISTS messages_by_change;
                  DROP TABLE IF EXISTS messages;
                  DROP TABLE IF EXISTS folders;
                  DROP TABLE IF EXISTS folder_info;
-                 DROP TABLE IF EXISTS well_known;",
+                 DROP TABLE IF EXISTS well_known;
+                 DROP TABLE IF EXISTS account;",
             )?;
-            conn.execute_batch(SCHEMA)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        let owner: Option<String> = tx
+            .query_row("SELECT id FROM account", [], |r| r.get(0))
+            .optional()?;
+        if owner.as_deref() != Some(account.as_str()) {
+            tx.execute_batch(
+                "DELETE FROM messages; DELETE FROM folders; DELETE FROM folder_info;
+                 DELETE FROM well_known; DELETE FROM account;",
+            )?;
+            tx.execute("INSERT INTO account (id) VALUES (?1)", [account.as_str()])?;
+        }
+        tx.commit()?;
         Ok(Self { conn })
     }
 
@@ -195,37 +236,44 @@ impl Db {
         tx.commit().map_err(failed)
     }
 
-    /// Up to `limit` of `folder`'s summaries from `offset`, newest first.
+    /// Up to `limit` of `folder`'s summaries, newest first (by
+    /// [`received_key`], then ID), after the one `after` is the key of.
     pub fn page(
         &self,
         folder: &FolderId,
-        offset: u64,
+        after: Option<&Key>,
         limit: u64,
     ) -> Result<Vec<MessageSummary>, Error> {
+        let (at, id) = after.map_or((None, ""), |(at, id)| (Some(*at), id.as_str()));
         self.summaries(
             "SELECT summary FROM messages WHERE folder = ?1
-             ORDER BY received DESC, id LIMIT ?2 OFFSET ?3",
-            params![folder.as_str(), sql(limit), sql(offset)],
+             AND (?2 IS NULL OR received < ?2 OR (received = ?2 AND id > ?3))
+             ORDER BY received DESC, id LIMIT ?4",
+            params![folder.as_str(), at, id, sql(limit)],
         )
     }
 
     /// Up to `limit` of `folder`'s summaries changed at or after `since`,
-    /// from `offset`, most recently changed first.
+    /// most recently changed first (by [`modified_key`], then ID), after
+    /// the one `after` is the key of.
     pub fn changed(
         &self,
         folder: &FolderId,
         since: DateTime<Utc>,
-        offset: u64,
+        after: Option<&Key>,
         limit: u64,
     ) -> Result<Vec<MessageSummary>, Error> {
+        let (at, id) = after.map_or((None, ""), |(at, id)| (Some(*at), id.as_str()));
         self.summaries(
             "SELECT summary FROM messages WHERE folder = ?1 AND modified >= ?2
-             ORDER BY modified DESC, id LIMIT ?3 OFFSET ?4",
+             AND (?3 IS NULL OR modified < ?3 OR (modified = ?3 AND id > ?4))
+             ORDER BY modified DESC, id LIMIT ?5",
             params![
                 folder.as_str(),
                 since.timestamp_millis(),
-                sql(limit),
-                sql(offset)
+                at,
+                id,
+                sql(limit)
             ],
         )
     }
@@ -344,9 +392,14 @@ impl Db {
         Ok(())
     }
 
-    /// Keeps `folders`, as a listing gave them, in its order.
-    pub fn keep_folders(&mut self, folders: &[Folder]) -> Result<(), Error> {
+    /// Keeps `folders`, as a listing gave them, in its order. A listing of
+    /// them `all` replaces what was kept.
+    pub fn keep_folders(&mut self, folders: &[Folder], all: bool) -> Result<(), Error> {
         let tx = self.conn.transaction().map_err(failed)?;
+        if all {
+            tx.execute_batch("DELETE FROM folder_info; DELETE FROM well_known;")
+                .map_err(failed)?;
+        }
         for (ord, folder) in folders.iter().enumerate() {
             let stored = serde_json::to_string(&StoredFolder::from(folder)).map_err(failed)?;
             tx.execute(
@@ -624,5 +677,39 @@ impl StoredExtras {
                 content: self.content,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn folder(id: &str) -> Folder {
+        Folder {
+            id: FolderId::new(id),
+            parent: None,
+            name: id.to_owned(),
+            well_known: None,
+            unread_count: 0,
+            total_count: 0,
+        }
+    }
+
+    #[test]
+    fn a_listing_of_all_folders_replaces_those_kept() {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        db.keep_folders(&[folder("a"), folder("b")], true).unwrap();
+        // One folder alone (opened) is added to the others.
+        db.keep_folders(&[folder("c")], false).unwrap();
+        assert_eq!(db.folders_below(None, true).unwrap().len(), 3);
+        // A listing of them all, without b (deleted), leaves it out.
+        db.keep_folders(&[folder("a"), folder("c")], true).unwrap();
+        let ids: Vec<String> = db
+            .folders_below(None, true)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.id.to_string())
+            .collect();
+        assert_eq!(ids, ["a", "c"]);
     }
 }

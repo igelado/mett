@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Address, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderChanges, FolderId,
-    MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, Page, PageCursor,
-    RECENT_UNREAD, Result, SyncState, WellKnownFolder,
+    AccountId, Address, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderChanges,
+    FolderId, MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, Page,
+    PageCursor, RECENT_UNREAD, Result, SyncState, WellKnownFolder,
 };
 use tokio::time::Instant;
 
-use crate::db::Db;
+use crate::db::{Db, Key, comes_after, modified_key, received_key};
 
 /// A folder synced this recently isn't synced again: the calls of one
 /// request (a check for new mail lists a folder and its changes) share a
@@ -61,20 +61,23 @@ type LastSync = Option<(Instant, u64)>;
 pub struct Cache(Db);
 
 impl Cache {
-    /// The cache in the file `path`, which is created (only its owner may
-    /// read it, as it holds mail) if needed.
-    pub fn open(path: &Path) -> std::result::Result<Self, CacheError> {
+    /// The cache of `account`'s mailbox in the file `path`, which is
+    /// created (only its owner may read it, as it holds mail) if needed.
+    /// One that held another account's is emptied.
+    pub fn open(path: &Path, account: &AccountId) -> std::result::Result<Self, CacheError> {
         let error = |source: Box<dyn std::error::Error + Send + Sync>| CacheError {
             path: path.display().to_string(),
             source,
         };
         private_file(path).map_err(|e| error(Box::new(e)))?;
-        Db::open(path).map(Self).map_err(|e| error(Box::new(e)))
+        Db::open(path, account)
+            .map(Self)
+            .map_err(|e| error(Box::new(e)))
     }
 
-    /// A cache in memory, gone when it is dropped.
-    pub fn in_memory() -> std::result::Result<Self, CacheError> {
-        Db::in_memory().map(Self).map_err(|e| CacheError {
+    /// A cache of `account`'s mailbox in memory, gone when it is dropped.
+    pub fn in_memory(account: &AccountId) -> std::result::Result<Self, CacheError> {
+        Db::in_memory(account).map(Self).map_err(|e| CacheError {
             path: ":memory:".into(),
             source: Box::new(e),
         })
@@ -220,27 +223,61 @@ impl<S: MailStore> CachedStore<S> {
     }
 
     /// A page of `folder`'s summaries from the cache, from `query` (`what`
-    /// the listing is, which its cursors record).
+    /// the listing is, which its cursors record), which `key` orders.
     fn cached_page(
         &self,
         folder: &FolderId,
         page: &Page,
         what: &str,
-        query: impl FnOnce(&Db, u64, u64) -> Result<Vec<MessageSummary>>,
+        key: fn(&MessageSummary) -> Key,
+        query: impl FnOnce(&Db, Option<&Key>, u64) -> Result<Vec<MessageSummary>>,
     ) -> Result<MessagePage> {
-        let offset = match page.cursor() {
-            None => 0,
-            Some(cursor) => parse_cursor(cursor, folder, what)?,
+        let after = match page.cursor() {
+            None => None,
+            Some(cursor) => Some(parse_cursor(cursor, folder, what)?),
         };
         let size = u64::from(page.size());
         // One more than asked for tells whether there are more.
-        let mut messages = self.with_cache(|db| query(db, offset, size + 1))?;
+        let mut messages = self.with_cache(|db| query(db, after.as_ref(), size + 1))?;
         let more = messages.len() as u64 > size;
         messages.truncate(page.size() as usize);
-        Ok(MessagePage {
-            messages,
-            next: more.then(|| cursor(offset + size, what, folder)),
-        })
+        // The next page starts after the last message of this one, however
+        // the folder changes meanwhile.
+        let next = messages
+            .last()
+            .filter(|_| more)
+            .map(|last| cursor(&key(last), what, folder));
+        Ok(MessagePage { messages, next })
+    }
+
+    /// Goes on, from the server, with a listing the cache began before it
+    /// failed: its pages from the start, without what came up to `after`
+    /// in the cache's order (`key`).
+    async fn resume<F: Future<Output = Result<MessagePage>>>(
+        &self,
+        size: u32,
+        after: &Key,
+        key: fn(&MessageSummary) -> Key,
+        list: impl Fn(Page) -> F,
+    ) -> Result<MessagePage> {
+        let mut page = Page::first(size);
+        loop {
+            let listed = list(page).await?;
+            let rest: Vec<MessageSummary> = listed
+                .messages
+                .into_iter()
+                .filter(|m| comes_after(&key(m), after))
+                .collect();
+            match listed.next {
+                Some(next) if rest.is_empty() => page = Page::after(next, size),
+                next => {
+                    return Ok(MessagePage {
+                        messages: rest,
+                        next,
+                    });
+                }
+            }
+        }
     }
 
     async fn list_cached(&self, folder: &FolderId, page: &Page) -> Result<MessagePage> {
@@ -251,8 +288,8 @@ impl<S: MailStore> CachedStore<S> {
                 synced => synced?,
             }
         }
-        self.cached_page(folder, page, "all", |db, offset, limit| {
-            db.page(folder, offset, limit)
+        self.cached_page(folder, page, "all", received_key, |db, after, limit| {
+            db.page(folder, after, limit)
         })
     }
 
@@ -266,8 +303,8 @@ impl<S: MailStore> CachedStore<S> {
             self.sync(folder).await?;
         }
         let what = since.timestamp_millis().to_string();
-        self.cached_page(folder, page, &what, |db, offset, limit| {
-            db.changed(folder, since, offset, limit)
+        self.cached_page(folder, page, &what, modified_key, |db, after, limit| {
+            db.changed(folder, since, after, limit)
         })
     }
 
@@ -283,12 +320,13 @@ impl<S: MailStore> CachedStore<S> {
         self.with_cache(|db| db.recent_unread(folder, since, limit as u64))
     }
 
-    /// Keeps what the server said of folders, to find them offline.
-    fn note_folders(&self, folders: &Result<Vec<Folder>>) {
+    /// Keeps what the server said of folders (`all` of them, or some), to
+    /// find them offline.
+    fn note_folders(&self, folders: &Result<Vec<Folder>>, all: bool) {
         if let Ok(folders) = folders
             && self.caching()
         {
-            let _ = self.with_cache(|db| db.keep_folders(folders));
+            let _ = self.with_cache(|db| db.keep_folders(folders, all));
         }
     }
 
@@ -311,26 +349,38 @@ impl<S: MailStore> CachedStore<S> {
     }
 }
 
-/// A page cursor into the cache: where the next page starts, in which
-/// listing (`what`) of which folder.
-fn cursor(offset: u64, what: &str, folder: &FolderId) -> PageCursor {
-    PageCursor::new(format!("cache {offset} {what} {folder}"))
+/// A page cursor into the cache: the key of the last message listed, in
+/// which listing (`what`) of which folder.
+fn cursor((at, id): &Key, what: &str, folder: &FolderId) -> PageCursor {
+    PageCursor::new(format!("cache\t{what}\t{at}\t{id}\t{folder}"))
 }
 
-/// The offset in `cursor`, which must be for `what` of `folder`.
-fn parse_cursor(cursor: &PageCursor, folder: &FolderId, what: &str) -> Result<u64> {
+/// Whether `cursor` is the cache's.
+fn is_cached(cursor: &PageCursor) -> bool {
+    cursor.as_str().starts_with("cache\t")
+}
+
+/// The key in `cursor`, which must be for `what` of `folder`.
+fn parse_cursor(cursor: &PageCursor, folder: &FolderId, what: &str) -> Result<Key> {
     let bad = || {
         Error::Backend(format!(
             "page cursor is not for this listing of folder {folder}"
         ))
     };
-    let rest = cursor.as_str().strip_prefix("cache ").ok_or_else(bad)?;
-    let (offset, rest) = rest.split_once(' ').ok_or_else(bad)?;
-    let (cursor_what, cursor_folder) = rest.split_once(' ').ok_or_else(bad)?;
+    let mut parts = cursor.as_str().splitn(5, '\t');
+    let (Some("cache"), Some(cursor_what), Some(at), Some(id), Some(cursor_folder)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(bad());
+    };
     if cursor_what != what || cursor_folder != folder.as_str() {
         return Err(bad());
     }
-    offset.parse().map_err(|_| bad())
+    Ok((at.parse().map_err(|_| bad())?, id.to_owned()))
 }
 
 // Reads go to the cache while it works; if it fails, the cache is no
@@ -346,7 +396,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
 
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let listed = self.inner.list_folders().await;
-        self.note_folders(&listed);
+        self.note_folders(&listed, true);
         self.or_as_seen(listed, |db| {
             db.folders_below(None, true)
                 .map(|all| Some(all).filter(|all| !all.is_empty()))
@@ -355,7 +405,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
         let listed = self.inner.child_folders(parent).await;
-        self.note_folders(&listed);
+        self.note_folders(&listed, false);
         self.or_as_seen(listed, |db| {
             db.folders_below(parent, false)
                 .map(|below| Some(below).filter(|below| !below.is_empty()))
@@ -369,6 +419,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 .as_ref()
                 .map(|f| vec![f.clone()])
                 .map_err(Clone::clone),
+            false,
         );
         self.or_as_seen(found, |db| db.folder_info(id))
     }
@@ -394,6 +445,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 .as_ref()
                 .map(|f| vec![f.clone()])
                 .map_err(Clone::clone),
+            false,
         );
         self.or_as_seen(found, |db| db.well_known(which))
     }
@@ -404,6 +456,14 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 Err(_) if self.broken() => {}
                 listed => return listed,
             }
+        }
+        if let Some(cursor) = page.cursor().filter(|c| is_cached(c)) {
+            let after = parse_cursor(cursor, folder, "all")?;
+            return self
+                .resume(page.size(), &after, received_key, |page| {
+                    self.inner.list_messages(folder, page)
+                })
+                .await;
         }
         self.inner.list_messages(folder, page).await
     }
@@ -419,6 +479,14 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 Err(_) if self.broken() => {}
                 listed => return listed,
             }
+        }
+        if let Some(cursor) = page.cursor().filter(|c| is_cached(c)) {
+            let after = parse_cursor(cursor, folder, &since.timestamp_millis().to_string())?;
+            return self
+                .resume(page.size(), &after, modified_key, |page| {
+                    self.inner.changed_messages(folder, since, page)
+                })
+                .await;
         }
         self.inner.changed_messages(folder, since, page).await
     }

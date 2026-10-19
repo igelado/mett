@@ -233,7 +233,7 @@ pub fn cached(
     let Some(path) = path else {
         return (CachedStore::new(mailbox, None), None);
     };
-    match Cache::open(&path) {
+    match Cache::open(&path, &url.account) {
         Ok(cache) => (CachedStore::new(mailbox, Some(cache)), None),
         Err(e) => (
             CachedStore::new(mailbox, None),
