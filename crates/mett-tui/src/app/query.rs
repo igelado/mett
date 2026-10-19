@@ -274,7 +274,7 @@ impl App {
                 let mut effects = self.back_to_question(&menu.purpose);
                 // A lookup still running is given up (its command killed).
                 if let Some(query) = menu.request {
-                    effects.push(self.request(Request::CancelQuery(query)));
+                    effects.push(self.request(Request::Cancel(query)));
                 }
                 return effects;
             }
@@ -641,7 +641,7 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::Request(_, Request::CancelQuery(q)) if *q == query))
+                .any(|e| matches!(e, Effect::Request(_, Request::Cancel(q)) if *q == query))
         );
     }
 

@@ -755,8 +755,10 @@ pub struct App {
     sidebar: Sidebar,
     /// The API the account is reached through.
     api: crate::account::Api,
-    /// The request watching the folders for changes, while one is.
+    /// The request watching the folders for changes, while one is, and
+    /// which folders it watches.
     watching: Option<RequestId>,
+    watched: Vec<mett_core::FolderId>,
     /// Whether the mailbox can tell when folders change (until it says it
     /// can't).
     can_watch: bool,
@@ -912,6 +914,7 @@ impl App {
             sidebar: Sidebar::default(),
             api: settings.api,
             watching: None,
+            watched: Vec::new(),
             can_watch: true,
             watch_retry: false,
             throttled: HashMap::new(),
@@ -1029,7 +1032,7 @@ impl App {
 
     fn request(&mut self, request: Request) -> Effect {
         // A request given up on isn't tried again.
-        if let Request::CancelQuery(query) = &request {
+        if let Request::Cancel(query) = &request {
             self.throttled.remove(query);
             if self.given_up.len() == GIVEN_UP_KEPT {
                 self.given_up.pop_front();
@@ -2758,7 +2761,7 @@ mod tests {
         assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), [], "stale");
         // Giving it up ends it too, even if a wait told of before comes
         // after.
-        app.request(Request::CancelQuery(RequestId(91)));
+        app.request(Request::Cancel(RequestId(91)));
         assert_eq!(app.throttled_notice(), None);
         let late = Event::Throttled {
             wait: Duration::from_secs(30),
@@ -2768,7 +2771,7 @@ mod tests {
         assert_eq!(app.throttled_notice(), None);
         // Only the last few are remembered.
         for query in 0..100 {
-            app.request(Request::CancelQuery(RequestId(1000 + query)));
+            app.request(Request::Cancel(RequestId(1000 + query)));
         }
         assert_eq!(app.given_up.len(), GIVEN_UP_KEPT);
         // Calls of one request waiting at once: the longest wait counts.

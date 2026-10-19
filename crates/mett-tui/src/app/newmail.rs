@@ -179,7 +179,6 @@ impl App {
     /// being watched already.
     pub(super) fn watch(&mut self) -> Vec<Effect> {
         if !self.can_watch
-            || self.watching.is_some()
             || self.watch_retry
             || self.sync_interval.is_none()
             || self.poll_paused
@@ -187,6 +186,26 @@ impl App {
         {
             return Vec::new();
         }
+        let folders = self.to_watch();
+        // Watched already, or nothing to watch.
+        if self.watching.is_some() && folders == self.watched || folders.is_empty() {
+            return Vec::new();
+        }
+        // Other folders now (the mailboxes found, another folder opened):
+        // the watch starts again.
+        let mut effects = Vec::new();
+        if let Some(old) = self.watching.take() {
+            effects.push(self.request(Request::Cancel(old)));
+        }
+        let watch = self.request(Request::Watch(folders.clone()));
+        self.watching = Some(effect_id(&watch));
+        self.watched = folders;
+        effects.push(watch);
+        effects
+    }
+
+    /// The folders to watch: the open folder, and the `mailboxes` found.
+    fn to_watch(&self) -> Vec<mett_core::FolderId> {
         let mut folders: Vec<mett_core::FolderId> = Vec::new();
         let open = self.folder.as_ref().map(|f| f.id.clone());
         let mailboxes = self
@@ -200,12 +219,7 @@ impl App {
                 folders.push(id);
             }
         }
-        if folders.is_empty() {
-            return Vec::new();
-        }
-        let watch = self.request(Request::Watch(folders));
-        self.watching = Some(effect_id(&watch));
-        vec![watch]
+        folders
     }
 
     /// The watch `id` ended: folders changed (`changed`), so mail is
@@ -225,9 +239,16 @@ impl App {
         match result {
             None => self.can_watch = false,
             Some(Ok(changed)) => {
+                // Only those that changed are checked.
                 if !changed.is_empty() && !self.poll_paused && self.sign_in.is_none() {
-                    effects.extend(self.poll_folder());
-                    effects.extend(self.check_mailboxes());
+                    if self
+                        .folder
+                        .as_ref()
+                        .is_some_and(|f| changed.contains(&f.id))
+                    {
+                        effects.extend(self.poll_folder());
+                    }
+                    effects.extend(self.check_mailboxes_in(Some(&changed)));
                 }
                 effects.extend(self.watch());
             }
@@ -308,6 +329,12 @@ impl App {
     /// Reads the counts of the mailboxes to check, unless that is on its
     /// way already.
     pub(super) fn check_mailboxes(&mut self) -> Vec<Effect> {
+        self.check_mailboxes_in(None)
+    }
+
+    /// Checks the `mailboxes` (with `only`, those of these folders) for new
+    /// mail, unless a check is under way.
+    fn check_mailboxes_in(&mut self, only: Option<&[mett_core::FolderId]>) -> Vec<Effect> {
         if self.checking.is_some() {
             return Vec::new();
         }
@@ -315,6 +342,14 @@ impl App {
             .mailboxes
             .iter()
             .filter(|m| m.poll)
+            .filter(|m| {
+                only.is_none_or(|only| {
+                    self.mailbox_state
+                        .get(&m.path)
+                        .and_then(|s| s.folder.as_ref())
+                        .is_some_and(|f| only.contains(&f.id))
+                })
+            })
             .map(|m| {
                 let id = self
                     .mailbox_state
@@ -795,7 +830,8 @@ impl App {
         }
         self.refresh_mailbox_browser();
         self.rebuild_sidebar(false);
-        Vec::new()
+        // The mailboxes found are watched too.
+        self.watch()
     }
 
     /// Says that new mail arrived, unless an error is on the message line:
@@ -1179,6 +1215,57 @@ mod tests {
             app.update(Msg::Timer(Timer::Poll(0)))
                 .iter()
                 .all(|e| { !matches!(e, Effect::Request(_, Request::Watch(_))) })
+        );
+    }
+
+    #[test]
+    fn the_watch_follows_the_folders_and_checks_only_those_changed() {
+        let (mut app, check) = app();
+        let inbox = mett_core::FolderId::new("in");
+        let work = mett_core::FolderId::new("wk");
+        let first = app.watching.expect("the folder is watched");
+        // The mailboxes found, they are watched too: the watch starts
+        // again.
+        let effects = check_both(
+            &mut app,
+            check,
+            checked("in", "Inbox", 1, None),
+            checked("wk", "Work", 0, None),
+        );
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::Cancel(id) if *id == first)),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().any(
+                |(_, r)| matches!(r, Request::Watch(f) if f == &[inbox.clone(), work.clone()])
+            ),
+            "{sent:?}"
+        );
+        // The same folders: not again.
+        assert!(app.watch().is_empty());
+        // Work changed: only it is checked.
+        let watch = app.watching.expect("watched");
+        let effects = respond(
+            &mut app,
+            watch,
+            Event::Watched(Some(Ok(vec![work.clone()]))),
+        );
+        let sent = requests(&effects);
+        assert!(
+            !sent
+                .iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "the Inbox didn't change: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|(_, r)| matches!(
+                r,
+                Request::CheckMailboxes(m) if m.len() == 1 && m[0].0 == super::tests::work()
+            )),
+            "{sent:?}"
         );
     }
 

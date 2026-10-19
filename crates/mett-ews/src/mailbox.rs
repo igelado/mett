@@ -1144,7 +1144,12 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
         for _ in 0..2 {
             let id = match &*subscription {
                 Some((id, watched)) if watched == folders => id.clone(),
-                _ => {
+                old => {
+                    // Other folders now: the old subscription goes (were it
+                    // left, they would pile up, up to Exchange's limit).
+                    if let Some((old, _)) = old {
+                        let _ = self.unsubscribe(old).await;
+                    }
                     let id = self.subscribe(folders).await?;
                     *subscription = Some((id.clone(), folders.to_vec()));
                     id
@@ -1201,6 +1206,16 @@ impl<A: Authenticator> EwsMailStore<A> {
         child_text(message, "SubscriptionId")
             .filter(|id| !id.is_empty())
             .ok_or_else(|| unexpected("Subscribe", "no SubscriptionId"))
+    }
+
+    /// Ends subscription `id`.
+    async fn unsubscribe(&self, id: &str) -> Result<()> {
+        let body = format!(
+            "<m:Unsubscribe><m:SubscriptionId>{}</m:SubscriptionId></m:Unsubscribe>",
+            escape(id)
+        );
+        let xml = self.call(&body, About::MAILBOX).await?;
+        only_message(&parse(&xml)?, About::MAILBOX).map(drop)
     }
 
     /// Reads the events of subscription `id` until some say folders

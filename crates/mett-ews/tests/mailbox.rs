@@ -1232,3 +1232,33 @@ async fn an_expired_subscription_is_made_again() {
         .unwrap();
     assert!(changed.is_empty(), "closed: watch again");
 }
+
+#[tokio::test]
+async fn watching_other_folders_ends_the_old_subscription() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"inbox-id\"/>"))
+        .respond_with(subscribed("sub1"))
+        .mount(&server)
+        .await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"work-id\"/>"))
+        .respond_with(subscribed("sub2"))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
+            "text/xml",
+        ))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    store.watch(&[FolderId::new("inbox-id")]).await.unwrap();
+    store.watch(&[FolderId::new("work-id")]).await.unwrap();
+}

@@ -88,9 +88,10 @@ pub enum Request {
     OwnAddresses,
     /// Find addresses matching a text.
     Query(QuerySource, String),
-    /// Give up on a [`Request::Query`] still running (its command is
-    /// killed). It has no answer.
-    CancelQuery(RequestId),
+    /// Give up on a [`Request::Query`] (its command is killed) or a
+    /// [`Request::Watch`] still running. It has no answer, nor has the
+    /// request given up on.
+    Cancel(RequestId),
     /// Read the counts of the folders at these paths, and their unread
     /// mail that changed since a time (if one is given), to tell which have
     /// new mail: by ID, where the folder was found before, or else by
@@ -219,13 +220,14 @@ pub async fn run<S: MailStore + MailSender + 'static>(
         std::sync::Mutex<std::collections::HashMap<RequestId, tokio::task::AbortHandle>>,
     > = Arc::default();
     while let Some((id, request)) = requests.recv().await {
-        if let Request::CancelQuery(query) = request {
+        if let Request::Cancel(query) = request {
             if let Some(task) = queries.lock().expect("lock").remove(&query) {
                 task.abort();
             }
             continue;
         }
-        let query = matches!(request, Request::Query(..));
+        // Those the UI may give up on.
+        let query = matches!(request, Request::Query(..) | Request::Watch(_));
         let store = Arc::clone(&store);
         let responses = responses.clone();
         let running = Arc::clone(&queries);
@@ -467,7 +469,7 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::Query(QuerySource::Directory, text) => {
             Event::Queried(store.search_people(&text).await.map_err(|e| e.to_string()))
         }
-        Request::CancelQuery(_) => unreachable!("handled by run"),
+        Request::Cancel(_) => unreachable!("handled by run"),
         Request::Query(QuerySource::Command(command), text) => {
             Event::Queried(run_query(&command, &text).await)
         }
@@ -1038,7 +1040,7 @@ mod tests {
         let slow = Request::Query(QuerySource::Command("sleep 30".into()), "x".into());
         request_tx.send((RequestId(1), slow)).unwrap();
         request_tx
-            .send((RequestId(2), Request::CancelQuery(RequestId(1))))
+            .send((RequestId(2), Request::Cancel(RequestId(1))))
             .unwrap();
         request_tx
             .send((RequestId(3), Request::OwnAddresses))
