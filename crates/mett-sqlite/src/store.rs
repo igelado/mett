@@ -295,6 +295,7 @@ impl<S: MailStore> CachedStore<S> {
                     _ => {
                         self.with_cache(|db| db.start_over(folder))?;
                         state = None;
+                        taken = 0;
                     }
                 }
                 continue;
