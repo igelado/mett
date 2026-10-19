@@ -349,11 +349,12 @@ impl Db {
         Ok(true)
     }
 
-    /// How many of `folder`'s messages are here.
+    /// How many of `folder`'s messages are here (and, while it syncs
+    /// from the start, seen again).
     pub fn count(&self, folder: &FolderId) -> Result<u64, Error> {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM messages WHERE folder = ?1",
+                "SELECT COUNT(*) FROM messages WHERE folder = ?1 AND seen",
                 [folder.as_str()],
                 |r| r.get::<_, i64>(0),
             )
@@ -991,6 +992,34 @@ mod tests {
         message.summary.modified = Some(at(2));
         db.keep_body(&message).unwrap();
         assert!(db.message(&message.summary.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_sync_from_the_start_counts_only_what_it_saw() {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        let inbox = FolderId::new("in");
+        let summary =
+            |id: &str| mett_core::mock::message(id, "in", "hi", DateTime::UNIX_EPOCH).summary;
+        let changes = |ids: &[&str], state: &str, more: bool| FolderChanges {
+            changed: ids.iter().map(|id| summary(id)).collect(),
+            removed: Vec::new(),
+            state: SyncState::new(state),
+            more,
+        };
+        db.start_over(&inbox).unwrap();
+        assert!(
+            db.apply(&inbox, None, &changes(&["a", "b", "c"], "s1", false))
+                .unwrap()
+        );
+        assert_eq!(db.count(&inbox).unwrap(), 3);
+        // Started over: what it hasn't seen again doesn't count.
+        db.start_over(&inbox).unwrap();
+        assert_eq!(db.count(&inbox).unwrap(), 0);
+        assert!(
+            db.apply(&inbox, None, &changes(&["a"], "t1", true))
+                .unwrap()
+        );
+        assert_eq!(db.count(&inbox).unwrap(), 1);
     }
 
     #[test]
