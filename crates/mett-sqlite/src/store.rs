@@ -769,6 +769,14 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         self.inner.can_sync()
     }
 
+    fn can_watch(&self) -> bool {
+        self.inner.can_watch()
+    }
+
+    async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
+        self.inner.watch(folders).await
+    }
+
     async fn sync_folder(
         &self,
         folder: &FolderId,

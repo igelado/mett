@@ -114,7 +114,14 @@ pub struct EwsMailStore<A> {
     /// takes them off (to put on again what is still to go), and leaves
     /// alone what was added elsewhere.
     uploads: Mutex<HashMap<DraftKey, Vec<Upload>>>,
+    /// The streaming subscription watching folders, and which: one watch
+    /// at a time.
+    subscription: tokio::sync::Mutex<Option<(String, Vec<FolderId>)>>,
 }
+
+/// How long a stream of notifications stays open, in minutes (EWS takes 1
+/// to 30): then [`MailStore::watch`] returns, to be called again.
+const WATCH_MINUTES: u64 = 5;
 
 /// A composed message, as backends tell its attempts apart: what it answers
 /// or recalls, and its [`Draft::attempt`].
@@ -232,6 +239,7 @@ impl<A: Authenticator> EwsMailStore<A> {
             roles: Mutex::new(None),
             kept: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            subscription: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -277,24 +285,37 @@ impl<A: Authenticator> EwsMailStore<A> {
     ) -> Result<String> {
         let xml = envelope(body);
         let timeout = timeout_for(xml.len(), download);
+        let response = self.send_soap(&xml, before, timeout).await?;
+        Self::checked(response, about).await
+    }
+
+    /// Sends the envelope `xml` (given `timeout`), with a token, and
+    /// returns the response, whatever its status. Errors from before the
+    /// request is made go through `before`.
+    async fn send_soap(
+        &self,
+        xml: &str,
+        before: fn(Error) -> Error,
+        timeout: Duration,
+    ) -> Result<reqwest::Response> {
         let token = self.auth.access_token().await.map_err(before)?;
-        let response = self.attempt(&xml, &token, timeout).await?;
+        let response = self.attempt(xml, &token, timeout).await?;
         if response.status() != StatusCode::UNAUTHORIZED {
-            return Self::checked(response, about).await;
+            return Ok(response);
         }
         // EWS rejected a token that hadn't expired (it may have been
         // revoked): get a new one and try once more.
         self.auth.token_rejected(&token).await;
         let fresh = self.auth.access_token().await.map_err(before)?;
         if fresh == token {
-            return Self::checked(response, about).await;
+            return Ok(response);
         }
-        let response = self.attempt(&xml, &fresh, timeout).await?;
+        let response = self.attempt(xml, &fresh, timeout).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             // Rejected too: don't let the next request reuse it.
             self.auth.token_rejected(&fresh).await;
         }
-        Self::checked(response, about).await
+        Ok(response)
     }
 
     async fn attempt(
@@ -1111,6 +1132,33 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
         })
     }
 
+    fn can_watch(&self) -> bool {
+        true
+    }
+
+    /// With a streaming subscription to `folders` (made once, and again if
+    /// it expires), whose events come on a response kept open for up to
+    /// [`WATCH_MINUTES`].
+    async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
+        let mut subscription = self.subscription.lock().await;
+        for _ in 0..2 {
+            let id = match &*subscription {
+                Some((id, watched)) if watched == folders => id.clone(),
+                _ => {
+                    let id = self.subscribe(folders).await?;
+                    *subscription = Some((id.clone(), folders.to_vec()));
+                    id
+                }
+            };
+            match self.stream_events(&id).await? {
+                Some(changed) => return Ok(changed),
+                // Gone (expired, say): subscribe again.
+                None => *subscription = None,
+            }
+        }
+        Ok(Vec::new())
+    }
+
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         if needs_server_draft(draft) || self.has_kept(draft) {
             // Postponed: what mett attached is the draft's own now.
@@ -1124,6 +1172,85 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
         let body = create_item("SaveOnly", Some("drafts"), &message_xml(draft));
         let xml = self.call(&body, About::MAILBOX).await?;
         created_id(&xml)
+    }
+}
+
+impl<A: Authenticator> EwsMailStore<A> {
+    /// Subscribes to `folders`' events, streamed; returns the
+    /// subscription's ID.
+    async fn subscribe(&self, folders: &[FolderId]) -> Result<String> {
+        let ids: String = folders.iter().map(folder_id).collect();
+        let events: String = [
+            "NewMailEvent",
+            "CreatedEvent",
+            "DeletedEvent",
+            "ModifiedEvent",
+            "MovedEvent",
+            "CopiedEvent",
+        ]
+        .iter()
+        .map(|event| format!("<t:EventType>{event}</t:EventType>"))
+        .collect();
+        let body = format!(
+            "<m:Subscribe><m:StreamingSubscriptionRequest><t:FolderIds>{ids}</t:FolderIds>\
+             <t:EventTypes>{events}</t:EventTypes></m:StreamingSubscriptionRequest></m:Subscribe>"
+        );
+        let xml = self.call(&body, About::MAILBOX).await?;
+        let doc = parse(&xml)?;
+        let message = only_message(&doc, About::MAILBOX)?;
+        child_text(message, "SubscriptionId")
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| unexpected("Subscribe", "no SubscriptionId"))
+    }
+
+    /// Reads the events of subscription `id` until some say folders
+    /// changed (those), or the server closes the stream (none). `None` if
+    /// the subscription is gone.
+    async fn stream_events(&self, id: &str) -> Result<Option<Vec<FolderId>>> {
+        use crate::stream::{Streamed, read_envelope, take_envelopes};
+
+        let body = format!(
+            "<m:GetStreamingEvents><m:SubscriptionIds><t:SubscriptionId>{}</t:SubscriptionId>\
+             </m:SubscriptionIds><m:ConnectionTimeout>{WATCH_MINUTES}</m:ConnectionTimeout>\
+             </m:GetStreamingEvents>",
+            escape(id)
+        );
+        let xml = envelope(&body);
+        // The response stays open as long as asked, and a little more.
+        let timeout = Duration::from_secs(WATCH_MINUTES * 60 + 60);
+        let mut response = self.send_soap(&xml, |e| e, timeout).await?;
+        if !response.status().is_success() {
+            return Self::checked(response, About::MAILBOX)
+                .await
+                .map(|_| Some(Vec::new()));
+        }
+        let mut buffer = Vec::new();
+        let mut changed: Vec<FolderId> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?
+        {
+            buffer.extend_from_slice(&chunk);
+            for envelope in take_envelopes(&mut buffer) {
+                match read_envelope(&envelope)? {
+                    Streamed::Changed(folders) => {
+                        for folder in folders {
+                            if !changed.contains(&folder) {
+                                changed.push(folder);
+                            }
+                        }
+                    }
+                    Streamed::Closed => return Ok(Some(changed)),
+                    Streamed::Unsubscribed => return Ok(None),
+                }
+            }
+            // What changed is told at once (the rest comes next time).
+            if !changed.is_empty() {
+                return Ok(Some(changed));
+            }
+        }
+        Ok(Some(changed))
     }
 }
 

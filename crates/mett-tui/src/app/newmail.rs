@@ -114,6 +114,9 @@ impl Seen {
     }
 }
 
+/// How long after watching the folders failed it is tried again.
+const WATCH_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl App {
     /// The unread mail the open folder's index shows has been seen: it
     /// isn't new once the user leaves (as mail a check finds that hasn't
@@ -159,13 +162,82 @@ impl App {
     /// Sets the timer for the next check, unless it is set or checking is
     /// off.
     pub(super) fn arm_poll(&mut self) -> Vec<Effect> {
-        match self.sync_interval {
+        let mut effects = match self.sync_interval {
             Some(interval) if !self.poll_armed => {
                 self.poll_armed = true;
                 vec![Effect::Later(interval, Timer::Poll(self.poll_timer))]
             }
             _ => Vec::new(),
+        };
+        // Checks wait for the timer; the backend may also tell at once.
+        effects.extend(self.watch());
+        effects
+    }
+
+    /// Watches the open folder and the `mailboxes` found so far for
+    /// changes, if the mailbox can tell, and mail is checked for, and isn't
+    /// being watched already.
+    pub(super) fn watch(&mut self) -> Vec<Effect> {
+        if !self.can_watch
+            || self.watching.is_some()
+            || self.watch_retry
+            || self.sync_interval.is_none()
+            || self.poll_paused
+            || self.sign_in.is_some()
+        {
+            return Vec::new();
         }
+        let mut folders: Vec<mett_core::FolderId> = Vec::new();
+        let open = self.folder.as_ref().map(|f| f.id.clone());
+        let mailboxes = self
+            .mailboxes
+            .iter()
+            .filter(|m| m.poll)
+            .filter_map(|m| self.mailbox_state.get(&m.path)?.folder.as_ref())
+            .map(|f| f.id.clone());
+        for id in open.into_iter().chain(mailboxes) {
+            if !folders.contains(&id) {
+                folders.push(id);
+            }
+        }
+        if folders.is_empty() {
+            return Vec::new();
+        }
+        let watch = self.request(Request::Watch(folders));
+        self.watching = Some(effect_id(&watch));
+        vec![watch]
+    }
+
+    /// The watch `id` ended: folders changed (`changed`), so mail is
+    /// checked for at once; or its wait ran out; or it failed, and is
+    /// tried again later; or the mailbox can't watch (`None`). Then the
+    /// folders are watched again.
+    pub(super) fn on_watched(
+        &mut self,
+        id: RequestId,
+        result: Option<mett_core::Result<Vec<mett_core::FolderId>>>,
+    ) -> Vec<Effect> {
+        if self.watching != Some(id) {
+            return Vec::new();
+        }
+        self.watching = None;
+        let mut effects = Vec::new();
+        match result {
+            None => self.can_watch = false,
+            Some(Ok(changed)) => {
+                if !changed.is_empty() && !self.poll_paused && self.sign_in.is_none() {
+                    effects.extend(self.poll_folder());
+                    effects.extend(self.check_mailboxes());
+                }
+                effects.extend(self.watch());
+            }
+            // The timer's checks go on meanwhile.
+            Some(Err(_)) => {
+                self.watch_retry = true;
+                effects.push(Effect::Later(WATCH_RETRY, Timer::Watch));
+            }
+        }
+        effects
     }
 
     /// The timer went off: check for new mail, and set it again. A timer
@@ -1059,6 +1131,55 @@ mod tests {
         let mut draft = summary(id, minutes);
         draft.draft = true;
         draft
+    }
+
+    #[test]
+    fn folders_are_checked_as_soon_as_they_change() {
+        let (mut app, _) = app();
+        let inbox = mett_core::FolderId::new("in");
+        // Opened, the Inbox is watched.
+        let watch = app.watching.expect("the folder is watched");
+        // A change: it is checked at once, and watched again.
+        let effects = respond(
+            &mut app,
+            watch,
+            Event::Watched(Some(Ok(vec![inbox.clone()]))),
+        );
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::Watch(f) if f == std::slice::from_ref(&inbox))),
+            "{sent:?}"
+        );
+        // Its wait ran out: watched again, nothing checked.
+        let watch = app.watching.expect("watched again");
+        let effects = respond(&mut app, watch, Event::Watched(Some(Ok(Vec::new()))));
+        assert!(matches!(requests(&effects)[..], [(_, Request::Watch(_))]));
+        // It failed: tried again later (the timer's checks go on).
+        let watch = app.watching.expect("watched again");
+        let failed = Event::Watched(Some(Err(mett_core::Error::Network("down".into()))));
+        let effects = respond(&mut app, watch, failed);
+        assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
+        assert!(
+            app.update(Msg::Timer(Timer::Poll(0)))
+                .iter()
+                .all(|e| { !matches!(e, Effect::Request(_, Request::Watch(_))) })
+        );
+        let effects = app.update(Msg::Timer(Timer::Watch));
+        assert!(matches!(requests(&effects)[..], [(_, Request::Watch(_))]));
+        // The mailbox can't watch: never again.
+        let watch = app.watching.expect("watched again");
+        assert!(respond(&mut app, watch, Event::Watched(None)).is_empty());
+        assert!(
+            app.update(Msg::Timer(Timer::Poll(0)))
+                .iter()
+                .all(|e| { !matches!(e, Effect::Request(_, Request::Watch(_))) })
+        );
     }
 
     #[test]

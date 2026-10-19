@@ -216,7 +216,10 @@ Graph delta queries, or EWS `SyncFolderItems`).
 - **Mitigation:** the first iteration may use online-only access behind the
   same `MailStore` port, adding the cache once the core flows work. The
   server is always treated as the source of truth.
-- **New mail** is found by polling. A timer (`Effect::Later`)
+- **New mail** is found by polling, and with backends that can push
+  (`MailStore::watch`: EWS streaming notifications), as soon as a folder
+  changes: the app keeps a watch open on the open folder and the
+  `mailboxes`, and checks them when it says they changed. A timer (`Effect::Later`)
   has the app list the newest page of the open folder again, and the
   messages changed since the last check (`MailStore::changed_messages`,
   which finds mail that arrives with an old date), and merge them into

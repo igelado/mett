@@ -96,6 +96,9 @@ pub enum Request {
     /// new mail: by ID, where the folder was found before, or else by
     /// path.
     CheckMailboxes(Vec<(FolderPath, Option<FolderId>, Option<DateTime<Utc>>)>),
+    /// Wait until something changes in these folders, as the backend
+    /// tells (see [`MailStore::watch`]).
+    Watch(Vec<FolderId>),
     /// Find which of `ids` are no longer in `folder` (deleted, or moved
     /// away).
     StillThere {
@@ -151,6 +154,9 @@ pub enum Event {
     MailboxesChecked(Vec<(FolderPath, Result<Checked>)>),
     /// Outcome of [`Request::StillThere`]: the messages gone.
     StillThere(Result<Vec<MessageId>>),
+    /// Outcome of [`Request::Watch`]: the folders that changed (none when
+    /// the backend's wait ran out); `None` if the backend can't watch.
+    Watched(Option<Result<Vec<FolderId>>>),
     /// Not an outcome: the server throttled the request, which is tried
     /// again after `wait`. Its outcome comes later.
     Throttled {
@@ -387,6 +393,14 @@ impl<S: MailStore> MailStore for Patient<'_, S> {
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         self.patiently(|| self.store.save_draft(draft)).await
     }
+
+    fn can_watch(&self) -> bool {
+        self.store.can_watch()
+    }
+
+    async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
+        self.patiently(|| self.store.watch(folders)).await
+    }
 }
 
 impl<S: MailSender> MailSender for Patient<'_, S> {
@@ -482,6 +496,10 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             }
             Event::StillThere(Ok(gone))
         }
+        Request::Watch(folders) => Event::Watched(match store.can_watch() {
+            true => Some(store.watch(&folders).await),
+            false => None,
+        }),
         Request::CheckMailboxes(mailboxes) => {
             Event::MailboxesChecked(check_mailboxes(store, mailboxes).await)
         }

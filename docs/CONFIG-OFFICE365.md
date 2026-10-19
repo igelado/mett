@@ -206,6 +206,10 @@ Graph:
   does a message from another `From:` address without a copy (Exchange
   doesn't send one for a delegate in one request). `copy` applies to them
   too: EWS can send a draft without keeping a copy.
+- **New mail by push:** EWS tells mett as soon as the open folder or a
+  `mailboxes` folder changes (streaming notifications), and mett checks it
+  at once; the timer's checks go on as a fallback. Graph can only push to
+  a public web address, so with Graph mett checks on the timer only.
 - **Directory search:** `<query>` resolves names against the directory and
   the user's contacts (`ResolveNames`), rather than the People API.
 - **Retirement:** Microsoft is retiring EWS in Exchange Online, starting in

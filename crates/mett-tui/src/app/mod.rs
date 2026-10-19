@@ -261,6 +261,8 @@ pub enum Timer {
     /// Check for new mail, if this is still the timer for it (it counts
     /// the changes of interval).
     Poll(u64),
+    /// Watch the folders for changes again, after watching failed.
+    Watch,
     /// A second of the wait for a throttling server went by, if this is
     /// still the countdown's timer (it counts the countdowns started).
     Throttled(u64),
@@ -753,6 +755,13 @@ pub struct App {
     sidebar: Sidebar,
     /// The API the account is reached through.
     api: crate::account::Api,
+    /// The request watching the folders for changes, while one is.
+    watching: Option<RequestId>,
+    /// Whether the mailbox can tell when folders change (until it says it
+    /// can't).
+    can_watch: bool,
+    /// A retry of watching is set, after it failed.
+    watch_retry: bool,
     /// The requests the server throttled, by how long until each is tried
     /// again (counted down every second) and which retry that is. A
     /// request's answer, or giving it up, takes it out.
@@ -902,6 +911,9 @@ impl App {
             listed_at: None,
             sidebar: Sidebar::default(),
             api: settings.api,
+            watching: None,
+            can_watch: true,
+            watch_retry: false,
             throttled: HashMap::new(),
             throttle_timer: 0,
             given_up: VecDeque::new(),
@@ -997,6 +1009,10 @@ impl App {
                 Vec::new()
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
+            Msg::Timer(Timer::Watch) => {
+                self.watch_retry = false;
+                self.watch()
+            }
             Msg::Syncing { folder, taken } => {
                 self.on_syncing(&folder, taken);
                 Vec::new()
@@ -1728,6 +1744,7 @@ impl App {
                 return effects;
             }
             Event::FolderPolled(result) => return self.on_polled(id, result),
+            Event::Watched(result) => return self.on_watched(id, result),
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
                     self.poll_paused = false;

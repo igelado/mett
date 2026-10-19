@@ -1130,3 +1130,105 @@ async fn items_are_looked_up_a_hundred_at_a_time() {
         .collect();
     assert_eq!(looked_up, [100, 50]);
 }
+
+/// One envelope of a `GetStreamingEvents` stream, with `rest` in its
+/// response message, of `code`.
+fn streamed(code: &str, rest: &str) -> String {
+    let class = if code == "NoError" {
+        "Success"
+    } else {
+        "Error"
+    };
+    format!(
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+         <s:Body xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\" \
+         xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+         <m:GetStreamingEventsResponse><m:ResponseMessages>\
+         <m:GetStreamingEventsResponseMessage ResponseClass=\"{class}\">\
+         <m:ResponseCode>{code}</m:ResponseCode>{rest}</m:GetStreamingEventsResponseMessage>\
+         </m:ResponseMessages></m:GetStreamingEventsResponse></s:Body></s:Envelope>"
+    )
+}
+
+/// A subscription answered with ID `id`.
+fn subscribed(id: &str) -> ResponseTemplate {
+    success(
+        "Subscribe",
+        &format!("<m:SubscriptionId>{id}</m:SubscriptionId>"),
+    )
+}
+
+#[tokio::test]
+async fn watches_folders_by_streaming_notifications() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<m:StreamingSubscriptionRequest>"))
+        .and(body_string_contains("<t:FolderId Id=\"inbox-id\"/>"))
+        .and(body_string_contains(
+            "<t:EventType>NewMailEvent</t:EventType>",
+        ))
+        .respond_with(subscribed("sub1"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The server says it is alive, then mail arrives.
+    let alive = streamed(
+        "NoError",
+        "<m:Notifications><m:Notification><t:StatusEvent/></m:Notification></m:Notifications>",
+    );
+    let mail = streamed(
+        "NoError",
+        "<m:Notifications><m:Notification><t:SubscriptionId>sub1</t:SubscriptionId>\
+         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/></t:NewMailEvent>\
+         </m:Notification></m:Notifications>",
+    );
+    ews("<m:GetStreamingEvents>")
+        .and(body_string_contains(
+            "<t:SubscriptionId>sub1</t:SubscriptionId>",
+        ))
+        .and(body_string_contains(
+            "<m:ConnectionTimeout>5</m:ConnectionTimeout>",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(format!("{alive}{mail}"), "text/xml"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    assert!(store.can_watch());
+    let inbox = [FolderId::new("inbox-id")];
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
+    // Watched again, the subscription goes on.
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
+}
+
+#[tokio::test]
+async fn an_expired_subscription_is_made_again() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub2"))
+        .mount(&server)
+        .await;
+    ews("<t:SubscriptionId>sub1</t:SubscriptionId>")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(streamed("ErrorSubscriptionNotFound", ""), "text/xml"),
+        )
+        .mount(&server)
+        .await;
+    ews("<t:SubscriptionId>sub2</t:SubscriptionId>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
+            "text/xml",
+        ))
+        .mount(&server)
+        .await;
+    let changed = store(&server)
+        .watch(&[FolderId::new("inbox-id")])
+        .await
+        .unwrap();
+    assert!(changed.is_empty(), "closed: watch again");
+}
