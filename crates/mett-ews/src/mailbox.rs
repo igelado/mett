@@ -123,6 +123,10 @@ pub struct EwsMailStore<A> {
 /// to 30): then [`MailStore::watch`] returns, to be called again.
 const WATCH_MINUTES: u64 = 5;
 
+/// How long after a change the stream is read for more, before what
+/// changed is told.
+const BURST: Duration = Duration::from_secs(1);
+
 /// A composed message, as backends tell its attempts apart: what it answers
 /// or recalls, and its [`Draft::attempt`].
 type DraftKey = (Option<DraftOrigin>, u64);
@@ -1161,7 +1165,10 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
                 None => *subscription = None,
             }
         }
-        Ok(Vec::new())
+        // Gone again at once: something is wrong, and is tried again later.
+        Err(Error::Backend(
+            "EWS keeps dropping the subscription to the folders' changes".into(),
+        ))
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
@@ -1241,11 +1248,20 @@ impl<A: Authenticator> EwsMailStore<A> {
         }
         let mut buffer = Vec::new();
         let mut changed: Vec<FolderId> = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?
-        {
+        // Once something changed, what follows at once (the rest of a
+        // burst) is read too, for a moment: events sent are not sent again.
+        let mut until: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match until {
+                None => response.chunk().await,
+                Some(until) => match tokio::time::timeout_at(until, response.chunk()).await {
+                    Ok(next) => next,
+                    Err(_) => return Ok(Some(changed)),
+                },
+            };
+            let Some(chunk) = next.map_err(|e| Error::Network(e.to_string()))? else {
+                break;
+            };
             buffer.extend_from_slice(&chunk);
             for envelope in take_envelopes(&mut buffer) {
                 match read_envelope(&envelope)? {
@@ -1260,9 +1276,8 @@ impl<A: Authenticator> EwsMailStore<A> {
                     Streamed::Unsubscribed => return Ok(None),
                 }
             }
-            // What changed is told at once (the rest comes next time).
-            if !changed.is_empty() {
-                return Ok(Some(changed));
+            if !changed.is_empty() && until.is_none() {
+                until = Some(tokio::time::Instant::now() + BURST);
             }
         }
         Ok(Some(changed))

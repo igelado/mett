@@ -1787,6 +1787,8 @@ impl App {
                         self.forget_missing_marks();
                         self.loaded();
                         self.relisted();
+                        // A change told of while it was listed.
+                        effects.extend(self.recheck());
                         // Clear the "Loading" message, but not an error that
                         // was reported while the folder was loading.
                         if self.status.starts_with("Loading ") {

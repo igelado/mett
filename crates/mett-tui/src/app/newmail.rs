@@ -281,8 +281,9 @@ impl App {
             && self.polling.is_none()
         {
             effects.extend(self.poll_folder());
-            // Checked, or being listed (which shows it anyway).
-            if self.polling.is_some() || self.listing.is_some() {
+            // Being checked now. (A listing under way may predate the
+            // change: it is checked when that ends.)
+            if self.polling.is_some() {
                 self.to_recheck.retain(|f| *f != open);
             }
         }

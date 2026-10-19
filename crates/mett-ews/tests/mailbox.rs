@@ -1234,6 +1234,28 @@ async fn an_expired_subscription_is_made_again() {
 }
 
 #[tokio::test]
+async fn a_subscription_dropped_again_at_once_is_an_error() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(streamed("ErrorInvalidSubscription", ""), "text/xml"),
+        )
+        .mount(&server)
+        .await;
+    assert!(
+        store(&server)
+            .watch(&[FolderId::new("inbox-id")])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn watching_other_folders_ends_the_old_subscription() {
     let server = MockServer::start().await;
     ews("<m:Subscribe>")
