@@ -7,7 +7,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{
     AccessToken, Address, AttachmentKind, Authenticator, BodyKind, Draft, DraftOrigin, Error,
     FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page, PageCursor,
-    WellKnownFolder,
+    SyncState, WellKnownFolder,
 };
 use mett_msgraph::{AuthSettings, Cloud, GraphMailStore};
 use serde_json::{Value, json};
@@ -2837,4 +2837,64 @@ async fn a_large_upload_is_known_by_its_decoded_id() {
         .on("POST", "/me/messages/d1/send", ResponseTemplate::new(202))
         .await;
     store.send(&message).await.unwrap();
+}
+
+#[tokio::test]
+async fn syncs_a_folder_with_delta_links() {
+    let server = MockServer::start().await;
+    let base = server.uri();
+    route("GET", "/me/mailFolders/inbox-id/messages/delta")
+        .and(header("prefer", "odata.maxpagesize=500"))
+        .and(wiremock::matchers::query_param_is_missing("$skiptoken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [message("m1", "2026-10-14T10:00:00Z")],
+            "@odata.nextLink": format!("{base}/v1.0/me/mailFolders/inbox-id/messages/delta?$skiptoken=p2"),
+        })))
+        .mount(&server)
+        .await;
+    route("GET", "/me/mailFolders/inbox-id/messages/delta")
+        .and(query_param("$skiptoken", "p2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                message("m2", "2026-10-14T11:00:00Z"),
+                { "id": "m0", "@removed": { "reason": "deleted" } },
+            ],
+            "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/inbox-id/messages/delta?$deltatoken=d1"),
+        })))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    assert!(store.can_sync());
+    let inbox = FolderId::new("inbox-id");
+    let first = store.sync_folder(&inbox, None).await.unwrap();
+    assert_eq!(first.changed[0].id, MessageId::new("m1"));
+    assert!(first.more);
+    let second = store.sync_folder(&inbox, Some(&first.state)).await.unwrap();
+    assert_eq!(second.changed[0].id, MessageId::new("m2"));
+    assert_eq!(second.removed, [MessageId::new("m0")]);
+    assert!(!second.more);
+    assert!(second.state.as_str().ends_with("$deltatoken=d1"));
+    // A state is only good for its own folder.
+    let other = store
+        .sync_folder(&FolderId::new("other"), Some(&second.state))
+        .await;
+    assert!(matches!(other, Err(Error::StaleSync)));
+}
+
+#[tokio::test]
+async fn an_expired_delta_link_starts_over() {
+    let server = MockServer::start().await;
+    route("GET", "/me/mailFolders/inbox-id/messages/delta")
+        .respond_with(graph_error(410, "SyncStateNotFound", "expired"))
+        .mount(&server)
+        .await;
+    let state = SyncState::new(format!(
+        "inbox-id {}/v1.0/me/mailFolders/inbox-id/messages/delta?$deltatoken=old",
+        server.uri()
+    ));
+    let e = store(&server)
+        .sync_folder(&FolderId::new("inbox-id"), Some(&state))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::StaleSync), "{e:?}");
 }
