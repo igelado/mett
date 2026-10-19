@@ -89,6 +89,29 @@ pub(crate) fn comes_after(key: &Key, after: &Key) -> bool {
     key.0 < after.0 || (key.0 == after.0 && key.1 > after.1)
 }
 
+/// Checks that `conn` is `account`'s cache, or a new database (`true`): a
+/// database of something else, or another account's cache (whatever its
+/// schema), is never touched.
+fn identify(conn: &Connection, account: &AccountId) -> Result<bool, OpenError> {
+    let id: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
+    if id != APPLICATION_ID {
+        let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))?;
+        if tables > 0 {
+            return Err(OpenError::Foreign);
+        }
+        return Ok(true);
+    }
+    let owner: Option<String> = conn
+        .query_row("SELECT id FROM account", [], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten();
+    if let Some(owner) = owner.filter(|owner| owner != account.as_str()) {
+        return Err(OpenError::Account(owner));
+    }
+    Ok(false)
+}
+
 /// Why the cache could not be opened.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpenError {
@@ -163,28 +186,13 @@ impl Db {
     /// transaction, which waits for the other.
     fn ready(mut conn: Connection, account: &AccountId) -> Result<Self, OpenError> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Nothing is changed before it is known to be this account's cache
+        // (or new); and again, as another mett may have changed it since.
+        identify(&conn, account)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // A database of something else is never touched: only a new one
-        // becomes a cache.
-        let id: i64 = tx.pragma_query_value(None, "application_id", |r| r.get(0))?;
-        if id != APPLICATION_ID {
-            let tables: i64 =
-                tx.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))?;
-            if tables > 0 {
-                return Err(OpenError::Foreign);
-            }
+        if identify(&tx, account)? {
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-        }
-        // Whose it is, if it says (whatever its schema): another account's
-        // is left alone, even if it is out of date.
-        let owner: Option<String> = tx
-            .query_row("SELECT id FROM account", [], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten();
-        if let Some(owner) = owner.filter(|owner| owner != account.as_str()) {
-            return Err(OpenError::Account(owner));
         }
         let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version != SCHEMA_VERSION {

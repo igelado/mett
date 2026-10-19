@@ -76,10 +76,11 @@ impl Cache {
         };
         // A relative path's directory is the working one: it is checked too.
         let path = std::path::absolute(path).map_err(|e| error(Box::new(e)))?;
+        private_place(&path).map_err(|e| error(Box::new(e)))?;
+        let db = Db::open(&path, account).map_err(|e| error(Box::new(e)))?;
+        // Known now to be this account's cache, it is made private.
         private_file(&path).map_err(|e| error(Box::new(e)))?;
-        Db::open(&path, account)
-            .map(Self)
-            .map_err(|e| error(Box::new(e)))
+        Ok(Self(db))
     }
 
     /// A cache of `account`'s mailbox in memory, gone when it is dropped.
@@ -109,10 +110,29 @@ impl<S> CachedStore<S> {
     }
 }
 
-/// Makes `path` readable only by its owner, creating it (and its
-/// directory, likewise) if it doesn't exist: it holds mail. (SQLite gives
-/// its journal files the database's permissions.)
+/// Makes the existing cache `path` readable only by its owner (it was
+/// there already, and may not be).
 fn private_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            permissions.set_mode(permissions.mode() & 0o700);
+            std::fs::set_permissions(path, permissions)?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Makes the place of the cache `path` safe, as it holds mail: its
+/// directory private (created so if it isn't there), and the file there
+/// not a symbolic link (created readable only by its owner if it isn't
+/// there; SQLite gives its journal files the database's permissions).
+fn private_place(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -134,17 +154,12 @@ fn private_file(path: &Path) -> std::io::Result<()> {
         if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(std::io::Error::other("it is a symbolic link"));
         }
-        let file = std::fs::OpenOptions::new()
+        // A new one is private from the start.
+        std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(path)?;
-        // A file that was there already may be readable by others.
-        let mut permissions = file.metadata()?.permissions();
-        if permissions.mode() & 0o077 != 0 {
-            permissions.set_mode(permissions.mode() & 0o700);
-            file.set_permissions(permissions)?;
-        }
     }
     // Elsewhere, mett can't make sure only its owner can read it.
     #[cfg(not(unix))]

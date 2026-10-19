@@ -244,12 +244,18 @@ async fn the_cache_is_private_and_lasts() {
         .unwrap()
         .execute_batch("CREATE TABLE messages (x); INSERT INTO messages VALUES (1);")
         .unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(Cache::open(&other, &alice()).is_err());
-    let kept: i64 = rusqlite::Connection::open(&other)
-        .unwrap()
+    let conn = rusqlite::Connection::open(&other).unwrap();
+    let kept: i64 = conn
         .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
         .unwrap();
     assert_eq!(kept, 1);
+    let journal: String = conn
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .unwrap();
+    assert_eq!(journal, "delete", "its journal mode too");
+    assert_eq!(mode(&other), 0o644, "and its permissions");
     // One made readable by others is made private again.
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     drop(Cache::open(&path, &alice()).unwrap());
