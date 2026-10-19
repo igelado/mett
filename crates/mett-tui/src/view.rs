@@ -192,6 +192,16 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
                 colors.message
             };
             frame.render_widget(Paragraph::new(app.status.as_str()).style(style), message);
+            // The wait for a throttling server, at the end of the line, so
+            // that it doesn't hide what the line says.
+            if let Some(notice) = app.throttled_notice() {
+                frame.render_widget(
+                    Paragraph::new(notice)
+                        .style(colors.message)
+                        .alignment(ratatui::layout::Alignment::Right),
+                    message,
+                );
+            }
         }
     }
     // The window may cover everything but the help line, which lists its
@@ -1033,6 +1043,26 @@ mod tests {
             .collect();
         listed(&mut app, list, messages, None);
         app
+    }
+
+    #[test]
+    fn the_wait_for_a_throttling_server_ends_the_message_line() {
+        let mut app = app(3);
+        app.status = "Mail sent.".into();
+        respond(
+            &mut app,
+            crate::worker::RequestId(90),
+            crate::worker::Event::Throttled {
+                wait: std::time::Duration::from_secs(12),
+                attempt: 1,
+            },
+        );
+        let line = screen(&app).pop().unwrap();
+        assert!(line.starts_with("Mail sent."), "{line}");
+        assert!(
+            line.ends_with("Throttled by the server: retry 1/5 in 12s"),
+            "{line}"
+        );
     }
 
     fn screen(app: &App) -> Vec<String> {

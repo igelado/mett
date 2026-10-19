@@ -30,6 +30,8 @@ url.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# Paused time, for retries after a wait.
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 
 [lints]

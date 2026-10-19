@@ -19,6 +19,7 @@ pub(crate) mod testing;
 mod threads;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 use mett_msgraph::SignInPrompt;
@@ -47,6 +48,9 @@ use crate::worker::{Event, Request, RequestId, Response};
 
 /// How many messages to request per page, unless configured.
 pub const PAGE_SIZE: u32 = 100;
+
+/// A second, the step of the throttling countdown.
+const SECOND: Duration = Duration::from_secs(1);
 
 /// Where a pending move goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +251,8 @@ pub enum Timer {
     /// Check for new mail, if this is still the timer for it (it counts
     /// the changes of interval).
     Poll(u64),
+    /// A second of the wait for a throttling server went by.
+    Throttled,
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -734,6 +740,10 @@ pub struct App {
     sidebar: Sidebar,
     /// The API the account is reached through.
     api: crate::account::Api,
+    /// How long until the server is tried again after it throttled
+    /// requests, counted down every second, and the highest retry of those
+    /// waiting.
+    throttled: Option<(Duration, u32)>,
 }
 
 impl App {
@@ -873,6 +883,7 @@ impl App {
             listed_at: None,
             sidebar: Sidebar::default(),
             api: settings.api,
+            throttled: None,
         };
         app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();
@@ -965,6 +976,7 @@ impl App {
                 Vec::new()
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
+            Msg::Timer(Timer::Throttled) => self.count_down_throttled(),
             Msg::Resize { width, height } => {
                 self.terminal_width = usize::from(width);
                 self.body_height = body_height(height);
@@ -1224,6 +1236,46 @@ impl App {
 
     /// Retries once the last of the requests that were pending when the
     /// user asked to retry has reported back.
+    /// The server throttled a request, which is tried again after `wait`:
+    /// the countdown shows the longest wait of those throttled.
+    fn on_throttled(&mut self, wait: Duration, attempt: u32) -> Vec<Effect> {
+        // Whole seconds, so that the countdown ends when the wait does.
+        let wait = Duration::from_secs(wait.as_secs() + u64::from(wait.subsec_nanos() > 0));
+        let counting = self.throttled.is_some();
+        self.throttled = Some(match self.throttled {
+            Some((left, highest)) => (left.max(wait), highest.max(attempt)),
+            None => (wait, attempt),
+        });
+        if counting {
+            Vec::new()
+        } else {
+            vec![Effect::Later(SECOND, Timer::Throttled)]
+        }
+    }
+
+    /// A second of the wait for the server went by.
+    fn count_down_throttled(&mut self) -> Vec<Effect> {
+        self.throttled = self
+            .throttled
+            .and_then(|(left, attempt)| Some((left.checked_sub(SECOND)?, attempt)))
+            .filter(|(left, _)| !left.is_zero());
+        match self.throttled {
+            Some(_) => vec![Effect::Later(SECOND, Timer::Throttled)],
+            None => Vec::new(),
+        }
+    }
+
+    /// What the message line says while waiting for a throttling server.
+    pub fn throttled_notice(&self) -> Option<String> {
+        self.throttled.map(|(left, attempt)| {
+            format!(
+                "Throttled by the server: retry {attempt}/{} in {}s",
+                crate::worker::THROTTLED_RETRIES,
+                left.as_secs()
+            )
+        })
+    }
+
     fn retry_if_requested(&mut self, id: RequestId) -> Vec<Effect> {
         if self.retry_after.remove(&id) && self.retry_after.is_empty() {
             self.retry()
@@ -1542,6 +1594,10 @@ impl App {
     }
 
     fn on_response(&mut self, response: Response) -> Vec<Effect> {
+        // Not an outcome: the request carries on after the wait.
+        if let Event::Throttled { wait, attempt } = response.event {
+            return self.on_throttled(wait, attempt);
+        }
         let id = response.id;
         let mut effects = self.handle_response(response);
         effects.extend(self.retry_if_requested(id));
@@ -1550,6 +1606,7 @@ impl App {
 
     fn handle_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
+            Event::Throttled { .. } => unreachable!("handled by on_response"),
             // A recall's steps.
             Event::FolderOpened(result) if self.recall_request() == Some(id) => {
                 return self.on_recall_opened(result);
@@ -2476,6 +2533,38 @@ mod tests {
 
     use super::*;
     use crate::app::testing::*;
+
+    #[test]
+    fn counts_down_the_wait_for_a_throttling_server() {
+        let (mut app, _) = App::new(80, 23);
+        let throttled = |wait: u64, attempt| Event::Throttled {
+            wait: Duration::from_millis(wait),
+            attempt,
+        };
+        let tick = [Effect::Later(SECOND, Timer::Throttled)];
+        assert_eq!(respond(&mut app, RequestId(90), throttled(2500, 1)), tick);
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 1/5 in 3s")
+        );
+        // Another request throttled meanwhile, for less: one countdown, to
+        // the end of the longest wait.
+        assert_eq!(respond(&mut app, RequestId(91), throttled(1000, 2)), []);
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 2/5 in 3s")
+        );
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled)), tick);
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 2/5 in 2s")
+        );
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled)), tick);
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled)), []);
+        assert_eq!(app.throttled_notice(), None);
+        // The status line is left alone.
+        assert_eq!(app.status, "Opening folder...");
+    }
 
     /// `n` messages, newest first, as Graph lists them.
     fn summaries(n: usize) -> Vec<MessageSummary> {
