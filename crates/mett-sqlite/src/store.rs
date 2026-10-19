@@ -45,8 +45,9 @@ pub struct CachedStore<S> {
     /// Set when the cache fails (a full disk, say): from then on,
     /// everything goes to `S`.
     broken: AtomicBool,
-    /// How many changes mett made that a sync may bring in elsewhere (a
-    /// copy, a draft): any folder synced before one is synced again.
+    /// How many changes mett made, which a sync brings in (with the dates
+    /// the server gives them) or elsewhere (a copy, a draft): any folder
+    /// synced before one is synced again.
     writes: AtomicU64,
     /// When each folder was last synced, and how many changes mett had
     /// made then. Its lock also keeps two syncs of one folder from running
@@ -527,6 +528,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
 
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
         self.inner.update_flags(id, update).await?;
+        // The server dates the change: the next sync brings its date in.
+        self.wrote();
         if self.caching() {
             let _ = self.with_cache(|db| db.update_flags(id, update));
         }
@@ -552,6 +555,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         self.inner.delete_message(id).await?;
+        self.wrote();
         if self.caching() {
             let _ = self.with_cache(|db| db.remove(id));
         }

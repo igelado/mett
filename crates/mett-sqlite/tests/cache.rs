@@ -126,13 +126,23 @@ async fn changes_made_here_show_at_once() {
         .update_flags(&MessageId::new("m2"), FlagsUpdate::flagged(true))
         .await
         .unwrap();
-    // Without syncing again.
+    // Shown as made.
     let page = store
         .list_messages(&inbox(), Page::first(10))
         .await
         .unwrap();
     assert!(page.messages[0].flags.flagged);
-    assert_eq!(store.inner().syncs(), 1);
+    // The next listing syncs, to take in the server's date of the change.
+    assert_eq!(store.inner().syncs(), 2);
+    let changed = store
+        .changed_messages(
+            &inbox(),
+            Utc::now() - TimeDelta::minutes(1),
+            Page::first(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&changed.messages), ["m2"]);
     // A move brings mail into another folder: folders sync again.
     store
         .move_message(&MessageId::new("m1"), &FolderId::new("arc"))
@@ -143,7 +153,7 @@ async fn changes_made_here_show_at_once() {
         .await
         .unwrap();
     assert_eq!(ids(&page.messages), ["m2", "m0"]);
-    assert_eq!(store.inner().syncs(), 2);
+    assert_eq!(store.inner().syncs(), 3);
 }
 
 #[tokio::test(start_paused = true)]
