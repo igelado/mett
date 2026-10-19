@@ -153,6 +153,9 @@ pub struct Config {
     /// Ignored commands and variables already warned about: each is
     /// reported once, where it first appears.
     warned: std::collections::HashSet<String>,
+    /// Old names of renamed variables that expansions (`$name`) used, to
+    /// warn about once the command has run (expanding only reads).
+    expanded_renamed: std::cell::RefCell<Vec<&'static str>>,
     /// Variables given a value by `set`, `unset` or `toggle`, as opposed
     /// to their defaults.
     assigned: std::collections::HashSet<&'static str>,
@@ -189,6 +192,7 @@ impl Config {
             warnings: Vec::new(),
             pending: Vec::new(),
             warned: Default::default(),
+            expanded_renamed: Default::default(),
             assigned: Default::default(),
             answers: Vec::new(),
             home,
@@ -587,6 +591,10 @@ impl Config {
         };
         if let Err(message) = result {
             self.errors.push(format!("{at}: {message}"));
+        }
+        for old in self.expanded_renamed.take() {
+            // Warns (once) as using the old name does.
+            self.find(old);
         }
         let pending = std::mem::take(&mut self.pending);
         self.warnings
@@ -987,8 +995,15 @@ struct Expand<'a> {
 
 impl Expander for Expand<'_> {
     fn variable(&self, name: &str) -> Option<String> {
-        // `$office365_tenant` still stands for `office365_tenant`.
-        let known = vars::renamed(name).unwrap_or(name);
+        // `$msgraph_tenant` still stands for `office365_tenant` (with a
+        // warning, once the command has run).
+        let known = match vars::renamed_entry(name) {
+            Some((old, new)) => {
+                self.config.expanded_renamed.borrow_mut().push(old);
+                new
+            }
+            None => name,
+        };
         if let Some(value) = self.config.values.get(known) {
             return Some(match value {
                 Value::Str(s) => s.clone(),
@@ -1364,6 +1379,10 @@ mod tests {
         let answer = config.run_line("reset msgraph_client_id").unwrap();
         assert!(answer[0].contains("office365_client_id"), "{answer:?}");
         assert_eq!(config.string("office365_client_id"), "");
+        // An old name in an expansion warns too.
+        let config = load("set my_c=$msgraph_cloud\n");
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(config.warnings[0].contains("msgraph_cloud is now office365_cloud"));
         // Graph's own settings keep their names.
         let config = load("set msgraph_scopes=Mail.Read\n");
         assert_eq!(config.string("msgraph_scopes"), "Mail.Read");

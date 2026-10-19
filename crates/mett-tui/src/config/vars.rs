@@ -232,10 +232,16 @@ const RENAMED: &[(&str, &str)] = &[
 
 /// The name a renamed variable has now, if `name` is an old one.
 pub fn renamed(name: &str) -> Option<&'static str> {
+    renamed_entry(name).map(|(_, new)| new)
+}
+
+/// The old and new names of the renamed variable whose old name is
+/// `name`.
+pub fn renamed_entry(name: &str) -> Option<(&'static str, &'static str)> {
     RENAMED
         .binary_search_by(|(old, _)| (*old).cmp(name))
         .ok()
-        .map(|i| RENAMED[i].1)
+        .map(|i| RENAMED[i])
 }
 
 /// Looks up a known variable.
