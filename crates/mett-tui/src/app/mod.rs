@@ -762,6 +762,8 @@ pub struct App {
     /// The request ending what the mailbox keeps for watching, while it
     /// is under way.
     unwatching: Option<RequestId>,
+    /// Ending it failed: it is tried again.
+    unwatch_failed: bool,
     /// The `poll_epoch` the watch started in.
     watch_epoch: u64,
     /// Watching is held off until the user signs in again: its sign-in
@@ -928,6 +930,7 @@ impl App {
             api: settings.api,
             watching: None,
             unwatching: None,
+            unwatch_failed: false,
             watch_epoch: 0,
             watch_paused: false,
             watched: Vec::new(),

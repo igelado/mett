@@ -207,6 +207,8 @@ impl App {
         let watch = self.request(Request::Watch(folders.clone()));
         self.watching = Some(effect_id(&watch));
         self.watch_epoch = self.poll_epoch;
+        // What was left to end, the mailbox ends first.
+        self.unwatch_failed = false;
         self.watched = folders;
         effects.push(watch);
         effects
@@ -220,8 +222,12 @@ impl App {
         if let Some(old) = self.watching.take() {
             effects.push(self.request(Request::Cancel(old)));
         }
-        if self.can_watch && !self.watched.is_empty() {
+        if self.can_watch
+            && (!self.watched.is_empty() || self.unwatch_failed)
+            && self.unwatching.is_none()
+        {
             self.watched.clear();
+            self.unwatch_failed = false;
             let unwatch = self.request(Request::Watch(Vec::new()));
             self.unwatching = Some(effect_id(&unwatch));
             effects.push(unwatch);
@@ -263,6 +269,13 @@ impl App {
     ) -> Vec<Effect> {
         if self.unwatching == Some(id) {
             self.unwatching = None;
+            // Tried again later (a watch would end it too), unless
+            // quitting.
+            if matches!(result, Some(Err(_))) && !self.quit {
+                self.unwatch_failed = true;
+                return vec![Effect::Later(WATCH_RETRY, Timer::Watch)];
+            }
+            return Vec::new();
         }
         if self.watching != Some(id) {
             // A watch replaced as it ended: what it said changed is not
@@ -1440,9 +1453,22 @@ mod tests {
         assert!(app.unwatching());
         // Once.
         assert!(app.watch().is_empty());
+        // It failed: tried again later.
         let unwatch = effect_id(&effects[1]);
+        let failed = Event::Watched(Some(Err(Error::Network("down".into()))));
+        let effects = respond(&mut app, unwatch, failed);
+        assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
+        assert!(!app.unwatching());
+        let effects = app.update(Msg::Timer(Timer::Watch));
+        let sent = requests(&effects);
+        assert!(
+            matches!(&sent[..], [(_, Request::Watch(f))] if f.is_empty()),
+            "{sent:?}"
+        );
+        let unwatch = effect_id(&effects[0]);
         assert!(respond(&mut app, unwatch, Event::Watched(Some(Ok(Vec::new())))).is_empty());
         assert!(!app.unwatching());
+        assert!(app.watch().is_empty());
     }
 
     #[test]

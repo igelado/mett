@@ -1450,8 +1450,11 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             let chunk = match next {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                // What changed was told already: it is not told again.
-                Err(_) if !changed.is_empty() => return Ok(Some((changed, true))),
+                // What changed, or part of an envelope, was sent already:
+                // it is not sent again.
+                Err(_) if !changed.is_empty() || unread(&buffer) => {
+                    return Ok(Some((changed, true)));
+                }
                 Err(e) => return Err(Error::Network(e.to_string())),
             };
             buffer.extend_from_slice(&chunk);

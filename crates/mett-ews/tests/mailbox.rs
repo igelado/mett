@@ -1607,3 +1607,13 @@ async fn an_envelope_a_canceled_watch_read_part_of_is_told_by_the_next() {
     let told = tokio::time::timeout(Duration::from_millis(100), store.watch(&folders)).await;
     assert_eq!(told.expect("told at once").unwrap(), folders);
 }
+
+#[tokio::test]
+async fn an_envelope_cut_short_by_a_broken_stream_is_told() {
+    let mail = inbox_mail();
+    let store =
+        store_breaking_streams(mail[..mail.len() / 2].to_owned(), Duration::from_millis(50)).await;
+    // Any folder watched may have changed.
+    let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
+    assert_eq!(store.watch(&folders).await.unwrap(), folders);
+}
