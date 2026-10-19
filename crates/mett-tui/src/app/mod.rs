@@ -764,6 +764,9 @@ pub struct App {
     unwatching: Option<RequestId>,
     /// The `poll_epoch` the watch started in.
     watch_epoch: u64,
+    /// Watching is held off until the user signs in again: its sign-in
+    /// failed. (Only watching: the mailbox may just not let mett watch.)
+    watch_paused: bool,
     /// What a watch said changed and is still to be checked (a check under
     /// way when it said may predate the change): the open folder, and the
     /// folders of `mailboxes` (the open one among them, for its counts).
@@ -926,6 +929,7 @@ impl App {
             watching: None,
             unwatching: None,
             watch_epoch: 0,
+            watch_paused: false,
             watched: Vec::new(),
             recheck_folder: false,
             recheck_mailboxes: Vec::new(),
@@ -1414,6 +1418,7 @@ impl App {
     fn retry(&mut self) -> Vec<Effect> {
         // Signed in again: checking for new mail can go on.
         self.poll_paused = false;
+        self.watch_paused = false;
         self.poll_epoch += 1;
         if self.quit {
             let mut effects = self.retry_saves();
@@ -1433,6 +1438,9 @@ impl App {
         effects.extend(self.retry_attachments());
         // The folders are listed whether or not one is open.
         effects.extend(self.retry_browser());
+        // Watching goes on, and the checks it asked for.
+        effects.extend(self.watch());
+        effects.extend(self.recheck());
         if self.folder.is_none() {
             if self.opening.is_none() {
                 effects.extend(self.open_folder());
