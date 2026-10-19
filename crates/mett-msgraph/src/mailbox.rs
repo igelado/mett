@@ -890,7 +890,9 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
                     .strip_prefix(folder.as_str())
                     .and_then(|rest| rest.strip_prefix(' '))
                     .ok_or(Error::StaleSync)?;
-                self.next_page_url(link)?
+                // A link of another endpoint (msgraph_endpoint changed) is
+                // never followed: the folder syncs again from the start.
+                self.next_page_url(link).map_err(|_| Error::StaleSync)?
             }
             None => {
                 let mut url =

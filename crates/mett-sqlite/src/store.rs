@@ -86,12 +86,13 @@ impl<S> CachedStore<S> {
     }
 }
 
-/// Creates `path` (and its directory) readable only by its owner, if it
-/// doesn't exist: it holds mail.
+/// Makes `path` readable only by its owner, creating it (and its
+/// directory, likewise) if it doesn't exist: it holds mail. (SQLite gives
+/// its journal files the database's permissions.)
 fn private_file(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::DirBuilder::new()
@@ -99,11 +100,17 @@ fn private_file(path: &Path) -> std::io::Result<()> {
                 .mode(0o700)
                 .create(dir)?;
         }
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(path)?;
+        // A file that was there already may be readable by others.
+        let mut permissions = file.metadata()?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            permissions.set_mode(permissions.mode() & 0o700);
+            file.set_permissions(permissions)?;
+        }
     }
     #[cfg(not(unix))]
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -317,7 +324,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
             return Ok(message);
         }
         let message = self.inner.fetch_message(id).await?;
-        self.with_cache(|db| db.keep_body(&message))?;
+        // Failing to keep it costs only fetching it again.
+        let _ = self.with_cache(|db| db.keep_body(&message));
         Ok(message)
     }
 
@@ -337,10 +345,14 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         self.inner.fetch_attachment(message, attachment).await
     }
 
+    // Once a change is made on the server, it is: failing to note it in
+    // the cache (a full disk, say) isn't failing to make it, and the next
+    // sync notes it anyway.
+
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
         self.inner.update_flags(id, update).await?;
         if self.caching() {
-            self.with_cache(|db| db.update_flags(id, update))?;
+            let _ = self.with_cache(|db| db.update_flags(id, update));
         }
         Ok(())
     }
@@ -349,7 +361,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         let moved = self.inner.move_message(id, to).await?;
         // Its new folder's sync brings it in there.
         if self.caching() {
-            self.with_cache(|db| db.remove(id))?;
+            let _ = self.with_cache(|db| db.remove(id));
         }
         Ok(moved)
     }
@@ -361,7 +373,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         self.inner.delete_message(id).await?;
         if self.caching() {
-            self.with_cache(|db| db.remove(id))?;
+            let _ = self.with_cache(|db| db.remove(id));
         }
         Ok(())
     }

@@ -2881,6 +2881,14 @@ async fn syncs_a_folder_with_delta_links() {
     assert_eq!(second.removed, [MessageId::new("m0")]);
     assert!(!second.more);
     assert!(second.state.as_str().ends_with("$deltatoken=d1"));
+    // A link of another endpoint is never followed.
+    let elsewhere = SyncState::new(
+        "inbox-id https://elsewhere.example/v1.0/me/mailFolders/inbox-id/messages/delta?$deltatoken=x",
+    );
+    assert!(matches!(
+        store.sync_folder(&inbox, Some(&elsewhere)).await,
+        Err(Error::StaleSync)
+    ));
     // A state is only good for its own folder.
     let other = store
         .sync_folder(&FolderId::new("other"), Some(&second.state))

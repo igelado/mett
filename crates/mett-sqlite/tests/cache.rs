@@ -200,6 +200,10 @@ async fn the_cache_is_private_and_lasts() {
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&path), 0o600);
     assert_eq!(mode(path.parent().unwrap()), 0o700);
+    // One made readable by others is made private again.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    drop(Cache::open(&path).unwrap());
+    assert_eq!(mode(&path), 0o600);
     // Opened again, the folder goes on from where its sync stood: the
     // mock store's state still tells nothing changed.
     let inner = mailbox(2);
