@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use mett_core::{
     AccessToken, Address, AttachmentKind, Authenticator, BodyKind, Draft, DraftOrigin, Error,
-    FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page,
+    FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page, SyncState,
     WellKnownFolder,
 };
 use mett_ews::EwsMailStore;
@@ -1000,4 +1000,133 @@ async fn failing_before_handing_over_leaves_mail_unsent() {
     };
     let e = store.send(&draft).await.unwrap_err();
     assert!(matches!(e, Error::NotSent(_)), "{e:?}");
+}
+
+/// A `SyncFolderItems` answer with `changes`, the new state `state`, and
+/// whether it is the last batch.
+fn sync_answer(changes: &str, state: &str, last: bool) -> ResponseTemplate {
+    success(
+        "SyncFolderItems",
+        &format!(
+            "<m:SyncState>{state}</m:SyncState>\
+             <m:IncludesLastItemInRange>{last}</m:IncludesLastItemInRange>\
+             <m:Changes>{changes}</m:Changes>"
+        ),
+    )
+}
+
+#[tokio::test]
+async fn a_first_sync_tells_of_every_message() {
+    let server = MockServer::start().await;
+    ews("<m:SyncFolderItems>")
+        .and(body_string_contains(
+            "<m:MaxChangesReturned>512</m:MaxChangesReturned>",
+        ))
+        .respond_with(sync_answer(
+            "<t:Create><t:Message><t:ItemId Id=\"m1\"/></t:Message></t:Create>\
+             <t:Create><t:Message><t:ItemId Id=\"gone\"/></t:Message></t:Create>",
+            "s1",
+            false,
+        ))
+        .mount(&server)
+        .await;
+    let gone = "<m:GetItemResponseMessage ResponseClass=\"Error\">\
+                <m:ResponseCode>ErrorItemNotFound</m:ResponseCode></m:GetItemResponseMessage>";
+    ews("<m:GetItem>")
+        .respond_with(soap(&format!(
+            "<m:GetItemResponse><m:ResponseMessages>\
+             <m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode>\
+             <m:Items>{}</m:Items></m:GetItemResponseMessage>{gone}\
+             </m:ResponseMessages></m:GetItemResponse>",
+            message("m1", "First", "2026-10-19T10:00:00Z"),
+        )))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    assert!(store.can_sync());
+    let changes = store
+        .sync_folder(&FolderId::new("inbox-id"), None)
+        .await
+        .unwrap();
+    assert!(!requests(&server).await[0].contains("<m:SyncState>"));
+    assert_eq!(changes.changed.len(), 1);
+    assert_eq!(changes.changed[0].subject, "First");
+    assert_eq!(changes.removed, [MessageId::new("gone")], "gone meanwhile");
+    assert_eq!(changes.state.as_str(), "s1");
+    assert!(changes.more);
+}
+
+#[tokio::test]
+async fn a_sync_goes_on_from_its_state() {
+    let server = MockServer::start().await;
+    ews("<m:SyncState>s1</m:SyncState>")
+        .respond_with(sync_answer(
+            "<t:ReadFlagChange><t:ItemId Id=\"m1\"/><t:IsRead>true</t:IsRead></t:ReadFlagChange>\
+             <t:Delete><t:ItemId Id=\"m3\"/></t:Delete>",
+            "s2",
+            true,
+        ))
+        .mount(&server)
+        .await;
+    ews("<m:GetItem>")
+        .respond_with(success(
+            "GetItem",
+            &format!(
+                "<m:Items>{}</m:Items>",
+                message("m1", "First", "2026-10-19T10:00:00Z")
+            ),
+        ))
+        .mount(&server)
+        .await;
+    let changes = store(&server)
+        .sync_folder(&FolderId::new("inbox-id"), Some(&SyncState::new("s1")))
+        .await
+        .unwrap();
+    assert_eq!(changes.changed[0].id, MessageId::new("m1"));
+    assert_eq!(changes.removed, [MessageId::new("m3")]);
+    assert_eq!(changes.state.as_str(), "s2");
+    assert!(!changes.more);
+}
+
+#[tokio::test]
+async fn a_stale_sync_state_starts_over() {
+    for code in ["ErrorInvalidSyncStateData", "ErrorSyncStateNotFound"] {
+        let server = MockServer::start().await;
+        ews("<m:SyncFolderItems>")
+            .respond_with(failure("SyncFolderItems", code))
+            .mount(&server)
+            .await;
+        let e = store(&server)
+            .sync_folder(&FolderId::new("inbox-id"), Some(&SyncState::new("old")))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::StaleSync), "{code}: {e:?}");
+    }
+}
+
+#[tokio::test]
+async fn items_are_looked_up_a_hundred_at_a_time() {
+    let server = MockServer::start().await;
+    let ids: Vec<String> = (0..150).map(|i| format!("m{i}")).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    ews("<m:FindItem")
+        .respond_with(found_items(&refs, true, 150))
+        .mount(&server)
+        .await;
+    ews("<m:GetItem>")
+        .respond_with(success("GetItem", "<m:Items/>"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    store(&server)
+        .list_messages(&FolderId::new("inbox-id"), Page::first(150))
+        .await
+        .unwrap();
+    let sent = requests(&server).await;
+    let looked_up: Vec<usize> = sent
+        .iter()
+        .filter(|r| r.contains("<m:GetItem>"))
+        .map(|r| r.matches("<t:ItemId ").count())
+        .collect();
+    assert_eq!(looked_up, [100, 50]);
 }

@@ -11,9 +11,9 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, AccountId, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body,
-    BodyKind, Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderId, MailSender,
-    MailStore, Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page,
-    PageCursor, RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder,
+    BodyKind, Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId,
+    MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment,
+    Page, PageCursor, RECENT_UNREAD, Result, SyncState, ThreadPosition, WellKnownFolder,
 };
 use reqwest::StatusCode;
 use roxmltree::Node;
@@ -74,6 +74,13 @@ const MESSAGE_FIELDS: &[&str] = &[
     "message:InternetMessageId",
     "item:Body",
 ];
+
+/// The most items looked up in one `GetItem`: Exchange's limit (its
+/// `EWSMaxBatchSize`, by default) is often 100.
+const ITEMS_PER_REQUEST: usize = 100;
+
+/// The most changes one `SyncFolderItems` returns (EWS takes up to 512).
+const SYNC_BATCH: u32 = 512;
 
 /// The distinguished folder at the root of the mail folders.
 const ROOT: &str = "msgfolderroot";
@@ -531,19 +538,19 @@ impl<A: Authenticator> EwsMailStore<A> {
     /// The summaries of the messages `ids`, in that order. Those gone
     /// meanwhile are left out.
     async fn summaries(&self, ids: &[String], about: About<'_>) -> Result<Vec<MessageSummary>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let xml = self.get_items(ids, SUMMARY_FIELDS, false, about).await?;
-        let doc = parse(&xml)?;
         let mut summaries = Vec::new();
-        for message in response_messages(&doc, about)? {
-            if response_code(message) == "ErrorItemNotFound" {
-                continue;
-            }
-            check(message, about)?;
-            if let Some(item) = first_item(message) {
-                summaries.push(summary(item)?);
+        // Exchange takes only so many items per request (often 100).
+        for ids in ids.chunks(ITEMS_PER_REQUEST) {
+            let xml = self.get_items(ids, SUMMARY_FIELDS, false, about).await?;
+            let doc = parse(&xml)?;
+            for message in response_messages(&doc, about)? {
+                if response_code(message) == "ErrorItemNotFound" {
+                    continue;
+                }
+                check(message, about)?;
+                if let Some(item) = first_item(message) {
+                    summaries.push(summary(item)?);
+                }
             }
         }
         Ok(summaries)
@@ -1019,6 +1026,89 @@ impl<A: Authenticator> MailStore for EwsMailStore<A> {
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         self.delete_item(id).await
+    }
+
+    fn can_sync(&self) -> bool {
+        true
+    }
+
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&SyncState>,
+    ) -> Result<FolderChanges> {
+        let about = About::folder(folder.as_str());
+        let state_xml = state
+            .map(|s| format!("<m:SyncState>{}</m:SyncState>", escape(s.as_str())))
+            .unwrap_or_default();
+        let body = format!(
+            "<m:SyncFolderItems>{}<m:SyncFolderId>{}</m:SyncFolderId>{state_xml}\
+             <m:MaxChangesReturned>{SYNC_BATCH}</m:MaxChangesReturned>\
+             <m:SyncScope>NormalItems</m:SyncScope></m:SyncFolderItems>",
+            item_shape(&[], None),
+            folder_id(folder)
+        );
+        let xml = self.call(&body, about).await?;
+        let doc = parse(&xml)?;
+        let message = response_messages(&doc, about)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| unexpected("SyncFolderItems", "no response"))?;
+        if matches!(
+            response_code(message).as_str(),
+            "ErrorInvalidSyncStateData" | "ErrorSyncStateNotFound"
+        ) {
+            return Err(Error::StaleSync);
+        }
+        check(message, about)?;
+        let new_state = child_text(message, "SyncState")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| unexpected("SyncFolderItems", "no SyncState"))?;
+        let last = child_text(message, "IncludesLastItemInRange").as_deref() != Some("false");
+        // What arrived or changed is looked up as the index needs it; what
+        // went is gone.
+        let mut touched: Vec<String> = Vec::new();
+        let mut removed: Vec<MessageId> = Vec::new();
+        for change in child(message, "Changes")
+            .into_iter()
+            .flat_map(|changes| changes.children().filter(Node::is_element))
+        {
+            let id = match change.tag_name().name() {
+                "Create" | "Update" => change.children().find(Node::is_element).and_then(item_id),
+                _ => child(change, "ItemId")
+                    .and_then(|id| id.attribute("Id"))
+                    .map(str::to_owned),
+            };
+            let Some(id) = id else {
+                continue;
+            };
+            if change.tag_name().name() == "Delete" {
+                touched.retain(|t| *t != id);
+                removed.push(MessageId::new(id));
+            } else if !touched.contains(&id) {
+                removed.retain(|r| r.as_str() != id);
+                touched.push(id);
+            }
+        }
+        let summaries = self.summaries(&touched, about).await?;
+        // Those gone (or moved away) since are gone.
+        for id in &touched {
+            if !summaries
+                .iter()
+                .any(|s| s.id.as_str() == id && &s.folder == folder)
+            {
+                removed.push(MessageId::new(id.as_str()));
+            }
+        }
+        Ok(FolderChanges {
+            changed: summaries
+                .into_iter()
+                .filter(|s| &s.folder == folder)
+                .collect(),
+            removed,
+            state: SyncState::new(new_state),
+            more: !last,
+        })
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {

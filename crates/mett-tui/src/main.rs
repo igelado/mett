@@ -158,6 +158,10 @@ fn main() -> ExitCode {
         else {
             return ExitCode::FAILURE;
         };
+        let (mailbox, warning) = account::cached(&config, &spoolfile, mailbox);
+        if let Some(warning) = warning {
+            eprintln!("mett: warning: {warning}");
+        }
         let mut pushed = Vec::new();
         for keys in config.take_pushed() {
             match keymap::parse_strokes(&keys) {
@@ -1159,14 +1163,22 @@ fn run_command(
             pushed: Vec::new(),
         };
     }
-    let changed = config.changed_since(&before);
+    let mut changed = config.changed_since(&before);
+    // `unset header_cache` keeps its (empty) value, but turns caching off.
+    if config.was_set("header_cache") != before.was_set("header_cache")
+        && !changed.contains(&"header_cache")
+    {
+        changed.push("header_cache");
+        changed.sort_unstable();
+    }
     // The mailbox and its sign-in were set up when mett started.
     if let Ok(warnings) = &mut outcome {
         warnings.extend(
             changed
                 .iter()
                 .filter(|name| {
-                    (name.starts_with("msgraph_") || ["use_ews", "ews_url"].contains(*name))
+                    (name.starts_with("msgraph_")
+                        || ["use_ews", "ews_url", "header_cache"].contains(*name))
                         && ![
                             "msgraph_page_size",
                             "msgraph_sync_interval",
@@ -1582,6 +1594,14 @@ mod tests {
             ])
         );
         assert_eq!(demo.config.string("msgraph_client_id"), "abc", "kept");
+        // Unsetting the cache keeps its empty value, but stops caching.
+        let done = demo.run("unset header_cache");
+        assert_eq!(
+            done.outcome,
+            Ok(vec![
+                "header_cache: takes effect when mett starts again".to_owned()
+            ])
+        );
     }
 
     #[test]

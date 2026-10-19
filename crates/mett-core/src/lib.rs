@@ -21,12 +21,13 @@ pub use attachment::{Attachment, AttachmentKind, OutgoingAttachment, content_typ
 pub use draft::{Draft, DraftOrigin};
 pub use error::{Error, Result};
 pub use folder::{Folder, UnknownWellKnownFolder, WellKnownFolder};
-pub use ids::{AccountId, AttachmentId, FolderId, MessageId, PageCursor};
+pub use ids::{AccountId, AttachmentId, FolderId, MessageId, PageCursor, SyncState};
 pub use join::{join_bounded, join_bounded_until};
 pub use message::{
     Address, AddressError, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary,
     ThreadPosition,
 };
 pub use ports::{
-    AccessToken, Authenticator, MailSender, MailStore, MessagePage, Page, RECENT_UNREAD,
+    AccessToken, Authenticator, FolderChanges, MailSender, MailStore, MessagePage, Page,
+    RECENT_UNREAD,
 };

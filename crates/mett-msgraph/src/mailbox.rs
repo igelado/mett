@@ -11,9 +11,10 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body, BodyKind,
-    Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
-    Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor,
-    RECENT_UNREAD, Result, ThreadPosition, WellKnownFolder, join_bounded_until,
+    Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId, MailSender,
+    MailStore, Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page,
+    PageCursor, RECENT_UNREAD, Result, SyncState, ThreadPosition, WellKnownFolder,
+    join_bounded_until,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -867,6 +868,83 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         self.send(self.request(Method::POST, url), About::message(id.as_str()))
             .await
             .map(drop)
+    }
+
+    fn can_sync(&self) -> bool {
+        true
+    }
+
+    /// With Graph's delta query: the state is the link to go on from (a
+    /// page's `@odata.nextLink`, or the last one's `@odata.deltaLink`).
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&SyncState>,
+    ) -> Result<FolderChanges> {
+        let url = match state {
+            // The state records its folder, so it can't be used for
+            // another one by mistake.
+            Some(state) => {
+                let link = state
+                    .as_str()
+                    .strip_prefix(folder.as_str())
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .ok_or(Error::StaleSync)?;
+                // A link of another endpoint (msgraph_endpoint changed) is
+                // never followed: the folder syncs again from the start.
+                self.next_page_url(link).map_err(|_| Error::StaleSync)?
+            }
+            None => {
+                let mut url =
+                    self.url(&["me", "mailFolders", folder.as_str(), "messages", "delta"]);
+                url.query_pairs_mut().append_pair("$select", SUMMARY_FIELDS);
+                url
+            }
+        };
+        let request = self
+            .request(Method::GET, url)
+            .header("Prefer", format!("odata.maxpagesize={DELTA_PAGE_SIZE}"));
+        let page: Delta = self.json(request, About::folder(folder.as_str())).await?;
+        let mut changes = FolderChanges {
+            changed: Vec::new(),
+            removed: Vec::new(),
+            state: SyncState::new(String::new()),
+            more: page.next_link.is_some(),
+        };
+        // A message may come more than once: its last entry tells.
+        for mut entry in page.value {
+            if entry.get("@removed").is_some() {
+                let id = entry
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| Error::Backend("delta entry without an id".into()))?;
+                let id = MessageId::new(id);
+                changes.changed.retain(|m| m.id != id);
+                if !changes.removed.contains(&id) {
+                    changes.removed.push(id);
+                }
+                continue;
+            }
+            // Delta entries are in the folder synced, whether or not they
+            // say so.
+            if let Some(fields) = entry.as_object_mut() {
+                fields
+                    .entry("parentFolderId")
+                    .or_insert_with(|| serde_json::Value::from(folder.as_str()));
+            }
+            let message: GraphMessage = serde_json::from_value(entry)
+                .map_err(|e| Error::Backend(format!("unexpected delta entry from Graph: {e}")))?;
+            let summary = message.into_summary()?;
+            changes.removed.retain(|id| *id != summary.id);
+            changes.changed.retain(|m| m.id != summary.id);
+            changes.changed.push(summary);
+        }
+        let link = page
+            .next_link
+            .or(page.delta_link)
+            .ok_or_else(|| Error::Backend("delta page without a next or delta link".into()))?;
+        changes.state = SyncState::new(format!("{folder} {link}"));
+        Ok(changes)
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
@@ -1775,6 +1853,8 @@ async fn error_from(response: reqwest::Response, about: About<'_>) -> Error {
         .unwrap_or_else(|_| format!("HTTP {status}"));
     match status {
         StatusCode::TOO_MANY_REQUESTS => Error::Throttled { retry_after },
+        // A delta link Graph no longer takes.
+        StatusCode::GONE => Error::StaleSync,
         StatusCode::NOT_FOUND => Error::NotFound {
             kind: about.kind,
             id: about.id.to_owned(),
@@ -1784,6 +1864,20 @@ async fn error_from(response: reqwest::Response, about: About<'_>) -> Error {
         s if s.is_server_error() => Error::Network(detail),
         _ => Error::Backend(detail),
     }
+}
+
+/// How many changes Graph is asked for per delta page.
+const DELTA_PAGE_SIZE: u32 = 500;
+
+/// A page of a delta query: messages (or `@removed` ones), and the link to
+/// go on from.
+#[derive(Deserialize)]
+struct Delta {
+    value: Vec<serde_json::Value>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink")]
+    delta_link: Option<String>,
 }
 
 #[derive(Deserialize)]

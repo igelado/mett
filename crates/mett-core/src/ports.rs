@@ -13,7 +13,7 @@ use crate::attachment::Attachment;
 use crate::draft::Draft;
 use crate::error::Result;
 use crate::folder::{Folder, WellKnownFolder};
-use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor};
+use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor, SyncState};
 use crate::message::{Address, FlagsUpdate, Message, MessageSummary};
 
 /// How many unread messages [`MailStore::recent_unread`] returns at most.
@@ -67,6 +67,20 @@ pub struct MessagePage {
     pub messages: Vec<MessageSummary>,
     /// The cursor for the next page, or `None` if this is the last one.
     pub next: Option<PageCursor>,
+}
+
+/// What changed in a folder since a sync state ([`MailStore::sync_folder`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderChanges {
+    /// The messages that arrived or changed, as they are now.
+    pub changed: Vec<MessageSummary>,
+    /// The messages that left the folder (deleted, or moved away). A
+    /// message is in at most one of `changed` and `removed`, as it ended.
+    pub removed: Vec<MessageId>,
+    /// Where the sync stands after these changes.
+    pub state: SyncState,
+    /// Whether more changes are waiting: sync again from `state` for them.
+    pub more: bool,
 }
 
 /// Access to a mailbox.
@@ -197,6 +211,28 @@ pub trait MailStore: Send + Sync {
     /// Saves `draft` in the drafts folder (mutt's `postponed`) and returns
     /// the saved message's identifier.
     fn save_draft(&self, draft: &Draft) -> impl Future<Output = Result<MessageId>> + Send;
+
+    /// Whether the backend can tell what changed in a folder since a sync
+    /// state ([`MailStore::sync_folder`]).
+    fn can_sync(&self) -> bool {
+        false
+    }
+
+    /// What changed in `folder` since `state`, a batch at a time (follow
+    /// [`FolderChanges::more`]). Without a state, every message in the
+    /// folder is a change. A state the backend no longer takes is
+    /// [`Error::StaleSync`](crate::Error::StaleSync): sync again without
+    /// one. Only for backends that [`MailStore::can_sync`].
+    fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&SyncState>,
+    ) -> impl Future<Output = Result<FolderChanges>> + Send {
+        let _ = (folder, state);
+        std::future::ready(Err(crate::Error::Backend(
+            "this mailbox can't sync folders".into(),
+        )))
+    }
 }
 
 /// Sends mail.

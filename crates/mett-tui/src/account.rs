@@ -3,18 +3,21 @@
 //! mailbox, through Microsoft Graph or Exchange Web Services (`use_ews`,
 //! `ews_url`) (`docs/CONFIG-OFFICE365.md` §4).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Address, Attachment, AttachmentId, Draft, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
-    Message, MessageId, MessagePage, Page, Result as PortResult, WellKnownFolder,
+    Address, Attachment, AttachmentId, Draft, FlagsUpdate, Folder, FolderChanges, FolderId,
+    MailSender, MailStore, Message, MessageId, MessagePage, Page, Result as PortResult, SyncState,
+    WellKnownFolder,
 };
 use mett_ews::EwsMailStore;
 use mett_msgraph::{
     AuthFlow, AuthSettings, FileStore, GraphAuthenticator, GraphMailStore, IdentityCheck,
     KeyringStore, TokenStore, TokenStoreError,
 };
+use mett_sqlite::{Cache, CachedStore};
 use url::Url;
 
 use crate::config::mailbox::MailboxUrl;
@@ -169,6 +172,73 @@ impl MailStore for Mailbox {
 
     async fn save_draft(&self, draft: &Draft) -> PortResult<MessageId> {
         either!(self, s => s.save_draft(draft).await)
+    }
+
+    fn can_sync(&self) -> bool {
+        either!(self, s => s.can_sync())
+    }
+
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&SyncState>,
+    ) -> PortResult<FolderChanges> {
+        either!(self, s => s.sync_folder(folder, state).await)
+    }
+}
+
+/// The cache file of the account in `url` (mutt's `header_cache`): by
+/// default `$XDG_CACHE_HOME/mett/<account>.sqlite` (`~/.cache/mett/...`
+/// when `XDG_CACHE_HOME` is unset or relative). A `header_cache` that is a
+/// directory (or ends with `/`) holds a file per account; another names
+/// the file. Unset, nothing is cached.
+pub fn cache_path(
+    config: &Config,
+    url: &MailboxUrl,
+    xdg_cache_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let file = format!("{}.sqlite", url.account);
+    if !config.was_set("header_cache") {
+        // The XDG Base Directory spec says to ignore relative values.
+        let cache = xdg_cache_home
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                home.filter(|h| !h.is_empty())
+                    .map(|home| PathBuf::from(home).join(".cache"))
+            })?;
+        return Some(cache.join("mett").join(file));
+    }
+    match config.string("header_cache") {
+        "" => None,
+        path if path.ends_with('/') || Path::new(path).is_dir() => Some(Path::new(path).join(file)),
+        path => Some(PathBuf::from(path)),
+    }
+}
+
+/// `mailbox` with its cache (see [`cache_path`]), and a warning if the
+/// cache can't be used: mett then works without it.
+pub fn cached(
+    config: &Config,
+    url: &MailboxUrl,
+    mailbox: Mailbox,
+) -> (CachedStore<Mailbox>, Option<String>) {
+    let path = cache_path(
+        config,
+        url,
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
+    );
+    let Some(path) = path else {
+        return (CachedStore::new(mailbox, None), None);
+    };
+    match Cache::open(&path, &url.account) {
+        Ok(cache) => (CachedStore::new(mailbox, Some(cache)), None),
+        Err(e) => (
+            CachedStore::new(mailbox, None),
+            Some(format!("header_cache: {e}; not caching")),
+        ),
     }
 }
 
@@ -524,6 +594,44 @@ mod tests {
             ..delegated
         }));
         assert!(!Api::Ews.always_copies(&attached));
+    }
+
+    #[test]
+    fn the_cache_follows_header_cache() {
+        let path = |source: &str, xdg: Option<&str>| {
+            cache_path(
+                &config(source),
+                &url(),
+                xdg.map(Into::into),
+                Some("/home/a".into()),
+            )
+        };
+        let file = "alice@contoso.com.sqlite";
+        // By default, in the XDG cache directory (a relative one is
+        // ignored).
+        assert_eq!(
+            path("", None),
+            Some(PathBuf::from("/home/a/.cache/mett").join(file))
+        );
+        assert_eq!(
+            path("", Some("/xdg")),
+            Some(PathBuf::from("/xdg/mett").join(file))
+        );
+        assert_eq!(
+            path("", Some("rel")),
+            Some(PathBuf::from("/home/a/.cache/mett").join(file))
+        );
+        // A directory holds a file per account; a file is used as it is.
+        assert_eq!(
+            path("set header_cache=~/hc/\n", None),
+            Some(PathBuf::from("/home/a/hc").join(file))
+        );
+        assert_eq!(
+            path("set header_cache=~/hc.db\n", None),
+            Some(PathBuf::from("/home/a/hc.db"))
+        );
+        // Unset, nothing is cached.
+        assert_eq!(path("unset header_cache\n", None), None);
     }
 
     #[test]

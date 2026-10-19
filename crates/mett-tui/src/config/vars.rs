@@ -138,6 +138,7 @@ pub const VARS: &[Var] = &[
     var("folder", Kind::Path, "~/Mail"),
     var("forward_format", Kind::String, "[%a: %s]"),
     var("from", Kind::String, ""),
+    var("header_cache", Kind::Path, ""),
     var("include", Kind::Quad, "ask-yes"),
     var("indent_string", Kind::String, "> "),
     var("index_format", Kind::String, "%4C %Z %{%b %d} %-15.15L  %s"),

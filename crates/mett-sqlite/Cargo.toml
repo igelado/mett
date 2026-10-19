@@ -1,0 +1,26 @@
+[package]
+name = "mett-sqlite"
+description = "SQLite cache for mett: folders' indexes and messages, kept up to date by syncing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+mett-core.workspace = true
+
+chrono.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+mett-core = { workspace = true, features = ["mock"] }
+# To break a cache from outside.
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
+[lints]
+workspace = true

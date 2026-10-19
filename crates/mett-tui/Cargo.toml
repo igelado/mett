@@ -15,6 +15,7 @@ path = "src/main.rs"
 mett-core = { workspace = true, features = ["mock"] }
 mett-ews.workspace = true
 mett-msgraph.workspace = true
+mett-sqlite.workspace = true
 
 base64.workspace = true
 chrono.workspace = true
