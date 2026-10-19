@@ -428,7 +428,7 @@ impl<S: MailStore> CachedStore<S> {
                 .changed_messages(folder, since, page.clone())
                 .await;
         }
-        let what = since.timestamp_millis().to_string();
+        let what = since.timestamp_micros().to_string();
         self.cached_page(folder, page, &what, modified_key, |db, after, limit| {
             db.changed(folder, since, after, limit)
         })
@@ -631,7 +631,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 listed => return listed,
             }
         }
-        let what = since.timestamp_millis().to_string();
+        let what = since.timestamp_micros().to_string();
         let resumed = self
             .resume_listing(folder, &what, &page, modified_key, |page| {
                 self.inner.changed_messages(folder, since, page)

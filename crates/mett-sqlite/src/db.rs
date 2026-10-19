@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Marks mett's caches (SQLite's `application_id`): "mett".
 const APPLICATION_ID: i64 = 0x6D65_7474;
@@ -37,7 +37,7 @@ const SCHEMA: &str = "
     CREATE TABLE messages (
         id TEXT PRIMARY KEY,
         folder TEXT NOT NULL,
-        -- The summary's dates, in milliseconds, to sort and filter by.
+        -- The summary's dates, in microseconds, to sort and filter by.
         received INTEGER NOT NULL,
         modified INTEGER,
         unread INTEGER NOT NULL,
@@ -66,19 +66,19 @@ const SCHEMA: &str = "
     CREATE INDEX messages_by_change ON messages (folder, modified DESC);
 ";
 
-/// Where a message is in a listing: its date there, in milliseconds, and
+/// Where a message is in a listing: its date there, in microseconds, and
 /// its ID (listings go by date, newest first, then by ID).
 pub(crate) type Key = (i64, String);
 
 /// `summary`'s key in a listing by date ([`Db::page`]).
 pub(crate) fn received_key(summary: &MessageSummary) -> Key {
-    (summary.received.timestamp_millis(), summary.id.to_string())
+    (summary.received.timestamp_micros(), summary.id.to_string())
 }
 
 /// `summary`'s key in a listing by change ([`Db::changed`]).
 pub(crate) fn modified_key(summary: &MessageSummary) -> Key {
     (
-        summary.modified.map_or(i64::MIN, |m| m.timestamp_millis()),
+        summary.modified.map_or(i64::MIN, |m| m.timestamp_micros()),
         summary.id.to_string(),
     )
 }
@@ -309,8 +309,8 @@ impl Db {
                 params![
                     summary.id.as_str(),
                     folder.as_str(),
-                    summary.received.timestamp_millis(),
-                    summary.modified.map(|m| m.timestamp_millis()),
+                    summary.received.timestamp_micros(),
+                    summary.modified.map(|m| m.timestamp_micros()),
                     !summary.flags.read,
                     stored,
                     summary.draft,
@@ -383,7 +383,7 @@ impl Db {
              ORDER BY modified DESC, id LIMIT ?5",
             params![
                 folder.as_str(),
-                since.timestamp_millis(),
+                since.timestamp_micros(),
                 at,
                 id,
                 sql(limit)
@@ -409,7 +409,7 @@ impl Db {
             .map_err(failed)?;
         let rows = statement
             .query_map(
-                params![folder.as_str(), since.timestamp_millis(), sql(limit)],
+                params![folder.as_str(), since.timestamp_micros(), sql(limit)],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
             .map_err(failed)?;
@@ -472,7 +472,7 @@ impl Db {
                 params![
                     message.summary.id.as_str(),
                     extras,
-                    modified.timestamp_millis()
+                    modified.timestamp_micros()
                 ],
             )
             .map_err(failed)?;
@@ -700,14 +700,14 @@ fn sql(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-/// A time in milliseconds, as stored.
-fn time(millis: i64) -> Result<DateTime<Utc>, Error> {
-    DateTime::from_timestamp_millis(millis).ok_or_else(|| failed("a date out of range"))
+/// A time in microseconds, as stored.
+fn time(micros: i64) -> Result<DateTime<Utc>, Error> {
+    DateTime::from_timestamp_micros(micros).ok_or_else(|| failed("a date out of range"))
 }
 
 /// An optional time, as stored.
-fn maybe_time(millis: Option<i64>) -> Result<Option<DateTime<Utc>>, Error> {
-    millis.map(time).transpose()
+fn maybe_time(micros: Option<i64>) -> Result<Option<DateTime<Utc>>, Error> {
+    micros.map(time).transpose()
 }
 
 /// A [`Folder`], as stored.
@@ -798,13 +798,13 @@ impl From<&MessageSummary> for StoredSummary {
             subject: s.subject.clone(),
             from: s.from.as_ref().map(StoredAddress::from),
             to: s.to.iter().map(StoredAddress::from).collect(),
-            received: s.received.timestamp_millis(),
+            received: s.received.timestamp_micros(),
             read: s.flags.read,
             flagged: s.flags.flagged,
             has_attachments: s.has_attachments,
             draft: s.draft,
-            delivered: s.delivered.map(|d| d.timestamp_millis()),
-            modified: s.modified.map(|m| m.timestamp_millis()),
+            delivered: s.delivered.map(|d| d.timestamp_micros()),
+            modified: s.modified.map(|m| m.timestamp_micros()),
             conversation: s.thread.as_ref().map(|t| t.conversation.clone()),
             thread_path: s
                 .thread
@@ -952,7 +952,7 @@ mod tests {
         assert!(
             changed[0]
                 .modified
-                .is_some_and(|m| m.timestamp_millis() >= before.timestamp_millis())
+                .is_some_and(|m| m.timestamp_micros() >= before.timestamp_micros())
         );
     }
 
@@ -979,6 +979,29 @@ mod tests {
         message.summary.modified = Some(at(2));
         db.keep_body(&message).unwrap();
         assert!(db.message(&message.summary.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn dates_keep_their_microseconds() {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        let inbox = FolderId::new("in");
+        let at = DateTime::UNIX_EPOCH + chrono::TimeDelta::milliseconds(1);
+        let later = at + chrono::TimeDelta::microseconds(500);
+        // "b" before "a" by ID, but after it by date.
+        let a = mett_core::mock::message("a", "in", "later", later).summary;
+        let b = mett_core::mock::message("b", "in", "sooner", at).summary;
+        db.start_over(&inbox).unwrap();
+        let changes = FolderChanges {
+            changed: vec![b, a],
+            removed: Vec::new(),
+            state: SyncState::new("s1"),
+            more: false,
+        };
+        assert!(db.apply(&inbox, None, &changes).unwrap());
+        let page = db.page(&inbox, None, 10).unwrap();
+        let ids: Vec<&str> = page.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(page[0].received, later);
     }
 
     #[test]
