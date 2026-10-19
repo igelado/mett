@@ -14,11 +14,11 @@ chrono.workspace = true
 reqwest.workspace = true
 roxmltree.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["macros", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 url.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 wiremock.workspace = true
 
 [lints]

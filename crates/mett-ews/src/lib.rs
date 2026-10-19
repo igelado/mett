@@ -12,5 +12,6 @@
 
 mod mailbox;
 mod soap;
+mod stream;
 
 pub use mailbox::{EwsMailStore, needs_server_draft};

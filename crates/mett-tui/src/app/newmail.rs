@@ -114,6 +114,9 @@ impl Seen {
     }
 }
 
+/// How long after watching the folders failed it is tried again.
+const WATCH_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl App {
     /// The unread mail the open folder's index shows has been seen: it
     /// isn't new once the user leaves (as mail a check finds that hasn't
@@ -159,13 +162,213 @@ impl App {
     /// Sets the timer for the next check, unless it is set or checking is
     /// off.
     pub(super) fn arm_poll(&mut self) -> Vec<Effect> {
-        match self.sync_interval {
+        let mut effects = match self.sync_interval {
             Some(interval) if !self.poll_armed => {
                 self.poll_armed = true;
                 vec![Effect::Later(interval, Timer::Poll(self.poll_timer))]
             }
             _ => Vec::new(),
+        };
+        // Checks wait for the timer; the backend may also tell at once.
+        effects.extend(self.watch());
+        effects
+    }
+
+    /// Watches the open folder and the `mailboxes` found so far for
+    /// changes, if the mailbox can tell, and mail is checked for, and isn't
+    /// being watched already.
+    pub(super) fn watch(&mut self) -> Vec<Effect> {
+        // Checks turned off: so is the watch.
+        if self.sync_interval.is_none() {
+            return self.unwatch();
         }
+        // Quitting: nothing new starts.
+        // Nor while watching is being ended: that could end the new watch.
+        if self.quit
+            || !self.can_watch
+            || self.watch_retry
+            || self.watch_paused
+            || self.unwatching.is_some()
+            || self.sync_interval.is_none()
+            || self.poll_paused
+            || self.sign_in.is_some()
+        {
+            return Vec::new();
+        }
+        let folders = self.to_watch();
+        // Watched already, or nothing to watch.
+        if self.watching.is_some() && folders == self.watched || folders.is_empty() {
+            return Vec::new();
+        }
+        // Other folders now (the mailboxes found, another folder opened):
+        // the watch starts again.
+        let mut effects = Vec::new();
+        if let Some(old) = self.watching.take() {
+            effects.push(self.request(Request::Cancel(old)));
+        }
+        let watch = self.request(Request::Watch(folders.clone()));
+        self.watching = Some(effect_id(&watch));
+        self.watch_epoch = self.poll_epoch;
+        // What was left to end, the mailbox ends first.
+        self.unwatch_failed = false;
+        self.watched = folders;
+        effects.push(watch);
+        effects
+    }
+
+    /// Stops watching (say, on quitting): the watch under way ends, and
+    /// so does what the mailbox keeps on the server for it (an EWS
+    /// subscription), rather than linger there until it expires.
+    pub fn unwatch(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if let Some(old) = self.watching.take() {
+            effects.push(self.request(Request::Cancel(old)));
+        }
+        if self.can_watch
+            && (!self.watched.is_empty() || self.unwatch_failed)
+            && self.unwatching.is_none()
+        {
+            self.watched.clear();
+            // Watching's sign-in failed: ended once the user signs in, not
+            // to ask them again unbidden.
+            if self.watch_paused {
+                self.unwatch_failed = true;
+                return effects;
+            }
+            self.unwatch_failed = false;
+            let unwatch = self.request(Request::Watch(Vec::new()));
+            self.unwatching = Some(effect_id(&unwatch));
+            effects.push(unwatch);
+        }
+        effects
+    }
+
+    /// Whether watching is being stopped ([`Self::unwatch`]).
+    pub fn unwatching(&self) -> bool {
+        self.unwatching.is_some()
+    }
+
+    /// The folders to watch: the open folder, and the `mailboxes` found.
+    fn to_watch(&self) -> Vec<mett_core::FolderId> {
+        let mut folders: Vec<mett_core::FolderId> = Vec::new();
+        let open = self.folder.as_ref().map(|f| f.id.clone());
+        let mailboxes = self
+            .mailboxes
+            .iter()
+            .filter(|m| m.poll)
+            .filter_map(|m| self.mailbox_state.get(&m.path)?.folder.as_ref())
+            .map(|f| f.id.clone());
+        for id in open.into_iter().chain(mailboxes) {
+            if !folders.contains(&id) {
+                folders.push(id);
+            }
+        }
+        folders
+    }
+
+    /// The watch `id` ended: folders changed (`changed`), so mail is
+    /// checked for at once; or its wait ran out; or it failed, and is
+    /// tried again later; or the mailbox can't watch (`None`). Then the
+    /// folders are watched again.
+    pub(super) fn on_watched(
+        &mut self,
+        id: RequestId,
+        result: Option<mett_core::Result<Vec<mett_core::FolderId>>>,
+    ) -> Vec<Effect> {
+        if self.unwatching == Some(id) {
+            self.unwatching = None;
+            // Tried again later (a watch would end it too), unless
+            // quitting; after a failed sign-in, once the user signs in, not
+            // to ask them again unbidden.
+            return match result {
+                Some(Err(_)) if self.quit => Vec::new(),
+                Some(Err(Error::Auth(_))) => {
+                    self.unwatch_failed = true;
+                    self.watch_paused = true;
+                    Vec::new()
+                }
+                Some(Err(_)) => {
+                    self.unwatch_failed = true;
+                    vec![Effect::Later(WATCH_RETRY, Timer::Watch)]
+                }
+                // Checks may have been turned on again meanwhile.
+                _ => self.watch(),
+            };
+        }
+        if self.watching != Some(id) {
+            // A watch replaced as it ended: what it said changed is not
+            // told again.
+            return match result {
+                Some(Ok(changed)) if !changed.is_empty() => {
+                    self.note_changed(changed);
+                    self.recheck()
+                }
+                _ => Vec::new(),
+            };
+        }
+        self.watching = None;
+        let mut effects = Vec::new();
+        match result {
+            None => self.can_watch = false,
+            Some(Ok(changed)) => {
+                self.note_changed(changed);
+                effects.extend(self.recheck());
+                effects.extend(self.watch());
+            }
+            // A sign-in failed (say, the user dismissed it): held off
+            // until the user signs in again, rather than ask again
+            // unbidden. (Unless the user has since.) Checks go on: the
+            // mailbox may only refuse to be watched.
+            Some(Err(Error::Auth(_))) if self.watch_epoch == self.poll_epoch => {
+                self.watch_paused = true;
+            }
+            // The timer's checks go on meanwhile.
+            Some(Err(_)) => {
+                self.watch_retry = true;
+                effects.push(Effect::Later(WATCH_RETRY, Timer::Watch));
+            }
+        }
+        effects
+    }
+
+    /// Notes the folders a watch said `changed`, to be checked: only
+    /// those.
+    fn note_changed(&mut self, changed: Vec<mett_core::FolderId>) {
+        if self
+            .folder
+            .as_ref()
+            .is_some_and(|f| changed.contains(&f.id))
+        {
+            self.recheck_folder = true;
+        }
+        for folder in changed {
+            if !self.recheck_mailboxes.contains(&folder) {
+                self.recheck_mailboxes.push(folder);
+            }
+        }
+    }
+
+    /// Checks the folders a watch said changed, as far as checks under
+    /// way allow: those still busy (whose check may predate the change)
+    /// are checked once it ends.
+    pub(super) fn recheck(&mut self) -> Vec<Effect> {
+        if self.quit || self.sync_interval.is_none() || self.poll_paused || self.sign_in.is_some() {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        if self.recheck_folder && self.polling.is_none() {
+            effects.extend(self.poll_folder());
+            // Being checked now. (A listing under way may predate the
+            // change: it is checked when that ends.)
+            if self.polling.is_some() {
+                self.recheck_folder = false;
+            }
+        }
+        if self.checking.is_none() && !self.recheck_mailboxes.is_empty() {
+            let changed = std::mem::take(&mut self.recheck_mailboxes);
+            effects.extend(self.check_mailboxes_in(Some(&changed)));
+        }
+        effects
     }
 
     /// The timer went off: check for new mail, and set it again. A timer
@@ -236,6 +439,12 @@ impl App {
     /// Reads the counts of the mailboxes to check, unless that is on its
     /// way already.
     pub(super) fn check_mailboxes(&mut self) -> Vec<Effect> {
+        self.check_mailboxes_in(None)
+    }
+
+    /// Checks the `mailboxes` (with `only`, those of these folders) for new
+    /// mail, unless a check is under way.
+    fn check_mailboxes_in(&mut self, only: Option<&[mett_core::FolderId]>) -> Vec<Effect> {
         if self.checking.is_some() {
             return Vec::new();
         }
@@ -243,6 +452,14 @@ impl App {
             .mailboxes
             .iter()
             .filter(|m| m.poll)
+            .filter(|m| {
+                only.is_none_or(|only| {
+                    self.mailbox_state
+                        .get(&m.path)
+                        .and_then(|s| s.folder.as_ref())
+                        .is_some_and(|f| only.contains(&f.id))
+                })
+            })
             .map(|m| {
                 let id = self
                     .mailbox_state
@@ -723,7 +940,8 @@ impl App {
         }
         self.refresh_mailbox_browser();
         self.rebuild_sidebar(false);
-        Vec::new()
+        // The mailboxes found are watched too.
+        self.watch()
     }
 
     /// Says that new mail arrived, unless an error is on the message line:
@@ -1059,6 +1277,342 @@ mod tests {
         let mut draft = summary(id, minutes);
         draft.draft = true;
         draft
+    }
+
+    #[test]
+    fn a_watch_whose_sign_in_failed_waits_for_the_user() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        let denied = || Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        // Not tried again unbidden. Checks go on: the mailbox may only
+        // refuse to be watched.
+        assert!(respond(&mut app, watch, denied()).is_empty());
+        assert!(app.watch_paused && !app.poll_paused);
+        assert!(app.watch().is_empty());
+        // The user signs in again: watched again.
+        let effects = app.retry();
+        assert!(
+            requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::Watch(_))),
+            "{effects:?}"
+        );
+        // A failure from before then doesn't hold it off again.
+        let watch = app.watching.expect("watched");
+        app.poll_epoch += 1;
+        let effects = respond(&mut app, watch, denied());
+        assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
+        assert!(!app.watch_paused);
+    }
+
+    #[test]
+    fn folders_are_checked_as_soon_as_they_change() {
+        let (mut app, _) = app();
+        let inbox = mett_core::FolderId::new("in");
+        // Opened, the Inbox is watched.
+        let watch = app.watching.expect("the folder is watched");
+        // A change: it is checked at once, and watched again.
+        let effects = respond(
+            &mut app,
+            watch,
+            Event::Watched(Some(Ok(vec![inbox.clone()]))),
+        );
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::Watch(f) if f == std::slice::from_ref(&inbox))),
+            "{sent:?}"
+        );
+        // Its wait ran out: watched again, nothing checked.
+        let watch = app.watching.expect("watched again");
+        let effects = respond(&mut app, watch, Event::Watched(Some(Ok(Vec::new()))));
+        assert!(matches!(requests(&effects)[..], [(_, Request::Watch(_))]));
+        // It failed: tried again later (the timer's checks go on).
+        let watch = app.watching.expect("watched again");
+        let failed = Event::Watched(Some(Err(mett_core::Error::Network("down".into()))));
+        let effects = respond(&mut app, watch, failed);
+        assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
+        assert!(
+            app.update(Msg::Timer(Timer::Poll(0)))
+                .iter()
+                .all(|e| { !matches!(e, Effect::Request(_, Request::Watch(_))) })
+        );
+        let effects = app.update(Msg::Timer(Timer::Watch));
+        assert!(matches!(requests(&effects)[..], [(_, Request::Watch(_))]));
+        // The mailbox can't watch: never again.
+        let watch = app.watching.expect("watched again");
+        assert!(respond(&mut app, watch, Event::Watched(None)).is_empty());
+        assert!(
+            app.update(Msg::Timer(Timer::Poll(0)))
+                .iter()
+                .all(|e| { !matches!(e, Effect::Request(_, Request::Watch(_))) })
+        );
+    }
+
+    #[test]
+    fn the_watch_follows_the_folders_and_checks_only_those_changed() {
+        let (mut app, check) = app();
+        let inbox = mett_core::FolderId::new("in");
+        let work = mett_core::FolderId::new("wk");
+        let first = app.watching.expect("the folder is watched");
+        // The mailboxes found, they are watched too: the watch starts
+        // again.
+        let effects = check_both(
+            &mut app,
+            check,
+            checked("in", "Inbox", 1, None),
+            checked("wk", "Work", 0, None),
+        );
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::Cancel(id) if *id == first)),
+            "{sent:?}"
+        );
+        assert!(
+            sent.iter().any(
+                |(_, r)| matches!(r, Request::Watch(f) if f == &[inbox.clone(), work.clone()])
+            ),
+            "{sent:?}"
+        );
+        // The same folders: not again.
+        assert!(app.watch().is_empty());
+        // The Inbox changed: its index is checked, and its counts (it is
+        // one of the mailboxes too).
+        let watch = app.watching.expect("watched");
+        let effects = respond(
+            &mut app,
+            watch,
+            Event::Watched(Some(Ok(vec![inbox.clone()]))),
+        );
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "{sent:?}"
+        );
+        let check = sent
+            .iter()
+            .find_map(|(id, r)| match r {
+                Request::CheckMailboxes(m) if m.len() == 1 && m[0].0 == super::tests::inbox() => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("the Inbox's counts are checked");
+        respond(&mut app, check, Event::MailboxesChecked(Vec::new()));
+        // Work changed: only it is checked.
+        let watch = app.watching.expect("watched");
+        let effects = respond(
+            &mut app,
+            watch,
+            Event::Watched(Some(Ok(vec![work.clone()]))),
+        );
+        let sent = requests(&effects);
+        assert!(
+            !sent
+                .iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "the Inbox didn't change: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|(_, r)| matches!(
+                r,
+                Request::CheckMailboxes(m) if m.len() == 1 && m[0].0 == super::tests::work()
+            )),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_during_a_check_is_checked_after_it() {
+        let (mut app, _) = app();
+        let inbox = mett_core::FolderId::new("in");
+        // A check is under way when the watch says the Inbox changed.
+        let check = poll(&mut app);
+        let watch = app.watching.expect("watched");
+        let effects = respond(&mut app, watch, Event::Watched(Some(Ok(vec![inbox]))));
+        assert!(
+            !requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "one at a time"
+        );
+        // It may predate the change: once it ends, the Inbox is checked
+        // again.
+        let effects = polled(&mut app, check, Vec::new());
+        assert!(
+            requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn turning_checks_off_ends_the_watch() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        app.sync_interval = None;
+        // The watch ends, and so does what the mailbox keeps for it.
+        let effects = app.watch();
+        let sent = requests(&effects);
+        assert!(
+            matches!(&sent[..], [(_, Request::Cancel(id)), (_, Request::Watch(f))]
+                if *id == watch && f.is_empty()),
+            "{sent:?}"
+        );
+        assert!(app.watching.is_none());
+        assert!(app.unwatching());
+        // Once.
+        assert!(app.watch().is_empty());
+        // It failed: tried again later.
+        let unwatch = effect_id(&effects[1]);
+        let failed = Event::Watched(Some(Err(Error::Network("down".into()))));
+        let effects = respond(&mut app, unwatch, failed);
+        assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
+        assert!(!app.unwatching());
+        let effects = app.update(Msg::Timer(Timer::Watch));
+        let sent = requests(&effects);
+        assert!(
+            matches!(&sent[..], [(_, Request::Watch(f))] if f.is_empty()),
+            "{sent:?}"
+        );
+        let unwatch = effect_id(&effects[0]);
+        assert!(respond(&mut app, unwatch, Event::Watched(Some(Ok(Vec::new())))).is_empty());
+        assert!(!app.unwatching());
+        assert!(app.watch().is_empty());
+    }
+
+    #[test]
+    fn changes_told_by_a_replaced_watch_are_checked() {
+        let (mut app, check) = app();
+        let inbox = mett_core::FolderId::new("in");
+        let first = app.watching.expect("the folder is watched");
+        // The mailboxes found, the watch starts again; the first had ended
+        // already, telling of a change.
+        check_both(
+            &mut app,
+            check,
+            checked("in", "Inbox", 1, None),
+            checked("wk", "Work", 0, None),
+        );
+        let second = app.watching.expect("watched again");
+        assert_ne!(first, second);
+        let effects = respond(&mut app, first, Event::Watched(Some(Ok(vec![inbox]))));
+        let sent = requests(&effects);
+        assert!(
+            sent.iter()
+                .any(|(_, r)| matches!(r, Request::PollFolder { .. })),
+            "{sent:?}"
+        );
+        // Not watched a third time.
+        assert_eq!(app.watching, Some(second));
+        assert!(
+            !sent.iter().any(|(_, r)| matches!(r, Request::Watch(_))),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn ending_a_watch_whose_sign_in_failed_waits_for_the_user() {
+        let (mut app, _) = app();
+        app.sync_interval = None;
+        let effects = app.watch();
+        let unwatch = effect_id(&effects[1]);
+        let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        assert!(respond(&mut app, unwatch, denied).is_empty());
+        // Not on the timer, nor when the sign-in window closes.
+        assert!(app.update(Msg::Timer(Timer::Watch)).is_empty());
+        let account = mett_core::AccountId::from("alice@contoso.com");
+        let cancelled = crate::SignInEvent::Finished {
+            account: account.clone(),
+            outcome: Err("cancelled".into()),
+        };
+        assert!(requests(&app.update(Msg::SignIn(cancelled))).is_empty());
+        // Signed in: tried again.
+        let signed_in = crate::SignInEvent::Finished {
+            account,
+            outcome: Ok(()),
+        };
+        let effects = app.update(Msg::SignIn(signed_in));
+        let sent = requests(&effects);
+        assert!(
+            matches!(&sent[..], [(_, Request::Watch(f))] if f.is_empty()),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_watch_paused_is_ended_once_signed_in() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        respond(&mut app, watch, denied);
+        // Checks turned off: not ended yet, not to ask for a sign-in.
+        app.sync_interval = None;
+        assert!(app.watch().is_empty());
+        let signed_in = crate::SignInEvent::Finished {
+            account: "alice@contoso.com".into(),
+            outcome: Ok(()),
+        };
+        let effects = app.update(Msg::SignIn(signed_in));
+        assert!(
+            matches!(&requests(&effects)[..], [(_, Request::Watch(f))] if f.is_empty()),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_watch_paused_goes_on_once_signed_in() {
+        let (mut app, _) = app();
+        let watch = app.watching.expect("watched");
+        let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
+        respond(&mut app, watch, denied);
+        let signed_in = crate::SignInEvent::Finished {
+            account: "alice@contoso.com".into(),
+            outcome: Ok(()),
+        };
+        let effects = app.update(Msg::SignIn(signed_in));
+        assert!(
+            requests(&effects)
+                .iter()
+                .any(|(_, r)| matches!(r, Request::Watch(f) if !f.is_empty())),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn checks_turned_on_again_watch_once_the_watch_has_ended() {
+        let (mut app, _) = app();
+        let interval = app.sync_interval;
+        app.sync_interval = None;
+        let effects = app.watch();
+        let unwatch = effect_id(&effects[1]);
+        app.sync_interval = interval;
+        assert!(app.watch().is_empty());
+        let effects = respond(&mut app, unwatch, Event::Watched(Some(Ok(Vec::new()))));
+        assert!(
+            matches!(&requests(&effects)[..], [(_, Request::Watch(f))] if !f.is_empty()),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_watched_nor_checked_after_quitting() {
+        let (mut app, _) = app();
+        app.quit = true;
+        let effects = app.unwatch();
+        assert!(app.unwatching(), "{effects:?}");
+        // Say, a sign-in a save needed ends: no watch starts again.
+        app.recheck_folder = true;
+        assert!(app.watch().is_empty());
+        assert!(app.recheck().is_empty());
     }
 
     #[test]

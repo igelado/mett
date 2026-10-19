@@ -30,7 +30,7 @@ fn store(server: &MockServer) -> EwsMailStore<StaticAuth> {
     store_with(server, Arc::new(StaticAuth))
 }
 
-fn store_with<A: Authenticator>(server: &MockServer, auth: Arc<A>) -> EwsMailStore<A> {
+fn store_with<A: Authenticator + 'static>(server: &MockServer, auth: Arc<A>) -> EwsMailStore<A> {
     let url = Url::parse(&format!("{}{ENDPOINT}", server.uri())).unwrap();
     EwsMailStore::new(
         reqwest::Client::new(),
@@ -1129,4 +1129,493 @@ async fn items_are_looked_up_a_hundred_at_a_time() {
         .map(|r| r.matches("<t:ItemId ").count())
         .collect();
     assert_eq!(looked_up, [100, 50]);
+}
+
+/// One envelope of a `GetStreamingEvents` stream, with `rest` in its
+/// response message, of `code`.
+fn streamed(code: &str, rest: &str) -> String {
+    let class = if code == "NoError" {
+        "Success"
+    } else {
+        "Error"
+    };
+    format!(
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+         <s:Body xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\" \
+         xmlns:t=\"http://schemas.microsoft.com/exchange/services/2006/types\">\
+         <m:GetStreamingEventsResponse><m:ResponseMessages>\
+         <m:GetStreamingEventsResponseMessage ResponseClass=\"{class}\">\
+         <m:ResponseCode>{code}</m:ResponseCode>{rest}</m:GetStreamingEventsResponseMessage>\
+         </m:ResponseMessages></m:GetStreamingEventsResponse></s:Body></s:Envelope>"
+    )
+}
+
+/// A stream telling of new mail in `folder`.
+fn new_mail(folder: &str) -> ResponseTemplate {
+    let mail = streamed(
+        "NoError",
+        &format!(
+            "<m:Notifications><m:Notification>\
+             <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"{folder}\"/>\
+             </t:NewMailEvent></m:Notification></m:Notifications>\
+             <m:ConnectionStatus>Closed</m:ConnectionStatus>"
+        ),
+    );
+    ResponseTemplate::new(200).set_body_raw(mail, "text/xml")
+}
+
+/// A subscription answered with ID `id`.
+fn subscribed(id: &str) -> ResponseTemplate {
+    success(
+        "Subscribe",
+        &format!("<m:SubscriptionId>{id}</m:SubscriptionId>"),
+    )
+}
+
+#[tokio::test]
+async fn watches_folders_by_streaming_notifications() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<m:StreamingSubscriptionRequest>"))
+        .and(body_string_contains("<t:FolderId Id=\"inbox-id\"/>"))
+        .and(body_string_contains(
+            "<t:EventType>NewMailEvent</t:EventType>",
+        ))
+        .respond_with(subscribed("sub1"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The server says it is alive, then mail arrives.
+    let alive = streamed(
+        "NoError",
+        "<m:Notifications><m:Notification><t:StatusEvent/></m:Notification></m:Notifications>",
+    );
+    let mail = streamed(
+        "NoError",
+        "<m:Notifications><m:Notification><t:SubscriptionId>sub1</t:SubscriptionId>\
+         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/></t:NewMailEvent>\
+         </m:Notification></m:Notifications>",
+    );
+    ews("<m:GetStreamingEvents>")
+        .and(body_string_contains(
+            "<t:SubscriptionId>sub1</t:SubscriptionId>",
+        ))
+        .and(body_string_contains(
+            "<m:ConnectionTimeout>5</m:ConnectionTimeout>",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(format!("{alive}{mail}"), "text/xml"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    assert!(store.can_watch());
+    let inbox = [FolderId::new("inbox-id")];
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
+    // Watched again, the subscription goes on.
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
+}
+
+#[tokio::test]
+async fn an_expired_subscription_is_made_again() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub2"))
+        .mount(&server)
+        .await;
+    ews("<t:SubscriptionId>sub1</t:SubscriptionId>")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(streamed("ErrorSubscriptionNotFound", ""), "text/xml"),
+        )
+        .mount(&server)
+        .await;
+    ews("<t:SubscriptionId>sub2</t:SubscriptionId>")
+        .respond_with(new_mail("inbox-id"))
+        .mount(&server)
+        .await;
+    let inbox = [FolderId::new("inbox-id")];
+    assert_eq!(store(&server).watch(&inbox).await.unwrap(), inbox);
+}
+
+#[tokio::test]
+async fn a_subscription_dropped_again_at_once_is_an_error() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(streamed("ErrorInvalidSubscription", ""), "text/xml"),
+        )
+        .mount(&server)
+        .await;
+    assert!(
+        store(&server)
+            .watch(&[FolderId::new("inbox-id")])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn watching_other_folders_ends_the_old_subscription() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"inbox-id\"/>"))
+        .respond_with(subscribed("sub1"))
+        .mount(&server)
+        .await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"work-id\"/>"))
+        .respond_with(subscribed("sub2"))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(new_mail("inbox-id"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    store.watch(&[FolderId::new("inbox-id")]).await.unwrap();
+    store.watch(&[FolderId::new("work-id")]).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stream_ended_early_is_an_error() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<s:Envel", "text/xml"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let inbox = [FolderId::new("inbox-id")];
+    let e = store.watch(&inbox).await.unwrap_err();
+    assert!(matches!(e, mett_core::Error::Network(_)), "{e:?}");
+    // Part of an envelope came: the next watch tells the folder may have
+    // changed, at once.
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
+}
+
+#[tokio::test]
+async fn a_canceled_watch_keeps_the_subscription_it_made() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1").set_delay(Duration::from_millis(300)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(0)
+        .mount(&server)
+        .await;
+    ews("<t:SubscriptionId>sub1</t:SubscriptionId>")
+        .respond_with(new_mail("inbox-id"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let inbox = [FolderId::new("inbox-id")];
+    // Canceled while subscribing: the subscription is made all the same,
+    // and kept for the next watch, which makes no other.
+    let canceled = tokio::time::timeout(Duration::from_millis(50), store.watch(&inbox)).await;
+    assert!(canceled.is_err());
+    assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
+}
+
+/// A stream's envelope telling of new mail in the Inbox.
+fn inbox_mail() -> String {
+    streamed(
+        "NoError",
+        "<m:Notifications><m:Notification>\
+         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/>\
+         </t:NewMailEvent></m:Notification></m:Notifications>",
+    )
+}
+
+/// A store on a server whose stream of events sends `events`, then stays
+/// open for `hold`, and breaks: wiremock can't break one.
+async fn store_breaking_streams(events: String, hold: Duration) -> EwsMailStore<StaticAuth> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mail = Arc::new(events);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mail = mail.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                // The whole request: its headers, then as long a body as
+                // they say.
+                let body = loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|n| n.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break body.to_owned();
+                    }
+                };
+                let envelope = if body.contains("<m:Subscribe>") {
+                    "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+                     <s:Body xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\">\
+                     <m:SubscribeResponse><m:ResponseMessages>\
+                     <m:SubscribeResponseMessage ResponseClass=\"Success\">\
+                     <m:ResponseCode>NoError</m:ResponseCode><m:SubscriptionId>sub</m:SubscriptionId>\
+                     </m:SubscribeResponseMessage></m:ResponseMessages></m:SubscribeResponse>\
+                     </s:Body></s:Envelope>"
+                        .to_owned()
+                } else {
+                    mail.to_string()
+                };
+                let chunked = !body.contains("<m:Subscribe>");
+                let response = if chunked {
+                    // One chunk, and no end.
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{envelope}\r\n",
+                        envelope.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\
+                         Connection: close\r\nContent-Length: {}\r\n\r\n{envelope}",
+                        envelope.len()
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                if chunked {
+                    socket.flush().await.unwrap();
+                    tokio::time::sleep(hold).await;
+                    drop(socket);
+                }
+            });
+        }
+    });
+    let url = Url::parse(&format!("http://{address}{ENDPOINT}")).unwrap();
+    EwsMailStore::new(
+        reqwest::Client::new(),
+        url,
+        "alice@contoso.com".into(),
+        Arc::new(StaticAuth),
+    )
+}
+
+#[tokio::test]
+async fn changes_read_before_a_broken_stream_are_kept() {
+    let store = store_breaking_streams(inbox_mail(), Duration::from_millis(50)).await;
+    // What came after the mail is lost: any folder watched may have
+    // changed.
+    let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
+    assert_eq!(store.watch(&folders).await.unwrap(), folders);
+}
+
+#[tokio::test]
+async fn changes_read_by_a_canceled_watch_are_told_by_the_next() {
+    // Canceled while reading the rest of the burst.
+    let store = store_breaking_streams(inbox_mail(), Duration::from_secs(5)).await;
+    let inbox = [FolderId::new("inbox-id")];
+    let canceled = tokio::time::timeout(Duration::from_millis(500), store.watch(&inbox)).await;
+    assert!(canceled.is_err());
+    // EWS won't tell again.
+    let told = tokio::time::timeout(Duration::from_millis(100), store.watch(&inbox)).await;
+    assert_eq!(told.expect("told at once").unwrap(), inbox);
+}
+
+#[tokio::test]
+async fn subscriptions_that_could_not_be_ended_are_ended_later() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"inbox-id\"/>"))
+        .respond_with(subscribed("sub1"))
+        .mount(&server)
+        .await;
+    ews("<m:Subscribe>")
+        .and(body_string_contains("<t:FolderId Id=\"work-id\"/>"))
+        .respond_with(subscribed("sub2"))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(failure("Unsubscribe", "ErrorInternalServerError"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Gone already: as good as ended.
+    ews("<m:Unsubscribe><m:SubscriptionId>sub2</m:SubscriptionId>")
+        .respond_with(failure("Unsubscribe", "ErrorSubscriptionNotFound"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(new_mail("inbox-id"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    store.watch(&[FolderId::new("inbox-id")]).await.unwrap();
+    // sub1 can't be ended now: it is, the next time.
+    store.watch(&[FolderId::new("work-id")]).await.unwrap();
+    assert!(store.watch(&[]).await.is_ok());
+    assert!(store.watch(&[]).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_stream_closed_at_once_is_an_error() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
+            "text/xml",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Watched again at once, it could be cut short again and again: the
+    // caller waits a while.
+    let e = store(&server)
+        .watch(&[FolderId::new("inbox-id")])
+        .await
+        .unwrap_err();
+    assert!(matches!(e, mett_core::Error::Network(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn changes_told_before_the_subscription_ends_are_kept() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub"))
+        .mount(&server)
+        .await;
+    let mail = streamed(
+        "NoError",
+        "<m:Notifications><m:Notification>\
+         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/>\
+         </t:NewMailEvent></m:Notification></m:Notifications>",
+    );
+    let gone = streamed("ErrorSubscriptionNotFound", "");
+    let busy = streamed("ErrorServerBusy", "");
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(format!("{mail}{gone}"), "text/xml"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(format!("{mail}{busy}"), "text/xml"))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let inbox = FolderId::new("inbox-id");
+    let folders = [inbox.clone(), FolderId::new("work-id")];
+    // The subscription ended after the mail came: the mail is told.
+    assert_eq!(store.watch(&folders).await.unwrap(), [inbox]);
+    // An error after it: what else changed is unknown.
+    assert_eq!(store.watch(&folders).await.unwrap(), folders);
+}
+
+#[tokio::test]
+async fn watching_no_folders_ends_the_subscription() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1"))
+        .mount(&server)
+        .await;
+    ews("<m:GetStreamingEvents>")
+        .respond_with(new_mail("inbox-id"))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    // Nothing to end yet.
+    assert!(store.watch(&[]).await.unwrap().is_empty());
+    store.watch(&[FolderId::new("inbox-id")]).await.unwrap();
+    assert!(store.watch(&[]).await.unwrap().is_empty());
+    // Ended once.
+    assert!(store.watch(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn watching_stops_after_a_canceled_subscription_is_made() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1").set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe><m:SubscriptionId>sub1</m:SubscriptionId>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let canceled = tokio::time::timeout(
+        Duration::from_millis(50),
+        store.watch(&[FolderId::new("inbox-id")]),
+    )
+    .await;
+    assert!(canceled.is_err());
+    // Stopped after: the subscription made meanwhile is ended.
+    assert!(store.watch(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_envelope_a_canceled_watch_read_part_of_is_told_by_the_next() {
+    let mail = inbox_mail();
+    let store =
+        store_breaking_streams(mail[..mail.len() / 2].to_owned(), Duration::from_secs(5)).await;
+    let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
+    let canceled = tokio::time::timeout(Duration::from_millis(500), store.watch(&folders)).await;
+    assert!(canceled.is_err());
+    // Any folder watched may have changed: EWS won't tell again.
+    let told = tokio::time::timeout(Duration::from_millis(100), store.watch(&folders)).await;
+    assert_eq!(told.expect("told at once").unwrap(), folders);
+}
+
+#[tokio::test]
+async fn an_envelope_cut_short_by_a_broken_stream_is_told() {
+    let mail = inbox_mail();
+    let store =
+        store_breaking_streams(mail[..mail.len() / 2].to_owned(), Duration::from_millis(50)).await;
+    // Any folder watched may have changed.
+    let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
+    assert_eq!(store.watch(&folders).await.unwrap(), folders);
 }

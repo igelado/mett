@@ -769,6 +769,20 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         self.inner.can_sync()
     }
 
+    fn can_watch(&self) -> bool {
+        self.inner.can_watch()
+    }
+
+    async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
+        let changed = self.inner.watch(folders).await?;
+        // Synced just before the change, the folders sync again: they are
+        // checked at once.
+        if !changed.is_empty() {
+            self.wrote();
+        }
+        Ok(changed)
+    }
+
     async fn sync_folder(
         &self,
         folder: &FolderId,

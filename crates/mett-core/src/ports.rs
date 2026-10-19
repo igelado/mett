@@ -218,6 +218,28 @@ pub trait MailStore: Send + Sync {
         false
     }
 
+    /// Whether the backend can tell when folders change, as it happens
+    /// ([`MailStore::watch`]).
+    fn can_watch(&self) -> bool {
+        false
+    }
+
+    /// Waits until something changes in some of `folders` (mail arrives,
+    /// changes or goes), and returns those; or, after a while the backend
+    /// sets (minutes), returns none, to be called again. Only for backends
+    /// that [`MailStore::can_watch`]. What changed is then found as ever
+    /// (say, by [`MailStore::sync_folder`]). Watching no folders stops
+    /// watching: what the backend keeps on the server for a watch goes.
+    fn watch(&self, folders: &[FolderId]) -> impl Future<Output = Result<Vec<FolderId>>> + Send {
+        std::future::ready(if folders.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(crate::Error::Backend(
+                "this mailbox can't watch folders".into(),
+            ))
+        })
+    }
+
     /// What changed in `folder` since `state`, a batch at a time (follow
     /// [`FolderChanges::more`]). Without a state, every message in the
     /// folder is a change. A state the backend no longer takes is

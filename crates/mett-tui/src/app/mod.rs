@@ -261,6 +261,8 @@ pub enum Timer {
     /// Check for new mail, if this is still the timer for it (it counts
     /// the changes of interval).
     Poll(u64),
+    /// Watch the folders for changes again, after watching failed.
+    Watch,
     /// A second of the wait for a throttling server went by, if this is
     /// still the countdown's timer (it counts the countdowns started).
     Throttled(u64),
@@ -753,6 +755,30 @@ pub struct App {
     sidebar: Sidebar,
     /// The API the account is reached through.
     api: crate::account::Api,
+    /// The request watching the folders for changes, while one is, and
+    /// which folders it watches.
+    watching: Option<RequestId>,
+    watched: Vec<mett_core::FolderId>,
+    /// The request ending what the mailbox keeps for watching, while it
+    /// is under way.
+    unwatching: Option<RequestId>,
+    /// Ending it failed: it is tried again.
+    unwatch_failed: bool,
+    /// The `poll_epoch` the watch started in.
+    watch_epoch: u64,
+    /// Watching is held off until the user signs in again: its sign-in
+    /// failed. (Only watching: the mailbox may just not let mett watch.)
+    watch_paused: bool,
+    /// What a watch said changed and is still to be checked (a check under
+    /// way when it said may predate the change): the open folder, and the
+    /// folders of `mailboxes` (the open one among them, for its counts).
+    recheck_folder: bool,
+    recheck_mailboxes: Vec<mett_core::FolderId>,
+    /// Whether the mailbox can tell when folders change (until it says it
+    /// can't).
+    can_watch: bool,
+    /// A retry of watching is set, after it failed.
+    watch_retry: bool,
     /// The requests the server throttled, by how long until each is tried
     /// again (counted down every second) and which retry that is. A
     /// request's answer, or giving it up, takes it out.
@@ -902,6 +928,16 @@ impl App {
             listed_at: None,
             sidebar: Sidebar::default(),
             api: settings.api,
+            watching: None,
+            unwatching: None,
+            unwatch_failed: false,
+            watch_epoch: 0,
+            watch_paused: false,
+            watched: Vec::new(),
+            recheck_folder: false,
+            recheck_mailboxes: Vec::new(),
+            can_watch: true,
+            watch_retry: false,
             throttled: HashMap::new(),
             throttle_timer: 0,
             given_up: VecDeque::new(),
@@ -971,7 +1007,16 @@ impl App {
         match msg {
             Msg::Action(action) => self.on_action(action),
             Msg::Response(response) => self.on_response(response),
-            Msg::SignIn(event) => self.on_sign_in(event),
+            Msg::SignIn(event) => {
+                let mut effects = self.on_sign_in(event);
+                // Signed in (or not): watching, and the checks it asked
+                // for, go on.
+                if self.sign_in.is_none() {
+                    effects.extend(self.watch());
+                    effects.extend(self.recheck());
+                }
+                effects
+            }
             Msg::Key(key) => self.on_key_press(key),
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
@@ -997,6 +1042,10 @@ impl App {
                 Vec::new()
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
+            Msg::Timer(Timer::Watch) => {
+                self.watch_retry = false;
+                self.watch()
+            }
             Msg::Syncing { folder, taken } => {
                 self.on_syncing(&folder, taken);
                 Vec::new()
@@ -1013,7 +1062,7 @@ impl App {
 
     fn request(&mut self, request: Request) -> Effect {
         // A request given up on isn't tried again.
-        if let Request::CancelQuery(query) = &request {
+        if let Request::Cancel(query) = &request {
             self.throttled.remove(query);
             if self.given_up.len() == GIVEN_UP_KEPT {
                 self.given_up.pop_front();
@@ -1129,6 +1178,8 @@ impl App {
                 // how the request that needed the sign-in went. But a
                 // cancellation that came too late didn't happen.
                 self.sign_in = None;
+                // Signed in: watching can go on.
+                self.watch_paused = false;
                 if std::mem::take(&mut self.cancelled) && self.status == "Sign-in cancelled." {
                     self.status.clear();
                 }
@@ -1372,6 +1423,7 @@ impl App {
     fn retry(&mut self) -> Vec<Effect> {
         // Signed in again: checking for new mail can go on.
         self.poll_paused = false;
+        self.watch_paused = false;
         self.poll_epoch += 1;
         if self.quit {
             let mut effects = self.retry_saves();
@@ -1391,6 +1443,9 @@ impl App {
         effects.extend(self.retry_attachments());
         // The folders are listed whether or not one is open.
         effects.extend(self.retry_browser());
+        // Watching goes on, and the checks it asked for.
+        effects.extend(self.watch());
+        effects.extend(self.recheck());
         if self.folder.is_none() {
             if self.opening.is_none() {
                 effects.extend(self.open_folder());
@@ -1727,7 +1782,12 @@ impl App {
                 }
                 return effects;
             }
-            Event::FolderPolled(result) => return self.on_polled(id, result),
+            Event::FolderPolled(result) => {
+                let mut effects = self.on_polled(id, result);
+                effects.extend(self.recheck());
+                return effects;
+            }
+            Event::Watched(result) => return self.on_watched(id, result),
             Event::MessagesListed(result) if self.listing == Some(id) => match result {
                 Ok(page) => {
                     self.poll_paused = false;
@@ -1759,6 +1819,8 @@ impl App {
                         self.forget_missing_marks();
                         self.loaded();
                         self.relisted();
+                        // A change told of while it was listed.
+                        effects.extend(self.recheck());
                         // Clear the "Loading" message, but not an error that
                         // was reported while the folder was loading.
                         if self.status.starts_with("Loading ") {
@@ -1798,7 +1860,11 @@ impl App {
             Event::AttachmentsListed(result) => return self.on_attachments_listed(id, result),
             Event::AttachmentFetched(result) => return self.on_attachment_fetched(id, result),
             Event::Queried(result) => return self.on_queried(id, result),
-            Event::MailboxesChecked(checked) => return self.on_mailboxes_checked(id, checked),
+            Event::MailboxesChecked(checked) => {
+                let mut effects = self.on_mailboxes_checked(id, checked);
+                effects.extend(self.recheck());
+                return effects;
+            }
             Event::StillThere(result) => return self.on_still_there(id, result),
             Event::Transferred(result) => {
                 // The messages leave the index, or it is listed again; the
@@ -2741,7 +2807,7 @@ mod tests {
         assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), [], "stale");
         // Giving it up ends it too, even if a wait told of before comes
         // after.
-        app.request(Request::CancelQuery(RequestId(91)));
+        app.request(Request::Cancel(RequestId(91)));
         assert_eq!(app.throttled_notice(), None);
         let late = Event::Throttled {
             wait: Duration::from_secs(30),
@@ -2751,7 +2817,7 @@ mod tests {
         assert_eq!(app.throttled_notice(), None);
         // Only the last few are remembered.
         for query in 0..100 {
-            app.request(Request::CancelQuery(RequestId(1000 + query)));
+            app.request(Request::Cancel(RequestId(1000 + query)));
         }
         assert_eq!(app.given_up.len(), GIVEN_UP_KEPT);
         // Calls of one request waiting at once: the longest wait counts.

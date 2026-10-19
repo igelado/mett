@@ -178,6 +178,14 @@ impl MailStore for Mailbox {
         either!(self, s => s.can_sync())
     }
 
+    fn can_watch(&self) -> bool {
+        either!(self, s => s.can_watch())
+    }
+
+    async fn watch(&self, folders: &[FolderId]) -> PortResult<Vec<FolderId>> {
+        either!(self, s => s.watch(folders).await)
+    }
+
     async fn sync_folder(
         &self,
         folder: &FolderId,

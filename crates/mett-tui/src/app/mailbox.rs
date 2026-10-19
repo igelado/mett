@@ -647,7 +647,10 @@ impl App {
                 self.status = format!("Loading {}...", folder.name);
                 self.folder = Some(folder);
                 self.visited();
-                self.list(Page::first(self.page_size))
+                let mut effects = self.list(Page::first(self.page_size));
+                // The folder opened is watched instead.
+                effects.extend(self.watch());
+                effects
             }
             Err(e) => {
                 // Without a sign-in, the sign-in window's Retry opens it.

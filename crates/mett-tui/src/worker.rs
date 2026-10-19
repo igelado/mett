@@ -88,14 +88,18 @@ pub enum Request {
     OwnAddresses,
     /// Find addresses matching a text.
     Query(QuerySource, String),
-    /// Give up on a [`Request::Query`] still running (its command is
-    /// killed). It has no answer.
-    CancelQuery(RequestId),
+    /// Give up on a [`Request::Query`] (its command is killed) or a
+    /// [`Request::Watch`] still running. It has no answer, nor has the
+    /// request given up on.
+    Cancel(RequestId),
     /// Read the counts of the folders at these paths, and their unread
     /// mail that changed since a time (if one is given), to tell which have
     /// new mail: by ID, where the folder was found before, or else by
     /// path.
     CheckMailboxes(Vec<(FolderPath, Option<FolderId>, Option<DateTime<Utc>>)>),
+    /// Wait until something changes in these folders, as the backend
+    /// tells (see [`MailStore::watch`]).
+    Watch(Vec<FolderId>),
     /// Find which of `ids` are no longer in `folder` (deleted, or moved
     /// away).
     StillThere {
@@ -151,6 +155,9 @@ pub enum Event {
     MailboxesChecked(Vec<(FolderPath, Result<Checked>)>),
     /// Outcome of [`Request::StillThere`]: the messages gone.
     StillThere(Result<Vec<MessageId>>),
+    /// Outcome of [`Request::Watch`]: the folders that changed (none when
+    /// the backend's wait ran out); `None` if the backend can't watch.
+    Watched(Option<Result<Vec<FolderId>>>),
     /// Not an outcome: the server throttled the request, which is tried
     /// again after `wait`. Its outcome comes later.
     Throttled {
@@ -213,13 +220,14 @@ pub async fn run<S: MailStore + MailSender + 'static>(
         std::sync::Mutex<std::collections::HashMap<RequestId, tokio::task::AbortHandle>>,
     > = Arc::default();
     while let Some((id, request)) = requests.recv().await {
-        if let Request::CancelQuery(query) = request {
+        if let Request::Cancel(query) = request {
             if let Some(task) = queries.lock().expect("lock").remove(&query) {
                 task.abort();
             }
             continue;
         }
-        let query = matches!(request, Request::Query(..));
+        // Those the UI may give up on.
+        let query = matches!(request, Request::Query(..) | Request::Watch(_));
         let store = Arc::clone(&store);
         let responses = responses.clone();
         let running = Arc::clone(&queries);
@@ -387,6 +395,14 @@ impl<S: MailStore> MailStore for Patient<'_, S> {
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         self.patiently(|| self.store.save_draft(draft)).await
     }
+
+    fn can_watch(&self) -> bool {
+        self.store.can_watch()
+    }
+
+    async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
+        self.patiently(|| self.store.watch(folders)).await
+    }
 }
 
 impl<S: MailSender> MailSender for Patient<'_, S> {
@@ -453,7 +469,7 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
         Request::Query(QuerySource::Directory, text) => {
             Event::Queried(store.search_people(&text).await.map_err(|e| e.to_string()))
         }
-        Request::CancelQuery(_) => unreachable!("handled by run"),
+        Request::Cancel(_) => unreachable!("handled by run"),
         Request::Query(QuerySource::Command(command), text) => {
             Event::Queried(run_query(&command, &text).await)
         }
@@ -482,6 +498,10 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             }
             Event::StillThere(Ok(gone))
         }
+        Request::Watch(folders) => Event::Watched(match store.can_watch() {
+            true => Some(store.watch(&folders).await),
+            false => None,
+        }),
         Request::CheckMailboxes(mailboxes) => {
             Event::MailboxesChecked(check_mailboxes(store, mailboxes).await)
         }
@@ -1020,7 +1040,7 @@ mod tests {
         let slow = Request::Query(QuerySource::Command("sleep 30".into()), "x".into());
         request_tx.send((RequestId(1), slow)).unwrap();
         request_tx
-            .send((RequestId(2), Request::CancelQuery(RequestId(1))))
+            .send((RequestId(2), Request::Cancel(RequestId(1))))
             .unwrap();
         request_tx
             .send((RequestId(3), Request::OwnAddresses))

@@ -664,6 +664,9 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         let effects = app.update(Msg::SignIn(event));
         carry_out(&mut app, effects);
     }
+    // Watching stops on the server too, while changes are saved.
+    let effects = app.unwatch();
+    carry_out(&mut app, effects);
     let unsaved = !app.save_failures().is_empty();
     if app.saving() || (unsaved && app.sign_in.is_some()) {
         app.status = "Saving changes...".into();
@@ -739,6 +742,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                                 | worker::Event::KeptDiscarded(_)
                                 | worker::Event::Transferred(_)
                                 | worker::Event::Purged(_)
+                                | worker::Event::Watched(_)
                         ) =>
                     {
                         Msg::Response(response)
@@ -767,11 +771,26 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     + app.save_wait().unwrap_or_default();
             }
         }
-        if app.saving() {
-            return Err(std::io::Error::other(
-                "gave up waiting for changes to be saved; some messages may still be unread",
-            ));
+    }
+    // Not for long: what is left on the server expires anyway.
+    let deadline = tokio::time::Instant::now() + UNWATCH_TIMEOUT;
+    while app.unwatching() {
+        tokio::select! {
+            response = response_rx.recv() => match response {
+                Some(response) if matches!(response.event, worker::Event::Watched(_)) => {
+                    let effects = app.update(Msg::Response(response));
+                    carry_out(&mut app, effects);
+                }
+                Some(_) => {}
+                None => break,
+            },
+            () = tokio::time::sleep_until(deadline) => break,
         }
+    }
+    if app.saving() {
+        return Err(std::io::Error::other(
+            "gave up waiting for changes to be saved; some messages may still be unread",
+        ));
     }
     let failures = app.save_failures();
     if !failures.is_empty() {
@@ -855,6 +874,9 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 
 /// How long to wait for pending changes when quitting.
 const SAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long to wait, when quitting, for watching to stop on the server.
+const UNWATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Effects that the main loop carries out itself, between messages.
 #[derive(Default)]
