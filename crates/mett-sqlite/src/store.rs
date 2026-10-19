@@ -77,9 +77,11 @@ impl Cache {
         // A relative path's directory is the working one: it is checked too.
         let path = std::path::absolute(path).map_err(|e| error(Box::new(e)))?;
         private_place(&path).map_err(|e| error(Box::new(e)))?;
-        let db = Db::open(&path, account).map_err(|e| error(Box::new(e)))?;
-        // Known now to be this account's cache, it is made private.
+        // Known to be this account's cache (or new), it is made private
+        // before anything is written to it, or beside it.
+        Db::check(&path, account).map_err(|e| error(Box::new(e)))?;
         private_file(&path).map_err(|e| error(Box::new(e)))?;
+        let db = Db::open(&path, account).map_err(|e| error(Box::new(e)))?;
         Ok(Self(db))
     }
 
@@ -110,17 +112,33 @@ impl<S> CachedStore<S> {
     }
 }
 
-/// Makes the existing cache `path` readable only by its owner (it was
-/// there already, and may not be).
+/// Makes the existing cache `path`, and SQLite's files beside it,
+/// readable only by their owner (they were there already, and may not be).
 fn private_file(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        if permissions.mode() & 0o077 != 0 {
-            permissions.set_mode(permissions.mode() & 0o700);
-            std::fs::set_permissions(path, permissions)?;
+        let beside = |suffix: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        };
+        for file in [path.to_owned(), beside("-wal"), beside("-shm")] {
+            let Ok(metadata) = std::fs::symlink_metadata(&file) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "{} is a symbolic link",
+                    file.display()
+                )));
+            }
+            let mut permissions = metadata.permissions();
+            if permissions.mode() & 0o077 != 0 {
+                permissions.set_mode(permissions.mode() & 0o700);
+                std::fs::set_permissions(&file, permissions)?;
+            }
         }
     }
     #[cfg(not(unix))]

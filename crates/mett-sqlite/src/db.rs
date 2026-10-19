@@ -8,7 +8,7 @@ use mett_core::{
     AccountId, Address, Body, BodyKind, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId,
     Message, MessageId, MessageSummary, SyncState, ThreadPosition, WellKnownFolder,
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 /// The schema's version. A cache of another version is dropped and filled
@@ -169,6 +169,13 @@ fn failed(e: impl std::fmt::Display) -> Error {
 }
 
 impl Db {
+    /// Checks, writing nothing, that the database at `path` is `account`'s
+    /// cache, or new.
+    pub fn check(path: &Path, account: &AccountId) -> Result<(), OpenError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        identify(&conn, account).map(drop)
+    }
+
     /// Opens (creating it if needed) the cache of `account`'s mailbox at
     /// `path`.
     pub fn open(path: &Path, account: &AccountId) -> Result<Self, OpenError> {

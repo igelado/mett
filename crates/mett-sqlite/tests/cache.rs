@@ -256,10 +256,18 @@ async fn the_cache_is_private_and_lasts() {
         .unwrap();
     assert_eq!(journal, "delete", "its journal mode too");
     assert_eq!(mode(&other), 0o644, "and its permissions");
-    // One made readable by others is made private again.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // One made readable by others is made private again, and SQLite's
+    // files beside it.
+    let wal = dir.join("cache").join("alice@contoso.com.sqlite-wal");
+    std::fs::write(&wal, b"").unwrap();
+    for file in [&path, &wal] {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
     drop(Cache::open(&path, &alice()).unwrap());
     assert_eq!(mode(&path), 0o600);
+    if wal.exists() {
+        assert_eq!(mode(&wal), 0o600);
+    }
     // Opened again, the folder goes on from where its sync stood: the
     // mock store's state still tells nothing changed.
     let inner = mailbox(2);
