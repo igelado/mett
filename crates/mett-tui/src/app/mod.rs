@@ -52,6 +52,9 @@ pub const PAGE_SIZE: u32 = 100;
 /// A second, the step of the throttling countdown.
 const SECOND: Duration = Duration::from_secs(1);
 
+/// How many requests given up on are remembered (see `App::given_up`).
+const GIVEN_UP_KEPT: usize = 16;
+
 /// Where a pending move goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Target {
@@ -747,9 +750,10 @@ pub struct App {
     throttled: HashMap<RequestId, (Duration, u32)>,
     /// The countdown's timer, which goes while a request waits.
     throttle_timer: u64,
-    /// The requests given up on, whose waits that the worker told of
-    /// before it stopped them are ignored.
-    given_up: HashSet<RequestId>,
+    /// The last requests given up on, whose waits that the worker told of
+    /// before it stopped them are ignored. Those come right after giving
+    /// up, so only the last few are kept.
+    given_up: VecDeque<RequestId>,
 }
 
 impl App {
@@ -891,7 +895,7 @@ impl App {
             api: settings.api,
             throttled: HashMap::new(),
             throttle_timer: 0,
-            given_up: HashSet::new(),
+            given_up: VecDeque::new(),
         };
         app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();
@@ -998,7 +1002,10 @@ impl App {
         // A request given up on isn't tried again.
         if let Request::CancelQuery(query) = &request {
             self.throttled.remove(query);
-            self.given_up.insert(*query);
+            if self.given_up.len() == GIVEN_UP_KEPT {
+                self.given_up.pop_front();
+            }
+            self.given_up.push_back(*query);
         }
         self.next_request += 1;
         Effect::Request(RequestId(self.next_request), request)
@@ -2650,6 +2657,11 @@ mod tests {
         };
         assert_eq!(respond(&mut app, RequestId(91), late), []);
         assert_eq!(app.throttled_notice(), None);
+        // Only the last few are remembered.
+        for query in 0..100 {
+            app.request(Request::CancelQuery(RequestId(1000 + query)));
+        }
+        assert_eq!(app.given_up.len(), GIVEN_UP_KEPT);
         // Calls of one request waiting at once: the longest wait counts.
         for wait in [20, 5] {
             let throttled = Event::Throttled {
