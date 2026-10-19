@@ -9,4 +9,4 @@
 mod db;
 mod store;
 
-pub use store::{Cache, CacheError, CachedStore};
+pub use store::{Cache, CacheError, CachedStore, Progress};

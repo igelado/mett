@@ -17,7 +17,7 @@ use mett_msgraph::{
     AuthFlow, AuthSettings, FileStore, GraphAuthenticator, GraphMailStore, IdentityCheck,
     KeyringStore, TokenStore, TokenStoreError,
 };
-use mett_sqlite::{Cache, CachedStore};
+use mett_sqlite::{Cache, CachedStore, Progress};
 use url::Url;
 
 use crate::config::mailbox::MailboxUrl;
@@ -217,12 +217,14 @@ pub fn cache_path(
     }
 }
 
-/// `mailbox` with its cache (see [`cache_path`]), and a warning if the
-/// cache can't be used: mett then works without it.
+/// `mailbox` with its cache (see [`cache_path`]), which tells `progress`
+/// how far its syncs have got, and a warning if the cache can't be used:
+/// mett then works without it.
 pub fn cached(
     config: &Config,
     url: &MailboxUrl,
     mailbox: Mailbox,
+    progress: Progress,
 ) -> (CachedStore<Mailbox>, Option<String>) {
     let path = cache_path(
         config,
@@ -234,7 +236,10 @@ pub fn cached(
         return (CachedStore::new(mailbox, None), None);
     };
     match Cache::open(&path, &url.account) {
-        Ok(cache) => (CachedStore::new(mailbox, Some(cache)), None),
+        Ok(cache) => (
+            CachedStore::new(mailbox, Some(cache)).with_progress(progress),
+            None,
+        ),
         Err(e) => (
             CachedStore::new(mailbox, None),
             Some(format!("header_cache: {e}; not caching")),

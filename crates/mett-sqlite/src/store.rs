@@ -57,7 +57,13 @@ pub struct CachedStore<S> {
     /// made then. Its lock also keeps two syncs of one folder from running
     /// at once.
     synced: Mutex<HashMap<FolderId, Arc<tokio::sync::Mutex<LastSync>>>>,
+    /// Told how far each sync has got.
+    progress: Option<Progress>,
 }
+
+/// Told, as a folder syncs, how many of its messages the cache has, batch
+/// by batch.
+pub type Progress = Box<dyn Fn(&FolderId, u64) + Send + Sync>;
 
 /// When a folder was last synced, and how many changes mett had made then.
 type LastSync = Option<(Instant, u64)>;
@@ -103,7 +109,15 @@ impl<S> CachedStore<S> {
             broken: AtomicBool::new(false),
             writes: AtomicU64::new(0),
             synced: Mutex::new(HashMap::new()),
+            progress: None,
         }
+    }
+
+    /// Tells `progress` how far each sync has got, batch by batch: a first
+    /// sync of a large folder takes a while.
+    pub fn with_progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     /// The store behind the cache.
@@ -248,6 +262,9 @@ impl<S: MailStore> CachedStore<S> {
             }
         };
         let mut lost = 0;
+        // How many of the folder's messages are here, once counted, and how
+        // many changes mett had made then.
+        let mut here: Option<(u64, u64)> = None;
         loop {
             let changes = match self.inner.sync_folder(folder, state.as_ref()).await {
                 // The server forgot where the sync stood: start over,
@@ -255,11 +272,15 @@ impl<S: MailStore> CachedStore<S> {
                 Err(Error::StaleSync) if state.is_some() => {
                     self.with_cache(|db| db.start_over(folder))?;
                     state = None;
+                    here = None;
                     continue;
                 }
                 changes => changes?,
             };
-            if !self.with_cache(|db| db.apply(folder, state.as_ref(), &changes))? {
+            let Some(more_here) = self.with_cache(|db| {
+                db.apply(folder, state.as_ref(), &changes, self.progress.is_some())
+            })?
+            else {
                 // Another mett sharing the cache synced the folder
                 // meanwhile: go on from where it left it (what came since
                 // may be in neither's changes). Should it keep winning, its
@@ -274,14 +295,39 @@ impl<S: MailStore> CachedStore<S> {
                     }
                     break;
                 }
+                // What is here changed meanwhile: it is counted again.
+                here = None;
                 match self.with_cache(|db| db.synced(folder))? {
                     Some(synced) if synced.state.is_some() => state = synced.state,
                     _ => {
                         self.with_cache(|db| db.start_over(folder))?;
                         state = None;
+                        here = None;
                     }
                 }
                 continue;
+            };
+            // How many are here, which only grows as a first sync goes on,
+            // however often it is cut short and taken up again. Counted
+            // once, for a sync of more than one batch (a quick one has
+            // nothing to tell), then kept up batch by batch.
+            // A change mett made meanwhile (a message deleted, say) means
+            // counting again. (Another mett's isn't seen: the count, only
+            // told, may then be off by as much until the sync ends.)
+            if let Some(progress) = &self.progress
+                && (changes.more || here.is_some())
+            {
+                let writes = self.writes.load(Ordering::SeqCst);
+                let now = match here {
+                    Some((here, then)) if then == writes => {
+                        Some(here.saturating_add_signed(more_here))
+                    }
+                    _ => self.with_cache(|db| db.count(folder)).ok(),
+                };
+                if let Some(now) = now {
+                    progress(folder, now);
+                }
+                here = now.map(|now| (now, writes));
             }
             let FolderChanges {
                 state: next, more, ..

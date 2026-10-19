@@ -183,6 +183,13 @@ pub enum Msg {
     Appended(Result<std::path::PathBuf, String>),
     /// A timer the app set went off.
     Timer(Timer),
+    /// A folder's sync goes on: the cache has this many of its messages.
+    Syncing {
+        /// The folder.
+        folder: mett_core::FolderId,
+        /// How many messages.
+        taken: u64,
+    },
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -988,6 +995,10 @@ impl App {
                 Vec::new()
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
+            Msg::Syncing { folder, taken } => {
+                self.on_syncing(&folder, taken);
+                Vec::new()
+            }
             Msg::Timer(Timer::Throttled(timer)) => self.count_down_throttled(timer),
             Msg::Resize { width, height } => {
                 self.terminal_width = usize::from(width);
@@ -1256,6 +1267,25 @@ impl App {
 
     /// Retries once the last of the requests that were pending when the
     /// user asked to retry has reported back.
+    /// The open folder's sync, while it loads, has `taken` of its messages
+    /// in the cache: the status line says so, as a large folder's first
+    /// sync takes a while.
+    fn on_syncing(&mut self, folder: &mett_core::FolderId, taken: u64) {
+        let Some(open) = self.folder.as_ref().filter(|f| &f.id == folder) else {
+            return;
+        };
+        // Only before its first page comes: the sync comes before it, and
+        // the pages tell how far they have got themselves.
+        let first_page = self.listing.is_some()
+            && self
+                .listing_page
+                .as_ref()
+                .is_some_and(|page| page.cursor().is_none());
+        if first_page && self.status.starts_with("Loading ") {
+            self.status = format!("Loading {}: {taken} messages synced...", open.name);
+        }
+    }
+
     /// The server throttled request `id`, which is tried again after
     /// `wait`, for the `attempt`th time.
     fn on_throttled(&mut self, id: RequestId, wait: Duration, attempt: u32) -> Vec<Effect> {
@@ -1702,7 +1732,17 @@ impl App {
                     self.reselect(page.next.is_none());
                     let mut effects = Vec::new();
                     if let Some(cursor) = page.next {
-                        // Keep loading until the whole folder is listed.
+                        // Keep loading until the whole folder is listed,
+                        // saying how far it has got.
+                        if let Some(folder) = &self.folder
+                            && self.status.starts_with("Loading ")
+                        {
+                            self.status = format!(
+                                "Loading {}: {} messages...",
+                                folder.name,
+                                self.total_messages()
+                            );
+                        }
                         effects = self.list(Page::after(cursor, self.page_size));
                     } else {
                         self.listing = None;
@@ -2588,6 +2628,51 @@ mod tests {
 
     use super::*;
     use crate::app::testing::*;
+
+    #[test]
+    fn loading_says_how_far_it_has_got() {
+        let (mut app, effects) = App::new(80, 23);
+        let [Effect::Request(open, Request::OpenFolder(_))] = effects.as_slice() else {
+            panic!("expected OpenFolder, got {effects:?}");
+        };
+        let folder = mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
+        let effects = respond(&mut app, *open, Event::FolderOpened(Ok(folder)));
+        let list = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Request(id, Request::ListMessages { .. }) => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(app.status, "Loading Inbox...");
+        // A first sync of the folder, in the cache.
+        let syncing = |taken| Msg::Syncing {
+            folder: mett_core::FolderId::new("in"),
+            taken,
+        };
+        app.update(syncing(512));
+        assert_eq!(app.status, "Loading Inbox: 512 messages synced...");
+        // Another folder's sync (a mailbox checked) doesn't say.
+        app.update(Msg::Syncing {
+            folder: mett_core::FolderId::new("other"),
+            taken: 9,
+        });
+        assert_eq!(app.status, "Loading Inbox: 512 messages synced...");
+        // Then the pages: how many are listed so far.
+        let page = mett_core::MessagePage {
+            messages: summaries(3),
+            next: Some(PageCursor::new("p2")),
+        };
+        respond(&mut app, list, Event::MessagesListed(Ok(page)));
+        assert_eq!(app.status, "Loading Inbox: 3 messages...");
+        // The sync's news, come late, doesn't take it back.
+        app.update(syncing(600));
+        assert_eq!(app.status, "Loading Inbox: 3 messages...");
+        // Not once loaded.
+        app.status = "Mail sent.".into();
+        app.update(syncing(3));
+        assert_eq!(app.status, "Mail sent.");
+    }
 
     #[test]
     fn counts_down_the_wait_for_a_throttling_server() {

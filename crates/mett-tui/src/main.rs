@@ -158,7 +158,15 @@ fn main() -> ExitCode {
         else {
             return ExitCode::FAILURE;
         };
-        let (mailbox, warning) = account::cached(&config, &spoolfile, mailbox);
+        // The cache tells the app how far a folder's sync has got.
+        let (syncs, syncing) = mpsc::unbounded_channel();
+        let progress = Box::new(move |folder: &mett_core::FolderId, taken: u64| {
+            let _ = syncs.send(Msg::Syncing {
+                folder: folder.clone(),
+                taken,
+            });
+        });
+        let (mailbox, warning) = account::cached(&config, &spoolfile, mailbox, progress);
         if let Some(warning) = warning {
             eprintln!("mett: warning: {warning}");
         }
@@ -178,6 +186,7 @@ fn main() -> ExitCode {
             config,
             editor,
             sign_in,
+            syncing,
             cancel: Some(cancel),
         };
         return start(&runtime, Arc::new(mailbox), session);
@@ -199,6 +208,7 @@ fn main() -> ExitCode {
         config,
         editor: Editor::from_env("", ""),
         sign_in,
+        syncing: mpsc::unbounded_channel().1,
         cancel: None,
     };
     start(&runtime, Arc::new(demo::mailbox()), session)
@@ -238,6 +248,8 @@ struct Session {
     editor: Editor,
     /// Events from the mailbox's sign-in.
     sign_in: mpsc::UnboundedReceiver<SignInEvent>,
+    /// How far the cache's syncs have got.
+    syncing: mpsc::UnboundedReceiver<Msg>,
     /// Cancels the sign-in in progress, for mailboxes that sign in.
     cancel: Option<CancelHandle>,
 }
@@ -474,6 +486,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         config,
         mut editor,
         sign_in: mut sign_in_rx,
+        syncing: mut syncing_rx,
         cancel,
     } = session;
 
@@ -576,6 +589,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                         event = input_rx.recv() => Received::Input(event),
                         Some(response) = response_rx.recv() => Received::Msg(Msg::Response(response)),
                         Some(event) = sign_in_rx.recv() => Received::Msg(Msg::SignIn(event)),
+                        Some(msg) = syncing_rx.recv() => Received::Msg(msg),
                         Some(timer) = timer_rx.recv() => Received::Msg(Msg::Timer(timer)),
                         Some(msg) = file_rx.recv() => Received::Msg(msg),
                         done = async { running.as_mut().expect("checked").await }, if running.is_some() => {
