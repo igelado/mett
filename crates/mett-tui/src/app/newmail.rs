@@ -466,6 +466,7 @@ impl App {
             }
         }
         reorder |= !arrived.is_empty();
+        self.open_for_new_mail(&arrived);
         if !arrived.is_empty() {
             let mut placing = self.placing();
             for message in arrived {

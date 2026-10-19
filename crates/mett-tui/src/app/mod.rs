@@ -564,9 +564,11 @@ pub struct App {
     /// Whether building the threads again would give what they were last
     /// built as (see [`crate::sort::Arranged::settled`]).
     settled: bool,
-    /// The threads (by key) collapsed, or with `collapse_all`, opened:
-    /// those that differ from the rest.
-    collapsed: HashSet<String>,
+    /// The threads (by key) the user collapsed (`true`) or opened
+    /// (`false`) themselves. The others are open, or with `collapse_all`
+    /// collapsed unless they hold unread mail (as mutt's
+    /// `collapse_unread=no`).
+    chosen: HashMap<String, bool>,
     /// `Esc V` collapsed every thread, including those listed since.
     collapse_all: bool,
     /// Whether the limit showed each message it was applied to, kept
@@ -824,7 +826,7 @@ impl App {
             threads: HashMap::new(),
             threaded_count: 0,
             settled: false,
-            collapsed: HashSet::new(),
+            chosen: HashMap::new(),
             collapse_all: false,
             limited: HashMap::new(),
             positions: HashMap::new(),
@@ -1536,7 +1538,12 @@ impl App {
             Action::DisplayMessage if self.folder.is_none() => {
                 self.status = "Opening folder...".into();
             }
-            Action::DisplayMessage => return self.open_selected(),
+            Action::DisplayMessage => {
+                // A collapsed thread with unread mail folded into it opens
+                // at its first unread message.
+                self.open_at_folded_unread();
+                return self.open_selected();
+            }
             _ => {}
         }
         Vec::new()

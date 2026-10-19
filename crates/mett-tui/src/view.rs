@@ -1328,6 +1328,14 @@ mod tests {
         .collect();
         let (mut app, _) = opened(sorted("threads"), HEIGHT, messages, None);
         act(&mut app, Action::CollapseAll);
+        // Collapsing every thread leaves "a" open, with unread mail: it is
+        // collapsed on its own.
+        app.selected = app
+            .messages
+            .iter()
+            .position(|m| m.id.as_str() == "a0")
+            .unwrap();
+        act(&mut app, Action::CollapseThread);
         let lines = sized_screen(&app, WIDTH, HEIGHT);
         let row = |id: &str| {
             let i = app
