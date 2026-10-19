@@ -183,10 +183,12 @@ impl App {
             return self.unwatch();
         }
         // Quitting: nothing new starts.
+        // Nor while watching is being ended: that could end the new watch.
         if self.quit
             || !self.can_watch
             || self.watch_retry
             || self.watch_paused
+            || self.unwatching.is_some()
             || self.sync_interval.is_none()
             || self.poll_paused
             || self.sign_in.is_some()
@@ -284,7 +286,8 @@ impl App {
                     self.unwatch_failed = true;
                     vec![Effect::Later(WATCH_RETRY, Timer::Watch)]
                 }
-                _ => Vec::new(),
+                // Checks may have been turned on again meanwhile.
+                _ => self.watch(),
             };
         }
         if self.watching != Some(id) {
@@ -1555,6 +1558,22 @@ mod tests {
             requests(&effects)
                 .iter()
                 .any(|(_, r)| matches!(r, Request::Watch(f) if !f.is_empty())),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn checks_turned_on_again_watch_once_the_watch_has_ended() {
+        let (mut app, _) = app();
+        let interval = app.sync_interval;
+        app.sync_interval = None;
+        let effects = app.watch();
+        let unwatch = effect_id(&effects[1]);
+        app.sync_interval = interval;
+        assert!(app.watch().is_empty());
+        let effects = respond(&mut app, unwatch, Event::Watched(Some(Ok(Vec::new()))));
+        assert!(
+            matches!(&requests(&effects)[..], [(_, Request::Watch(f))] if !f.is_empty()),
             "{effects:?}"
         );
     }

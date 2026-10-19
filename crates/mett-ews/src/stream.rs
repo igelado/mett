@@ -94,10 +94,16 @@ pub(crate) fn read_envelope(envelope: &[u8]) -> Result<Streamed, Error> {
                 {
                     continue;
                 }
-                for folder in ["ParentFolderId", "OldParentFolderId"]
-                    .into_iter()
-                    .filter_map(|name| child(event, name))
-                    .filter_map(|f| f.attribute("Id"))
+                // A folder's own events name it too.
+                for folder in [
+                    "ParentFolderId",
+                    "OldParentFolderId",
+                    "FolderId",
+                    "OldFolderId",
+                ]
+                .into_iter()
+                .filter_map(|name| child(event, name))
+                .filter_map(|f| f.attribute("Id"))
                 {
                     let folder = FolderId::new(folder);
                     if !changed.contains(&folder) {
@@ -173,11 +179,18 @@ mod tests {
              <t:MovedEvent><t:ItemId Id=\"i2\"/><t:ParentFolderId Id=\"archive\"/>\
              <t:OldItemId Id=\"i0\"/><t:OldParentFolderId Id=\"inbox\"/></t:MovedEvent>\
              <t:StatusEvent><t:Watermark>w</t:Watermark></t:StatusEvent>\
+             <t:ModifiedEvent><t:FolderId Id=\"work\"/><t:ParentFolderId Id=\"root\"/>\
+             </t:ModifiedEvent>\
              </m:Notification></m:Notifications>";
         let streamed = read_envelope(envelope(&message("Success", "NoError", events)).as_bytes());
         assert_eq!(
             streamed.unwrap(),
-            Streamed::Changed(vec![FolderId::new("inbox"), FolderId::new("archive")])
+            Streamed::Changed(vec![
+                FolderId::new("inbox"),
+                FolderId::new("archive"),
+                FolderId::new("root"),
+                FolderId::new("work"),
+            ])
         );
         // Only alive.
         let alive = "<m:Notifications><m:Notification><t:StatusEvent/></m:Notification></m:Notifications>\
