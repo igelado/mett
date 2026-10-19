@@ -42,7 +42,8 @@ done
 # number before the number alone (vercmp: 1.0rc < 1.0 < 1.0.1). Both put a
 # pre-release such as 0.2.0-rc.1 (0.2.0~rc.1, 0.2.0rc.1) before 0.2.0.
 deb_version=$(echo "$version" | sed 's/-/~/')-$release
-arch_version=$(echo "$version" | sed 's/-//')
+# (Arch versions can't hold a hyphen at all: 1.0.0-rc-2 is 1.0.0rc2.)
+arch_version=${version//-/}
 
 # Copies the files every package installs below $1. The README links to
 # the rest of the documentation online.

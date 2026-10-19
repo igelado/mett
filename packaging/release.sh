@@ -40,7 +40,9 @@ for file in *.deb *.pkg.tar.zst *.tar.gz SHA256SUMS; do
     for asset in $existing; do
         call -X DELETE "$api/releases/$id/assets/$asset" >/dev/null
     done
-    call -X POST -F "attachment=@$file" "$api/releases/$id/assets?name=$file" >/dev/null
+    # Encoded: a `+` (build metadata) would read as a space.
+    name=$(jq -rn --arg name "$file" '$name | @uri')
+    call -X POST -F "attachment=@$file" "$api/releases/$id/assets?name=$name" >/dev/null
     echo "Uploaded $file"
 done
 echo "Published $(echo "$release" | jq -r .html_url)"
