@@ -30,7 +30,7 @@ fn store(server: &MockServer) -> EwsMailStore<StaticAuth> {
     store_with(server, Arc::new(StaticAuth))
 }
 
-fn store_with<A: Authenticator>(server: &MockServer, auth: Arc<A>) -> EwsMailStore<A> {
+fn store_with<A: Authenticator + 'static>(server: &MockServer, auth: Arc<A>) -> EwsMailStore<A> {
     let url = Url::parse(&format!("{}{ENDPOINT}", server.uri())).unwrap();
     EwsMailStore::new(
         reqwest::Client::new(),
@@ -1301,4 +1301,125 @@ async fn a_stream_ended_early_is_an_error() {
         .await
         .unwrap_err();
     assert!(matches!(e, mett_core::Error::Network(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn a_canceled_watch_keeps_the_subscription_it_made() {
+    let server = MockServer::start().await;
+    ews("<m:Subscribe>")
+        .respond_with(subscribed("sub1").set_delay(Duration::from_millis(300)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:Unsubscribe>")
+        .respond_with(success("Unsubscribe", ""))
+        .expect(0)
+        .mount(&server)
+        .await;
+    ews("<t:SubscriptionId>sub1</t:SubscriptionId>")
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            streamed("NoError", "<m:ConnectionStatus>Closed</m:ConnectionStatus>"),
+            "text/xml",
+        ))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    let inbox = [FolderId::new("inbox-id")];
+    // Canceled while subscribing: the subscription is made all the same,
+    // and kept for the next watch, which makes no other.
+    let canceled = tokio::time::timeout(Duration::from_millis(50), store.watch(&inbox)).await;
+    assert!(canceled.is_err());
+    assert!(store.watch(&inbox).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn changes_read_before_a_broken_stream_are_kept() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A server whose stream of events breaks after telling of new mail:
+    // wiremock can't break one.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                // The whole request: its headers, then as long a body as
+                // they say.
+                let body = loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|n| n.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break body.to_owned();
+                    }
+                };
+                let envelope = if body.contains("<m:Subscribe>") {
+                    "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+                     <s:Body xmlns:m=\"http://schemas.microsoft.com/exchange/services/2006/messages\">\
+                     <m:SubscribeResponse><m:ResponseMessages>\
+                     <m:SubscribeResponseMessage ResponseClass=\"Success\">\
+                     <m:ResponseCode>NoError</m:ResponseCode><m:SubscriptionId>sub</m:SubscriptionId>\
+                     </m:SubscribeResponseMessage></m:ResponseMessages></m:SubscribeResponse>\
+                     </s:Body></s:Envelope>"
+                        .to_owned()
+                } else {
+                    streamed(
+                        "NoError",
+                        "<m:Notifications><m:Notification>\
+                         <t:NewMailEvent><t:ItemId Id=\"m9\"/><t:ParentFolderId Id=\"inbox-id\"/>\
+                         </t:NewMailEvent></m:Notification></m:Notifications>",
+                    )
+                };
+                let chunked = !body.contains("<m:Subscribe>");
+                let response = if chunked {
+                    // One chunk, and no end: the connection just drops.
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{envelope}\r\n",
+                        envelope.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n\
+                         Connection: close\r\nContent-Length: {}\r\n\r\n{envelope}",
+                        envelope.len()
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+                if chunked {
+                    socket.flush().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    drop(socket);
+                }
+            });
+        }
+    });
+    let url = Url::parse(&format!("http://{address}{ENDPOINT}")).unwrap();
+    let store = EwsMailStore::new(
+        reqwest::Client::new(),
+        url,
+        "alice@contoso.com".into(),
+        Arc::new(StaticAuth),
+    );
+    // What came after the mail is lost: any folder watched may have
+    // changed.
+    let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
+    assert_eq!(store.watch(&folders).await.unwrap(), folders);
 }
