@@ -321,12 +321,19 @@ covers the same needs more cleanly.
 
 ## 7. Error handling
 
-- Library crates (`mett-core`, `mett-msgraph` and the cache crate) define typed
+- Library crates (`mett-core`, the adapters and the cache crate) define typed
   error enums.
 - The binary (`mett-tui`) adds context to errors at the top level.
 - Errors from the worker reach the UI as `Event`s and are shown in mutt's
   status line. They never cause a panic.
 - Authentication errors move the UI into a re-authentication flow.
+- Throttling (`Error::Throttled`) is waited out: the worker tries each
+  throttled call again after the wait the server asks for (Graph's
+  `Retry-After`, EWS's `BackOffMilliseconds`; without one, 2 s, doubling
+  each time; at most 5 minutes), up to 5 times, before its failure is the
+  answer. Throttled calls weren't carried out, so this is safe for sending
+  too. It tells the UI of each wait with an interim `Event::Throttled`,
+  and the message line counts the longest one down, second by second.
 
 ## 8. Configuration
 

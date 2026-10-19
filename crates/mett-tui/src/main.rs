@@ -650,7 +650,10 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     if app.saving() || (unsaved && app.sign_in.is_some()) {
         app.status = "Saving changes...".into();
         stale = true;
-        let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
+        // A save the server throttled before the user quit waits that much
+        // longer.
+        let mut deadline =
+            tokio::time::Instant::now() + SAVE_TIMEOUT + app.save_wait().unwrap_or_default();
         loop {
             // A failed save's sign-in failure is sent before the save's own
             // response; take it in first, so the window opens and the
@@ -694,6 +697,18 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     Some(_) => continue,
                 },
                 response = response_rx.recv() => match response {
+                    // A save the server throttled is tried again after the
+                    // wait it asked for: wait for it that much longer.
+                    Some(response)
+                        if matches!(response.event, worker::Event::Throttled { .. })
+                            && app.saves(response.id) =>
+                    {
+                        if let worker::Event::Throttled { wait, .. } = response.event {
+                            deadline =
+                                deadline.max(tokio::time::Instant::now() + wait + SAVE_TIMEOUT);
+                        }
+                        Msg::Response(response)
+                    }
                     // Only save results matter now. Anything else (say, a
                     // late message fetch) could start new work that would
                     // never be sent.
@@ -714,6 +729,9 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     None => break,
                 },
                 Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
+                // The countdown of a throttled save goes on; other timers
+                // would start new work.
+                Some(timer @ app::Timer::Throttled(_)) = timer_rx.recv() => Msg::Timer(timer),
                 // The user may take a while to sign in; the wait only
                 // counts while they don't have to.
                 () = tokio::time::sleep_until(deadline), if app.sign_in.is_none() => break,
@@ -724,8 +742,11 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             // Nothing is edited, nor configured, any more.
             let _ = carry_out(&mut app, effects);
             // The wait starts again once the user is done signing in.
+            // (Still with what a throttled save has left to wait.)
             if window_was_open || app.sign_in.is_some() {
-                deadline = tokio::time::Instant::now() + SAVE_TIMEOUT;
+                deadline = tokio::time::Instant::now()
+                    + SAVE_TIMEOUT
+                    + app.save_wait().unwrap_or_default();
             }
         }
         if app.saving() {

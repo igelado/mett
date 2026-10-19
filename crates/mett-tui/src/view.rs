@@ -191,7 +191,28 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
             } else {
                 colors.message
             };
-            frame.render_widget(Paragraph::new(app.status.as_str()).style(style), message);
+            // The wait for a throttling server, at the end of the line, in
+            // its own room, so that it doesn't hide what the line says: at
+            // most half of it, shortened (or left out) to fit.
+            let notice = app.throttled_notices().and_then(|notices| {
+                notices
+                    .into_iter()
+                    .find(|n| n.width() < usize::from(message.width / 2))
+            });
+            let [text, end] = Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(notice.as_deref().map_or(0, |n| n.width() as u16 + 1)),
+            ])
+            .areas(message);
+            frame.render_widget(Paragraph::new(app.status.as_str()).style(style), text);
+            if let Some(notice) = notice {
+                frame.render_widget(
+                    Paragraph::new(notice)
+                        .style(colors.message)
+                        .alignment(ratatui::layout::Alignment::Right),
+                    end,
+                );
+            }
         }
     }
     // The window may cover everything but the help line, which lists its
@@ -1033,6 +1054,44 @@ mod tests {
             .collect();
         listed(&mut app, list, messages, None);
         app
+    }
+
+    #[test]
+    fn the_wait_for_a_throttling_server_ends_the_message_line() {
+        let mut app = app(3);
+        app.status = "Mail sent.".into();
+        respond(
+            &mut app,
+            crate::worker::RequestId(90),
+            crate::worker::Event::Throttled {
+                wait: std::time::Duration::from_secs(12),
+                attempt: 1,
+            },
+        );
+        let line = sized_screen(&app, 100, HEIGHT).pop().unwrap();
+        assert!(line.starts_with("Mail sent."), "{line}");
+        // A narrow line has room for a short one, then for none.
+        let narrow = sized_screen(&app, 40, HEIGHT).pop().unwrap();
+        assert!(narrow.starts_with("Mail sent."), "{narrow}");
+        assert!(narrow.ends_with("Throttled: 12s"), "{narrow}");
+        let tiny = sized_screen(&app, 20, HEIGHT).pop().unwrap();
+        assert_eq!(tiny, "Mail sent.");
+        // An error keeps its own color, and its room.
+        colored(&mut app, &["color error brightred default"]);
+        app.status = "x".repeat(100);
+        app.error = Some(app.status.clone());
+        let error = styles(&app);
+        let row = HEIGHT - 1;
+        assert_eq!(error[(0, row)].fg, ratatui::style::Color::LightRed);
+        assert_eq!(
+            error[(WIDTH - 1, row)].fg,
+            ratatui::style::Color::Reset,
+            "the notice isn't an error"
+        );
+        assert!(
+            line.ends_with("Throttled by the server: retry 1/5 in 12s"),
+            "{line}"
+        );
     }
 
     fn screen(app: &App) -> Vec<String> {

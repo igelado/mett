@@ -26,3 +26,6 @@ mett-*-*.txt
 
 # Rust build output
 target/
+
+# Release packages (packaging/package.sh)
+dist/

@@ -19,6 +19,7 @@ pub(crate) mod testing;
 mod threads;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use mett_core::{AccountId, Error, FlagsUpdate, Folder, Message, MessageId, MessageSummary, Page};
 use mett_msgraph::SignInPrompt;
@@ -47,6 +48,12 @@ use crate::worker::{Event, Request, RequestId, Response};
 
 /// How many messages to request per page, unless configured.
 pub const PAGE_SIZE: u32 = 100;
+
+/// A second, the step of the throttling countdown.
+const SECOND: Duration = Duration::from_secs(1);
+
+/// How many requests given up on are remembered (see `App::given_up`).
+const GIVEN_UP_KEPT: usize = 16;
 
 /// Where a pending move goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,6 +254,9 @@ pub enum Timer {
     /// Check for new mail, if this is still the timer for it (it counts
     /// the changes of interval).
     Poll(u64),
+    /// A second of the wait for a throttling server went by, if this is
+    /// still the countdown's timer (it counts the countdowns started).
+    Throttled(u64),
 }
 
 /// A screen on the navigation stack (`docs/DESIGN.md` §5.6).
@@ -734,6 +744,16 @@ pub struct App {
     sidebar: Sidebar,
     /// The API the account is reached through.
     api: crate::account::Api,
+    /// The requests the server throttled, by how long until each is tried
+    /// again (counted down every second) and which retry that is. A
+    /// request's answer, or giving it up, takes it out.
+    throttled: HashMap<RequestId, (Duration, u32)>,
+    /// The countdown's timer, which goes while a request waits.
+    throttle_timer: u64,
+    /// The last requests given up on, whose waits that the worker told of
+    /// before it stopped them are ignored. Those come right after giving
+    /// up, so only the last few are kept.
+    given_up: VecDeque<RequestId>,
 }
 
 impl App {
@@ -873,6 +893,9 @@ impl App {
             listed_at: None,
             sidebar: Sidebar::default(),
             api: settings.api,
+            throttled: HashMap::new(),
+            throttle_timer: 0,
+            given_up: VecDeque::new(),
         };
         app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();
@@ -965,6 +988,7 @@ impl App {
                 Vec::new()
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
+            Msg::Timer(Timer::Throttled(timer)) => self.count_down_throttled(timer),
             Msg::Resize { width, height } => {
                 self.terminal_width = usize::from(width);
                 self.body_height = body_height(height);
@@ -975,6 +999,14 @@ impl App {
     }
 
     fn request(&mut self, request: Request) -> Effect {
+        // A request given up on isn't tried again.
+        if let Request::CancelQuery(query) = &request {
+            self.throttled.remove(query);
+            if self.given_up.len() == GIVEN_UP_KEPT {
+                self.given_up.pop_front();
+            }
+            self.given_up.push_back(*query);
+        }
         self.next_request += 1;
         Effect::Request(RequestId(self.next_request), request)
     }
@@ -1224,6 +1256,62 @@ impl App {
 
     /// Retries once the last of the requests that were pending when the
     /// user asked to retry has reported back.
+    /// The server throttled request `id`, which is tried again after
+    /// `wait`, for the `attempt`th time.
+    fn on_throttled(&mut self, id: RequestId, wait: Duration, attempt: u32) -> Vec<Effect> {
+        // Whole seconds, so that the countdown ends when the wait does.
+        let wait = Duration::from_secs(wait.as_secs() + u64::from(wait.subsec_nanos() > 0));
+        if self.given_up.contains(&id) {
+            return Vec::new();
+        }
+        let counting = !self.throttled.is_empty();
+        // Calls of one request may wait at once: the longest wait counts.
+        let entry = self.throttled.entry(id).or_insert((wait, attempt));
+        *entry = (entry.0.max(wait), entry.1.max(attempt));
+        if counting {
+            return Vec::new();
+        }
+        self.throttle_timer += 1;
+        vec![Effect::Later(SECOND, Timer::Throttled(self.throttle_timer))]
+    }
+
+    /// A second of the wait for the server went by: the countdown goes on
+    /// while a request still waits.
+    fn count_down_throttled(&mut self, timer: u64) -> Vec<Effect> {
+        if timer != self.throttle_timer {
+            return Vec::new();
+        }
+        for (left, _) in self.throttled.values_mut() {
+            *left = left.saturating_sub(SECOND);
+        }
+        self.throttled.retain(|_, (left, _)| !left.is_zero());
+        if self.throttled.is_empty() {
+            return Vec::new();
+        }
+        vec![Effect::Later(SECOND, Timer::Throttled(timer))]
+    }
+
+    /// What the message line says while requests wait for a throttling
+    /// server: the longest wait, and the highest retry.
+    #[cfg(test)]
+    pub fn throttled_notice(&self) -> Option<String> {
+        self.throttled_notices().map(|[long, _]| long)
+    }
+
+    /// [`App::throttled_notice`], and a shorter one for a narrow line.
+    pub fn throttled_notices(&self) -> Option<[String; 2]> {
+        let left = self.throttled.values().map(|(left, _)| *left).max()?;
+        let attempt = self.throttled.values().map(|(_, attempt)| *attempt).max()?;
+        let seconds = left.as_secs();
+        Some([
+            format!(
+                "Throttled by the server: retry {attempt}/{} in {seconds}s",
+                crate::worker::THROTTLED_RETRIES,
+            ),
+            format!("Throttled: {seconds}s"),
+        ])
+    }
+
     fn retry_if_requested(&mut self, id: RequestId) -> Vec<Effect> {
         if self.retry_after.remove(&id) && self.retry_after.is_empty() {
             self.retry()
@@ -1542,7 +1630,12 @@ impl App {
     }
 
     fn on_response(&mut self, response: Response) -> Vec<Effect> {
+        // Not an outcome: the request carries on after the wait.
+        if let Event::Throttled { wait, attempt } = response.event {
+            return self.on_throttled(response.id, wait, attempt);
+        }
         let id = response.id;
+        self.throttled.remove(&id);
         let mut effects = self.handle_response(response);
         effects.extend(self.retry_if_requested(id));
         effects
@@ -1550,6 +1643,7 @@ impl App {
 
     fn handle_response(&mut self, Response { id, event }: Response) -> Vec<Effect> {
         match event {
+            Event::Throttled { .. } => unreachable!("handled by on_response"),
             // A recall's steps.
             Event::FolderOpened(result) if self.recall_request() == Some(id) => {
                 return self.on_recall_opened(result);
@@ -2353,6 +2447,24 @@ impl App {
 
     /// Whether changes to the mailbox are still being saved. mett waits
     /// for them before exiting, so they aren't lost.
+    /// The longest wait of a save the server throttled, if one is waiting.
+    pub fn save_wait(&self) -> Option<Duration> {
+        self.throttled
+            .iter()
+            .filter(|(id, _)| self.saves(**id))
+            .map(|(_, (left, _))| *left)
+            .max()
+    }
+
+    /// Whether request `id` saves a change (one [`App::saving`] waits for).
+    pub fn saves(&self, id: RequestId) -> bool {
+        self.writing
+            .as_ref()
+            .is_some_and(|(writing, _)| *writing == id)
+            || self.delivery_request() == Some(id)
+            || self.discarding.contains_key(&id)
+    }
+
     pub fn saving(&self) -> bool {
         self.writing.is_some()
             || !self.writes.is_empty()
@@ -2476,6 +2588,95 @@ mod tests {
 
     use super::*;
     use crate::app::testing::*;
+
+    #[test]
+    fn counts_down_the_wait_for_a_throttling_server() {
+        let (mut app, _) = App::new(80, 23);
+        let throttled = |wait: u64, attempt| Event::Throttled {
+            wait: Duration::from_millis(wait),
+            attempt,
+        };
+        let tick = |timer| [Effect::Later(SECOND, Timer::Throttled(timer))];
+        assert_eq!(
+            respond(&mut app, RequestId(90), throttled(2500, 1)),
+            tick(1)
+        );
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 1/5 in 3s")
+        );
+        // Another request throttled meanwhile, for less: one countdown, to
+        // the end of the longest wait.
+        assert_eq!(respond(&mut app, RequestId(91), throttled(1000, 2)), []);
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 2/5 in 3s")
+        );
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), tick(1));
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 1/5 in 2s"),
+            "the other one's wait is over"
+        );
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), tick(1));
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), []);
+        assert_eq!(app.throttled_notice(), None);
+        // The status line is left alone.
+        assert_eq!(app.status, "Opening folder...");
+    }
+
+    #[test]
+    fn answered_requests_wait_no_more() {
+        let (mut app, _) = App::new(80, 23);
+        let throttled = Event::Throttled {
+            wait: Duration::from_secs(30),
+            attempt: 1,
+        };
+        respond(&mut app, RequestId(90), throttled);
+        // Its answer, however late or stale, ends its wait.
+        respond(&mut app, RequestId(90), Event::FlagsUpdated(Ok(())));
+        assert_eq!(app.throttled_notice(), None);
+        // The countdown running then stops, and a new one starts afresh.
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), []);
+        let throttled = Event::Throttled {
+            wait: Duration::from_secs(30),
+            attempt: 1,
+        };
+        assert_eq!(
+            respond(&mut app, RequestId(91), throttled),
+            [Effect::Later(SECOND, Timer::Throttled(2))]
+        );
+        assert_eq!(app.update(Msg::Timer(Timer::Throttled(1))), [], "stale");
+        // Giving it up ends it too, even if a wait told of before comes
+        // after.
+        app.request(Request::CancelQuery(RequestId(91)));
+        assert_eq!(app.throttled_notice(), None);
+        let late = Event::Throttled {
+            wait: Duration::from_secs(30),
+            attempt: 2,
+        };
+        assert_eq!(respond(&mut app, RequestId(91), late), []);
+        assert_eq!(app.throttled_notice(), None);
+        // Only the last few are remembered.
+        for query in 0..100 {
+            app.request(Request::CancelQuery(RequestId(1000 + query)));
+        }
+        assert_eq!(app.given_up.len(), GIVEN_UP_KEPT);
+        // Calls of one request waiting at once: the longest wait counts.
+        for wait in [20, 5] {
+            let throttled = Event::Throttled {
+                wait: Duration::from_secs(wait),
+                attempt: 1,
+            };
+            respond(&mut app, RequestId(92), throttled);
+        }
+        assert_eq!(
+            app.throttled_notice().as_deref(),
+            Some("Throttled by the server: retry 1/5 in 20s")
+        );
+        // None of them saves anything.
+        assert_eq!(app.save_wait(), None);
+    }
 
     /// `n` messages, newest first, as Graph lists them.
     fn summaries(n: usize) -> Vec<MessageSummary> {
