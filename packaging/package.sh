@@ -192,8 +192,9 @@ tarball() {
     rm -rf "$work/tar-$arch"
     install -Dm755 "$binary" "$tree/mett"
     install -Dm755 "$gui" "$tree/mett-gui"
-    install -m644 packaging/linux/mett.desktop packaging/icons/mett-256.png \
-        README.md LICENSE-MIT LICENSE-APACHE "$tree/"
+    install -m644 packaging/linux/mett.desktop README.md LICENSE-MIT LICENSE-APACHE "$tree/"
+    # Named as mett.desktop asks for it (in ~/.local/share/icons/hicolor/256x256/apps/).
+    install -m644 packaging/icons/mett-256.png "$tree/mett.png"
     install -m644 "$notices" "$tree/THIRD-PARTY-NOTICES"
     stamp "$tree"
     tar -C "$work/tar-$arch" --owner=0 --group=0 --numeric-owner --sort=name \

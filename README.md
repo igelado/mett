@@ -29,8 +29,9 @@ for x86_64 and aarch64, with both programs: `mett`, in the terminal, and
 - **Arch Linux:** `sudo pacman -U mett-<version>-1-<x86_64|aarch64>.pkg.tar.zst`
 - **Other Linux:** the `-linux.tar.gz` holds the `mett` binary, which needs
   nothing else, and `mett-gui`, which needs glibc 2.28 or later and the
-  system's graphics libraries (with `mett.desktop` and `mett-256.png`, to
-  add it to the menus).
+  system's graphics libraries. To add it to the menus, put `mett-gui` on
+  the `PATH`, `mett.desktop` in `~/.local/share/applications/` and
+  `mett.png` in `~/.local/share/icons/hicolor/256x256/apps/`.
 - **macOS** (Apple silicon or Intel): open `mett-<version>-macos.dmg` and
   run *Install mett.pkg*, which installs `/usr/local/bin/mett` and
   `/Applications/mett.app` (mett-gui). The

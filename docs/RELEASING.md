@@ -98,7 +98,8 @@ the script:
 
 ```sh
 pipx install cargo-zigbuild       # also installs zig (pip refuses outside a venv on Debian)
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+    x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 sudo apt install libarchive-tools zstd    # bsdtar, zstd; dpkg-deb comes with Debian
 packaging/package.sh x86_64 aarch64
 ```
