@@ -157,8 +157,11 @@ fn find_links(line: &str, collapse: bool, marks: bool, open: bool) -> Found {
             // Without text (as in `(<https://...>)`), the URL is shown.
             if collapse && (start < out.len() || earlier) {
                 // The text may be a URL found already, as in
-                // `https://a<https://b>`.
-                if start < out.len() && links.last().is_none_or(|l| l.end != out.len()) {
+                // `https://a<https://b>`: then it is underlined already.
+                let found = links
+                    .last()
+                    .is_some_and(|l| l.start <= start && l.end == out.len());
+                if start < out.len() && !found {
                     links.push(start..out.len());
                 }
             } else {
@@ -174,8 +177,13 @@ fn find_links(line: &str, collapse: bool, marks: bool, open: bool) -> Found {
         if scheme_len(rest).is_some()
             && out.chars().next_back().is_none_or(|c| !c.is_alphanumeric())
         {
+            // A link's mark ends it too, in HTML.
             let end = rest
-                .find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"')
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(c, '<' | '>' | '"')
+                        || (marks && matches!(c, LINK_START | LINK_URL))
+                })
                 .unwrap_or(rest.len());
             // Punctuation after a URL usually ends the sentence.
             let url = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '\'']);
@@ -891,6 +899,18 @@ mod tests {
             assert_eq!(attribute(tag, "href"), Some("https://e.com"), "{tag}");
         }
         assert_eq!(attribute("a download", "href"), None);
+        // A label ending in a URL is underlined whole.
+        let body = Body {
+            kind: BodyKind::Html,
+            content: r#"<a href="https://target">See https://other</a>"#.into(),
+        };
+        assert_eq!(
+            view_lines(body, true).1,
+            [
+                (0, "See https://other".to_owned()),
+                (0, "https://other".to_owned())
+            ]
+        );
         // What would end the URL is encoded.
         let body = Body {
             kind: BodyKind::Html,
