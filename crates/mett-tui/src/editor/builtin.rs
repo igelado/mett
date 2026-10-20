@@ -464,6 +464,17 @@ impl Builtin {
         } else if is_ctrl(key, 'v') {
             self.deselect();
             self.paste();
+        } else if let Some((start, end)) = selected
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            // Left and Right leave the selection at its start or end.
+            self.deselect();
+            self.state.cursor = if key.code == KeyCode::Left {
+                start
+            } else {
+                end
+            };
         } else {
             self.deselect();
             self.edit(key);
@@ -740,8 +751,14 @@ fn notepad_bindings() -> KeyEventHandler {
         (R::i(vec![ctrl(KeyCode::Right)]), MoveWordForward(1).into()),
         (R::i(vec![key(KeyCode::Home)]), MoveToStartOfLine().into()),
         (R::i(vec![key(KeyCode::End)]), MoveToEndOfLine().into()),
-        (R::i(vec![ctrl(KeyCode::Home)]), MoveToFirstRow().into()),
-        (R::i(vec![ctrl(KeyCode::End)]), MoveToLastRow().into()),
+        (
+            R::i(vec![ctrl(KeyCode::Home)]),
+            MoveToFirstRow().chain(MoveToStartOfLine()).into(),
+        ),
+        (
+            R::i(vec![ctrl(KeyCode::End)]),
+            MoveToLastRow().chain(MoveToEndOfLine()).into(),
+        ),
         (R::i(vec![key(KeyCode::PageUp)]), MovePageUp().into()),
         (R::i(vec![key(KeyCode::PageDown)]), MovePageDown().into()),
         (R::i(vec![key(KeyCode::Enter)]), LineBreak(1).into()),
@@ -1199,6 +1216,34 @@ mod tests {
             &[ctrl('e'), ctrl(' '), ctrl('n'), alt('w'), ctrl('y')],
         );
         assert_eq!(emacs.text(), "ab\ncd\ncd\n");
+    }
+
+    #[test]
+    fn notepad_moves_like_notepad() {
+        let mut notepad = Builtin::new("one two\nthree four\n", Keys::Notepad);
+        let (left, right) = (
+            KeyEvent::from(KeyCode::Left),
+            KeyEvent::from(KeyCode::Right),
+        );
+        let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+        let ctrl_home = KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+        // Ctrl+End and Ctrl+Home go to the end and start of the text.
+        press(&mut notepad, &[right, right, ctrl_end]);
+        assert_eq!(notepad.state.cursor, Index2::new(2, 0));
+        press(
+            &mut notepad,
+            &[KeyEvent::from(KeyCode::Up), right, right, ctrl_home],
+        );
+        assert_eq!(notepad.state.cursor, Index2::new(0, 0));
+        // Left and Right leave a selection at its edges.
+        let select = [right, shift(KeyCode::Right), shift(KeyCode::Right)];
+        press(&mut notepad, &select);
+        press(&mut notepad, &[left]);
+        assert_eq!(notepad.state.cursor, Index2::new(0, 1));
+        assert_eq!(notepad.region(), None);
+        press(&mut notepad, &select[1..]);
+        press(&mut notepad, &[right]);
+        assert_eq!(notepad.state.cursor, Index2::new(0, 3));
     }
 
     #[test]
