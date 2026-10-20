@@ -21,6 +21,7 @@ mett-sqlite.workspace = true
 
 base64.workspace = true
 chrono.workspace = true
+edtui.workspace = true
 encoding_rs.workspace = true
 open.workspace = true
 ratatui.workspace = true

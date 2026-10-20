@@ -1,5 +1,5 @@
 //! What differs between the systems mett runs on: where the user's home
-//! is, the default editor, and how commands are run.
+//! is, and how commands are run.
 //!
 //! Commands from the mettrc (`editor`, `query_command`, backticks) are
 //! shell commands, run with `sh -c` as mutt runs them. Windows has no `sh`
@@ -10,10 +10,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
-
-/// The editor used when neither `editor`, `$VISUAL` nor `$EDITOR` names
-/// one.
-pub const DEFAULT_EDITOR: &str = if cfg!(windows) { "notepad" } else { "vi" };
 
 /// The user's home directory: `$HOME`, else (on Windows, where it is
 /// usually unset) `%USERPROFILE%`.

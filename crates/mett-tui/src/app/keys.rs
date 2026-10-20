@@ -49,6 +49,19 @@ impl App {
         // Ctrl-J is a newline: it does what Enter does, unless bound.
         let ctrl_j = Key::from(event) == Key::ctrl('j');
         self.input_note = None;
+        // The built-in editor takes the keys (unless the sign-in window
+        // is up), until the user leaves it.
+        if self.sign_in.is_none()
+            && let Some(editing) = &mut self.editing
+        {
+            return match editing.get_mut().key(event) {
+                crate::editor::builtin::Outcome::Editing => Vec::new(),
+                crate::editor::builtin::Outcome::Done(text) => {
+                    self.editing = None;
+                    self.on_edited(Ok(text))
+                }
+            };
+        }
         // Keys wait for a file being read or saved; `^G` gives up on it.
         if let Some((_, path)) = &self.file_wait
             && self.sign_in.is_none()
@@ -181,8 +194,9 @@ impl App {
     /// given up for a move elsewhere), so the rest of them are dropped.
     pub fn typed(&mut self) {
         // Keys for the sign-in window serve the sign-in the macro waits
-        // for, rather than taking over from it.
-        if self.sign_in.is_some() {
+        // for, rather than taking over from it; so do those typed in the
+        // built-in editor, as they would in an external one.
+        if self.sign_in.is_some() || self.editing.is_some() {
             return;
         }
         if !self.strokes.is_empty() && self.waiting() {
@@ -237,6 +251,9 @@ impl App {
             || !self.writes.is_empty()
             // The user has to sign in first; the keys play afterwards.
             || self.sign_in.is_some()
+            // A message being written: the next keys act on what it
+            // becomes (`e` then `<send-message>` sends the edited text).
+            || self.editing.is_some()
             // A `:` command may bind the keys that come next.
             || self.configuring > 0
     }

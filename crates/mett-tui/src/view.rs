@@ -24,6 +24,7 @@ use crate::app::{
     SignIn, TextView, highlighted,
 };
 use crate::color::Colors;
+use crate::editor::{self, builtin::Builtin};
 use crate::expando::{self, Display, Entry, Status};
 use crate::format;
 use crate::keymap::{Keymap, Menu};
@@ -146,6 +147,9 @@ pub struct Overlay {
 /// Draws the whole screen, and returns text that the main loop should print
 /// over it, if any.
 pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
+    if let Some(editing) = &app.editing {
+        return render_editor(app, &mut editing.borrow_mut(), frame);
+    }
     let keymap = &app.keymap;
     let [help, body, status, message] = Layout::vertical([
         Constraint::Length(1),
@@ -231,6 +235,42 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         let [_, below_help] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
         return render_sign_in(window, keymap, colors.normal, frame, below_help);
+    }
+    None
+}
+
+/// Draws the built-in editor: the text, and below it the line with its
+/// commands, questions and messages; the sign-in window over them, if it
+/// is up.
+fn render_editor(app: &App, editor: &mut Builtin, frame: &mut Frame) -> Option<Overlay> {
+    let colors = &app.display.colors;
+    frame.render_widget(Block::new().style(colors.normal), frame.area());
+    let [text, bottom] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+    let mut cursor = editor.render(text, frame.buffer_mut(), colors.normal, colors.indicator);
+    let width = usize::from(bottom.width);
+    let line = match editor.bottom(width) {
+        editor::builtin::Bottom::Prompt {
+            prompt,
+            text,
+            cursor: column,
+        } => {
+            let prompt = truncate(&prompt, width.saturating_sub(1));
+            let x = u16::try_from(prompt.width() + column).unwrap_or(u16::MAX);
+            cursor = Some((bottom.x + x.min(bottom.width.saturating_sub(1)), bottom.y).into());
+            Line::from(vec![Span::styled(prompt, colors.prompt), Span::raw(text)])
+        }
+        editor::builtin::Bottom::Note(note) => Line::styled(truncate(&note, width), colors.message),
+        editor::builtin::Bottom::Hint(hint) => Line::styled(truncate(&hint, width), colors.message),
+    };
+    frame.render_widget(Paragraph::new(line), bottom);
+    if let Some(cursor) = cursor {
+        frame.set_cursor_position(cursor);
+    }
+    if let Some(window) = &app.sign_in {
+        let [_, below_help] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+        return render_sign_in(window, &app.keymap, colors.normal, frame, below_help);
     }
     None
 }
@@ -1025,7 +1065,7 @@ mod tests {
     use mett_msgraph::SignInPrompt;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use unicode_width::UnicodeWidthStr;
 
     use super::*;
@@ -1258,6 +1298,28 @@ mod tests {
         assert_eq!(buffer[(3, cafe)].symbol(), "e\u{301}");
         assert_eq!(buffer[(3, cafe)].fg, Color::Red);
         assert_eq!(buffer[(4, cafe)].symbol(), " ");
+    }
+
+    #[test]
+    fn draws_the_builtin_editor() {
+        let mut app = app(1);
+        let editor =
+            crate::editor::builtin::Builtin::new("Hi!\n-- \nMe\n", crate::editor::Keys::Vim);
+        app.editing = Some(std::cell::RefCell::new(editor));
+        let lines = sized_screen(&app, WIDTH, 6);
+        assert_eq!(lines[..3], ["Hi!", "--", "Me"]);
+        assert_eq!(lines[5], ":wq sends the text on, :q! drops the changes");
+        // The bottom line has the cursor while a command is typed.
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char(':'))));
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Char('w'))));
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(&app, frame);
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 5)].symbol(), ":");
+        terminal.backend_mut().assert_cursor_position((2, 5));
     }
 
     #[test]

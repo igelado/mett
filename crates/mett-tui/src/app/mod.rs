@@ -558,6 +558,9 @@ pub struct App {
     pub input: Option<Input>,
     /// A message being set up for the compose menu.
     composing: Option<Composing>,
+    /// The built-in editor, while a message is written in it. (The view
+    /// lays the text out in it, hence the cell.)
+    pub editing: Option<std::cell::RefCell<crate::editor::builtin::Builtin>>,
     /// The request fetching a message to reply to or forward.
     compose_fetch: Option<(RequestId, Kind, MessageId)>,
     /// The reply or forward whose message couldn't be fetched for want of
@@ -875,6 +878,7 @@ impl App {
             dismissed: false,
             input: None,
             composing: None,
+            editing: None,
             compose_fetch: None,
             compose_unfetched: None,
             recall: None,

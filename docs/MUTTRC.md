@@ -106,7 +106,8 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `ssl_force_tls` | boolean | Require encrypted connections. |
 | Caching | `header_cache` | path | Header cache database. |
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
-| Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then `vi`. |
+| Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then mett's built-in editor (§4.11), which `builtin` asks for. |
+| | `editor_keys` | string | mett's own: the built-in editor's keys, `vim`, `emacs` or `notepad` (§4.11). |
 | | `include` | quadoption | Quote the message in replies. |
 | | `attribution`, `indent_string` | string | The line before quoted text (`On %d, %n wrote:`), and the prefix of quoted lines (`> `). |
 | | `forward_format` | string | Subject of forwarded messages (`[%a: %s]`). |
@@ -316,6 +317,35 @@ Its `color` objects are `sidebar_new` (new or unread mail),
 open mailbox; `indicator` until set), `sidebar_highlight` (the highlight;
 underlined by default), `sidebar_divider` and, from neomutt,
 `sidebar_ordinary` (the others; `normal` until set).
+
+### 4.11 The built-in editor
+
+mett has an editor of its own, which writes messages in mett's screen. It
+is used when `editor` is `builtin`, or when neither `editor`, `$VISUAL`
+nor `$EDITOR` names an editor. `editor_keys` (mett's own) chooses its
+keys: `vim`, `emacs` or `notepad`. Unset (the default), they are those of
+the editor that `editor` (if not `builtin`), `$VISUAL` or `$EDITOR`
+names: vim's for vi, vim, Neovim and their kin, emacs's for emacs,
+emacsclient, mg and their kin, Notepad's for any other, or none.
+
+As with any editor, the text goes back to the compose flow as last saved:
+leaving without saving gives back the text as it was (an unmodified
+message, which `abort_unmodified` aborts).
+
+| | vim | emacs | notepad |
+|---|---|---|---|
+| Save and leave | `:wq`, `:x`, `ZZ` | `C-x C-c` | `^S` |
+| Leave without saving | `:q!`, `ZQ` (`:q` when nothing changed) | `C-x k` (asks if something changed) | Esc (asks if something changed) |
+| Save | `:w` | `C-x C-s` | |
+| Search | `/` | `C-s` | `^F`, then F3 and Shift+F3 |
+| Select | `v` | `C-Space` sets the mark; `C-w` cuts, `M-w` copies | Shift and the arrows, Home, End; `^A` selects all; `^X`, `^C`, `^V` |
+| Undo, redo | `u`, `^R` | `C-/`, `C-u`; `C-r` | `^Z`, `^Y` |
+
+`M-x` runs `save-buffer`, `save-buffers-kill-terminal` and `kill-buffer`.
+The editing keys are those of [edtui](https://github.com/preiter93/edtui),
+the editor it is built on: most of vim's motions and operators, and
+emacs's movement and deletion. Its clipboard is its own: paste text from
+elsewhere through the terminal.
 
 ## 5. Mailbox shortcuts
 
