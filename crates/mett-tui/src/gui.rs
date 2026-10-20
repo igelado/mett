@@ -363,10 +363,16 @@ impl Gui {
         let mut fonts = ratatui_wgpu::Fonts::new(font.clone(), font_px);
         fonts.add_regular_fonts([font]);
         fonts.add_regular_fonts(self.fallbacks.clone());
+        let size = window.inner_size();
         if let Some(terminal) = &mut self.terminal {
-            terminal.backend_mut().update_fonts(fonts);
+            let backend = terminal.backend_mut();
+            backend.update_fonts(fonts);
+            // ratatui-wgpu lays its cells out again only when the size
+            // changes: it changes for a moment.
+            let other = if size.height > 1 { size.height - 1 } else { 2 };
+            backend.resize(size.width, other);
         }
-        self.resized(window.inner_size());
+        self.resized(size);
     }
 
     /// The window's size changed: so may the number of cells in it.
@@ -507,8 +513,22 @@ impl ApplicationHandler<Shown> for Gui {
                 }
                 let plain = event.key_without_modifiers();
                 self.typed = event.text.as_ref().map(ToString::to_string);
+                let typing = !(self.modifiers.control_key()
+                    || self.modifiers.alt_key()
+                    || self.modifiers.super_key());
+                let several = event
+                    .text
+                    .as_deref()
+                    .filter(|text| typing && text.chars().nth(1).is_some());
                 if is_paste(&plain, self.modifiers) {
                     self.paste();
+                } else if let Some(text) = several {
+                    // A letter and a combining accent, say: each is typed.
+                    for c in text.chars().filter(|c| !c.is_control()) {
+                        self.send(UserEvent::Term(TermEvent::Key(KeyEvent::from(
+                            KeyCode::Char(c),
+                        ))));
+                    }
                 } else if let Some(key) = key(
                     &event.logical_key,
                     &plain,
