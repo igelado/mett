@@ -293,6 +293,8 @@ fn lock_file(path: &Path) -> io::Result<fs::File> {
 
 /// Options that create a file readable only by the user.
 fn private_options() -> fs::OpenOptions {
+    // Changed on Unix only.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = fs::OpenOptions::new();
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);

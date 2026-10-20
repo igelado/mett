@@ -1049,6 +1049,8 @@ fn replace_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
 /// user, and opens it with the program the system has for it.
 fn open_file(name: &str, data: &[u8]) -> std::io::Result<()> {
     static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Changed on Unix only.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {

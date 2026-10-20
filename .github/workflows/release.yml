@@ -29,6 +29,9 @@ jobs:
         with:
           # The whole history, to tell whether the tag is on main.
           fetch-depth: 0
+      # The checkout belongs to another user than the container's: git
+      # (for the tag checks, and the packages' dates) must trust it.
+      - run: git config --global --add safe.directory "$PWD"
       - uses: actions/cache@v4
         with:
           path: |
@@ -56,7 +59,6 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          git config --global --add safe.directory "$PWD"
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$TAG^{commit}" FETCH_HEAD; then
             echo "tag $TAG isn't on main: tag the merge on main"

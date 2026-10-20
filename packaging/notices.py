@@ -25,6 +25,8 @@ LICENSE_FILES = ("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT", "UNLICE
 
 
 def main() -> None:
+    # UTF-8, whatever the system's encoding (Windows' isn't).
+    sys.stdout.reconfigure(encoding="utf-8")
     targets = sys.argv[1].split(",")
     musl = Path(sys.argv[2]) if len(sys.argv) > 2 else None
     linked = set()
@@ -32,14 +34,14 @@ def main() -> None:
         tree = subprocess.run(
             ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
              "--target", target, "--prefix", "none", "-f", "{p}"],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, encoding="utf-8",
         ).stdout
         for line in tree.splitlines():
             name, version = line.split()[:2]
             linked.add((name, version.lstrip("v")))
     metadata = json.loads(subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout)
     workspace = set(metadata["workspace_members"])
     out = sys.stdout
@@ -64,10 +66,10 @@ def main() -> None:
             out.write(f"\nLicensed under {package.get('license')}.\n")
         for file in files:
             out.write(f"\n--- {file.name} ---\n\n")
-            out.write(file.read_text(errors="replace"))
+            out.write(file.read_text(encoding="utf-8", errors="replace"))
     if musl:
         out.write(f"\n{'=' * 72}\nmusl libc (statically linked)\n{'=' * 72}\n\n")
-        out.write(musl.read_text(errors="replace"))
+        out.write(musl.read_text(encoding="utf-8", errors="replace"))
 
 
 if __name__ == "__main__":
