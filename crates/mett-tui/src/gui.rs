@@ -196,11 +196,16 @@ impl Fonts {
     }
 }
 
-/// How wide a font's `m` is, for its height; `None` unless that makes
-/// cells a terminal's could be (a tenth as wide as high, to twice).
+/// How wide a font's `m` is, for its height; `None` unless the font is
+/// monospaced (as wide an `i` as an `m`), with cells a terminal's could be
+/// (a tenth as wide as high, to twice).
 fn aspect(data: &[u8]) -> Option<f32> {
     let face = ttf_parser::Face::parse(data, 0).ok()?;
-    let advance = face.glyph_hor_advance(face.glyph_index('m')?)?;
+    let width = |c| face.glyph_hor_advance(face.glyph_index(c)?);
+    let advance = width('m')?;
+    if width('i') != Some(advance) {
+        return None;
+    }
     let aspect = f32::from(advance) / f32::from(face.height());
     (0.1..=2.0).contains(&aspect).then_some(aspect)
 }
@@ -984,6 +989,17 @@ mod tests {
         let aspect = aspect(FONT).expect("Cascadia Mono");
         assert!((0.5..0.7).contains(&aspect), "{aspect}");
         assert_eq!(super::aspect(b"not a font"), None);
+        // A proportional font, the system's, if it has one.
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let proportional = db.faces().find(|face| !face.monospaced && face.index == 0);
+        if let Some(face) = proportional
+            && let Some(data) = db.with_face_data(face.id, |data, _| data.to_vec())
+            && ttf_parser::Face::parse(&data, 0)
+                .is_ok_and(|f| f.glyph_index('i').is_some() && f.glyph_index('m').is_some())
+        {
+            assert_eq!(super::aspect(&data), None, "{:?}", face.families);
+        }
     }
 
     #[test]

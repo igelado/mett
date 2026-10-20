@@ -108,7 +108,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
 | Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then mett's built-in editor (§4.11), which `builtin` asks for. |
 | | `editor_keys` | string | mett's own: the built-in editor's keys, `vim`, `emacs` or `notepad` (§4.11). |
-| | `gui_font`, `gui_font_size` | path, number | mett's own, for `mett-gui`: the font its window shows text in (a TrueType or OpenType file; by default, the Cascadia Mono it comes with), and its size in points (`14`). Read when it starts. |
+| | `gui_font`, `gui_font_size` | path, number | mett's own, for `mett-gui`: the font its window shows text in (a monospaced TrueType or OpenType file; by default, the Cascadia Mono it comes with), and its size in points (`14`). Read when it starts. |
 | | `include` | quadoption | Quote the message in replies. |
 | | `attribution`, `indent_string` | string | The line before quoted text (`On %d, %n wrote:`), and the prefix of quoted lines (`> `). |
 | | `forward_format` | string | Subject of forwarded messages (`[%a: %s]`). |

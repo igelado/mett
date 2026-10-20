@@ -23,7 +23,8 @@ compose flow that uses the user's `$EDITOR`, and configurable key bindings.
 
 - Supporting mail providers other than Office365. The design leaves room for
   them, but they are not planned.
-- Offering a graphical (non-terminal) UI.
+- A graphical UI of its own, with widgets. `mett-gui` shows the terminal
+  UI's screens, cell for cell, in a window (§5.2).
 - Full compatibility with mutt's `muttrc`. mett uses the muttrc syntax but
   implements only part of mutt's commands and variables (see
   [CONFIG-OFFICE365.md](CONFIG-OFFICE365.md)).
@@ -141,6 +142,25 @@ run `$EDITOR`. The main loop carries them out.
   - Side effects take a round trip through messages.
 - **Mitigation:** split `Msg` and `update` per screen, with a top-level
   dispatcher. Render only the visible rows of large lists.
+
+**Frontends.** The main loop is the same for the terminal and for
+`mett-gui`'s window: it reads crossterm events from a channel, and draws on
+a `Frontend`, which gives the screen's size, draws the `App`, copies to the
+clipboard and runs the user's own editor.
+
+- **The terminal** (`mett`): crossterm, with a thread reading its input;
+  it hands the terminal over to `$EDITOR`.
+- **The window** (`mett-gui`, the `gui` feature): winit's window, drawn by
+  ratatui-wgpu. winit needs the main thread, so the app runs on a thread of
+  its own. It draws each screen into cells (a ratatui backend that keeps
+  them) and sends them to the window's thread. That thread shows them, and
+  sends keys back as the crossterm events a terminal would give. There is
+  no terminal for `$EDITOR`, so messages are written in the built-in
+  editor (`editor/builtin.rs`, on edtui).
+
+The built-in editor is part of the model, like any screen. edtui lays its
+text out while drawing, so the model holds it in a `RefCell`: the one
+place the view changes anything, and only that layout.
 
 ### 5.3 Command pattern for key bindings
 
