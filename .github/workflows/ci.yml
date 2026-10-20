@@ -1,8 +1,12 @@
-# CI, run by GitHub Actions on every push. PRs can only be merged into main
-# when these jobs succeed (see AGENTS.md).
+# CI, run by GitHub Actions on every pull request (and again on each push
+# to it), and on main once merged. PRs can only be merged into main when
+# every one of these jobs succeeds (see AGENTS.md).
 
 name: ci
-on: push
+on:
+  pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read

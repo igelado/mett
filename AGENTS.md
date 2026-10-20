@@ -71,8 +71,11 @@ GitHub enforces this workflow:
   succeed, and once every review conversation is resolved.
 - The head branch is deleted after merge by default.
 - CI is defined in `.github/workflows/ci.yml` and runs with GitHub Actions
-  on every push. Add new checks there, and add them to the required checks
-  of the `main` protection rule, so that they gate merging.
+  on every pull request (and each push to one), and on `main`. A branch
+  without a PR gets no CI, so open the PR to have it checked. Every CI job
+  must be a required check of the `main` protection rule: when adding a
+  job, add its name to the required checks (from GitHub Actions), so that
+  it gates merging.
 
 If a new review comment arrives while the merge is scheduled, GitHub holds
 the merge until its conversation is resolved.
