@@ -408,8 +408,17 @@ fn html_to_text(html: &str) -> String {
                     // A link in a link: the outer one is left out.
                     out.remove(start);
                 }
+                // What would end a URL in the text is percent-encoded.
                 anchor = attribute(raw, "href")
-                    .map(|href| decode_entities(href).into_owned())
+                    .map(|href| {
+                        decode_entities(href.trim())
+                            .replace(' ', "%20")
+                            .replace('\t', "%09")
+                            .replace('\n', "%0A")
+                            .replace('\r', "%0D")
+                            .replace('<', "%3C")
+                            .replace('>', "%3E")
+                    })
                     .filter(|href| {
                         scheme_len(href).is_some() && !href.contains([LINK_START, LINK_URL])
                     })
@@ -869,6 +878,30 @@ mod tests {
                 ],
                 vec![(2, "https://e.com".to_owned())]
             )
+        );
+    }
+
+    #[test]
+    fn html_attributes_without_values_are_skipped() {
+        for tag in [
+            r#"a download href="https://e.com""#,
+            r#"a download   href = https://e.com"#,
+            r#"a hidden/ href='https://e.com'"#,
+        ] {
+            assert_eq!(attribute(tag, "href"), Some("https://e.com"), "{tag}");
+        }
+        assert_eq!(attribute("a download", "href"), None);
+        // What would end the URL is encoded.
+        let body = Body {
+            kind: BodyKind::Html,
+            content: r#"<a href=" https://e.com/a b&gt;c ">x</a>"#.into(),
+        };
+        assert_eq!(body_lines(&body), ["x<https://e.com/a%20b%3Ec>"]);
+        assert_eq!(view_lines(body, true).0, ["x"]);
+        assert_eq!(attribute("a download /", "href"), None);
+        assert_eq!(
+            html(r#"<a download href="https://e.com">x</a>"#),
+            ["x<https://e.com>"]
         );
     }
 
