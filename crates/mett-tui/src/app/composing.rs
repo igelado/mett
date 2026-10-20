@@ -706,8 +706,8 @@ impl App {
     }
 
     /// The window was closed: mett quits as `q` in the index does (asking
-    /// to purge deleted messages, as set), unless a message is being
-    /// written, which would be lost.
+    /// to purge deleted messages, as set), unless what is going on would
+    /// be lost: a message being written, a file being saved, a question.
     pub(super) fn close(&mut self) -> Vec<Effect> {
         let writing = self.editing.is_some()
             || self.composing.is_some()
@@ -716,8 +716,17 @@ impl App {
             self.fail("A message is being written: send or postpone it first.");
             return Vec::new();
         }
-        // A question asked meanwhile goes unanswered.
-        self.input = None;
+        // What a file being saved, or a question, is waiting for would be
+        // lost.
+        if let Some((_, path)) = &self.file_wait {
+            let why = format!("Waiting for {} (^G gives up) first.", path.display());
+            self.fail(why);
+            return Vec::new();
+        }
+        if self.input.is_some() {
+            self.input_note = Some("Answer the question (or ^G) first.".into());
+            return Vec::new();
+        }
         self.leave_folder(super::mailbox::AfterPurge::Quit)
     }
 
@@ -1200,8 +1209,19 @@ mod tests {
 
     #[test]
     fn closing_the_window_quits_unless_a_message_is_being_written() {
-        // In the index, it quits.
+        // In the index, it quits; not while a question is asked.
         let mut index = app(settings());
+        act(&mut index, Action::Search);
+        index.update(Msg::Close);
+        assert!(!index.quit);
+        assert_eq!(
+            index.input_note.as_deref(),
+            Some("Answer the question (or ^G) first.")
+        );
+        index.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
         index.update(Msg::Close);
         assert!(index.quit);
 
