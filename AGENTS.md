@@ -52,10 +52,12 @@ pull requests, comments, checks, merges and releases.
 4. Make sure all checks pass, and wait for code review.
 5. Address every error and review comment on the same branch. Reply to each
    review comment and resolve its conversation.
-6. Once every review conversation is resolved, schedule the PR to merge
-   automatically with a merge commit (`gh pr merge --auto --merge
-   --delete-branch`). GitHub merges it into `main` as soon as all its
-   checks pass; don't wait for them to merge by hand.
+6. Don't merge by hand. When a PR opens (or leaves draft), the `automerge`
+   workflow turns on its auto-merge (with a merge commit), and GitHub
+   merges it into `main` as soon as every required check passed and every
+   review conversation is resolved. To hold a PR back, open it as a draft,
+   or turn auto-merge off (`gh pr merge --disable-auto`); turn it back on
+   with `gh pr merge --auto --merge`.
 
 While a PR waits for checks or review, start the next feature on its own
 branch instead of waiting. Return to the waiting PR when its results arrive,
@@ -78,7 +80,14 @@ GitHub enforces this workflow:
   it gates merging.
 
 If a new review comment arrives while the merge is scheduled, GitHub holds
-the merge until its conversation is resolved.
+the merge until its conversation is resolved. A comment only holds the
+merge when it opens a conversation (a review comment on the diff), not a
+plain PR comment.
+
+A merge made by auto-merge that the `automerge` workflow turned on is made
+with the workflow's token, and GitHub starts no workflows for it, so CI
+doesn't run again on `main` after such a merge. What was merged had passed
+CI on the PR.
 
 ## Locally generated files
 
