@@ -16,10 +16,10 @@ use std::rc::Rc;
 use edtui::actions::motion::{MoveToFirstRow, MoveToLastRow};
 use edtui::actions::search::StartSearch;
 use edtui::actions::{
-    Action, Chainable, DeleteChar, DeleteCharForward, DeleteWordBackward, FindNext, FindPrevious,
-    InsertChar, LineBreak, MoveBackward, MoveDown, MoveForward, MovePageDown, MovePageUp,
-    MoveToEndOfLine, MoveToStartOfLine, MoveUp, MoveWordBackward, MoveWordForward, Redo,
-    RemoveCharFromSearch, SelectCurrentSearch, StopSearch, SwitchMode, Undo,
+    Action, AppendCharToSearch, Chainable, DeleteChar, DeleteCharForward, DeleteWordBackward,
+    FindNext, FindPrevious, InsertChar, LineBreak, MoveBackward, MoveDown, MoveForward,
+    MovePageDown, MovePageUp, MoveToEndOfLine, MoveToStartOfLine, MoveUp, MoveWordBackward,
+    MoveWordForward, Redo, RemoveCharFromSearch, SelectCurrentSearch, StopSearch, SwitchMode, Undo,
 };
 use edtui::clipboard::ClipboardTrait;
 use edtui::events::{KeyEventHandler, KeyEventRegister, KeyInput};
@@ -621,8 +621,19 @@ impl Builtin {
     /// Inserts pasted `text` at the cursor (in place of Notepad's
     /// selection), or in the command being typed.
     pub fn paste(&mut self, text: &str) {
+        if self.question.is_some() {
+            return;
+        }
         if let Some(command) = &mut self.command {
             command.insert_text(text);
+            return;
+        }
+        // In a search, it is what is searched for (on one line).
+        if self.state.mode == EditorMode::Search {
+            for c in text.chars() {
+                let c = if matches!(c, '\r' | '\n') { ' ' } else { c };
+                self.state.execute(AppendCharToSearch(c));
+            }
             return;
         }
         match self.region() {
@@ -1314,6 +1325,18 @@ mod tests {
         let mut notepad = Builtin::new("ab\n", Keys::Notepad);
         press(&mut notepad, &[shift(KeyCode::Right)]);
         notepad.paste("Z");
+        assert_eq!(notepad.text(), "Zb\n");
+        // In a search, it is searched for; while a question is asked, it
+        // does nothing.
+        press(&mut notepad, &[ctrl('f')]);
+        notepad.paste("b");
+        assert_eq!(notepad.state.search_pattern(), "b");
+        assert_eq!(notepad.text(), "Zb\n");
+        press(
+            &mut notepad,
+            &[KeyEvent::from(KeyCode::Esc), KeyEvent::from(KeyCode::Esc)],
+        );
+        notepad.paste("x");
         assert_eq!(notepad.text(), "Zb\n");
     }
 

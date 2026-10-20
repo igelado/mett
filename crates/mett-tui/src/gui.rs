@@ -225,6 +225,7 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
         composing: false,
         typed: None,
         clipboard: None,
+        fallbacks: Vec::new(),
         code: ExitCode::SUCCESS,
     };
     if let Err(e) = event_loop.run_app(&mut gui) {
@@ -261,6 +262,8 @@ struct Gui {
     typed: Option<String>,
     /// The system's clipboard, once pasted from.
     clipboard: Option<arboard::Clipboard>,
+    /// The system's fonts the font falls back on.
+    fallbacks: Vec<Font<'static>>,
     /// How the app ended.
     code: ExitCode,
 }
@@ -276,28 +279,18 @@ impl Gui {
                 .create_window(attributes)
                 .map_err(|e| e.to_string())?,
         );
-        let scale = window.scale_factor();
-        // Points to pixels: a point is 1/72 inch, a logical pixel 1/96.
-        let aspect = f64::from(aspect(self.fonts.main).ok_or("the font has no `m`")?);
-        // Cells at least a pixel wide (ratatui-wgpu divides by their
-        // width), and not larger than the window can show.
-        let font_px = (f64::from(self.fonts.size) * 96.0 / 72.0 * scale)
-            .round()
-            .clamp((1.0 / aspect).ceil() + 1.0, 512.0);
-        // The window grows and shrinks by whole cells, where the system
-        // lets it (the cells are drawn from its top left corner).
-        let cell = winit::dpi::PhysicalSize::new((aspect * font_px).floor(), font_px);
-        window.set_resize_increments(Some(cell));
+        let font_px = self.font_px(&window)?;
         // Text typed with an input method (Chinese, Japanese, ...) comes
         // as `Ime` events.
         window.set_ime_allowed(true);
         let font = Font::new(self.fonts.main).ok_or("the font can't be read")?;
         let size = window.inner_size();
+        self.fallbacks = self.fonts.fallbacks();
         // The font first, then the others; it is also the last resort.
         let builder = Builder::from_font(font.clone())
             .with_regular_fonts([font])
-            .with_regular_fonts(self.fonts.fallbacks())
-            .with_font_size_px(font_px as u32)
+            .with_regular_fonts(self.fallbacks.clone())
+            .with_font_size_px(font_px)
             .with_width_and_height(Dimensions {
                 width: NonZeroU32::new(size.width.max(1)).expect("not zero"),
                 height: NonZeroU32::new(size.height.max(1)).expect("not zero"),
@@ -339,6 +332,64 @@ impl Gui {
         }
         window.request_redraw();
         Ok(())
+    }
+
+    /// The font's size in `window`'s pixels; the window grows and shrinks
+    /// by cells of that font, where the system lets it (the cells are
+    /// drawn from its top left corner).
+    fn font_px(&self, window: &Window) -> Result<u32, String> {
+        let aspect = f64::from(aspect(self.fonts.main).ok_or("the font has no `m`")?);
+        // Points to pixels: a point is 1/72 inch, a logical pixel 1/96.
+        // Cells at least a pixel wide (ratatui-wgpu divides by their
+        // width), and not larger than the window can show.
+        let font_px = (f64::from(self.fonts.size) * 96.0 / 72.0 * window.scale_factor())
+            .round()
+            .clamp((1.0 / aspect).ceil() + 1.0, 512.0);
+        let cell = winit::dpi::PhysicalSize::new((aspect * font_px).floor(), font_px);
+        window.set_resize_increments(Some(cell));
+        // A whole number, clamped above.
+        Ok(font_px as u32)
+    }
+
+    /// The window moved to a display of another scale: the text keeps its
+    /// size in points.
+    fn rescaled(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let (Ok(font_px), Some(font)) = (self.font_px(&window), Font::new(self.fonts.main)) else {
+            return;
+        };
+        let mut fonts = ratatui_wgpu::Fonts::new(font.clone(), font_px);
+        fonts.add_regular_fonts([font]);
+        fonts.add_regular_fonts(self.fallbacks.clone());
+        if let Some(terminal) = &mut self.terminal {
+            terminal.backend_mut().update_fonts(fonts);
+        }
+        self.resized(window.inner_size());
+    }
+
+    /// The window's size changed: so may the number of cells in it.
+    fn resized(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+        terminal.backend_mut().resize(size.width, size.height);
+        if let Ok(cells) = terminal.size() {
+            let changed = {
+                let mut shared = self.size.lock().expect("not poisoned");
+                std::mem::replace(&mut *shared, cells) != cells
+            };
+            if changed {
+                self.send(UserEvent::Term(TermEvent::Resize(
+                    cells.width,
+                    cells.height,
+                )));
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// Sends the app what the user did.
@@ -443,27 +494,8 @@ impl ApplicationHandler<Shown> for Gui {
                 self.send(UserEvent::Close);
             }
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                let Some(terminal) = &mut self.terminal else {
-                    return;
-                };
-                terminal.backend_mut().resize(size.width, size.height);
-                if let Ok(cells) = terminal.size() {
-                    let changed = {
-                        let mut shared = self.size.lock().expect("not poisoned");
-                        std::mem::replace(&mut *shared, cells) != cells
-                    };
-                    if changed {
-                        self.send(UserEvent::Term(TermEvent::Resize(
-                            cells.width,
-                            cells.height,
-                        )));
-                    }
-                }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
+            WindowEvent::Resized(size) => self.resized(size),
+            WindowEvent::ScaleFactorChanged { .. } => self.rescaled(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if ended {
@@ -486,7 +518,13 @@ impl ApplicationHandler<Shown> for Gui {
                     self.send(UserEvent::Term(TermEvent::Key(key)));
                 }
             }
-            WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                self.composing = !text.is_empty();
+                // What it commits is its own, not the last key's text.
+                if self.composing {
+                    self.typed = None;
+                }
+            }
             WindowEvent::Ime(Ime::Disabled) => self.composing = false,
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.composing = false;
