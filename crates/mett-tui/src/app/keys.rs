@@ -49,6 +49,19 @@ impl App {
         // Ctrl-J is a newline: it does what Enter does, unless bound.
         let ctrl_j = Key::from(event) == Key::ctrl('j');
         self.input_note = None;
+        // The built-in editor takes the keys (unless the sign-in window
+        // is up), until the user leaves it.
+        if self.sign_in.is_none()
+            && let Some(editing) = &mut self.editing
+        {
+            return match editing.get_mut().key(event) {
+                crate::editor::builtin::Outcome::Editing => Vec::new(),
+                crate::editor::builtin::Outcome::Done(text) => {
+                    self.editing = None;
+                    self.on_edited(Ok(text))
+                }
+            };
+        }
         // Keys wait for a file being read or saved; `^G` gives up on it.
         if let Some((_, path)) = &self.file_wait
             && self.sign_in.is_none()

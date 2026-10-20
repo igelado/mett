@@ -40,8 +40,8 @@ for x86_64 and aarch64:
   signed yet, so SmartScreen may warn: choose **More info › Run anyway**.
   The `-windows.zip` holds `mett.exe` alone. Run mett in Windows Terminal. It reads `mettrc` from
   `%USERPROFILE%\.config\mett\` (or `%USERPROFILE%\.mettrc`), keeps sign-ins
-  in the Windows Credential Manager, and edits messages with Notepad
-  unless `editor` says otherwise. Its cache is in
+  in the Windows Credential Manager, and edits messages in its built-in
+  editor unless `editor`, `%VISUAL%` or `%EDITOR%` names another. Its cache is in
   `%USERPROFILE%\.cache\mett\`. `query_command` and backticks in the
   mettrc need a POSIX `sh`, such as [Git for Windows](https://gitforwindows.org/)'.
   In the mettrc, `\` is an escape, as in mutt: write paths with `/`

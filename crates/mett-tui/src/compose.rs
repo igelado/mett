@@ -51,6 +51,10 @@ pub struct Settings {
     pub fast_reply: bool,
     /// `metoo`: keep the user's own addresses in group replies.
     pub metoo: bool,
+    /// The keys of the built-in editor, if messages are written in it
+    /// rather than in the user's own (`editor`, `editor_keys`). Set by the
+    /// caller, which knows the environment ([`crate::editor::builtin`]).
+    pub builtin_editor: Option<crate::editor::Keys>,
 }
 
 impl Default for Settings {
@@ -76,6 +80,7 @@ impl Default for Settings {
             askbcc: false,
             fast_reply: false,
             metoo: false,
+            builtin_editor: None,
         }
     }
 }
@@ -138,6 +143,7 @@ impl Settings {
             askbcc: config.flag("askbcc"),
             fast_reply: config.flag("fast_reply"),
             metoo: config.flag("metoo"),
+            builtin_editor: None,
         })
     }
 

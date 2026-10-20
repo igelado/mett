@@ -135,6 +135,7 @@ pub const VARS: &[Var] = &[
     ),
     var("delete", Kind::Quad, "ask-yes"),
     var("editor", Kind::Path, ""),
+    var("editor_keys", Kind::String, ""),
     var("ews_url", Kind::String, ""),
     var("fast_reply", Kind::Bool, "no"),
     var("folder", Kind::Path, "~/Mail"),

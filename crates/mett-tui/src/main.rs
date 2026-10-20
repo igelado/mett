@@ -273,7 +273,13 @@ fn settings_keeping(
     account: &mett_core::AccountId,
     signature: Option<Option<String>>,
 ) -> Result<Settings, String> {
-    let compose = compose::Settings::from_config_keeping(config, account, signature)?;
+    let mut compose = compose::Settings::from_config_keeping(config, account, signature)?;
+    compose.builtin_editor = editor::builtin(
+        config.string("editor"),
+        config.string("editor_keys"),
+        false,
+        &|name| std::env::var(name).ok(),
+    )?;
     let trash = match config.string("trash") {
         "" => None,
         // mutt's shortcuts work here too (`^` and `-` name no folder before

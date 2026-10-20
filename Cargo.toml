@@ -18,6 +18,9 @@ mett-sqlite = { path = "crates/mett-sqlite" }
 
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+# The built-in editor. Its own clipboard (arboard, the system one, is
+# left out): a terminal pastes on its own.
+edtui = { version = "0.11.7", default-features = false }
 encoding_rs = "0.8.35"
 getrandom = "0.4.3"
 keyring = "4.2.0"
