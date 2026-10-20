@@ -64,7 +64,8 @@ pull requests, comments, checks, merges and releases.
    (`gh api repos/igelado/mett --jq .delete_branch_on_merge` prints `true`;
    `gh repo edit --delete-branch-on-merge` turns it back on). A PR merged
    any other way is merged with `gh pr merge --delete-branch`. Once merged,
-   delete the local branch too (`git branch -d`).
+   delete the local branch too: switch to `main`, bring it up to date
+   (`git switch main && git pull`), then `git branch -d <branch>`.
 
 While a PR waits for checks or review, start the next feature on its own
 branch instead of waiting. Return to the waiting PR when its results arrive.
