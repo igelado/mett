@@ -49,7 +49,8 @@ pull requests, comments, checks, merges and releases.
 3. When the feature is complete, push the branch and open a pull request
    (PR) into `main` (`gh pr create`). Post the clean Codex review result as
    a PR comment (`gh pr comment`).
-4. Make sure all checks pass, and wait for code review.
+4. Make sure all checks pass. The clean Codex review (step 2) is the
+   review a PR needs; no approval is required.
 5. Address every error and review comment on the same branch. Reply to each
    review comment and resolve its conversation.
 6. Don't merge by hand. When a PR opens (or leaves draft), the `automerge`
@@ -60,8 +61,9 @@ pull requests, comments, checks, merges and releases.
    with `gh pr merge --auto --merge`.
 
 While a PR waits for checks or review, start the next feature on its own
-branch instead of waiting. Return to the waiting PR when its results arrive,
-and don't merge it before its review is complete. If review comments arrive
+branch instead of waiting. Return to the waiting PR when its results arrive.
+A PR that needs more than CI and the Codex review (a look from someone
+else, say) is opened as a draft, so it doesn't merge before then. If review comments arrive
 after a PR was merged, fix them in a follow-up PR and reply in each
 conversation with the fix.
 
