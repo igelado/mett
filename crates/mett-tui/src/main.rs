@@ -1655,7 +1655,8 @@ mod tests {
         let path = dir.join("signature");
         std::fs::write(&path, "-- \nAlice\n").unwrap();
         let mut demo = Commanded::demo("/home/alice");
-        let set = format!("set signature={}", path.display());
+        // Quoted: a Windows path's `\` would be an escape.
+        let set = format!("set signature='{}'", path.display());
         let first = demo.run(&set);
         assert!(first.settings.is_ok());
         assert_eq!(demo.signature.as_deref(), Some("-- \nAlice\n"));

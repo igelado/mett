@@ -633,9 +633,11 @@ mod tests {
             path("", None),
             Some(PathBuf::from("/home/a/.cache/mett").join(file))
         );
+        // An absolute path, on Windows too.
+        let xdg = if cfg!(windows) { r"C:\xdg" } else { "/xdg" };
         assert_eq!(
-            path("", Some("/xdg")),
-            Some(PathBuf::from("/xdg/mett").join(file))
+            path("", Some(xdg)),
+            Some(PathBuf::from(xdg).join("mett").join(file))
         );
         assert_eq!(
             path("", Some("rel")),
@@ -660,13 +662,16 @@ mod tests {
             token_store(&config(""), &url()),
             Ok(AnyStore::Keyring(_))
         ));
-        assert!(matches!(
-            token_store(
-                &config("set office365_token_store=file office365_token_file=~/t\n"),
-                &url()
-            ),
-            Ok(AnyStore::File(_))
-        ));
+        // A file only on Unix, where it can be kept private.
+        let file = token_store(
+            &config("set office365_token_store=file office365_token_file=~/t\n"),
+            &url(),
+        );
+        if cfg!(unix) {
+            assert!(matches!(file, Ok(AnyStore::File(_))));
+        } else {
+            assert!(file.is_err());
+        }
         assert!(token_store(&config("set office365_token_store=vault\n"), &url()).is_err());
     }
 }

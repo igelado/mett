@@ -59,7 +59,8 @@ jobs:
           restore-keys: macos-cargo-
       - run: rustup toolchain install 1.95 --profile minimal -c clippy && rustup default 1.95
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
+      # Every crate's failures, not only the first one's.
+      - run: cargo test --workspace --all-features --no-fail-fast
 
   windows:
     runs-on: windows-latest
@@ -77,4 +78,5 @@ jobs:
           restore-keys: windows-cargo-
       - run: rustup toolchain install 1.95 --profile minimal -c clippy && rustup default 1.95
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
+      # Every crate's failures, not only the first one's.
+      - run: cargo test --workspace --all-features --no-fail-fast
