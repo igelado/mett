@@ -385,6 +385,7 @@ impl App {
         if !self.poll_paused && self.sign_in.is_none() {
             effects.extend(self.poll_folder());
             effects.extend(self.check_mailboxes());
+            self.sidebar_outdated();
         }
         effects.extend(self.arm_poll());
         effects
@@ -540,7 +541,7 @@ impl App {
     /// line already says, and holds off checking after a sign-in failed.
     /// A failure from before the user last retried doesn't hold off
     /// checking again.
-    fn background_error(&mut self, e: Error, epoch: u64) {
+    pub(super) fn background_error(&mut self, e: Error, epoch: u64) {
         if matches!(e, Error::Auth(_)) && epoch == self.poll_epoch {
             self.poll_paused = true;
         }
@@ -975,6 +976,8 @@ impl App {
                 state.folder = Some(open.clone());
             }
         }
+        // The folder left may have been read.
+        self.sidebar_outdated();
         self.rebuild_sidebar(true);
     }
 
@@ -1022,6 +1025,7 @@ impl App {
                     new: self.has_new_mail(m),
                     path: m.text.clone(),
                     target: m.path.clone(),
+                    well_known: folder.and_then(|f| f.well_known),
                 }
             })
             .collect()
@@ -1066,6 +1070,11 @@ impl App {
         };
         if checked(&self.mailboxes) != checked(&mailboxes) || self.sync_interval != interval {
             self.checking = None;
+        }
+        // Without them, the sidebar lists every folder: they may have
+        // changed since it last did.
+        if mailboxes.is_empty() && !self.mailboxes.is_empty() {
+            self.sidebar_outdated();
         }
         self.mailboxes = mailboxes;
         // A timer set for another interval is replaced.

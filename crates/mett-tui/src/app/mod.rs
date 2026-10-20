@@ -961,6 +961,10 @@ impl App {
             return Menu::SignIn;
         }
         match self.screen() {
+            // The sidebar is beside the index and the pager.
+            Screen::Index | Screen::Pager(_) | Screen::Text(_) if self.sidebar_focused() => {
+                Menu::Sidebar
+            }
             Screen::Index => Menu::Index,
             Screen::Pager(_) => Menu::Pager,
             Screen::Compose(_) => Menu::Compose,
@@ -983,6 +987,9 @@ impl App {
 
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        if matches!(msg, Msg::Action(_)) {
+            self.retry_sidebar();
+        }
         let mut effects = self.handle(msg);
         // A search given up on (the user moved on, or left the message it
         // waited for) stops saying it is searching.
@@ -1000,6 +1007,9 @@ impl App {
             self.relist_on_return = false;
             effects.extend(self.refresh());
         }
+        // The sidebar lists every folder, if it shows them, once it is
+        // on screen and they may have changed.
+        effects.extend(self.list_sidebar_folders());
         effects
     }
 
@@ -1146,6 +1156,7 @@ impl App {
             Menu::Compose => self.on_compose_action(action),
             Menu::Browser => self.on_browser_action(action),
             Menu::Help => self.on_help_action(action),
+            Menu::Sidebar => self.on_sidebar_menu_action(action),
             Menu::Generic => Vec::new(),
         }
     }
@@ -1856,6 +1867,9 @@ impl App {
                 return self.on_compose_fetched(kind, message, result);
             }
             Event::MessageFetched(result) => return self.on_message_fetched(id, result),
+            Event::FoldersListed(result) if self.sidebar_request() == Some(id) => {
+                self.on_sidebar_listed(result);
+            }
             Event::FoldersListed(result) => return self.on_folders_listed(id, result),
             Event::AttachmentsListed(result) => return self.on_attachments_listed(id, result),
             Event::AttachmentFetched(result) => return self.on_attachment_fetched(id, result),

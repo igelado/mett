@@ -185,7 +185,8 @@ exec          function [ ... ]
 ```
 
 The maps are the menus: `generic`, `index`, `pager`, `compose`, `attach`,
-`browser`, `alias`, `query`, `editor`, `postpone`, `pgp` and `smime`. Keys use
+`browser`, `alias`, `query`, `editor`, `postpone`, `pgp` and `smime`, and
+mett's `sidebar` (§4.10). Keys use
 names such as `<Enter>`, `<Esc>`, `\Cx` (Ctrl+x) and `<F1>`. Functions are
 written as `<function-name>`, for example `<next-entry>` or `<reply>`.
 
@@ -262,15 +263,18 @@ nospam        pattern
 
 mutt's sidebar lists the `mailboxes` in a column beside the menus, with
 their counts. mett supports it as below; neomutt's additions are marked,
-and so is mett's own.
+and so is mett's own. Without `mailboxes`, mett's sidebar lists every
+folder instead, as a tree (`Inbox`, `Inbox/Projects`), with their
+counts, as last listed: when a folder opens and at each check for new
+mail.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `sidebar_visible` | `no` | Show the sidebar. |
 | `sidebar_width` | `30` | Its width in columns, the divider included. |
 | `sidebar_format` | `%B%*  %n` | Each entry: `%B` name, `%N` unread, `%S` messages, `%n` `N` with new mail, `%F` flagged, `%!` `!`, `!!` or `N!` for the flagged, and for the open folder `%d` deleted, `%L` shown by the limit, `%t` tagged; `%?X?…&…?`, `%>X`, `%*X` and `%\|X` as in other formats. |
-| `sidebar_short_path` | `no` | Show only the last part of each path (after `sidebar_delim_chars`). |
-| `sidebar_folder_indent` | `no` | Indent mailboxes below `folder` by their depth, with `sidebar_indent_string` (`"  "`). |
+| `sidebar_short_path` | `no` | Show only the last part of each path (after `sidebar_delim_chars`); for every folder, its name. |
+| `sidebar_folder_indent` | `no` | Indent mailboxes below `folder` by their depth, with `sidebar_indent_string` (`"  "`); every folder, by its depth in the tree. |
 | `sidebar_delim_chars` | `/.` | What separates the parts of a path. |
 | `sidebar_divider_char` | `\|` | The line between the sidebar and the menus. |
 | `sidebar_sort_method` | `unsorted` | `unsorted` (`mailbox-order`), `path`, `alpha` (`name`: the label, or the path), `count`, `unread` (`new`) or `flagged`, most first for counts; with `reverse-`. |
@@ -290,6 +294,20 @@ highlight; `<sidebar-open>` opens its mailbox; and
 bind index,pager \CP sidebar-prev
 bind index,pager \CN sidebar-next
 bind index,pager \CO sidebar-open
+```
+
+mett's `<sidebar-focus>`, on Tab in the index and the pager, gives the
+sidebar the keys instead, in a menu of its own, `sidebar`: there `j` and
+`k` (or the arrows) move its highlight, `=` and `*` (Home and End) go to
+the first and the last mailbox, `z` and `Z` (Page Down and Page Up) a
+page, and Enter or Space opens the mailbox. Opening one, Tab, `q` or Esc
+gives the keys back. While the sidebar has them, its highlight is drawn
+with `indicator`, then `sidebar_highlight`. For example, to put it on
+the right, and show its folders' names indented:
+
+```muttrc
+set sidebar_visible sidebar_on_right
+set sidebar_short_path sidebar_folder_indent
 ```
 
 Its `color` objects are `sidebar_new` (new or unread mail),

@@ -112,6 +112,15 @@ const HELP: &[(Menu, &[(Action, &str)])] = &[
         ],
     ),
     (
+        Menu::Sidebar,
+        &[
+            (Action::Exit, "Exit"),
+            (Action::SidebarOpen, "Open"),
+            (Action::SidebarNext, "Next"),
+            (Action::SidebarPrev, "Prev"),
+        ],
+    ),
+    (
         Menu::SignIn,
         &[
             (Action::Exit, "Close"),

@@ -32,6 +32,8 @@ pub enum Menu {
     Query,
     /// Postponed messages to choose from.
     Postpone,
+    /// The sidebar, while it has the keys (a mett addition).
+    Sidebar,
 }
 
 impl Menu {
@@ -48,6 +50,7 @@ impl Menu {
             Menu::Attach => "attach",
             Menu::Query => "query",
             Menu::Postpone => "postpone",
+            Menu::Sidebar => "sidebar",
         }
     }
 
@@ -64,6 +67,7 @@ impl Menu {
             Menu::Attach,
             Menu::Query,
             Menu::Postpone,
+            Menu::Sidebar,
         ]
         .into_iter()
         .find(|m| m.name() == name)
@@ -336,6 +340,7 @@ impl Keymap {
             (Key::char('R'), RecallMessage),
             (Key::ctrl('n'), NextThread),
             (Key::ctrl('p'), PreviousThread),
+            (Key::new(KeyCode::Tab), SidebarFocus),
         ];
 
         // mutt's generic menu: keys that work in every menu but the pager,
@@ -461,9 +466,30 @@ impl Keymap {
             (Key::char('s'), SaveEntry),
         ];
         let query: &[(Key, Action)] = &[(Key::char('m'), Mail)];
+        // The sidebar's, while it has the keys: the list menus' keys move
+        // its cursor.
+        let sidebar: &[(Key, Action)] = &[
+            (Key::char('q'), Exit),
+            (Key::new(Esc), Exit),
+            (Key::new(KeyCode::Tab), SidebarFocus),
+            (Key::char('j'), SidebarNext),
+            (Key::new(Down), SidebarNext),
+            (Key::char('k'), SidebarPrev),
+            (Key::new(Up), SidebarPrev),
+            (Key::char('='), SidebarFirst),
+            (Key::new(Home), SidebarFirst),
+            (Key::char('*'), SidebarLast),
+            (Key::new(End), SidebarLast),
+            (Key::char('z'), SidebarPageDown),
+            (Key::new(PageDown), SidebarPageDown),
+            (Key::char('Z'), SidebarPageUp),
+            (Key::new(PageUp), SidebarPageUp),
+            (Key::new(Enter), SidebarOpen),
+            (Key::char(' '), SidebarOpen),
+        ];
 
         type Table = [(Key, Action)];
-        let menus: [(Menu, &[&Table]); 10] = [
+        let menus: [(Menu, &[&Table]); 11] = [
             (Menu::Generic, &[generic]),
             (Menu::Index, &[index, mailbox]),
             (Menu::Pager, &[pager, mailbox]),
@@ -474,6 +500,7 @@ impl Keymap {
             (Menu::Attach, &[list, attach]),
             (Menu::Query, &[list, choose, query]),
             (Menu::Postpone, &[list, choose]),
+            (Menu::Sidebar, &[sidebar]),
         ];
         for (menu, tables) in menus {
             for (key, action) in tables.iter().copied().flatten() {

@@ -81,7 +81,9 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
 
 /// How an entry is drawn: by what mail it has, as in mutt, then with the
 /// open folder's `sidebar_indicator` (or `indicator`) or the cursor's
-/// `sidebar_highlight` over that.
+/// `sidebar_highlight` over that. While the sidebar has the keys, its
+/// cursor is drawn as a menu's, with `indicator`, and `sidebar_highlight`
+/// over it, wherever it is.
 fn entry_style(app: &App, values: &Values, highlighted: bool) -> Style {
     let colors = &app.display.colors;
     let sidebar = &colors.sidebar;
@@ -97,6 +99,9 @@ fn entry_style(app: &App, values: &Values, highlighted: bool) -> Style {
         sidebar.ordinary
     };
     let style = colors.normal.patch(base);
+    if highlighted && app.sidebar_focused() {
+        return style.patch(colors.indicator).patch(sidebar.highlight);
+    }
     if entry.open {
         let indicator = if sidebar.indicator == unset {
             colors.indicator
@@ -480,5 +485,33 @@ mod tests {
         let status = &lines[usize::from(height) - 2];
         assert!(status.starts_with("-"), "{lines:#?}");
         assert_eq!(status.chars().count(), usize::from(WIDTH), "{lines:#?}");
+    }
+
+    #[test]
+    fn its_cursor_is_a_menu_cursor_while_it_has_the_keys() {
+        let mut app = app(visible(), 2);
+        act(&mut app, crate::action::Action::SidebarFocus);
+        let lines = screen(&app);
+        assert!(
+            lines[0].starts_with("q:Exit"),
+            "its own help line: {lines:#?}"
+        );
+        // On the open folder, reversed and underlined.
+        let buffer = drawn(&app, WIDTH, HEIGHT);
+        let cell = &buffer[(0, 1)];
+        assert!(
+            cell.modifier
+                .contains(Modifier::REVERSED | Modifier::UNDERLINED)
+        );
+        // Moved, the open folder keeps its indicator.
+        act(&mut app, crate::action::Action::SidebarNext);
+        let buffer = drawn(&app, WIDTH, HEIGHT);
+        assert!(!buffer[(0, 1)].modifier.contains(Modifier::UNDERLINED));
+        assert!(buffer[(0, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(
+            buffer[(0, 2)]
+                .modifier
+                .contains(Modifier::REVERSED | Modifier::UNDERLINED)
+        );
     }
 }

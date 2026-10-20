@@ -255,9 +255,12 @@ Each screen has its own keymap, its own `update` logic and its own `view`.
   state local to them.
 
 The sidebar is not a screen either: it sits beside every screen, as in
-mutt, and its state (its entries and its highlight) lives in the `App`.
-Its entries are made again only when what they show changes (the
-mailboxes are checked, the settings change, another folder opens), so
+mutt, and its state (its entries, its highlight, whether it has the
+keys, and the folders listed for it) lives in the `App`. While it has
+the keys, `App::menu` is its own, `sidebar`, whatever the screen beside
+it. Its entries are made again only when what they show changes (the
+mailboxes are checked or the folders listed, the settings change,
+another folder opens), so
 drawing it formats only the rows on screen. The app gives the menus the
 width the sidebar leaves (`App::width`), so that what they lay out
 (the pager's wrapping, say) fits beside it.
