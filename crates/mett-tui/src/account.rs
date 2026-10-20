@@ -408,6 +408,10 @@ fn is_loopback(url: &Url) -> bool {
 pub fn token_store(config: &Config, url: &MailboxUrl) -> Result<AnyStore, String> {
     match config.string("office365_token_store") {
         "keyring" => Ok(AnyStore::Keyring(KeyringStore)),
+        // The file is kept private with Unix permissions only.
+        "file" if !cfg!(unix) => {
+            Err("office365_token_store = file works only on Unix: use keyring (the default)".into())
+        }
         "file" => {
             let path = match config.string("office365_token_file") {
                 "" => FileStore::default_path(&url.account).ok_or(
