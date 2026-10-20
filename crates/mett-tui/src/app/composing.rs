@@ -740,6 +740,8 @@ impl App {
             editing.get_mut().paste(text);
         } else if let Some(Input::Line { editor, .. }) = &mut self.input {
             editor.insert_text(text);
+            // The answer shows again, as when a key is typed.
+            self.input_note = None;
         }
     }
 

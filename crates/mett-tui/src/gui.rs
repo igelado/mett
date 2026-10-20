@@ -188,11 +188,13 @@ impl Fonts {
     }
 }
 
-/// How wide a font's `m` is, for its height.
+/// How wide a font's `m` is, for its height; `None` unless that makes
+/// cells a terminal's could be (a tenth as wide as high, to twice).
 fn aspect(data: &[u8]) -> Option<f32> {
     let face = ttf_parser::Face::parse(data, 0).ok()?;
     let advance = face.glyph_hor_advance(face.glyph_index('m')?)?;
-    Some(f32::from(advance) / f32::from(face.height()))
+    let aspect = f32::from(advance) / f32::from(face.height());
+    (0.1..=2.0).contains(&aspect).then_some(aspect)
 }
 
 /// Shows the window until it closes: the app's screens, started with
@@ -967,6 +969,13 @@ mod tests {
         // Control+V is mett's (Notepad's paste in the built-in editor).
         assert!(!is_paste(&v, ModifiersState::CONTROL));
         assert!(!is_paste(&ch("c"), ModifiersState::SUPER));
+    }
+
+    #[test]
+    fn fonts_are_measured_by_their_m() {
+        let aspect = aspect(FONT).expect("Cascadia Mono");
+        assert!((0.5..0.7).contains(&aspect), "{aspect}");
+        assert_eq!(super::aspect(b"not a font"), None);
     }
 
     #[test]
