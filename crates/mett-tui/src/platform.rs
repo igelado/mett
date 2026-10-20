@@ -53,7 +53,11 @@ pub fn editor(editor: &str, file: &std::path::Path) -> Command {
             .arg(file);
         return command;
     }
-    cmd(&format!("{editor} \"{}\"", file.display()))
+    // cmd expands `%METT_FILE%` once: whatever the path holds (`%`, `&`)
+    // isn't read as cmd syntax, in the quotes.
+    let mut command = cmd(&format!("{editor} \"%METT_FILE%\""));
+    command.env("METT_FILE", file);
+    command
 }
 
 /// `cmd /C line`, given to `cmd` as it is (`cmd` doesn't parse its
@@ -70,7 +74,9 @@ fn cmd(line: &str) -> Command {
 #[cfg(not(windows))]
 fn cmd(line: &str) -> Command {
     let mut command = Command::new("sh");
-    command.arg("-c").arg(line);
+    command
+        .arg("-c")
+        .arg(line.replace("%METT_FILE%", "$METT_FILE"));
     command
 }
 

@@ -1021,6 +1021,12 @@ impl Expander for Expand<'_> {
         if let Some(value) = self.config.user.get(name) {
             return Some(value.clone());
         }
+        // The home mett found, which on Windows may not be `$HOME`.
+        if name == "HOME"
+            && let Some(home) = self.config.home()
+        {
+            return Some(home.to_owned());
+        }
         std::env::var(name).ok()
     }
 
@@ -1164,6 +1170,13 @@ mod tests {
             config.string("spoolfile"),
             "msgraph://alice@contoso.com/@inbox"
         );
+    }
+
+    #[test]
+    fn home_is_the_one_mett_found() {
+        // `/home/a`, whatever `$HOME` is (on Windows, often unset).
+        let config = load("set my_sig=$HOME/.sig\n");
+        assert_eq!(config.user.get("my_sig").unwrap(), "/home/a/.sig");
     }
 
     #[test]
