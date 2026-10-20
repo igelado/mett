@@ -11,7 +11,7 @@ and of musl on Linux, go with it. Each crate's own license files are copied; one
 without any is listed with its license expression. Bundled C code (SQLite
 in libsqlite3-sys, AWS-LC in aws-lc-sys) comes with its crate's files.
 mett-gui also has a font in it, Cascadia Mono, under the SIL Open Font
-License.
+License; and both an English dictionary, SCOWL's en_US (MIT and BSD).
 
 Usage: notices.py TARGET [MUSL_COPYRIGHT_FILE] > THIRD-PARTY-NOTICES
 
@@ -75,6 +75,9 @@ def main() -> None:
     font = Path(__file__).parent.parent / "crates/mett-tui/assets/fonts/CascadiaOFL.txt"
     out.write(f"\n{'=' * 72}\nCascadia Mono (font, in mett-gui) (OFL-1.1)\n{'=' * 72}\n\n")
     out.write(font.read_text(encoding="utf-8"))
+    words = Path(__file__).parent.parent / "crates/mett-tui/assets/dictionaries/en_US-LICENSE"
+    out.write(f"\n{'=' * 72}\nen_US Hunspell dictionary, from SCOWL (MIT AND BSD)\n{'=' * 72}\n\n")
+    out.write(words.read_text(encoding="utf-8"))
     if musl:
         out.write(f"\n{'=' * 72}\nmusl libc (statically linked)\n{'=' * 72}\n\n")
         out.write(musl.read_text(encoding="utf-8", errors="replace"))

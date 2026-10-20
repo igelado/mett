@@ -4,6 +4,7 @@
 //! ([`builtin`]).
 
 pub mod builtin;
+pub mod spell;
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;

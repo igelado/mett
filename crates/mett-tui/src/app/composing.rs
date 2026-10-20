@@ -768,11 +768,78 @@ impl App {
     pub(super) fn edit(&mut self, text: String) -> Vec<Effect> {
         match self.settings.builtin_editor {
             Some(keys) => {
-                let editor = crate::editor::builtin::Builtin::new(&text, keys);
+                let mut editor = crate::editor::builtin::Builtin::new(&text, keys);
+                let (speller, effects) = self.speller();
+                editor.set_spelling(speller, self.settings.spell.check);
                 self.editing = Some(std::cell::RefCell::new(editor));
-                Vec::new()
+                effects
             }
             None => vec![Effect::Edit(text)],
+        }
+    }
+
+    /// The dictionaries for the spelling settings, if spelling is checked
+    /// and they are loaded; if not loaded, the effect that loads them
+    /// (once).
+    fn speller(
+        &mut self,
+    ) -> (
+        Option<std::sync::Arc<crate::editor::spell::Speller>>,
+        Vec<Effect>,
+    ) {
+        if !self.settings.spell.check {
+            return (None, Vec::new());
+        }
+        // Turning checking off and on again needs no other dictionaries.
+        let wanted = crate::editor::spell::Settings {
+            check: true,
+            ..self.settings.spell.clone()
+        };
+        if let Some((loaded, speller)) = &self.speller
+            && *loaded == wanted
+        {
+            return (Some(speller.clone()), Vec::new());
+        }
+        if self.speller_loading.as_ref() == Some(&wanted) {
+            return (None, Vec::new());
+        }
+        self.speller_loading = Some(wanted.clone());
+        (None, vec![Effect::LoadSpeller(wanted)])
+    }
+
+    /// Gives the built-in editor, if open, the spelling settings and their
+    /// dictionaries (loading them, if need be).
+    pub(super) fn respell(&mut self) -> Vec<Effect> {
+        if self.editing.is_none() {
+            return Vec::new();
+        }
+        let (speller, effects) = self.speller();
+        let check = self.settings.spell.check;
+        if let Some(editing) = &mut self.editing {
+            editing.get_mut().set_spelling(speller, check);
+        }
+        effects
+    }
+
+    /// Takes in dictionaries loaded for `settings`, or why they couldn't
+    /// be.
+    pub(super) fn on_speller_loaded(
+        &mut self,
+        settings: crate::editor::spell::Settings,
+        result: Result<std::sync::Arc<crate::editor::spell::Speller>, String>,
+    ) -> Vec<Effect> {
+        if self.speller_loading.as_ref() == Some(&settings) {
+            self.speller_loading = None;
+        }
+        match result {
+            Ok(speller) => {
+                self.speller = Some((settings, speller));
+                self.respell()
+            }
+            Err(error) => {
+                self.fail(error);
+                Vec::new()
+            }
         }
     }
 
@@ -1154,8 +1221,13 @@ mod tests {
         });
         act(&mut app, Action::Mail);
         answer(&mut app, "bob@x.org");
-        // No editor to run: the built-in one opens, with the signature.
-        assert_eq!(answer(&mut app, "Hi"), []);
+        // No editor to run: the built-in one opens, with the signature,
+        // and loads the dictionaries.
+        let effects = answer(&mut app, "Hi");
+        assert!(
+            matches!(effects.as_slice(), [Effect::LoadSpeller(_)]),
+            "{effects:?}"
+        );
         let editor = app.editing.as_ref().expect("the built-in editor");
         assert_eq!(editor.borrow().text(), "\n-- \nMe\n");
         // It takes the keys, `:` included.
@@ -1291,6 +1363,58 @@ mod tests {
             editor.borrow().text().starts_with("HelloHello\n"),
             "{editor:?}"
         );
+    }
+
+    #[test]
+    fn the_builtin_editor_checks_spelling() {
+        let words = std::path::PathBuf::from("/home/me/.config/mett/words");
+        let mut app = app(compose::Settings {
+            builtin_editor: Some(crate::editor::Keys::Vim),
+            spell: crate::editor::spell::Settings {
+                words: Some(words.clone()),
+                ..Default::default()
+            },
+            ..settings()
+        });
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        let effects = answer(&mut app, "Hi");
+        let [Effect::LoadSpeller(wanted)] = effects.as_slice() else {
+            panic!("expected the dictionaries loaded, got {effects:?}");
+        };
+        // Loaded, they reach the editor.
+        let speller = crate::editor::spell::Speller::load(wanted, None).map(std::sync::Arc::new);
+        app.update(Msg::SpellerLoaded(wanted.clone(), speller));
+        typed(&mut app, "iWrnog");
+        key(&mut app, KeyCode::Esc);
+        let bottom = |app: &App| app.editing.as_ref().map(|e| e.borrow().bottom(80));
+        typed(&mut app, "z=");
+        assert!(
+            matches!(bottom(&app), Some(crate::editor::builtin::Bottom::Prompt { prompt, .. }) if prompt == "Wrnog: ")
+        );
+        key(&mut app, KeyCode::Esc);
+        // `zg` adds the word to `spell_words`.
+        let effects = typed_effects(&mut app, "zg");
+        assert_eq!(
+            effects,
+            [Effect::AddWord {
+                path: words,
+                word: "Wrnog".into()
+            }]
+        );
+        // `:set nospell` sets mett's own `spell_check`.
+        let effects = typed_effects(&mut app, ":set nospell\n");
+        assert_eq!(effects, [Effect::Command("set spell_check=no".into())]);
+    }
+
+    /// Types `text` (`\n` is Enter), and gives back the effects.
+    fn typed_effects(app: &mut App, text: &str) -> Vec<Effect> {
+        text.chars()
+            .flat_map(|c| match c {
+                '\n' => key(app, KeyCode::Enter),
+                c => key(app, KeyCode::Char(c)),
+            })
+            .collect()
     }
 
     #[test]

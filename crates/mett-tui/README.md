@@ -47,8 +47,10 @@ cargo test -p mett-tui
 - **`config` tests:** the lexer (quoting, escapes, expansion, backticks,
   line continuation), every form of `set`, `source` (including loops),
   file lookup, and `msgraph://` URLs with mutt's `=` shortcut.
-- **`editor` tests:** which editor and keys are used, and the built-in
-  editor's keys for each of vim, emacs and Notepad.
+- **`editor` tests:** which editor and keys are used, the built-in
+  editor's keys for each of vim, emacs and Notepad, and spell checking
+  (`editor/spell.rs`: words, dictionaries, suggestions; the keys of each).
+  The en_US dictionary is built in (`assets/dictionaries/`).
 - **`gui` tests:** window keys as a terminal reports them (Control, Meta,
   AltGr, dead keys), the paste shortcut, font measuring, and the backend
   that keeps the cells and the cursor. They need no window.

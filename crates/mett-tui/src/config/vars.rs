@@ -199,6 +199,10 @@ pub const VARS: &[Var] = &[
     var("signature", Kind::Path, "~/.signature"),
     var("sort", Kind::String, "reverse-date"),
     var("sort_aux", Kind::String, "date"),
+    var("spell_check", Kind::Bool, "yes"),
+    var("spell_dict_path", Kind::String, ""),
+    var("spell_lang", Kind::String, "en_US"),
+    var("spell_words", Kind::Path, "~/.config/mett/words"),
     var("spoolfile", Kind::Path, ""),
     var(
         "status_format",

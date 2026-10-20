@@ -55,6 +55,9 @@ pub struct Settings {
     /// rather than in the user's own (`editor`, `editor_keys`). Set by the
     /// caller, which knows the environment ([`crate::editor::builtin`]).
     pub builtin_editor: Option<crate::editor::Keys>,
+    /// How the built-in editor checks spelling (`spell_check`,
+    /// `spell_lang`, `spell_dict_path`, `spell_words`).
+    pub spell: crate::editor::spell::Settings,
 }
 
 impl Default for Settings {
@@ -81,6 +84,7 @@ impl Default for Settings {
             fast_reply: false,
             metoo: false,
             builtin_editor: None,
+            spell: crate::editor::spell::Settings::default(),
         }
     }
 }
@@ -144,6 +148,12 @@ impl Settings {
             fast_reply: config.flag("fast_reply"),
             metoo: config.flag("metoo"),
             builtin_editor: None,
+            spell: crate::editor::spell::Settings::new(
+                config.flag("spell_check"),
+                config.string("spell_lang"),
+                config.string("spell_dict_path"),
+                config.string("spell_words"),
+            ),
         })
     }
 

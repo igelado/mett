@@ -192,6 +192,11 @@ pub enum Msg {
     },
     /// The user closed the window (the GUI's).
     Close,
+    /// The dictionaries for these spelling settings were loaded, or not.
+    SpellerLoaded(
+        crate::editor::spell::Settings,
+        Result<std::sync::Arc<crate::editor::spell::Speller>, String>,
+    ),
     /// The user pasted text.
     Paste(String),
     /// The user asked to paste from the clipboard (in the GUI's window).
@@ -245,6 +250,16 @@ pub enum Effect {
         path: std::path::PathBuf,
         /// The text.
         text: String,
+    },
+    /// Load the dictionaries for these spelling settings, then send back
+    /// [`Msg::SpellerLoaded`].
+    LoadSpeller(crate::editor::spell::Settings),
+    /// Add `word` to the user's own words, in the file at `path`.
+    AddWord {
+        /// The file (`spell_words`).
+        path: std::path::PathBuf,
+        /// The word.
+        word: String,
     },
     /// Edit the text in the user's editor, then send back
     /// [`Msg::Edited`].
@@ -570,6 +585,13 @@ pub struct App {
     /// The built-in editor, while a message is written in it. (The view
     /// lays the text out in it, hence the cell.)
     pub editing: Option<std::cell::RefCell<crate::editor::builtin::Builtin>>,
+    /// The dictionaries, once loaded, with the settings they are for.
+    speller: Option<(
+        crate::editor::spell::Settings,
+        std::sync::Arc<crate::editor::spell::Speller>,
+    )>,
+    /// The settings whose dictionaries are being loaded.
+    speller_loading: Option<crate::editor::spell::Settings>,
     /// The request fetching a message to reply to or forward.
     compose_fetch: Option<(RequestId, Kind, MessageId)>,
     /// The reply or forward whose message couldn't be fetched for want of
@@ -889,6 +911,8 @@ impl App {
             input: None,
             composing: None,
             editing: None,
+            speller: None,
+            speller_loading: None,
             compose_fetch: None,
             compose_unfetched: None,
             recall: None,
@@ -1088,6 +1112,7 @@ impl App {
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
             Msg::Close => self.close(),
+            Msg::SpellerLoaded(settings, result) => self.on_speller_loaded(settings, result),
             Msg::Paste(text) => {
                 self.paste(&text);
                 Vec::new()
@@ -2710,6 +2735,10 @@ impl App {
     pub(super) fn fail(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.error = Some(self.status.clone());
+        // The built-in editor hides the message line: it says it.
+        if let Some(editing) = &mut self.editing {
+            editing.get_mut().say(&self.status);
+        }
     }
 
     /// [`Self::fail`], shown over the question being asked too.

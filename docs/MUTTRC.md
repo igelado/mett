@@ -108,6 +108,8 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
 | Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then mett's built-in editor (§4.11), which `builtin` asks for. |
 | | `editor_keys` | string | mett's own: the built-in editor's keys, `vim`, `emacs` or `notepad` (§4.11). |
+| | `spell_check`, `spell_lang` | boolean, string | mett's own: whether the built-in editor underlines misspelled words (`yes`), and with which dictionaries, comma-separated (`en_US`) (§4.11). |
+| | `spell_dict_path`, `spell_words` | string, path | mett's own: more directories to find dictionaries in (separated as in `PATH`), and the file of the words you added (`~/.config/mett/words`) (§4.11). |
 | | `gui_font`, `gui_font_size` | path, number | mett's own, for `mett-gui`: the font its window shows text in (a monospaced TrueType or OpenType file; by default, the Cascadia Mono it comes with), and its size in points (`14`). Read when it starts. |
 | | `include` | quadoption | Quote the message in replies. |
 | | `attribution`, `indent_string` | string | The line before quoted text (`On %d, %n wrote:`), and the prefix of quoted lines (`> `). |
@@ -343,8 +345,31 @@ message, which `abort_unmodified` aborts).
 | Search | `/` | `C-s` | `^F`, then F3 and Shift+F3 |
 | Select | `v` | `C-Space` sets the mark; `C-w` cuts, `M-w` copies | Shift and the arrows, Home, End; `^A` selects all; `^X`, `^C`, `^V` |
 | Undo, redo | `u`, `^R` | `C-/`, `C-u`; `C-r` | `^Z`, `^Y` |
+| Spelling on, off | `:set spell`, `:set nospell`, `:set spell!` | `M-x flyspell-mode` | F7 |
+| Dictionaries | `:set spelllang=en_us,es_es` | `M-x ispell-change-dictionary` | (`:set spell_lang` in mett) |
+| Next, previous misspelled word | `]s`, `[s` | `M-g n`, `M-g p` | F8 (and its suggestions), Shift+F8 |
+| Suggestions for the word | `z=` | `M-$` | `^.` |
+| Add the word to yours | `zg` | `a` in the suggestions | `a` in the suggestions |
 
-`M-x` runs `save-buffer`, `save-buffers-kill-terminal` and `kill-buffer`.
+`M-x` runs `save-buffer`, `save-buffers-kill-terminal`, `kill-buffer`,
+`flyspell-mode` and `ispell-change-dictionary`.
+
+**Spelling.** With `spell_check` set (the default), the built-in editor
+underlines misspelled words, in red where the terminal can: not in quoted
+lines (`>`), the signature, web and mail addresses, words with digits, or
+in capitals (`HTML`). Suggestions show on the bottom line: a digit puts one
+in place of the word, `a` adds it to your words (`spell_words`, one a
+line), any other key leaves it. Turning spelling on or off, or changing
+the dictionaries, in the editor sets `spell_check` and `spell_lang` until
+mett ends (the mettrc is left as it is).
+
+The dictionaries are Hunspell's (`<lang>.aff` and `<lang>.dic`): mett has
+`en_US`, from [SCOWL](http://wordlist.aspell.net/), and finds others in
+`spell_dict_path`, `~/.config/mett/dictionaries/`, and the system's
+(`/usr/share/hunspell/`, `/usr/share/myspell/`; on a Mac,
+`~/Library/Spelling/` and `/Library/Spelling/`). Linux distributions
+package them (`hunspell-es` on Debian, `hunspell-es_any` on Arch, say);
+LibreOffice's are the same files. `en_us` finds `en_US` too.
 The editing keys are those of [edtui](https://github.com/preiter93/edtui),
 the editor it is built on: most of vim's motions and operators, and
 emacs's movement and deletion. In the terminal, its clipboard is its

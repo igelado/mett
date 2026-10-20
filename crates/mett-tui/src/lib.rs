@@ -1483,6 +1483,17 @@ fn dispatch(
                 Some(app::Msg::FileRead(op, path, read))
             }),
             Effect::Command(command) => deferred.commands.push(command),
+            // Loading dictionaries takes a moment: on a thread of its own.
+            Effect::LoadSpeller(settings) => spawn_file(files, false, move || {
+                let home = platform::home();
+                let loaded = editor::spell::Speller::load(&settings, home.as_deref());
+                Some(Msg::SpellerLoaded(settings, loaded.map(Arc::new)))
+            }),
+            Effect::AddWord { path, word } => spawn_file(files, true, move || {
+                append_line(&path, &word)
+                    .err()
+                    .map(|e| Msg::Failed(format!("spell_words: {}: {e}", path.display())))
+            }),
             Effect::Later(after, timer) => {
                 let timers = timers.clone();
                 tokio::spawn(async move {
