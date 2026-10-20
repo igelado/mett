@@ -102,6 +102,11 @@ pub struct Builtin {
     clipboard: Clipboard,
     /// The text as last saved: what leaving without saving gives back.
     saved: String,
+    /// The text given, and as the editor holds it (without `\r` before
+    /// line ends): left unchanged, the text given goes back.
+    given: (String, String),
+    /// Escape was typed in emacs's keys: the next key has Meta.
+    meta: bool,
     /// A command being typed on the bottom line (vim's `:`, emacs's
     /// `M-x`).
     command: Option<LineEditor>,
@@ -163,12 +168,15 @@ impl Builtin {
             Keys::Emacs => "C-x C-c sends the text on, C-x k drops the changes",
             Keys::Notepad => "^S sends the text on, Esc drops the changes",
         };
+        let held = String::from(state.lines.clone());
         Self {
             state,
             events,
             keys,
             clipboard,
-            saved: text.to_owned(),
+            saved: held.clone(),
+            given: (text.to_owned(), held),
+            meta: false,
             command: None,
             question: None,
             prefix: None,
@@ -200,12 +208,21 @@ impl Builtin {
 
     /// Leaves, saving the text first.
     fn save_and_leave(&mut self) -> Outcome {
-        Outcome::Done(self.text())
+        let text = self.text();
+        self.done(text)
     }
 
     /// Leaves without saving.
     fn leave(&mut self) -> Outcome {
-        Outcome::Done(std::mem::take(&mut self.saved))
+        let text = std::mem::take(&mut self.saved);
+        self.done(text)
+    }
+
+    /// Hands `text` back: the text given, if it is what the editor started
+    /// with.
+    fn done(&mut self, text: String) -> Outcome {
+        let (given, held) = std::mem::take(&mut self.given);
+        Outcome::Done(if text == held { given } else { text })
     }
 
     /// Applies a key press.
@@ -346,6 +363,16 @@ impl Builtin {
             self.edit(key);
             return Outcome::Editing;
         }
+        // Escape and a key is Meta and that key, for terminals that send
+        // them apart (and as emacs reads them anyway).
+        let key = if std::mem::take(&mut self.meta) {
+            KeyEvent::new(key.code, key.modifiers | KeyModifiers::ALT)
+        } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            self.meta = true;
+            return Outcome::Editing;
+        } else {
+            key
+        };
         if is_ctrl(key, 'x') {
             self.prefix = Some(key);
         } else if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::ALT {
@@ -609,6 +636,9 @@ impl Builtin {
         }
         if let Some(prefix) = self.prefix {
             return Bottom::Hint(describe(prefix) + "-");
+        }
+        if self.meta {
+            return Bottom::Hint("ESC-".into());
         }
         let mode = match (self.keys, self.state.mode) {
             (Keys::Vim, EditorMode::Insert) => "-- INSERT --",
@@ -918,6 +948,47 @@ mod tests {
         assert_eq!(
             press(&mut emacs, &chars("kill-buffer\n")),
             Outcome::Done("text\n".into())
+        );
+    }
+
+    #[test]
+    fn line_ends_with_carriage_returns_go_back_as_given() {
+        let given = "\r\n-- \r\nMe\r\n";
+        let mut vim = Builtin::new(given, Keys::Vim);
+        assert_eq!(press(&mut vim, &chars(":q\n")), Outcome::Done(given.into()));
+        let mut vim = Builtin::new(given, Keys::Vim);
+        assert_eq!(press(&mut vim, &chars("ZZ")), Outcome::Done(given.into()));
+        // Changed, the text has the editor's line ends.
+        let mut vim = Builtin::new(given, Keys::Vim);
+        assert_eq!(
+            press(&mut vim, &chars("iHi\x1bZZ")),
+            Outcome::Done("Hi\n-- \nMe\n".into())
+        );
+    }
+
+    #[test]
+    fn emacs_reads_escape_and_a_key_as_meta() {
+        let esc = KeyEvent::from(KeyCode::Esc);
+        let mut emacs = Builtin::new("one two\n", Keys::Emacs);
+        press(
+            &mut emacs,
+            &[ctrl(' '), ctrl('f'), ctrl('f'), ctrl('f'), esc],
+        );
+        assert_eq!(emacs.bottom(80), Bottom::Hint("ESC-".into()));
+        press(&mut emacs, &chars("w"));
+        assert_eq!(emacs.text(), "one two\n");
+        press(&mut emacs, &[ctrl('e'), ctrl('y')]);
+        assert_eq!(emacs.text(), "one twoone\n");
+        press(&mut emacs, &[esc]);
+        press(&mut emacs, &chars("x"));
+        assert_eq!(
+            press(&mut emacs, &chars("kill-buffer\n")),
+            Outcome::Editing,
+            "asks first"
+        );
+        assert_eq!(
+            press(&mut emacs, &chars("y")),
+            Outcome::Done("one two\n".into())
         );
     }
 
