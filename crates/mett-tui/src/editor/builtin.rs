@@ -17,8 +17,8 @@ use edtui::actions::motion::{MoveToFirstRow, MoveToLastRow};
 use edtui::actions::search::StartSearch;
 use edtui::actions::{
     Action, Chainable, DeleteChar, DeleteCharForward, DeleteWordBackward, FindNext, FindPrevious,
-    LineBreak, MoveBackward, MoveDown, MoveForward, MovePageDown, MovePageUp, MoveToEndOfLine,
-    MoveToStartOfLine, MoveUp, MoveWordBackward, MoveWordForward, PasteBefore, Redo,
+    InsertChar, LineBreak, MoveBackward, MoveDown, MoveForward, MovePageDown, MovePageUp,
+    MoveToEndOfLine, MoveToStartOfLine, MoveUp, MoveWordBackward, MoveWordForward, Redo,
     RemoveCharFromSearch, SelectCurrentSearch, StopSearch, SwitchMode, Undo,
 };
 use edtui::clipboard::ClipboardTrait;
@@ -143,11 +143,6 @@ impl Builtin {
             Keys::Vim => EditorEventHandler::vim_mode(),
             Keys::Emacs => {
                 let mut events = EditorEventHandler::emacs_mode();
-                // `C-y` yanks at the cursor (edtui's emacs pastes after
-                // the character under it, as vim's `p`).
-                events
-                    .key_handler
-                    .insert(KeyEventRegister::i(vec![KeyInput::ctrl('y')]), PasteBefore);
                 // `C-/` undoes, as in emacs. Terminals send it as `C-_`,
                 // which crossterm may also read as `C-7`.
                 for key in ['/', '_', '7'] {
@@ -384,6 +379,9 @@ impl Builtin {
         } else if is_ctrl(key, 'g') {
             self.deselect();
             self.note = Some("Quit".into());
+        } else if is_ctrl(key, 'y') {
+            self.deselect();
+            self.paste();
         } else if is_ctrl(key, 'w') {
             if let Some(region) = self.region() {
                 self.copy(region);
@@ -455,10 +453,17 @@ impl Builtin {
         {
             self.delete(region);
         } else if let Some(region) = selected
-            && (typing(key) || is_ctrl(key, 'v'))
+            && let Some(text) = self.replacement(key)
         {
-            self.delete(region);
-            self.edit(key);
+            // Replaced, as one change to undo; with nothing to paste, the
+            // selection stays.
+            if !text.is_empty() {
+                self.delete(region);
+                self.insert(&text);
+            }
+        } else if is_ctrl(key, 'v') {
+            self.deselect();
+            self.paste();
         } else {
             self.deselect();
             self.edit(key);
@@ -563,6 +568,49 @@ impl Builtin {
             Some((cursor, anchor))
         } else {
             None
+        }
+    }
+
+    /// What `key` puts in place of a selection: what it types, or, for
+    /// `^V`, what is on the clipboard.
+    fn replacement(&self, key: KeyEvent) -> Option<String> {
+        if is_ctrl(key, 'v') {
+            return Some(self.clipboard.0.borrow().clone());
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Tab if plain(key) => Some(
+                if key.code == KeyCode::Enter {
+                    "\n"
+                } else {
+                    "\t"
+                }
+                .into(),
+            ),
+            _ => typed(key).map(String::from),
+        }
+    }
+
+    /// Inserts the clipboard's text at the cursor, as typed (edtui's
+    /// paste takes text starting with a line end as whole lines, as vim
+    /// does), as one change to undo.
+    fn paste(&mut self) {
+        let text = self.clipboard.0.borrow().clone();
+        if !text.is_empty() {
+            // edtui keeps its undo point to itself; deleting nothing sets
+            // one.
+            self.state.execute(DeleteChar(0));
+            self.insert(&text);
+        }
+    }
+
+    /// Inserts `text` at the cursor, as part of the last change to undo.
+    fn insert(&mut self, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\n' => self.state.execute(LineBreak(1)),
+                '\r' => {}
+                c => self.state.execute(InsertChar(c)),
+            }
         }
     }
 
@@ -708,7 +756,6 @@ fn notepad_bindings() -> KeyEventHandler {
         ),
         (R::i(vec![KeyInput::ctrl('z')]), Undo.into()),
         (R::i(vec![KeyInput::ctrl('y')]), Redo.into()),
-        (R::i(vec![KeyInput::ctrl('v')]), PasteBefore.into()),
         (
             R::i(vec![KeyInput::ctrl('f')]),
             StartSearch.chain(SwitchMode(EditorMode::Search)).into(),
@@ -774,7 +821,20 @@ fn plain(key: KeyEvent) -> bool {
 
 /// Whether `key` types text (a character, Enter, Tab).
 fn typing(key: KeyEvent) -> bool {
-    plain(key) && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
+    typed(key).is_some() || (plain(key) && matches!(key.code, KeyCode::Enter | KeyCode::Tab))
+}
+
+/// The character `key` types: one with no Control or Alt, or, as edtui
+/// takes it, one typed with AltGr (Control and Alt, or Alt alone, and not
+/// a letter: AltGr+Q is `@` on German keyboards).
+fn typed(key: KeyEvent) -> Option<char> {
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    let modifiers = key.modifiers.difference(KeyModifiers::SHIFT);
+    let altgr =
+        modifiers == KeyModifiers::CONTROL | KeyModifiers::ALT || modifiers == KeyModifiers::ALT;
+    (modifiers.is_empty() || (altgr && !c.is_ascii_alphabetic())).then_some(c)
 }
 
 /// Whether `key` moves the cursor in Notepad's keys.
@@ -1093,6 +1153,52 @@ mod tests {
             press(&mut emacs, &[ctrl(c)]);
             assert_eq!(emacs.text(), "text\n", "C-{c}");
         }
+    }
+
+    #[test]
+    fn notepad_replaces_a_selection_as_one_change() {
+        let mut notepad = Builtin::new("one two\n", Keys::Notepad);
+        let right = shift(KeyCode::Right);
+        // Nothing on the clipboard yet: ^V leaves the selection.
+        press(&mut notepad, &[right, right, right, ctrl('v')]);
+        assert_eq!(notepad.text(), "one two\n");
+        assert!(notepad.region().is_some());
+        press(&mut notepad, &chars("1"));
+        assert_eq!(notepad.text(), "1 two\n");
+        press(&mut notepad, &[ctrl('z')]);
+        assert_eq!(notepad.text(), "one two\n");
+        // AltGr+Q, `@` on a German keyboard, replaces it too.
+        let at = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        press(
+            &mut notepad,
+            &[KeyEvent::from(KeyCode::Home), right, right, right, at],
+        );
+        assert_eq!(notepad.text(), "@ two\n");
+    }
+
+    #[test]
+    fn pastes_line_ends_as_typed() {
+        // The line end after `ab`, and `cd`, copied and pasted after `cd`.
+        let mut notepad = Builtin::new("ab\ncd\n", Keys::Notepad);
+        let end = KeyEvent::from(KeyCode::End);
+        press(&mut notepad, &[end, shift(KeyCode::Down), ctrl('c')]);
+        press(
+            &mut notepad,
+            &[KeyEvent::from(KeyCode::Left), end, ctrl('v')],
+        );
+        assert_eq!(notepad.text(), "ab\ncd\ncd\n");
+        press(&mut notepad, &[ctrl('z')]);
+        assert_eq!(notepad.text(), "ab\ncd\n");
+
+        let mut emacs = Builtin::new("ab\ncd\n", Keys::Emacs);
+        press(
+            &mut emacs,
+            &[ctrl('e'), ctrl(' '), ctrl('n'), alt('w'), ctrl('y')],
+        );
+        assert_eq!(emacs.text(), "ab\ncd\ncd\n");
     }
 
     #[test]
