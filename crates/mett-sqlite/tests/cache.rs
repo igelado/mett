@@ -208,6 +208,22 @@ async fn backends_that_cannot_sync_are_not_cached() {
     assert_eq!(listing(&store, 2).await, ["m0"]);
 }
 
+/// On every system (Windows too), a cache opens in a place that isn't
+/// there yet, and opens again.
+#[tokio::test(start_paused = true)]
+async fn a_new_cache_opens_anywhere() {
+    let dir = std::env::temp_dir().join(format!("mett-sqlite-new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("cache").join("alice@contoso.com.sqlite");
+    {
+        let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
+        listing(&store, 10).await;
+    }
+    assert!(path.is_file());
+    Cache::open(&path, &alice()).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test(start_paused = true)]
 async fn the_cache_is_private_and_lasts() {

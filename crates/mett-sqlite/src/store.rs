@@ -197,9 +197,10 @@ fn private_place(path: &Path) -> std::io::Result<()> {
 }
 
 /// Elsewhere (Windows), the cache is used without making sure only its
-/// owner can read it: its directory is created if it isn't there, and the
-/// file there must not be a symbolic link. (In the user's profile, the
-/// default place, others can't read it anyway.)
+/// owner can read it: its directory and file are created if they aren't
+/// there (the file is checked before SQLite opens it), and the file must
+/// not be a symbolic link. (In the user's profile, the default place,
+/// others can't read it anyway.)
 #[cfg(not(unix))]
 fn private_place(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -208,6 +209,10 @@ fn private_place(path: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(std::io::Error::other("it is a symbolic link"));
     }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     Ok(())
 }
 
