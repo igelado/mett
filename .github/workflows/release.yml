@@ -2,8 +2,8 @@
 #
 # Pushing a tag vX.Y.Z builds the Debian/Ubuntu, Arch Linux and tarball
 # packages for x86_64 and aarch64 Linux, the macOS archives (aarch64,
-# x86_64) and the Windows one (x86_64), and publishes them as that tag's
-# release. Running it by hand (workflow_dispatch) only builds them, to check
+# x86_64) and disk image (an installer for both), and the Windows archive
+# and installer (x86_64), and publishes them as that tag's release. Running it by hand (workflow_dispatch) only builds them, to check
 # that they build, and keeps them as the run's artifacts; it publishes
 # nothing.
 
@@ -78,6 +78,7 @@ jobs:
           -t aarch64-apple-darwin -t x86_64-apple-darwin
           && rustup default 1.95
       - run: packaging/archive.sh aarch64-apple-darwin x86_64-apple-darwin
+      - run: packaging/macos-installer.sh
       - uses: actions/upload-artifact@v4
         with:
           name: packages-macos
@@ -96,6 +97,11 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
       - run: packaging/archive.sh x86_64-pc-windows-msvc
+      - name: Install Inno Setup, if the runner hasn't it
+        run: >
+          command -v iscc || [ -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]
+          || choco install innosetup --no-progress -y
+      - run: packaging/windows-installer.sh
       - uses: actions/upload-artifact@v4
         with:
           name: packages-windows

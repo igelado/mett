@@ -136,7 +136,7 @@ mod tests {
         let dir = tmpdir("private");
         // An "editor" that appends a line, and records the file's mode.
         let editor = Editor::new(
-            "f() { echo world >> \"$1\"; stat -c %a \"$1\" > \"$1.mode\"; }; f",
+            "f() { echo world >> \"$1\"; ls -l \"$1\" | cut -c1-10 > \"$1.mode\"; }; f",
             dir.to_str().unwrap(),
             &|_| None,
         );
@@ -147,7 +147,10 @@ mod tests {
             .collect();
         // The message file itself is gone; only the mode record is left.
         assert_eq!(modes.len(), 1, "{modes:?}");
-        assert_eq!(fs::read_to_string(&modes[0]).unwrap().trim(), "600");
+        // (Windows has no such modes: the user's own temporary directory
+        // keeps it private there.)
+        #[cfg(unix)]
+        assert_eq!(fs::read_to_string(&modes[0]).unwrap().trim(), "-rw-------");
         fs::remove_dir_all(&dir).unwrap();
     }
 

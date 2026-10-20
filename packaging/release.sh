@@ -23,7 +23,7 @@ if ! gh release view "$tag" >/dev/null 2>&1; then
     # --verify-tag: the tag must have been pushed; never create one.
     gh release create "$tag" --verify-tag $prerelease \
         --title "mett ${tag#v}" \
-        --notes 'Packages for Linux: Debian and Ubuntu (`.deb`), Arch Linux (`.pkg.tar.zst`) and other distributions (`-linux.tar.gz`), for x86_64 and aarch64. For macOS (`-macos.tar.gz`), Apple silicon (aarch64) and Intel (x86_64). For Windows (`-windows.zip`), x86_64. Check them against `SHA256SUMS`.'
+        --notes 'Packages for Linux: Debian and Ubuntu (`.deb`), Arch Linux (`.pkg.tar.zst`) and other distributions (`-linux.tar.gz`), for x86_64 and aarch64. For macOS: an installer (`-macos.dmg`) for Apple silicon and Intel, or the binary alone (`-aarch64-macos.tar.gz`, `-x86_64-macos.tar.gz`). For Windows on x86_64: an installer (`-windows-setup.exe`), or the binary alone (`-windows.zip`). The installers are not signed yet: see the README. Check them against `SHA256SUMS`.'
 fi
 [ -f SHA256SUMS ] || { echo "$0: dist/SHA256SUMS is missing" >&2; exit 1; }
 gh release upload "$tag" --clobber -- *

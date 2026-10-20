@@ -25,12 +25,20 @@ for x86_64 and aarch64:
 - **Arch Linux:** `sudo pacman -U mett-<version>-1-<x86_64|aarch64>.pkg.tar.zst`
 - **Other Linux:** the `-linux.tar.gz` holds the `mett` binary, which needs
   nothing else.
-- **macOS:** the `-aarch64-macos.tar.gz` (Apple silicon) or
-  `-x86_64-macos.tar.gz` (Intel) holds the `mett` binary: put it on your
-  `PATH`. It isn't signed: if macOS refuses to open it, run
-  `xattr -d com.apple.quarantine mett` once.
-- **Windows (x86_64):** the `-windows.zip` holds `mett.exe`: put it on your
-  `PATH` and run it in Windows Terminal. It reads `mettrc` from
+- **macOS** (Apple silicon or Intel): open `mett-<version>-macos.dmg` and
+  run *Install mett.pkg*, which installs `/usr/local/bin/mett`. The
+  installer isn't signed yet, so macOS stops it the first time: open
+  **System Settings › Privacy & Security** and choose **Open Anyway**
+  (or run `sudo installer -pkg "/Volumes/mett <version>/Install mett.pkg"
+  -target /`). To remove it: `sudo rm -r /usr/local/bin/mett
+  /usr/local/share/doc/mett && sudo pkgutil --forget io.github.igelado.mett`.
+  The `-aarch64-macos.tar.gz` and `-x86_64-macos.tar.gz` hold the binary
+  alone (if macOS refuses to run it, `xattr -d com.apple.quarantine mett`).
+- **Windows** (x86_64): run `mett-<version>-x86_64-windows-setup.exe`. It
+  installs for you alone (or for everyone, as administrator), adds mett to
+  the `PATH`, and is uninstalled from Windows' **Installed apps**. It isn't
+  signed yet, so SmartScreen may warn: choose **More info › Run anyway**.
+  The `-windows.zip` holds `mett.exe` alone. Run mett in Windows Terminal. It reads `mettrc` from
   `%USERPROFILE%\.config\mett\` (or `%USERPROFILE%\.mettrc`), keeps sign-ins
   in the Windows Credential Manager, and edits messages with Notepad
   unless `editor` says otherwise. `query_command` and backticks in the
