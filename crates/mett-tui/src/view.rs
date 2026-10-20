@@ -860,14 +860,14 @@ fn render_pager(
             let (style, body) = line_style(pager, *line, &app.display);
             // Byte by byte, what colors each part of the row.
             let mut marks: Vec<Option<Style>> = vec![None; range.len()];
-            let mut mark = |start: usize, end: usize, style: Style| {
+            let mut restyle = |start: usize, end: usize, change: &dyn Fn(Style) -> Style| {
                 let (start, end) = (start.max(range.start), end.min(range.end));
                 for slot in marks
                     .iter_mut()
                     .take(end.saturating_sub(range.start))
                     .skip(start.saturating_sub(range.start))
                 {
-                    *slot = Some(style);
+                    *slot = Some(change(slot.unwrap_or(style)));
                 }
             };
             if body {
@@ -882,15 +882,21 @@ fn render_pager(
                         })
                         .collect()
                 }) {
-                    mark(found.start, found.end, style.patch(*rule));
+                    restyle(found.start, found.end, &|_| style.patch(*rule));
                 }
             }
+            // Links are underlined, in whatever color they have.
+            for link in pager.links.iter().filter(|link| link.line == *line) {
+                restyle(link.range.start, link.range.end, &|s| {
+                    s.add_modifier(Modifier::UNDERLINED)
+                });
+            }
             for (_, found) in found.iter().filter(|(r, _)| r == row) {
-                mark(
-                    range.start + found.start,
-                    range.start + found.end,
-                    style.patch(colors.search),
-                );
+                // Over a link, still underlined.
+                restyle(range.start + found.start, range.start + found.end, &|s| {
+                    let link = s.add_modifier & Modifier::UNDERLINED;
+                    style.patch(colors.search).add_modifier(link)
+                });
             }
             let row_text = &text[range.clone()];
             // Runs of one style, cut only between graphemes (a match in
@@ -1641,6 +1647,37 @@ mod tests {
             lines[10],
             "-- mett: Compose  [Approx. msg size: 2.0K   Atts: 1]---"
         );
+    }
+
+    #[test]
+    fn links_are_underlined() {
+        let mut app = app(1);
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
+        let mut message = mock::message("m0", "in", "Subject 0", received(0));
+        message.body.content = "Read the docs<https://example.com>.".into();
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        assert_eq!(screen(&app)[4], "Read the docs.");
+        let buffer = drawn(&app, WIDTH, HEIGHT);
+        let underlined = |x: u16| buffer[(x, 4)].modifier.contains(Modifier::UNDERLINED);
+        assert!((9..13).all(underlined), "the link's text");
+        assert!(!underlined(8) && !underlined(13));
+
+        // Found by a search, it is still underlined.
+        act(&mut app, Action::Search);
+        typed(&mut app, "the d");
+        key(&mut app, KeyCode::Enter);
+        let buffer = drawn(&app, WIDTH, HEIGHT);
+        let found = |x: u16| buffer[(x, 4)].modifier.contains(Modifier::REVERSED);
+        let underlined = |x: u16| buffer[(x, 4)].modifier.contains(Modifier::UNDERLINED);
+        assert!((5..10).all(found), "the match");
+        assert!((9..13).all(underlined) && !underlined(5) && !underlined(8));
+
+        act(&mut app, Action::ToggleLinks);
+        assert_eq!(screen(&app)[4], "Read the docs<https://example.com>.");
+        let buffer = drawn(&app, WIDTH, HEIGHT);
+        let underlined = |x: u16| buffer[(x, 4)].modifier.contains(Modifier::UNDERLINED);
+        assert!((14..33).all(underlined), "the URL");
+        assert!(!underlined(10) && !underlined(13) && !underlined(33));
     }
 
     #[test]

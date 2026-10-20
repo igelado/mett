@@ -350,6 +350,7 @@ fn settings_keeping(
                 .map_err(|_| "pager_index_lines must be 0 (off) or a number of lines")?,
             _ => 0,
         },
+        collapse_links: config.flag("collapse_links"),
     };
     let ordering = app::Ordering {
         sort: sort::Sort::parse(config.string("sort"), true).map_err(|e| format!("sort: {e}"))?,

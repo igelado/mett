@@ -27,6 +27,8 @@ pub struct Display {
     /// `pager_index_lines`: the rows of the index shown above the pager
     /// (see [`Display::mini_index_rows`]).
     pub pager_index_lines: usize,
+    /// `collapse_links`: the pager shows links' text, not their URLs.
+    pub collapse_links: bool,
 }
 
 /// The fewest rows the pager keeps for the message when the mini-index
@@ -79,6 +81,7 @@ impl PartialEq for Display {
             && self.colors == other.colors
             && self.wrap == other.wrap
             && self.pager_index_lines == other.pager_index_lines
+            && self.collapse_links == other.collapse_links
     }
 }
 
@@ -103,6 +106,7 @@ impl Default for Display {
             colors: Colors::default(),
             wrap: 0,
             pager_index_lines: 0,
+            collapse_links: true,
         }
     }
 }
@@ -320,6 +324,16 @@ mod tests {
 
     use super::*;
     use crate::format::expand;
+
+    #[test]
+    fn displays_differ_in_how_links_are_shown() {
+        let collapsed = Display::default();
+        let expanded = Display {
+            collapse_links: false,
+            ..Display::default()
+        };
+        assert_ne!(collapsed, expanded);
+    }
 
     #[test]
     fn index_expandos() {

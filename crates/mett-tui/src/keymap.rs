@@ -393,6 +393,7 @@ impl Keymap {
             (Key::char('r'), Reply),
             (Key::char('g'), GroupReply),
             (Key::char('f'), Forward),
+            (Key::char('L'), ToggleLinks),
         ];
 
         let sign_in: &[(Key, Action)] = &[

@@ -670,7 +670,8 @@ mod tests {
         message.bcc = vec![Address::new("secret@x.org")];
         assert!(!forwarded(&message).contains("secret@x.org"));
         assert!(
-            text::pager_lines(&message)
+            text::pager_view(&message, true)
+                .0
                 .iter()
                 .any(|l| l.contains("secret@x.org"))
         );

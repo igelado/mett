@@ -92,6 +92,7 @@ actions! {
     SaveEntry => "save-entry", "Save the attachment to a file";
     AttachFile => "attach-file", "Attach a file to the message";
     DetachFile => "detach-file", "Take the attached file off the message";
+    ToggleLinks => "toggle-links", "Show or hide the URLs of the message's links";
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";

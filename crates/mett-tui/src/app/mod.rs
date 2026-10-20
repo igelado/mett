@@ -330,9 +330,52 @@ pub struct Pager {
     pub body_start: usize,
     /// The line the signature starts at (`-- `), if there is one.
     pub signature: Option<usize>,
+    /// The links in `lines`, drawn underlined.
+    pub links: Vec<text::Link>,
+    /// Links show only their text, not their URLs (`collapse_links`, until
+    /// `toggle-links`).
+    pub collapse_links: bool,
 }
 
 impl Pager {
+    /// Lays out `message` to show, wrapped to `width`.
+    fn show(&mut self, message: &Message, width: usize) {
+        (self.lines, self.links) = text::pager_view(message, self.collapse_links);
+        self.body_start = self
+            .lines
+            .iter()
+            .position(String::is_empty)
+            .map_or(self.lines.len(), |blank| blank + 1);
+        self.signature = self.lines[self.body_start..]
+            .iter()
+            .position(|line| line == "-- ")
+            .map(|at| self.body_start + at);
+        self.rows_width = None;
+        self.layout(width);
+    }
+
+    /// Shows the message's links collapsed or not, keeping the line at the
+    /// top of the screen there.
+    fn collapse_links(&mut self, collapse: bool, width: usize) {
+        if self.collapse_links == collapse {
+            return;
+        }
+        self.collapse_links = collapse;
+        let Some(message) = self.message.take() else {
+            // It is laid out as chosen once it arrives.
+            return;
+        };
+        let top = (self.scroll < self.row_count()).then(|| self.line_of(self.scroll));
+        self.show(&message, width);
+        self.message = Some(message);
+        if let Some(line) = top {
+            self.scroll = self.line_rows[line];
+        }
+        // Where the last search found text has moved.
+        self.search_match = None;
+        self.highlight = None;
+    }
+
     /// Re-wraps the message if the width changed.
     fn layout(&mut self, width: usize) {
         if self.rows_width != Some(width) {
@@ -1648,9 +1691,20 @@ impl App {
             Action::PreviousLine => self.scroll_by(-1),
             Action::NextPage => self.scroll_by(page as isize),
             Action::PreviousPage => self.scroll_by(-(page as isize)),
+            Action::ToggleLinks => self.toggle_links(),
             _ => {}
         }
         Vec::new()
+    }
+
+    /// Shows the open message's links' URLs, or hides them again, keeping
+    /// the line at the top of the screen there.
+    fn toggle_links(&mut self) {
+        let width = self.wrap_width();
+        if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
+            pager.collapse_links(!pager.collapse_links, width);
+        }
+        self.clamp_scroll();
     }
 
     /// The width the pager and text views wrap their text at: `wrap`
@@ -1728,6 +1782,8 @@ impl App {
             pending_search: None,
             body_start: 0,
             signature: None,
+            links: Vec::new(),
+            collapse_links: self.display.collapse_links,
         }));
         vec![fetch]
     }
@@ -2010,18 +2066,7 @@ impl App {
         let Screen::Pager(pager) = &mut self.screens[position] else {
             unreachable!("found above");
         };
-        pager.lines = text::pager_lines(&message);
-        pager.body_start = pager
-            .lines
-            .iter()
-            .position(String::is_empty)
-            .map_or(pager.lines.len(), |blank| blank + 1);
-        pager.signature = pager.lines[pager.body_start..]
-            .iter()
-            .position(|line| line == "-- ")
-            .map(|at| pager.body_start + at);
-        pager.rows_width = None;
-        pager.layout(self.display.wrap_width(self.width));
+        pager.show(&message, self.display.wrap_width(self.width));
         let message_id = message.summary.id.clone();
         let chosen = pager.read_chosen;
         pager.message = Some(message);
@@ -2337,7 +2382,19 @@ impl App {
         self.delete = settings.delete;
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
+        let collapse = settings.display.collapse_links;
+        let changed = collapse != self.display.collapse_links;
         self.display = settings.display;
+        if changed {
+            // Open messages follow `collapse_links` (also those shown as
+            // `toggle-links` chose).
+            let width = self.wrap_width();
+            for screen in &mut self.screens {
+                if let Screen::Pager(pager) = screen {
+                    pager.collapse_links(collapse, width);
+                }
+            }
+        }
         self.apply_sidebar(settings.sidebar);
         // `wrap` may have changed: the pager and text views wrap again.
         self.clamp_scroll();
@@ -3210,6 +3267,67 @@ mod tests {
         assert_eq!(app.screen(), &Screen::Index);
         act(&mut app, Action::Quit);
         assert!(app.quit);
+    }
+
+    #[test]
+    fn links_show_their_urls_only_when_asked() {
+        let mut app = loaded(1);
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
+        let mut message = message("m0", 30);
+        message
+            .body
+            .content
+            .push_str("the docs<https://example.com>\n");
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        let last = pager(&app).lines.len() - 1;
+        assert_eq!(pager(&app).lines[last], "the docs");
+        let link = text::Link {
+            line: last,
+            range: 4..8,
+        };
+        assert_eq!(pager(&app).links, [link]);
+
+        act(&mut app, Action::NextPage);
+        let top = pager(&app).scroll;
+        act(&mut app, Action::ToggleLinks);
+        assert_eq!(pager(&app).lines[last], "the docs<https://example.com>");
+        assert_eq!(pager(&app).links[0].range, 9..28);
+        assert_eq!(pager(&app).scroll, top, "the same line stays at the top");
+        assert_eq!(
+            pager(&app).row_count(),
+            text::wrap_all(&pager(&app).lines, 80).len()
+        );
+
+        act(&mut app, Action::ToggleLinks);
+        assert_eq!(pager(&app).lines[last], "the docs");
+        // The next message shows its links collapsed again.
+        act(&mut app, Action::ToggleLinks);
+        act(&mut app, Action::Exit);
+        act(&mut app, Action::DisplayMessage);
+        assert!(pager(&app).collapse_links);
+    }
+
+    #[test]
+    fn the_open_message_follows_collapse_links() {
+        let mut app = loaded(1);
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
+        let mut message = message("m0", 0);
+        message.body.content = "the docs<https://example.com>".into();
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        let last = pager(&app).lines.len() - 1;
+        assert_eq!(pager(&app).lines[last], "the docs");
+
+        let mut settings = Settings::default();
+        settings.display.collapse_links = false;
+        app.apply_settings(settings.clone());
+        assert_eq!(pager(&app).lines[last], "the docs<https://example.com>");
+        // Shown as toggle-links chose, until the setting changes again.
+        act(&mut app, Action::ToggleLinks);
+        app.apply_settings(settings.clone());
+        assert_eq!(pager(&app).lines[last], "the docs");
+        settings.display.collapse_links = true;
+        app.apply_settings(settings);
+        assert_eq!(pager(&app).lines[last], "the docs");
     }
 
     #[test]
