@@ -59,7 +59,10 @@ opens a window of its own, with the same screens and keys, and the same
 mettrc. In the window, messages are always written in mett's built-in
 editor (see [MUTTRC.md](docs/MUTTRC.md) §4.11). On Linux, `mett-gui`
 needs X11 or Wayland and the system's Vulkan or OpenGL drivers (Mesa's do)
-to run; nothing more to build.
+to run; nothing more to build. On Wayland, it reaches the system's
+clipboard through the compositor's data-control protocol (KDE's, Sway's,
+Hyprland's, ...) or else XWayland (GNOME runs it): without either, copying
+and pasting only work within mett.
 
 1. Install Rust with [rustup](https://rustup.rs/) (or `rustup update` an
    older one), then a C compiler and Git: `sudo apt install build-essential
