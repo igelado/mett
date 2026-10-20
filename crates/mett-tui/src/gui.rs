@@ -60,6 +60,14 @@ pub fn main() -> ExitCode {
     code
 }
 
+/// Says `message` on the standard error, if there is one (a program
+/// started from Windows' Explorer has none).
+fn log(message: &str) {
+    use std::io::Write;
+
+    let _ = writeln!(std::io::stderr(), "mett: {message}");
+}
+
 /// mett in a window: what it said before starting, and whether it did.
 #[derive(Default)]
 struct InWindow {
@@ -69,7 +77,7 @@ struct InWindow {
 
 impl Launch for &mut InWindow {
     fn say(&mut self, message: &str) {
-        eprintln!("mett: {message}");
+        log(message);
         self.said.push(message.to_owned());
     }
 
@@ -204,7 +212,7 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
     let event_loop = match EventLoop::<Shown>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(e) => {
-            eprintln!("mett: cannot open a window: {e}");
+            log(&format!("cannot open a window: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -240,7 +248,7 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
         code,
     };
     if let Err(e) = event_loop.run_app(&mut gui) {
-        eprintln!("mett: {e}");
+        log(&e.to_string());
         return ExitCode::FAILURE;
     }
     gui.code
@@ -479,7 +487,7 @@ impl Gui {
             }
         });
         if let Err(e) = drawn {
-            eprintln!("mett: cannot draw: {e}");
+            log(&format!("cannot draw: {e}"));
         }
     }
 }
@@ -490,7 +498,7 @@ impl ApplicationHandler<Shown> for Gui {
             return;
         }
         if let Err(e) = self.open(event_loop) {
-            eprintln!("mett: {e}");
+            log(&e.to_string());
             self.code = ExitCode::FAILURE;
             event_loop.exit();
         }

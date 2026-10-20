@@ -713,7 +713,12 @@ impl App {
             || self.composing.is_some()
             || self.screens.iter().any(|s| matches!(s, Screen::Compose(_)));
         if writing {
-            self.fail("A message is being written: send or postpone it first.");
+            let why = "A message is being written: send or postpone it first.";
+            match &mut self.editing {
+                // Said where the editor shows it.
+                Some(editing) => editing.get_mut().say(why),
+                None => self.fail(why),
+            }
             return Vec::new();
         }
         // What a file being saved, or a question, is waiting for would be
@@ -1236,10 +1241,13 @@ mod tests {
         answer(&mut app, "Hi");
         app.update(Msg::Close);
         assert!(!app.quit);
-        assert!(app.editing.is_some(), "still writing");
+        let editor = app.editing.as_ref().expect("still writing");
+        // Said on the editor's bottom line.
         assert_eq!(
-            app.status,
-            "A message is being written: send or postpone it first."
+            editor.borrow().bottom(80),
+            crate::editor::builtin::Bottom::Note(
+                "A message is being written: send or postpone it first.".into()
+            )
         );
         typed(&mut app, "iHello");
         key(&mut app, KeyCode::Esc);

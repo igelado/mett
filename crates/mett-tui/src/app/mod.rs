@@ -549,6 +549,9 @@ pub struct App {
     redraw: bool,
     /// Keys to play once the folder is listed.
     after_load: Vec<Stroke>,
+    /// What to say on the message line once the folder is listed (the
+    /// configuration's warnings, in the GUI's window).
+    notice: Option<String>,
     /// Escape was typed where it does nothing by itself, in this menu, and
     /// when: with the next key there, soon after, it is Meta and that key
     /// (`Esc v`), as in mutt.
@@ -879,6 +882,7 @@ impl App {
             played: 0,
             redraw: false,
             after_load: Vec::new(),
+            notice: None,
             escape: None,
             cancelled: false,
             dismissed: false,

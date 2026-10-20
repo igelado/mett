@@ -213,6 +213,11 @@ impl Builtin {
         String::from(self.state.lines.clone())
     }
 
+    /// Says `note` on the bottom line, until the next key.
+    pub fn say(&mut self, note: &str) {
+        self.note = Some(note.to_owned());
+    }
+
     /// Whether the text differs from the text as last saved.
     fn modified(&self) -> bool {
         self.text() != self.saved

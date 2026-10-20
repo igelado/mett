@@ -655,7 +655,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     let (mut app, effects) = App::open(size.width, size.height, folder, settings);
     app.keymap = keymap;
     if let Some(notice) = notice {
-        app.status = notice;
+        app.notice(notice);
     }
     // Played once the folder is listed, so that `push <last-entry>` has
     // somewhere to go.
