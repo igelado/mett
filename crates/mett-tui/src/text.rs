@@ -12,16 +12,6 @@ use mett_core::{Address, Body, BodyKind, Message};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-/// The lines the pager shows for `message`: the headers mutt shows by
-/// default, a blank line, then the body. They are not wrapped yet; see
-/// [`wrap`].
-pub fn pager_lines(message: &Message) -> Vec<String> {
-    let mut lines = header_lines(message, true);
-    lines.push(String::new());
-    lines.extend(body_lines(&message.body));
-    lines
-}
-
 /// A link in the pager's text: the bytes of a line drawn underlined.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
@@ -31,23 +21,31 @@ pub struct Link {
     pub range: Range<usize>,
 }
 
-/// [`pager_lines`], with the body's links found. With `collapse`, a link
+/// The lines the pager shows for `message`: the headers mutt shows by
+/// default, a blank line, then the body, not wrapped yet (see [`wrap`]);
+/// and the body's links. With `collapse`, a link
 /// written as its text followed by the URL in angle brackets
 /// (`text<https://...>`, as Exchange writes them in text bodies, and as
 /// [`body_lines`] writes HTML links) shows only its text; otherwise the
 /// URLs are shown. Either way, what shows each link is underlined: its
 /// text when collapsed, or the URL.
 pub fn pager_view(message: &Message, collapse: bool) -> (Vec<String>, Vec<Link>) {
-    let mut lines = pager_lines(message);
-    let body = lines.iter().position(String::is_empty).map_or(0, |i| i + 1);
+    let mut lines = header_lines(message, true);
+    lines.push(String::new());
     let mut links = Vec::new();
-    for (i, line) in lines.iter_mut().enumerate().skip(body) {
+    for line in body_text(&message.body).lines() {
         let (shown, ranges) = find_links(line, collapse);
-        *line = shown;
+        let i = lines.len();
         links.extend(ranges.into_iter().map(|range| Link { line: i, range }));
+        lines.push(shown);
     }
     (lines, links)
 }
+
+/// Where an HTML link's text starts, in the text [`body_text`] makes of
+/// HTML (a private-use character, which nothing else shows): text bodies
+/// don't say where a link's text starts.
+const LINK_START: char = '\u{E000}';
 
 /// The URL schemes links are found with.
 const SCHEMES: &[&str] = &["https://", "http://", "ftp://", "mailto:"];
@@ -63,13 +61,21 @@ fn scheme_len(text: &str) -> Option<usize> {
         .map(|scheme| scheme.len())
 }
 
-/// `line` with its links collapsed (with `collapse`), and the byte ranges
-/// of the result that show them: see [`pager_view`].
+/// `line` with its links collapsed (with `collapse`) and its tabs expanded,
+/// as shown (so that tab stops count what is shown), and the byte ranges of
+/// the result that show the links: see [`pager_view`].
 fn find_links(line: &str, collapse: bool) -> (String, Vec<Range<usize>>) {
     let mut out = String::with_capacity(line.len());
     let mut links: Vec<Range<usize>> = Vec::new();
     let mut rest = line;
+    // Where the text of the link whose URL comes next starts, if known.
+    let mut text_start = None;
     while let Some(c) = rest.chars().next() {
+        if c == LINK_START {
+            text_start = Some(out.len());
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
         // A URL in angle brackets: `<https://...>`, with no space in it.
         let bracketed = rest
             .strip_prefix('<')
@@ -79,16 +85,17 @@ fn find_links(line: &str, collapse: bool) -> (String, Vec<Range<usize>>) {
                 after[end..].starts_with('>').then_some(end)
             });
         if let Some(len) = bracketed {
-            // Right after a word, it is that word's link.
-            let attached = out.chars().next_back().is_some_and(|c| !c.is_whitespace());
-            if collapse && attached {
-                let start = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-                // Opening punctuation isn't part of the link's text.
-                let start = start + out[start..].len()
-                    - out[start..].trim_start_matches(['(', '[', '"', '\'']).len();
+            // The link's text: from where an HTML link said it starts, or
+            // else the word right before it, without opening punctuation.
+            let start = text_start.take().unwrap_or_else(|| {
+                let word = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                out.len() - out[word..].trim_start_matches(['(', '[', '"', '\'']).len()
+            });
+            // Without text (as in `(<https://...>)`), the URL is shown.
+            if collapse && start < out.len() {
                 // The text may be a URL found already, as in
                 // `https://a<https://b>`.
-                if start < out.len() && links.last().is_none_or(|l| l.end != out.len()) {
+                if links.last().is_none_or(|l| l.end != out.len()) {
                     links.push(start..out.len());
                 }
             } else {
@@ -116,7 +123,12 @@ fn find_links(line: &str, collapse: bool) -> (String, Vec<Range<usize>>) {
                 continue;
             }
         }
-        out.push(c);
+        if c == '\t' {
+            // Tabs would be dropped by the terminal buffer, so expand them.
+            out.extend(std::iter::repeat_n(' ', 8 - out.width() % 8));
+        } else {
+            out.push(c);
+        }
         rest = &rest[c.len_utf8()..];
     }
     (out, links)
@@ -238,12 +250,19 @@ pub fn truncate(text: &str, width: usize) -> String {
 
 /// The body as plain-text lines.
 pub fn body_lines(body: &Body) -> Vec<String> {
-    let text = match body.kind {
-        BodyKind::Text => body.content.replace("\r\n", "\n"),
-        BodyKind::Html => html_to_text(&body.content),
-    };
-    // Tabs would be dropped by the terminal buffer, so expand them.
-    text.lines().map(expand_tabs).collect()
+    body_text(body)
+        .lines()
+        .map(|line| expand_tabs(&line.replace(LINK_START, "")))
+        .collect()
+}
+
+/// The body as plain text, where HTML links' text starts marked with
+/// [`LINK_START`]. Its tabs aren't expanded yet.
+fn body_text(body: &Body) -> Cow<'_, str> {
+    match body.kind {
+        BodyKind::Text => body.content.replace("\r\n", "\n").into(),
+        BodyKind::Html => html_to_text(&body.content).into(),
+    }
 }
 
 /// Replaces tabs with spaces up to the next 8-column tab stop, counting
@@ -307,22 +326,34 @@ fn html_to_text(html: &str) -> String {
             .unwrap_or("");
         match name {
             "a" if !tag.starts_with('/') => {
+                if let Some((_, start)) = anchor.take() {
+                    // A link in a link: the outer one is left out.
+                    out.remove(start);
+                }
                 anchor = attribute(raw, "href")
                     .map(|href| decode_entities(href).into_owned())
                     .filter(|href| scheme_len(href).is_some())
                     .map(|href| (href, out.len()));
+                if anchor.is_some() {
+                    out.push(LINK_START);
+                }
             }
             // The link's URL follows its text, as Exchange writes links in
             // text bodies, unless the text is the URL. A link without text
             // (an image's) is left out.
             "a" => {
                 if let Some((href, start)) = anchor.take() {
-                    let text = out[start..].trim();
+                    let text = out[start + LINK_START.len_utf8()..].trim();
                     if !text.is_empty() && text != href {
+                        // Spaces after the text stay after the URL.
+                        let spaces = out[out.trim_end().len()..].to_owned();
                         out.truncate(out.trim_end().len());
                         out.push('<');
                         out.push_str(&href);
                         out.push('>');
+                        out.push_str(&spaces);
+                    } else {
+                        out.remove(start);
                     }
                 }
             }
@@ -346,6 +377,10 @@ fn html_to_text(html: &str) -> String {
         }
     }
     out.push_str(&decode_entities(rest));
+    if let Some((_, start)) = anchor {
+        // A link never closed has no URL to follow it.
+        out.remove(start);
+    }
     collapse_blank_lines(&out)
 }
 
@@ -589,6 +624,74 @@ mod tests {
         // Not a URL: no scheme, or nothing after the scheme.
         for line in ["a<b@x.org>", "see https:// here"] {
             assert_eq!(links(line, true), (line.to_owned(), Vec::new()));
+        }
+    }
+
+    #[test]
+    fn urls_without_text_are_never_collapsed() {
+        let line = "(<https://example.com>) and \"<https://b.org>\"";
+        assert_eq!(
+            links(line, true),
+            (
+                line.to_owned(),
+                vec!["https://example.com".to_owned(), "https://b.org".to_owned()]
+            )
+        );
+    }
+
+    /// An HTML message's body in the pager, and the text of its links.
+    fn html_view(content: &str, collapse: bool) -> (String, Vec<String>) {
+        let mut message = mett_core::mock::message("m", "in", "s", chrono::DateTime::UNIX_EPOCH);
+        message.body = Body {
+            kind: BodyKind::Html,
+            content: content.into(),
+        };
+        let (lines, links) = pager_view(&message, collapse);
+        let texts = links
+            .iter()
+            .map(|l| lines[l.line][l.range.clone()].to_owned())
+            .collect();
+        (lines.last().unwrap().clone(), texts)
+    }
+
+    #[test]
+    fn html_links_are_underlined_whole_and_keep_their_spaces() {
+        // Tabs are expanded as shown: without the hidden URLs, or with them.
+        let body = concat!(
+            r#"<p>Read <a href="https://e.com/n">the latest news </a>today, "#,
+            r#"(<a href="https://e.com/a">x"#,
+            "\t",
+            "y</a>)</p>"
+        );
+        let shown = expand_tabs("Read the latest news today, (x\ty)");
+        let tab = "x  y";
+        assert!(shown.ends_with("(x  y)"), "{shown:?}");
+        assert_eq!(
+            html_view(body, true),
+            (
+                shown.clone(),
+                vec!["the latest news".to_owned(), tab.to_owned()]
+            )
+        );
+        let expanded =
+            expand_tabs("Read the latest news<https://e.com/n> today, (x\ty<https://e.com/a>)");
+        assert_eq!(
+            html_view(body, false),
+            (
+                expanded.clone(),
+                vec!["https://e.com/n".to_owned(), "https://e.com/a".to_owned()]
+            )
+        );
+        // Replies and forwards quote the text without the marks.
+        assert_eq!(html(body), [expanded]);
+        // Marks of links that show no URL are dropped.
+        for body in [
+            "<a href='https://e.com'>https://e.com</a>",
+            "<a href='https://e.com'><img></a>z",
+            "<a href='https://e.com'>never closed",
+            "<a href='https://e.com'>outer <a href='/rel'>inner</a></a>",
+        ] {
+            assert!(!html_view(body, true).0.contains(LINK_START), "{body}");
         }
     }
 
