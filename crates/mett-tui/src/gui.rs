@@ -74,16 +74,16 @@ impl Launch for &mut InWindow {
     }
 
     fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
-        self,
+        mut self,
         runtime: tokio::runtime::Runtime,
         store: Arc<S>,
         mut session: Session,
     ) -> ExitCode {
         self.started = true;
         crate::remove_viewed_before();
+        let font = Fonts::from_config(&session.config, &mut |warning| self.say(&warning));
         // Warnings from the configuration go on the message line.
         session.notice = Some(self.said.join("; ")).filter(|notice| !notice.is_empty());
-        let font = Fonts::from_config(&session.config);
         let start: StartApp = Box::new(move |screen, events| {
             let result = runtime.block_on(crate::run(screen, events, store, session));
             crate::wait_for_saves();
@@ -117,7 +117,9 @@ struct Fonts {
 }
 
 impl Fonts {
-    fn from_config(config: &crate::config::Config) -> Self {
+    /// The fonts the configuration sets; `warn` is told why one it names
+    /// can't be used.
+    fn from_config(config: &crate::config::Config, warn: &mut dyn FnMut(String)) -> Self {
         let main = match config.string("gui_font") {
             "" => FONT,
             path => match std::fs::read(path) {
@@ -127,11 +129,13 @@ impl Fonts {
                     Vec::leak(data)
                 }
                 Ok(_) => {
-                    eprintln!("mett: gui_font: {path} isn't a font mett can use");
+                    warn(format!(
+                        "warning: gui_font: {path} isn't a font mett can use"
+                    ));
                     FONT
                 }
                 Err(e) => {
-                    eprintln!("mett: gui_font: {path}: {e}");
+                    warn(format!("warning: gui_font: {path}: {e}"));
                     FONT
                 }
             },
@@ -212,6 +216,11 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
             None,
         ),
     };
+    // Why mett didn't start: its exit code, until the app says another.
+    let code = match &shown {
+        Shown::Ended(code, _) => *code,
+        _ => ExitCode::SUCCESS,
+    };
     let mut gui = Gui {
         proxy: event_loop.create_proxy(),
         start,
@@ -226,7 +235,7 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
         typed: None,
         cell: winit::dpi::PhysicalSize::new(1, 1),
         fallbacks: Vec::new(),
-        code: ExitCode::SUCCESS,
+        code,
     };
     if let Err(e) = event_loop.run_app(&mut gui) {
         eprintln!("mett: {e}");
