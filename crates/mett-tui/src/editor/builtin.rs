@@ -417,7 +417,7 @@ impl Builtin {
             self.note = Some("Quit".into());
         } else if is_ctrl(key, 'y') {
             self.deselect();
-            self.paste();
+            self.paste_clipboard();
         } else if is_ctrl(key, 'w') {
             if let Some(region) = self.region() {
                 self.copy(region);
@@ -499,7 +499,7 @@ impl Builtin {
             }
         } else if is_ctrl(key, 'v') {
             self.deselect();
-            self.paste();
+            self.paste_clipboard();
         } else if let Some((start, end)) = selected
             && key.modifiers.is_empty()
             && matches!(key.code, KeyCode::Left | KeyCode::Right)
@@ -618,6 +618,23 @@ impl Builtin {
         }
     }
 
+    /// Inserts pasted `text` at the cursor (in place of Notepad's
+    /// selection), or in the command being typed.
+    pub fn paste(&mut self, text: &str) {
+        if let Some(command) = &mut self.command {
+            command.insert_text(text);
+            return;
+        }
+        match self.region() {
+            Some(region) if self.keys == Keys::Notepad => self.delete(region),
+            // edtui keeps its undo point to itself; deleting nothing sets
+            // one.
+            _ => self.state.execute(DeleteChar(0)),
+        }
+        self.deselect();
+        self.insert(text);
+    }
+
     /// What `key` puts in place of a selection: what it types, or, for
     /// `^V`, what is on the clipboard.
     fn replacement(&self, key: KeyEvent) -> Option<String> {
@@ -640,7 +657,7 @@ impl Builtin {
     /// Inserts the clipboard's text at the cursor, as typed (edtui's
     /// paste takes text starting with a line end as whole lines, as vim
     /// does), as one change to undo.
-    fn paste(&mut self) {
+    fn paste_clipboard(&mut self) {
         let text = self.clipboard.get();
         if !text.is_empty() {
             // edtui keeps its undo point to itself; deleting nothing sets
@@ -1280,6 +1297,24 @@ mod tests {
         press(&mut notepad, &select[1..]);
         press(&mut notepad, &[right]);
         assert_eq!(notepad.state.cursor, Index2::new(0, 3));
+    }
+
+    #[test]
+    fn pasting_inserts_the_text() {
+        let mut vim = Builtin::new("ab\n", Keys::Vim);
+        vim.paste("x\r\ny");
+        assert_eq!(vim.text(), "x\nyab\n");
+        press(&mut vim, &chars("u"));
+        assert_eq!(vim.text(), "ab\n");
+        // In a command being typed, on its line.
+        press(&mut vim, &chars(":"));
+        vim.paste("w");
+        assert_eq!(press(&mut vim, &chars("q\n")), Outcome::Done("ab\n".into()));
+        // In place of Notepad's selection.
+        let mut notepad = Builtin::new("ab\n", Keys::Notepad);
+        press(&mut notepad, &[shift(KeyCode::Right)]);
+        notepad.paste("Z");
+        assert_eq!(notepad.text(), "Zb\n");
     }
 
     #[test]

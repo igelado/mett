@@ -192,6 +192,8 @@ pub enum Msg {
     },
     /// The user closed the window (the GUI's).
     Close,
+    /// The user pasted text (in the GUI's window).
+    Paste(String),
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -1080,6 +1082,10 @@ impl App {
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
             Msg::Close => self.close(),
+            Msg::Paste(text) => {
+                self.paste(&text);
+                Vec::new()
+            }
             Msg::FileSaved(op, outcome) => self.on_file_saved(op, outcome),
             Msg::FileRead(op, path, result) => self.on_file_read(op, path, result),
             Msg::Failed(why) => {

@@ -24,7 +24,7 @@ use ratatui_wgpu::shaders::AspectPreservingDefaultPostProcessor;
 use ratatui_wgpu::{Builder, Dimensions, Font, WgpuBackend};
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -122,7 +122,10 @@ impl Fonts {
             "" => FONT,
             path => match std::fs::read(path) {
                 // Kept for as long as mett runs.
-                Ok(data) if Font::new(&data).is_some() => Vec::leak(data),
+                // (Its `m` tells how wide its cells are.)
+                Ok(data) if Font::new(&data).is_some() && aspect(&data).is_some() => {
+                    Vec::leak(data)
+                }
                 Ok(_) => {
                     eprintln!("mett: gui_font: {path} isn't a font mett can use");
                     FONT
@@ -219,6 +222,9 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
         size: Arc::new(Mutex::new(Size::default())),
         input: None,
         modifiers: ModifiersState::empty(),
+        composing: false,
+        typed: None,
+        clipboard: None,
         code: ExitCode::SUCCESS,
     };
     if let Err(e) = event_loop.run_app(&mut gui) {
@@ -248,6 +254,13 @@ struct Gui {
     /// Where keys go: the app.
     input: Option<mpsc::UnboundedSender<std::io::Result<UserEvent>>>,
     modifiers: ModifiersState,
+    /// Text an input method is composing: keys go to it meanwhile.
+    composing: bool,
+    /// The text the last key press typed, which an input method may
+    /// commit again.
+    typed: Option<String>,
+    /// The system's clipboard, once pasted from.
+    clipboard: Option<arboard::Clipboard>,
     /// How the app ended.
     code: ExitCode,
 }
@@ -265,14 +278,19 @@ impl Gui {
         );
         let scale = window.scale_factor();
         // Points to pixels: a point is 1/72 inch, a logical pixel 1/96.
-        let font_px = (f64::from(self.fonts.size) * 96.0 / 72.0 * scale).round();
+        let aspect = f64::from(aspect(self.fonts.main).ok_or("the font has no `m`")?);
+        // Cells at least a pixel wide (ratatui-wgpu divides by their
+        // width), and not larger than the window can show.
+        let font_px = (f64::from(self.fonts.size) * 96.0 / 72.0 * scale)
+            .round()
+            .clamp((1.0 / aspect).ceil() + 1.0, 512.0);
         // The window grows and shrinks by whole cells, where the system
         // lets it (the cells are drawn from its top left corner).
-        if let Some(aspect) = aspect(self.fonts.main) {
-            let cell =
-                winit::dpi::PhysicalSize::new((f64::from(aspect) * font_px).floor(), font_px);
-            window.set_resize_increments(Some(cell));
-        }
+        let cell = winit::dpi::PhysicalSize::new((aspect * font_px).floor(), font_px);
+        window.set_resize_increments(Some(cell));
+        // Text typed with an input method (Chinese, Japanese, ...) comes
+        // as `Ime` events.
+        window.set_ime_allowed(true);
         let font = Font::new(self.fonts.main).ok_or("the font can't be read")?;
         let size = window.inner_size();
         // The font first, then the others; it is also the last resort.
@@ -327,6 +345,17 @@ impl Gui {
     fn send(&self, event: UserEvent) {
         if let Some(input) = &self.input {
             let _ = input.send(Ok(event));
+        }
+    }
+
+    /// Sends the app the system clipboard's text, pasted.
+    fn paste(&mut self) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        let text = self.clipboard.as_mut().and_then(|c| c.get_text().ok());
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            self.send(UserEvent::Term(TermEvent::Paste(text)));
         }
     }
 
@@ -441,14 +470,34 @@ impl ApplicationHandler<Shown> for Gui {
                     event_loop.exit();
                     return;
                 }
+                if self.composing {
+                    return;
+                }
                 let plain = event.key_without_modifiers();
-                if let Some(key) = key(
+                self.typed = event.text.as_ref().map(ToString::to_string);
+                if is_paste(&plain, self.modifiers) {
+                    self.paste();
+                } else if let Some(key) = key(
                     &event.logical_key,
                     &plain,
                     event.text.as_deref(),
                     self.modifiers,
                 ) {
                     self.send(UserEvent::Term(TermEvent::Key(key)));
+                }
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
+            WindowEvent::Ime(Ime::Disabled) => self.composing = false,
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.composing = false;
+                // Committed as the key press typed it already.
+                if self.typed.take().as_deref() == Some(text.as_str()) {
+                    return;
+                }
+                for c in text.chars() {
+                    self.send(UserEvent::Term(TermEvent::Key(KeyEvent::from(
+                        KeyCode::Char(c),
+                    ))));
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
@@ -537,6 +586,19 @@ fn key(
             Some(KeyEvent::new(KeyCode::Char(c), held))
         }
     }
+}
+
+/// Whether the key `plain`, with `modifiers` held, pastes: Command+V on a
+/// Mac, Control+Shift+V elsewhere (as in terminals: Control+V is a key of
+/// mett's own).
+fn is_paste(plain: &Key, modifiers: ModifiersState) -> bool {
+    let v = matches!(plain, Key::Character(c) if c.eq_ignore_ascii_case("v"));
+    let held = if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL | ModifiersState::SHIFT
+    };
+    v && modifiers == held
 }
 
 /// The one character `s` is, if it is one.
@@ -774,6 +836,20 @@ mod tests {
             press(ch("c"), ch("c"), Some("c"), ModifiersState::SUPER),
             None
         );
+    }
+
+    #[test]
+    fn pasting_is_the_system_s_shortcut() {
+        let v = ch("v");
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(is_paste(&v, ModifiersState::SUPER), mac);
+        assert_eq!(
+            is_paste(&v, ModifiersState::CONTROL | ModifiersState::SHIFT),
+            !mac
+        );
+        // Control+V is mett's (Notepad's paste in the built-in editor).
+        assert!(!is_paste(&v, ModifiersState::CONTROL));
+        assert!(!is_paste(&ch("c"), ModifiersState::SUPER));
     }
 
     #[test]

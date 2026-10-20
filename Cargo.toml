@@ -26,7 +26,7 @@ getrandom = "0.4.3"
 keyring = "4.2.0"
 open = "5.4.4"
 # The GUI (mett-gui): drawing, windows, the clipboard, fonts.
-arboard = { version = "3.7.0", default-features = false }
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 fontdb = "0.24.0"
 pollster = "1.0.1"
 ratatui-wgpu = "0.6.0"

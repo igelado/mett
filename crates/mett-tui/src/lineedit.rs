@@ -116,6 +116,20 @@ impl LineEditor {
         }
     }
 
+    /// Inserts `text` at the cursor, its line ends as spaces.
+    pub fn insert_text(&mut self, text: &str) {
+        let mut last = None;
+        for c in text.chars() {
+            match c {
+                // `\r\n` is one line end.
+                '\n' if last == Some('\r') => {}
+                '\r' | '\n' => self.insert(' '),
+                c => self.insert(c),
+            }
+            last = Some(c);
+        }
+    }
+
     fn insert(&mut self, c: char) {
         // A combining character joins the grapheme before the cursor.
         if self.cursor > 0 {

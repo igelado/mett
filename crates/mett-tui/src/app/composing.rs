@@ -721,6 +721,19 @@ impl App {
         self.leave_folder(super::mailbox::AfterPurge::Quit)
     }
 
+    /// Puts pasted `text` where the user is typing: in the built-in editor,
+    /// or in the answer to the question on the message line (on one line).
+    pub(super) fn paste(&mut self, text: &str) {
+        if self.sign_in.is_some() {
+            return;
+        }
+        if let Some(editing) = &mut self.editing {
+            editing.get_mut().paste(text);
+        } else if let Some(Input::Line { editor, .. }) = &mut self.input {
+            editor.insert_text(text);
+        }
+    }
+
     /// Lets the user edit `text`, in the built-in editor or (through the
     /// main loop) in their own; [`Msg::Edited`] brings it back.
     pub(super) fn edit(&mut self, text: String) -> Vec<Effect> {
@@ -1201,6 +1214,24 @@ mod tests {
         app.update(Msg::Close);
         assert!(!app.quit);
         assert_eq!(app.menu(), Menu::Compose);
+    }
+
+    #[test]
+    fn pasted_text_goes_where_the_user_types() {
+        let mut app = app(compose::Settings {
+            builtin_editor: Some(crate::editor::Keys::Notepad),
+            ..settings()
+        });
+        // Nowhere to type: nothing happens.
+        app.update(Msg::Paste("x".into()));
+        act(&mut app, Action::Mail);
+        app.update(Msg::Paste("bob@x.org\n".into()));
+        assert_eq!(prompt(&app), "To: bob@x.org ");
+        key(&mut app, KeyCode::Enter);
+        answer(&mut app, "Hi");
+        app.update(Msg::Paste("Hello\n".into()));
+        let editor = app.editing.as_ref().expect("the built-in editor");
+        assert!(editor.borrow().text().starts_with("Hello\n"));
     }
 
     #[test]

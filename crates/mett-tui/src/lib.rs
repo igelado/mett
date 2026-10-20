@@ -391,7 +391,9 @@ fn settings_keeping(
         quote,
         colors: config
             .colors()
-            .active(color::mono_terminal(&|name| std::env::var(name).ok()))
+            // The window has colors, whatever terminal it was started
+            // from.
+            .active(!platform::gui() && color::mono_terminal(&|name| std::env::var(name).ok()))
             .clone(),
         wrap: match config.get("wrap") {
             Some(config::Value::Number(n)) => *n,
@@ -759,6 +761,10 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     }
                     UserEvent::Term(TermEvent::Resize(width, height)) => {
                         Msg::Resize { width, height }
+                    }
+                    UserEvent::Term(TermEvent::Paste(text)) => {
+                        app.typed();
+                        Msg::Paste(text)
                     }
                     UserEvent::Close => Msg::Close,
                     // Nothing changed: nothing to draw again.
