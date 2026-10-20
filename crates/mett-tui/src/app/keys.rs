@@ -222,6 +222,14 @@ impl App {
         self.after_load.extend(strokes);
     }
 
+    /// Says `notice` on the message line now, and again once the folder
+    /// has been listed (which says it is loading meanwhile), unless that
+    /// failed.
+    pub fn notice(&mut self, notice: String) {
+        self.status.clone_from(&notice);
+        self.notice = Some(notice);
+    }
+
     /// Whether the last action is still waiting for the mailbox: a macro's
     /// next keys wait for it, as they would in mutt, which waits for each
     /// command to finish. Its result decides what the keys apply to.
@@ -261,6 +269,12 @@ impl App {
     /// Plays the keys that waited for the folder.
     pub(super) fn loaded(&mut self) {
         self.strokes.extend(std::mem::take(&mut self.after_load));
+        if let Some(notice) = self.notice.take()
+            && self.error.as_deref() != Some(self.status.as_str())
+        {
+            self.status = notice;
+            self.redraw = true;
+        }
     }
 
     /// Opens the help screen for the current menu.
@@ -597,6 +611,17 @@ mod tests {
         listed(&mut app, list, three(), None);
         play(&mut app);
         assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn a_notice_is_said_again_once_the_folder_is_listed() {
+        let (mut app, effects) = App::open(80, 10, inbox(), Settings::default());
+        app.notice("warning: gui_font: x: no such file".into());
+        assert_eq!(app.status, "warning: gui_font: x: no such file");
+        let open = first_request(&effects);
+        let list = folder_opened(&mut app, open, mock::folder("in", "Inbox", None));
+        listed(&mut app, list, three(), None);
+        assert_eq!(app.status, "warning: gui_font: x: no such file");
     }
 
     #[test]

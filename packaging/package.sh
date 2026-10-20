@@ -184,7 +184,9 @@ for arch in "$@"; do
     esac
     target=$arch-unknown-linux-musl
     echo "Building mett $version for $arch"
-    cargo zigbuild --release --locked -p mett-tui --target "$target"
+    # mett alone: mett-gui (the default `gui` feature) needs the system's
+    # graphics libraries, which a static binary can't load.
+    cargo zigbuild --release --locked -p mett-tui --no-default-features --target "$target"
     binary=${CARGO_TARGET_DIR:-target}/$target/release/mett
     notices=$work/THIRD-PARTY-NOTICES-$arch
     mkdir -p "$work"

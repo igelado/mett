@@ -16,10 +16,10 @@ use std::rc::Rc;
 use edtui::actions::motion::{MoveToFirstRow, MoveToLastRow};
 use edtui::actions::search::StartSearch;
 use edtui::actions::{
-    Action, Chainable, DeleteChar, DeleteCharForward, DeleteWordBackward, FindNext, FindPrevious,
-    InsertChar, LineBreak, MoveBackward, MoveDown, MoveForward, MovePageDown, MovePageUp,
-    MoveToEndOfLine, MoveToStartOfLine, MoveUp, MoveWordBackward, MoveWordForward, Redo,
-    RemoveCharFromSearch, SelectCurrentSearch, StopSearch, SwitchMode, Undo,
+    Action, AppendCharToSearch, Chainable, DeleteChar, DeleteCharForward, DeleteWordBackward,
+    FindNext, FindPrevious, InsertChar, LineBreak, MoveBackward, MoveDown, MoveForward,
+    MovePageDown, MovePageUp, MoveToEndOfLine, MoveToStartOfLine, MoveUp, MoveWordBackward,
+    MoveWordForward, Redo, RemoveCharFromSearch, SelectCurrentSearch, StopSearch, SwitchMode, Undo,
 };
 use edtui::clipboard::ClipboardTrait;
 use edtui::events::{KeyEventHandler, KeyEventRegister, KeyInput};
@@ -79,18 +79,45 @@ pub enum Bottom {
     Hint(String),
 }
 
-/// The editor's clipboard: its own, shared with mett so that replacing a
-/// selection doesn't put the replaced text on it.
+/// The editor's clipboard, which mett copies to and pastes from too: its
+/// own, and in a window (the GUI) the system's. (In a terminal, text from
+/// elsewhere is pasted through the terminal.)
 #[derive(Clone, Default)]
-struct Clipboard(Rc<RefCell<String>>);
+struct Clipboard {
+    own: Rc<RefCell<String>>,
+}
+
+impl Clipboard {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self) -> String {
+        #[cfg(feature = "gui")]
+        if crate::platform::gui()
+            && let Ok(text) = crate::platform::with_clipboard(|system| system.get_text())
+        {
+            return text;
+        }
+        self.own.borrow().clone()
+    }
+
+    fn set(&self, text: String) {
+        #[cfg(feature = "gui")]
+        if crate::platform::gui() {
+            let _ = crate::platform::with_clipboard(|system| system.set_text(text.clone()));
+        }
+        *self.own.borrow_mut() = text;
+    }
+}
 
 impl ClipboardTrait for Clipboard {
     fn set_text(&mut self, text: String) {
-        *self.0.borrow_mut() = text;
+        self.set(text);
     }
 
     fn get_text(&mut self) -> String {
-        self.0.borrow().clone()
+        self.get()
     }
 }
 
@@ -137,7 +164,7 @@ impl Builtin {
     /// An editor on `text`, with `keys`.
     pub fn new(text: &str, keys: Keys) -> Self {
         let mut state = EditorState::new(Lines::from(text));
-        let clipboard = Clipboard::default();
+        let clipboard = Clipboard::new();
         state.set_clipboard(clipboard.clone());
         let events = match keys {
             Keys::Vim => EditorEventHandler::vim_mode(),
@@ -184,6 +211,11 @@ impl Builtin {
     /// The text being edited.
     pub fn text(&self) -> String {
         String::from(self.state.lines.clone())
+    }
+
+    /// Says `note` on the bottom line, until the next key.
+    pub fn say(&mut self, note: &str) {
+        self.note = Some(note.to_owned());
     }
 
     /// Whether the text differs from the text as last saved.
@@ -381,7 +413,7 @@ impl Builtin {
             self.note = Some("Quit".into());
         } else if is_ctrl(key, 'y') {
             self.deselect();
-            self.paste();
+            self.paste_clipboard();
         } else if is_ctrl(key, 'w') {
             if let Some(region) = self.region() {
                 self.copy(region);
@@ -463,7 +495,7 @@ impl Builtin {
             }
         } else if is_ctrl(key, 'v') {
             self.deselect();
-            self.paste();
+            self.paste_clipboard();
         } else if let Some((start, end)) = selected
             && key.modifiers.is_empty()
             && matches!(key.code, KeyCode::Left | KeyCode::Right)
@@ -582,11 +614,39 @@ impl Builtin {
         }
     }
 
+    /// Inserts pasted `text` at the cursor (in place of Notepad's
+    /// selection), or in the command being typed.
+    pub fn paste(&mut self, text: &str) {
+        if self.question.is_some() {
+            return;
+        }
+        if let Some(command) = &mut self.command {
+            command.insert_text(text);
+            return;
+        }
+        // In a search, it is what is searched for (on one line).
+        if self.state.mode == EditorMode::Search {
+            for c in text.chars() {
+                let c = if matches!(c, '\r' | '\n') { ' ' } else { c };
+                self.state.execute(AppendCharToSearch(c));
+            }
+            return;
+        }
+        match self.region() {
+            Some(region) if self.keys == Keys::Notepad => self.delete(region),
+            // edtui keeps its undo point to itself; deleting nothing sets
+            // one.
+            _ => self.state.execute(DeleteChar(0)),
+        }
+        self.deselect();
+        self.insert(text);
+    }
+
     /// What `key` puts in place of a selection: what it types, or, for
     /// `^V`, what is on the clipboard.
     fn replacement(&self, key: KeyEvent) -> Option<String> {
         if is_ctrl(key, 'v') {
-            return Some(self.clipboard.0.borrow().clone());
+            return Some(self.clipboard.get());
         }
         match key.code {
             KeyCode::Enter | KeyCode::Tab if plain(key) => Some(
@@ -601,11 +661,20 @@ impl Builtin {
         }
     }
 
+    /// Pastes the clipboard's text (the system's, else its own) as
+    /// [`Builtin::paste`] does.
+    pub fn paste_from_clipboard(&mut self) {
+        let text = self.clipboard.get();
+        if !text.is_empty() {
+            self.paste(&text);
+        }
+    }
+
     /// Inserts the clipboard's text at the cursor, as typed (edtui's
     /// paste takes text starting with a line end as whole lines, as vim
     /// does), as one change to undo.
-    fn paste(&mut self) {
-        let text = self.clipboard.0.borrow().clone();
+    fn paste_clipboard(&mut self) {
+        let text = self.clipboard.get();
         if !text.is_empty() {
             // edtui keeps its undo point to itself; deleting nothing sets
             // one.
@@ -645,7 +714,7 @@ impl Builtin {
 
     /// Puts the text of `region` on the clipboard.
     fn copy(&mut self, region: (Index2, Index2)) {
-        *self.clipboard.0.borrow_mut() = self.region_text(region);
+        self.clipboard.set(self.region_text(region));
     }
 
     /// Deletes the text of `region`, as one change to undo. (Backspacing
@@ -1244,6 +1313,36 @@ mod tests {
         press(&mut notepad, &select[1..]);
         press(&mut notepad, &[right]);
         assert_eq!(notepad.state.cursor, Index2::new(0, 3));
+    }
+
+    #[test]
+    fn pasting_inserts_the_text() {
+        let mut vim = Builtin::new("ab\n", Keys::Vim);
+        vim.paste("x\r\ny");
+        assert_eq!(vim.text(), "x\nyab\n");
+        press(&mut vim, &chars("u"));
+        assert_eq!(vim.text(), "ab\n");
+        // In a command being typed, on its line.
+        press(&mut vim, &chars(":"));
+        vim.paste("w");
+        assert_eq!(press(&mut vim, &chars("q\n")), Outcome::Done("ab\n".into()));
+        // In place of Notepad's selection.
+        let mut notepad = Builtin::new("ab\n", Keys::Notepad);
+        press(&mut notepad, &[shift(KeyCode::Right)]);
+        notepad.paste("Z");
+        assert_eq!(notepad.text(), "Zb\n");
+        // In a search, it is searched for; while a question is asked, it
+        // does nothing.
+        press(&mut notepad, &[ctrl('f')]);
+        notepad.paste("b");
+        assert_eq!(notepad.state.search_pattern(), "b");
+        assert_eq!(notepad.text(), "Zb\n");
+        press(
+            &mut notepad,
+            &[KeyEvent::from(KeyCode::Esc), KeyEvent::from(KeyCode::Esc)],
+        );
+        notepad.paste("x");
+        assert_eq!(notepad.text(), "Zb\n");
     }
 
     #[test]

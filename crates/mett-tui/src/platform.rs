@@ -11,6 +11,48 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Whether mett runs in a window of its own (`mett-gui`) rather than in a
+/// terminal.
+static GUI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether mett runs in a window of its own: then there is no terminal for
+/// an editor of the user's own.
+pub fn gui() -> bool {
+    GUI.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Notes that mett runs in a window of its own.
+#[cfg(feature = "gui")]
+pub fn set_gui() {
+    GUI.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Runs `f` on the system's clipboard. It stays open for as long as mett
+/// runs: on X11, what mett copied is only there while it is.
+#[cfg(feature = "gui")]
+pub fn with_clipboard<T>(
+    f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, String> {
+    static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+    let mut clipboard = CLIPBOARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if clipboard.is_none() {
+        *clipboard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+    }
+    f(clipboard.as_mut().expect("just set")).map_err(|e| e.to_string())
+}
+
+/// The text on the system's clipboard, if it can be read (only in a
+/// window: in a terminal, text is pasted through it).
+pub fn clipboard_text() -> Option<String> {
+    #[cfg(feature = "gui")]
+    if gui() {
+        return with_clipboard(|clipboard| clipboard.get_text()).ok();
+    }
+    None
+}
+
 /// The user's home directory: `$HOME`, else (on Windows, where it is
 /// usually unset) `%USERPROFILE%`.
 pub fn home() -> Option<String> {

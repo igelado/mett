@@ -1,13 +1,18 @@
 # mett-tui
 
-The `mett` binary: the mutt-like terminal UI. It follows the Elm
-Architecture (`docs/DESIGN.md` §5.2):
+The `mett` binary, the mutt-like terminal UI, and `mett-gui`, which shows
+the same screens in a window of its own (the default `gui` feature;
+`--no-default-features` leaves it out). Both are thin: `lib.rs` has the
+main loop, over a `Frontend` (the terminal, or `gui.rs`'s window). It
+follows the Elm Architecture (`docs/DESIGN.md` §5.2):
 
 - **`app/`:** the model and `update`. All UI logic lives here;
   `app/composing.rs` has the steps of writing a message.
 - **`compose.rs`:** how replies and forwards are built (quoting,
   attribution, recipients, signature); **`lineedit.rs`:** the line editor
-  for questions such as `To:`; **`editor.rs`:** runs the external editor;
+  for questions such as `To:`; **`editor/`:** runs the external editor, or
+  is the built-in one (`builtin.rs`, on edtui, with vim's, emacs's or
+  Notepad's keys);
   **`pattern.rs`:** mutt's patterns, for searching and limiting.
 - **`view.rs`:** draws the model with [ratatui](https://ratatui.rs);
   `view/sidebar.rs` draws the sidebar, whose entries `app/sidebar.rs`
@@ -42,6 +47,14 @@ cargo test -p mett-tui
 - **`config` tests:** the lexer (quoting, escapes, expansion, backticks,
   line continuation), every form of `set`, `source` (including loops),
   file lookup, and `msgraph://` URLs with mutt's `=` shortcut.
+- **`editor` tests:** which editor and keys are used, and the built-in
+  editor's keys for each of vim, emacs and Notepad.
+- **`gui` tests:** window keys as a terminal reports them (Control, Meta,
+  AltGr, dead keys), the paste shortcut, font measuring, and the backend
+  that keeps the cells and the cursor. They need no window.
+
+`cargo clippy -p mett-tui --all-targets --no-default-features` checks the
+build without the GUI, as the packages are built.
 
 ## Configuration
 
@@ -281,3 +294,26 @@ Check that:
 - The pager's status bar shows `(all)`, a percentage, or `(end)` as you
   scroll.
 - Resizing the terminal keeps the layout intact.
+
+### The window (`mett-gui`)
+
+```sh
+cargo run -p mett-tui --bin mett-gui -- --demo
+```
+
+Check that the screens and keys are those of the terminal, and that:
+
+- `m` writes the message in the built-in editor, with the keys of your
+  `$EDITOR` (vim's, emacs's, else Notepad's), whatever `editor` says.
+- Copying (`c` in the sign-in window, `^C` or `M-w` in the editor) and
+  pasting (Command+V on a Mac, Control+Shift+V elsewhere; `^V` or `C-y` in
+  the editor) use the system's clipboard.
+- Resizing the window lays the screen out again; text stays sharp.
+- Closing the window quits, as `q` does; not while a message is written,
+  a file is saved or a question asked.
+- With a broken mettrc (`-F` a file with an error), the window says why
+  mett can't start, and closes on a key.
+
+On Linux without a display, Xvfb (`Xvfb :99 &`, then `DISPLAY=:99`) and
+Mesa's software Vulkan (lavapipe) are enough to run it; `xdotool` types
+keys into it, and `xwd -root` takes screenshots.

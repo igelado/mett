@@ -705,6 +705,64 @@ impl App {
         }
     }
 
+    /// The window was closed: mett quits as `q` in the index does (asking
+    /// to purge deleted messages, as set), unless what is going on would
+    /// be lost: a message being written, a file being saved, a question.
+    pub(super) fn close(&mut self) -> Vec<Effect> {
+        let writing = self.editing.is_some()
+            || self.composing.is_some()
+            || self.screens.iter().any(|s| matches!(s, Screen::Compose(_)));
+        if writing {
+            let why = "A message is being written: send or postpone it first.";
+            match &mut self.editing {
+                // Said where the editor shows it.
+                Some(editing) => editing.get_mut().say(why),
+                None => self.fail(why),
+            }
+            return Vec::new();
+        }
+        // What a file being saved, or a question, is waiting for would be
+        // lost.
+        if let Some((_, path)) = &self.file_wait {
+            let why = format!("Waiting for {} (^G gives up) first.", path.display());
+            self.fail(why);
+            return Vec::new();
+        }
+        if self.input.is_some() {
+            self.input_note = Some("Answer the question (or ^G) first.".into());
+            return Vec::new();
+        }
+        self.leave_folder(super::mailbox::AfterPurge::Quit)
+    }
+
+    /// Puts pasted `text` where the user is typing: in the built-in editor,
+    /// or in the answer to the question on the message line (on one line).
+    pub(super) fn paste(&mut self, text: &str) {
+        if self.sign_in.is_some() {
+            return;
+        }
+        if let Some(editing) = &mut self.editing {
+            editing.get_mut().paste(text);
+        } else if let Some(Input::Line { editor, .. }) = &mut self.input {
+            editor.insert_text(text);
+            // The answer shows again, as when a key is typed.
+            self.input_note = None;
+        }
+    }
+
+    /// Pastes the clipboard's text where the user is typing: the system's,
+    /// or, in the built-in editor, its own if the system's can't be read.
+    pub(super) fn paste_clipboard(&mut self) {
+        if self.sign_in.is_some() {
+            return;
+        }
+        if let Some(editing) = &mut self.editing {
+            editing.get_mut().paste_from_clipboard();
+        } else if let Some(text) = crate::platform::clipboard_text() {
+            self.paste(&text);
+        }
+    }
+
     /// Lets the user edit `text`, in the built-in editor or (through the
     /// main loop) in their own; [`Msg::Edited`] brings it back.
     pub(super) fn edit(&mut self, text: String) -> Vec<Effect> {
@@ -1154,6 +1212,85 @@ mod tests {
         };
         // The editor opens with the cursor at the start.
         assert_eq!(sent.body, "HelloHi! \n-- \nMe\n");
+    }
+
+    #[test]
+    fn closing_the_window_quits_unless_a_message_is_being_written() {
+        // In the index, it quits; not while a question is asked.
+        let mut index = app(settings());
+        act(&mut index, Action::Search);
+        index.update(Msg::Close);
+        assert!(!index.quit);
+        assert_eq!(
+            index.input_note.as_deref(),
+            Some("Answer the question (or ^G) first.")
+        );
+        index.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
+        index.update(Msg::Close);
+        assert!(index.quit);
+
+        let mut app = app(compose::Settings {
+            builtin_editor: Some(crate::editor::Keys::Vim),
+            ..settings()
+        });
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Close);
+        assert!(!app.quit);
+        let editor = app.editing.as_ref().expect("still writing");
+        // Said on the editor's bottom line.
+        assert_eq!(
+            editor.borrow().bottom(80),
+            crate::editor::builtin::Bottom::Note(
+                "A message is being written: send or postpone it first.".into()
+            )
+        );
+        typed(&mut app, "iHello");
+        key(&mut app, KeyCode::Esc);
+        typed(&mut app, ":wq");
+        key(&mut app, KeyCode::Enter);
+        // In the compose menu, too.
+        app.update(Msg::Close);
+        assert!(!app.quit);
+        assert_eq!(app.menu(), Menu::Compose);
+    }
+
+    #[test]
+    fn pasted_text_goes_where_the_user_types() {
+        let mut app = app(compose::Settings {
+            builtin_editor: Some(crate::editor::Keys::Notepad),
+            ..settings()
+        });
+        // Nowhere to type: nothing happens.
+        app.update(Msg::Paste("x".into()));
+        act(&mut app, Action::Mail);
+        app.update(Msg::Paste("bob@x.org\n".into()));
+        assert_eq!(prompt(&app), "To: bob@x.org ");
+        key(&mut app, KeyCode::Enter);
+        answer(&mut app, "Hi");
+        app.update(Msg::Paste("Hello\n".into()));
+        let editor = app.editing.as_ref().expect("the built-in editor");
+        assert!(editor.borrow().text().starts_with("Hello\n"));
+        // From the clipboard: the editor's own, where the system's can't
+        // be read (here, out of a window).
+        let shift_end = KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT);
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Up)));
+        app.update(Msg::Key(shift_end));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        app.update(Msg::Key(KeyEvent::from(KeyCode::End)));
+        app.update(Msg::PasteClipboard);
+        let editor = app.editing.as_ref().expect("the built-in editor");
+        assert!(
+            editor.borrow().text().starts_with("HelloHello\n"),
+            "{editor:?}"
+        );
     }
 
     #[test]

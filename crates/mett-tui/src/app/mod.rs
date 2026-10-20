@@ -190,6 +190,12 @@ pub enum Msg {
         /// How many messages.
         taken: u64,
     },
+    /// The user closed the window (the GUI's).
+    Close,
+    /// The user pasted text.
+    Paste(String),
+    /// The user asked to paste from the clipboard (in the GUI's window).
+    PasteClipboard,
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -543,6 +549,9 @@ pub struct App {
     redraw: bool,
     /// Keys to play once the folder is listed.
     after_load: Vec<Stroke>,
+    /// What to say on the message line once the folder is listed (the
+    /// configuration's warnings, in the GUI's window).
+    notice: Option<String>,
     /// Escape was typed where it does nothing by itself, in this menu, and
     /// when: with the next key there, soon after, it is Meta and that key
     /// (`Esc v`), as in mutt.
@@ -873,6 +882,7 @@ impl App {
             played: 0,
             redraw: false,
             after_load: Vec::new(),
+            notice: None,
             escape: None,
             cancelled: false,
             dismissed: false,
@@ -1077,6 +1087,15 @@ impl App {
             Msg::Key(key) => self.on_key_press(key),
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
+            Msg::Close => self.close(),
+            Msg::Paste(text) => {
+                self.paste(&text);
+                Vec::new()
+            }
+            Msg::PasteClipboard => {
+                self.paste_clipboard();
+                Vec::new()
+            }
             Msg::FileSaved(op, outcome) => self.on_file_saved(op, outcome),
             Msg::FileRead(op, path, result) => self.on_file_read(op, path, result),
             Msg::Failed(why) => {

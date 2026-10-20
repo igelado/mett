@@ -12,6 +12,23 @@ repository.workspace = true
 name = "mett"
 path = "src/main.rs"
 
+# mett in a window of its own; `--no-default-features` leaves it out.
+[[bin]]
+name = "mett-gui"
+path = "src/bin/mett-gui.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+gui = [
+    "dep:arboard",
+    "dep:fontdb",
+    "dep:pollster",
+    "dep:ratatui-wgpu",
+    "dep:ttf-parser",
+    "dep:winit",
+]
+
 [dependencies]
 # The `mock` store backs `mett --demo`.
 mett-core = { workspace = true, features = ["mock"] }
@@ -31,6 +48,13 @@ tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", 
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 url.workspace = true
+
+arboard = { workspace = true, optional = true }
+fontdb = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+ratatui-wgpu = { workspace = true, optional = true }
+ttf-parser = { workspace = true, optional = true }
+winit = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

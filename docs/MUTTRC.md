@@ -108,6 +108,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
 | Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then mett's built-in editor (§4.11), which `builtin` asks for. |
 | | `editor_keys` | string | mett's own: the built-in editor's keys, `vim`, `emacs` or `notepad` (§4.11). |
+| | `gui_font`, `gui_font_size` | path, number | mett's own, for `mett-gui`: the font its window shows text in (a monospaced TrueType or OpenType file; by default, the Cascadia Mono it comes with), and its size in points (`14`). Read when it starts. |
 | | `include` | quadoption | Quote the message in replies. |
 | | `attribution`, `indent_string` | string | The line before quoted text (`On %d, %n wrote:`), and the prefix of quoted lines (`> `). |
 | | `forward_format` | string | Subject of forwarded messages (`[%a: %s]`). |
@@ -322,7 +323,9 @@ underlined by default), `sidebar_divider` and, from neomutt,
 
 mett has an editor of its own, which writes messages in mett's screen. It
 is used when `editor` is `builtin`, or when neither `editor`, `$VISUAL`
-nor `$EDITOR` names an editor. `editor_keys` (mett's own) chooses its
+nor `$EDITOR` names an editor; and always in `mett-gui`'s window, which
+has no terminal for another (`editor` is ignored there). In the window, it
+copies to and pastes from the system's clipboard. `editor_keys` (mett's own) chooses its
 keys: `vim`, `emacs` or `notepad`. Unset (the default), they are those of
 the editor that `editor` (if not `builtin`), `$VISUAL` or `$EDITOR`
 names: vim's for vi, vim, Neovim and their kin, emacs's for emacs,
@@ -344,8 +347,8 @@ message, which `abort_unmodified` aborts).
 `M-x` runs `save-buffer`, `save-buffers-kill-terminal` and `kill-buffer`.
 The editing keys are those of [edtui](https://github.com/preiter93/edtui),
 the editor it is built on: most of vim's motions and operators, and
-emacs's movement and deletion. Its clipboard is its own: paste text from
-elsewhere through the terminal.
+emacs's movement and deletion. In the terminal, its clipboard is its
+own: paste text from elsewhere through the terminal.
 
 ## 5. Mailbox shortcuts
 
