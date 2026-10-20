@@ -1118,6 +1118,45 @@ mod tests {
     }
 
     #[test]
+    fn macros_wait_for_the_builtin_editor() {
+        let mut app = app(compose::Settings {
+            builtin_editor: Some(crate::editor::Keys::Notepad),
+            ..settings()
+        });
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        typed(&mut app, "Hi! ");
+        app.update(Msg::Key(ctrl_s));
+        assert_eq!(app.menu(), Menu::Compose);
+
+        // `e` opens the editor; `<send-message>` waits for it, and for the
+        // keys the user types in it.
+        app.push_keys("e<send-message>").unwrap();
+        let mut effects = Vec::new();
+        let play = |app: &mut App, effects: &mut Vec<Effect>| {
+            while let Some(msg) = app.next_stroke() {
+                effects.extend(app.update(msg));
+            }
+        };
+        play(&mut app, &mut effects);
+        assert!(app.editing.is_some());
+        for key in "Hello".chars().map(KeyCode::Char) {
+            app.typed();
+            app.update(Msg::Key(KeyEvent::from(key)));
+        }
+        app.typed();
+        app.update(Msg::Key(ctrl_s));
+        play(&mut app, &mut effects);
+        let (_, Request::Send(sent)) = request(&effects) else {
+            panic!("expected Send, got {effects:?}");
+        };
+        // The editor opens with the cursor at the start.
+        assert_eq!(sent.body, "HelloHi! \n-- \nMe\n");
+    }
+
+    #[test]
     fn an_unmodified_message_from_the_builtin_editor_is_aborted() {
         let mut app = app(compose::Settings {
             builtin_editor: Some(crate::editor::Keys::Notepad),

@@ -194,8 +194,9 @@ impl App {
     /// given up for a move elsewhere), so the rest of them are dropped.
     pub fn typed(&mut self) {
         // Keys for the sign-in window serve the sign-in the macro waits
-        // for, rather than taking over from it.
-        if self.sign_in.is_some() {
+        // for, rather than taking over from it; so do those typed in the
+        // built-in editor, as they would in an external one.
+        if self.sign_in.is_some() || self.editing.is_some() {
             return;
         }
         if !self.strokes.is_empty() && self.waiting() {
@@ -250,6 +251,9 @@ impl App {
             || !self.writes.is_empty()
             // The user has to sign in first; the keys play afterwards.
             || self.sign_in.is_some()
+            // A message being written: the next keys act on what it
+            // becomes (`e` then `<send-message>` sends the edited text).
+            || self.editing.is_some()
             // A `:` command may bind the keys that come next.
             || self.configuring > 0
     }

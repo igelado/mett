@@ -16,11 +16,10 @@ use std::rc::Rc;
 use edtui::actions::motion::{MoveToFirstRow, MoveToLastRow};
 use edtui::actions::search::StartSearch;
 use edtui::actions::{
-    Action, Chainable, CopySelection, DeleteChar, DeleteCharForward, DeleteSelection,
-    DeleteWordBackward, FindNext, FindPrevious, LineBreak, MoveBackward, MoveDown, MoveForward,
-    MovePageDown, MovePageUp, MoveToEndOfLine, MoveToStartOfLine, MoveUp, MoveWordBackward,
-    MoveWordForward, PasteBefore, Redo, RemoveCharFromSearch, SelectCurrentSearch, StopSearch,
-    SwitchMode, Undo,
+    Action, Chainable, DeleteChar, DeleteCharForward, DeleteWordBackward, FindNext, FindPrevious,
+    LineBreak, MoveBackward, MoveDown, MoveForward, MovePageDown, MovePageUp, MoveToEndOfLine,
+    MoveToStartOfLine, MoveUp, MoveWordBackward, MoveWordForward, PasteBefore, Redo,
+    RemoveCharFromSearch, SelectCurrentSearch, StopSearch, SwitchMode, Undo,
 };
 use edtui::clipboard::ClipboardTrait;
 use edtui::events::{KeyEventHandler, KeyEventRegister, KeyInput};
@@ -144,9 +143,9 @@ impl Builtin {
                 events
                     .key_handler
                     .insert(KeyEventRegister::i(vec![KeyInput::ctrl('y')]), PasteBefore);
-                // `C-/` (which terminals send as `C-_`) undoes, as in
-                // emacs.
-                for key in ['/', '_'] {
+                // `C-/` undoes, as in emacs. Terminals send it as `C-_`,
+                // which crossterm may also read as `C-7`.
+                for key in ['/', '_', '7'] {
                     events
                         .key_handler
                         .insert(KeyEventRegister::i(vec![KeyInput::ctrl(key)]), Undo);
@@ -359,13 +358,15 @@ impl Builtin {
             self.deselect();
             self.note = Some("Quit".into());
         } else if is_ctrl(key, 'w') {
-            self.select_to_cursor();
-            self.state.execute(DeleteSelection);
-            self.anchor = None;
+            if let Some(region) = self.region() {
+                self.copy(region);
+                self.delete(region);
+            }
         } else if key.code == KeyCode::Char('w') && key.modifiers == KeyModifiers::ALT {
-            self.select_to_cursor();
-            self.state.execute(CopySelection);
-            self.anchor = None;
+            if let Some(region) = self.region() {
+                self.copy(region);
+            }
+            self.deselect();
         } else if typing(key) {
             // Typing ends the region, as in emacs.
             self.deselect();
@@ -396,7 +397,11 @@ impl Builtin {
         if key.code == KeyCode::Esc && key.modifiers.is_empty() {
             return self.leave_asking(Question::DiscardChanges);
         }
-        let selected = self.state.selection.is_some();
+        if key.code == KeyCode::F(3) {
+            self.find_again(!key.modifiers.contains(KeyModifiers::SHIFT));
+            return Outcome::Editing;
+        }
+        let selected = self.region();
         if moves(key) && key.modifiers.contains(KeyModifiers::SHIFT) {
             let anchor = self.anchor.unwrap_or(self.state.cursor);
             self.edit(KeyEvent::new(
@@ -410,22 +415,74 @@ impl Builtin {
             self.anchor = Some(Index2::new(0, 0));
             self.select_to_cursor();
         } else if is_ctrl(key, 'c') {
-            let selection = self.state.selection.clone();
-            self.state.execute(CopySelection);
-            self.state.selection = selection;
+            if let Some(region) = selected {
+                self.copy(region);
+            }
         } else if is_ctrl(key, 'x') {
-            self.state.execute(DeleteSelection);
-            self.anchor = None;
-        } else if selected && matches!(key.code, KeyCode::Backspace | KeyCode::Delete) {
-            self.delete_selection();
-        } else if selected && (typing(key) || is_ctrl(key, 'v')) {
-            self.delete_selection();
+            if let Some(region) = selected {
+                self.copy(region);
+                self.delete(region);
+            }
+        } else if let Some(region) = selected
+            && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        {
+            self.delete(region);
+        } else if let Some(region) = selected
+            && (typing(key) || is_ctrl(key, 'v'))
+        {
+            self.delete(region);
             self.edit(key);
         } else {
             self.deselect();
             self.edit(key);
         }
         Outcome::Editing
+    }
+
+    /// Finds the last search's text again (Notepad's F3), after the
+    /// cursor or, `backwards`, before it, and selects it. The text is
+    /// searched afresh: it may have changed since.
+    fn find_again(&mut self, forward: bool) {
+        let pattern: Vec<char> = self.state.search_pattern().chars().collect();
+        if pattern.is_empty() {
+            self.note = Some("No search yet: ^F searches".into());
+            return;
+        }
+        let rows: Vec<Vec<char>> = self
+            .text()
+            .split('\n')
+            .map(|row| row.chars().collect())
+            .collect();
+        let matches: Vec<Index2> = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, chars)| {
+                chars
+                    .windows(pattern.len())
+                    .enumerate()
+                    .filter(|(_, window)| *window == pattern.as_slice())
+                    .map(move |(col, _)| Index2::new(row, col))
+            })
+            .collect();
+        // From the cursor, or before what the last search found, and past
+        // the last match, from the other end.
+        let cursor = self.state.cursor;
+        let from = self.region().map_or(cursor, |(start, _)| start);
+        let found = if forward {
+            matches
+                .iter()
+                .find(|m| **m >= cursor && **m != from)
+                .or(matches.first())
+        } else {
+            matches.iter().rev().find(|m| **m < from).or(matches.last())
+        };
+        let Some(&start) = found else {
+            self.note = Some(format!("Can't find \"{}\"", self.state.search_pattern()));
+            return;
+        };
+        self.anchor = Some(start);
+        self.state.cursor = Index2::new(start.row, start.col + pattern.len());
+        self.select_to_cursor();
     }
 
     /// Hands a key to edtui. Keys it doesn't know (F1, Insert, ...),
@@ -467,12 +524,52 @@ impl Builtin {
         self.state.selection = None;
     }
 
-    /// Deletes the selection, keeping the clipboard as it was.
-    fn delete_selection(&mut self) {
-        let kept = self.clipboard.0.borrow().clone();
-        self.state.execute(DeleteSelection);
-        *self.clipboard.0.borrow_mut() = kept;
-        self.anchor = None;
+    /// The text from the anchor to the cursor (emacs's region, Notepad's
+    /// selection): where it starts, and where it ends, the character there
+    /// left out; `None` if nothing is selected.
+    fn region(&self) -> Option<(Index2, Index2)> {
+        let anchor = self.anchor?;
+        let cursor = self.state.cursor;
+        if anchor < cursor {
+            Some((anchor, cursor))
+        } else if cursor < anchor {
+            Some((cursor, anchor))
+        } else {
+            None
+        }
+    }
+
+    /// The text of `region`.
+    fn region_text(&self, (start, end): (Index2, Index2)) -> String {
+        let text = self.text();
+        let mut out = String::new();
+        for (row, line) in text.split('\n').enumerate() {
+            if row < start.row || row > end.row {
+                continue;
+            }
+            let from = if row == start.row { start.col } else { 0 };
+            let to = if row == end.row { end.col } else { usize::MAX };
+            out.extend(line.chars().take(to).skip(from));
+            if row < end.row {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Puts the text of `region` on the clipboard.
+    fn copy(&mut self, region: (Index2, Index2)) {
+        *self.clipboard.0.borrow_mut() = self.region_text(region);
+    }
+
+    /// Deletes the text of `region`, as one change to undo. (Backspacing
+    /// over it: edtui's own deletion of a selection drops a line whose
+    /// text is all selected.)
+    fn delete(&mut self, region: (Index2, Index2)) {
+        let count = self.region_text(region).chars().count();
+        self.deselect();
+        self.state.cursor = region.1;
+        self.state.execute(DeleteChar(count));
     }
 
     /// What the bottom line shows, `width` cells wide.
@@ -867,6 +964,63 @@ mod tests {
                 assert_eq!(editor.key(KeyEvent::from(code)), Outcome::Editing);
             }
             assert_eq!(editor.text(), "text\n");
+        }
+    }
+
+    #[test]
+    fn notepad_finds_again() {
+        let mut notepad = Builtin::new("one two\ntwo\n", Keys::Notepad);
+        press(&mut notepad, &[ctrl('f')]);
+        press(&mut notepad, &chars("two\n"));
+        assert_eq!(notepad.state.cursor, Index2::new(0, 4));
+        // F3 finds the next one, and selects it: typing replaces it.
+        let f3 = KeyEvent::from(KeyCode::F(3));
+        press(&mut notepad, &[f3]);
+        assert_eq!(
+            notepad.region(),
+            Some((Index2::new(1, 0), Index2::new(1, 3)))
+        );
+        press(&mut notepad, &chars("2"));
+        assert_eq!(notepad.text(), "one two\n2\n");
+        // Past the last one, it starts again; Shift+F3 goes back.
+        let first = Some((Index2::new(0, 4), Index2::new(0, 7)));
+        press(&mut notepad, &[f3]);
+        assert_eq!(notepad.region(), first);
+        press(&mut notepad, &[shift(KeyCode::F(3))]);
+        assert_eq!(notepad.region(), first);
+        press(&mut notepad, &chars("3"));
+        assert_eq!(notepad.text(), "one 3\n2\n");
+        press(&mut notepad, &[f3]);
+        assert_eq!(
+            notepad.bottom(80),
+            Bottom::Note("Can't find \"two\"".into())
+        );
+    }
+
+    #[test]
+    fn deleting_a_whole_line_of_text_keeps_the_line() {
+        let mut notepad = Builtin::new("one\ntwo\nthree\n", Keys::Notepad);
+        let down = KeyEvent::from(KeyCode::Down);
+        press(&mut notepad, &[down, shift(KeyCode::End), ctrl('x')]);
+        assert_eq!(notepad.text(), "one\n\nthree\n");
+        press(
+            &mut notepad,
+            &[down, KeyEvent::from(KeyCode::Home), ctrl('v')],
+        );
+        assert_eq!(notepad.text(), "one\n\ntwothree\n");
+        press(&mut notepad, &[ctrl('z')]);
+        assert_eq!(notepad.text(), "one\n\nthree\n");
+        press(&mut notepad, &[ctrl('z')]);
+        assert_eq!(notepad.text(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn emacs_undoes_with_any_spelling_of_control_slash() {
+        for c in ['/', '_', '7'] {
+            let mut emacs = Builtin::new("text\n", Keys::Emacs);
+            press(&mut emacs, &chars("A"));
+            press(&mut emacs, &[ctrl(c)]);
+            assert_eq!(emacs.text(), "text\n", "C-{c}");
         }
     }
 
