@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.89"
 publish = false
 license = "MIT OR Apache-2.0"
-repository = "https://git.gelado.org/igelado/mett"
+repository = "https://github.com/igelado/mett"
 
 [workspace.dependencies]
 mett-core = { path = "crates/mett-core" }

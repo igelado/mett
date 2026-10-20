@@ -1,0 +1,28 @@
+# Turns on auto-merge for every pull request when it opens (or leaves
+# draft), so GitHub merges it into main once the main protection rule
+# allows: every required CI check passed and every review conversation
+# resolved (see AGENTS.md). Not CI, and not a required check.
+#
+# Only for branches of this repository: a fork's PR is never merged
+# without a look. (The fork's token couldn't turn it on anyway.)
+
+name: automerge
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  enable:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --merge "$PR"

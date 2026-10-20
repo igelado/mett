@@ -1,19 +1,22 @@
-# CI, run by Forgejo Actions on every push. PRs can only be merged into main
-# when these jobs succeed (see AGENTS.md).
+# CI, run by GitHub Actions on every pull request (and again on each push
+# to it), and on main once merged. PRs can only be merged into main when
+# every one of these jobs succeeds (see AGENTS.md).
 
 name: ci
-on: push
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   # Fails if a Markdown file links to a relative path that does not exist.
   docs:
-    runs-on: docker
-    container:
-      image: alpine:3.20
+    runs-on: ubuntu-latest
     steps:
-      # Actions are JavaScript, so the container needs Node.
-      - run: apk add --no-cache nodejs git
-      - uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: actions/checkout@v4
       - run: |
           status=0
           for f in $(find . -name '*.md' -not -path './.git/*' -not -path './target/*'); do
@@ -24,13 +27,12 @@ jobs:
           exit $status
 
   rust:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: rust:1.95
     steps:
-      - run: apt-get update && apt-get install -y --no-install-recommends nodejs
-      - uses: https://code.forgejo.org/actions/checkout@v4
-      - uses: https://code.forgejo.org/actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
         with:
           path: |
             /usr/local/cargo/registry

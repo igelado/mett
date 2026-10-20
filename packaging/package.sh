@@ -23,7 +23,7 @@ cd "$root"
 version=$(packaging/version.sh)
 release=1
 maintainer=${METT_MAINTAINER:-"Isaac Gelado <igelado@nvidia.com>"}
-homepage=https://git.gelado.org/igelado/mett
+homepage=https://github.com/igelado/mett
 summary="mutt-like terminal mail client for Office365"
 # Reproducible: everything is dated when the commit was made.
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
@@ -73,7 +73,7 @@ install_files() {
     done
     # The guides' links into the source tree (../crates/..., ../LICENSE...)
     # point at this version's online.
-    sed -i "s#](\.\./#]($homepage/src/tag/v$version/#g" \
+    sed -i "s#](\.\./#]($homepage/blob/v$version/#g" \
         "$1/usr/share/doc/mett/CONFIG-OFFICE365.md" "$1/usr/share/doc/mett/MUTTRC.md"
 }
 
