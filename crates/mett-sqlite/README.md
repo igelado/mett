@@ -27,11 +27,12 @@ of each folder listed, and each message read, in a database file: mutt's
   again at once. The server is always the source of truth.
 - **Failures:** if the cache fails (a full disk, say), mett leaves it
   alone for the rest of the session and asks the server for everything.
-- **Privacy:** the cache holds mail, so its directory is created with mode
-  `0700` and its file with mode `0600` (an existing one is made so). A
-  directory others can write to, a symbolic link, or a database that isn't
-  mett's cache is refused. Only Unix permissions keep it private, so
-  elsewhere mett doesn't cache.
+- **Privacy:** the cache holds mail, so on Unix its directory is created
+  with mode `0700` and its file with mode `0600` (an existing one is made
+  so), and a directory others can write to is refused. On Windows, mett
+  sets no permissions: the cache relies on its folder's access rules
+  (the user profile's, by default, which others can't read). Everywhere,
+  a symbolic link, or a database that isn't mett's cache, is refused.
 
 A cache of another schema version is dropped and filled again: it holds
 nothing the server doesn't. A cache holds one account's mailbox: another

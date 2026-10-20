@@ -41,11 +41,10 @@ for x86_64 and aarch64:
   The `-windows.zip` holds `mett.exe` alone. Run mett in Windows Terminal. It reads `mettrc` from
   `%USERPROFILE%\.config\mett\` (or `%USERPROFILE%\.mettrc`), keeps sign-ins
   in the Windows Credential Manager, and edits messages with Notepad
-  unless `editor` says otherwise. `query_command` and backticks in the
+  unless `editor` says otherwise. Its cache is in
+  `%USERPROFILE%\.cache\mett\`. `query_command` and backticks in the
   mettrc need a POSIX `sh`, such as [Git for Windows](https://gitforwindows.org/)'.
-  The header cache is Unix-only (file permissions keep it private), so
-  add `unset header_cache` to the mettrc to skip its warning. In the
-  mettrc, `\` is an escape, as in mutt: write paths with `/`
+  In the mettrc, `\` is an escape, as in mutt: write paths with `/`
   (`C:/Users/me/.signature`), or in single quotes.
 
 [docs/RELEASING.md](https://github.com/igelado/mett/blob/main/docs/RELEASING.md) explains how releases are made.
