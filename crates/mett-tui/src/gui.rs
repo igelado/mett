@@ -34,6 +34,9 @@ use crate::app::App;
 use crate::editor::Editor;
 use crate::{InputEvents, Launch, Session, UserEvent};
 
+/// The window's icon (the packages' launchers have it too).
+static ICON: &[u8] = include_bytes!("../assets/icon-64.png");
+
 /// The font used unless `gui_font` names another.
 static FONT: &[u8] = include_bytes!("../assets/fonts/CascadiaMono-Regular.ttf");
 
@@ -196,6 +199,17 @@ impl Fonts {
     }
 }
 
+/// The window's icon, decoded.
+fn icon() -> Option<winit::window::Icon> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(ICON));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info().ok()?;
+    let mut rgba = vec![0; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut rgba).ok()?;
+    rgba.truncate(frame.buffer_size());
+    winit::window::Icon::from_rgba(rgba, frame.width, frame.height).ok()
+}
+
 /// How wide a font's `m` is, for its height; `None` unless the font is
 /// monospaced (as wide an `i` as an `m`), with cells a terminal's could be
 /// (a tenth as wide as high, to twice).
@@ -297,6 +311,7 @@ impl Gui {
     fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
         let attributes = Window::default_attributes()
             .with_title("mett")
+            .with_window_icon(icon())
             .with_inner_size(WINDOW_SIZE);
         let window = Arc::new(
             event_loop
@@ -988,6 +1003,11 @@ mod tests {
         // Control+V is mett's (Notepad's paste in the built-in editor).
         assert!(!is_paste(&v, ModifiersState::CONTROL));
         assert!(!is_paste(&ch("c"), ModifiersState::SUPER));
+    }
+
+    #[test]
+    fn the_icon_decodes() {
+        assert!(icon().is_some());
     }
 
     #[test]

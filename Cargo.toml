@@ -28,6 +28,7 @@ open = "5.4.4"
 # The GUI (mett-gui): drawing, windows, the clipboard, fonts.
 arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 fontdb = "0.24.0"
+png = "0.18.1"
 pollster = "1.0.1"
 ratatui-wgpu = "0.6.0"
 ttf-parser = "0.25.1"

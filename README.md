@@ -19,26 +19,37 @@ management are still to come.
 ## Install
 
 Each [release](https://github.com/igelado/mett/releases) has packages
-for x86_64 and aarch64:
+for x86_64 and aarch64, with both programs: `mett`, in the terminal, and
+`mett-gui`, mett in a window of its own (the system's menus launch it as
+*mett*):
 
 - **Debian, Ubuntu:** `sudo apt install ./mett_<version>-1_<amd64|arm64>.deb`
+  (it recommends the X11, Wayland and Vulkan libraries `mett-gui` uses;
+  `--no-install-recommends` leaves them out, on a server say)
 - **Arch Linux:** `sudo pacman -U mett-<version>-1-<x86_64|aarch64>.pkg.tar.zst`
 - **Other Linux:** the `-linux.tar.gz` holds the `mett` binary, which needs
-  nothing else.
+  nothing else, and `mett-gui`, which needs glibc 2.28 or later and the
+  system's graphics libraries (with `mett.desktop` and `mett-256.png`, to
+  add it to the menus).
 - **macOS** (Apple silicon or Intel): open `mett-<version>-macos.dmg` and
-  run *Install mett.pkg*, which installs `/usr/local/bin/mett`. The
+  run *Install mett.pkg*, which installs `/usr/local/bin/mett` and
+  `/Applications/mett.app` (mett-gui). The
   installer isn't signed yet, so macOS stops it the first time: open
   **System Settings › Privacy & Security** and choose **Open Anyway**
   (or run `sudo installer -pkg "/Volumes/mett <version>/Install mett.pkg"
   -target /`). To remove it: `sudo rm -r /usr/local/bin/mett
-  /usr/local/share/doc/mett && sudo pkgutil --forget io.github.igelado.mett`.
-  The `-aarch64-macos.tar.gz` and `-x86_64-macos.tar.gz` hold the binary
-  alone (if macOS refuses to run it, `xattr -d com.apple.quarantine mett`).
+  /Applications/mett.app /usr/local/share/doc/mett && sudo pkgutil --forget
+  io.github.igelado.mett`. The `-aarch64-macos.tar.gz` and
+  `-x86_64-macos.tar.gz` hold the binaries alone (if macOS refuses to run
+  them, `xattr -d com.apple.quarantine mett mett-gui`). Started from
+  Finder, mett.app doesn't see your shell's `EDITOR`: set `editor_keys`
+  in the mettrc for the built-in editor's keys.
 - **Windows** (x86_64): run `mett-<version>-x86_64-windows-setup.exe`. It
   installs for you alone (or for everyone, as administrator), adds mett to
-  the `PATH`, and is uninstalled from Windows' **Installed apps**. It isn't
-  signed yet, so SmartScreen may warn: choose **More info › Run anyway**.
-  The `-windows.zip` holds `mett.exe` alone. Run mett in Windows Terminal. It reads `mettrc` from
+  the `PATH` and *mett* (mett-gui) to Start's menu, and is uninstalled
+  from Windows' **Installed apps**. It isn't signed yet, so SmartScreen
+  may warn: choose **More info › Run anyway**. The `-windows.zip` holds
+  `mett.exe` and `mett-gui.exe`. Run mett in Windows Terminal. It reads `mettrc` from
   `%USERPROFILE%\.config\mett\` (or `%USERPROFILE%\.mettrc`), keeps sign-ins
   in the Windows Credential Manager, and edits messages in its built-in
   editor unless `editor`, `%VISUAL%` or `%EDITOR%` names another. Its cache is in

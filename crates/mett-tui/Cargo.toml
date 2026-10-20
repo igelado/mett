@@ -23,6 +23,7 @@ default = ["gui"]
 gui = [
     "dep:arboard",
     "dep:fontdb",
+    "dep:png",
     "dep:pollster",
     "dep:ratatui-wgpu",
     "dep:ttf-parser",
@@ -51,6 +52,7 @@ url.workspace = true
 
 arboard = { workspace = true, optional = true }
 fontdb = { workspace = true, optional = true }
+png = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 ratatui-wgpu = { workspace = true, optional = true }
 ttf-parser = { workspace = true, optional = true }

@@ -1,6 +1,9 @@
 ; mett's Windows installer, built by packaging/windows-installer.sh, which
 ; defines Version, NumericVersion (Version without a pre-release part) and
-; Source (the directory with mett.exe and its files).
+; Source (the directory with mett.exe, mett-gui.exe and their files).
+;
+; Start's menu gets a shortcut to mett-gui, mett in a window of its own
+; (and the desktop one, if asked for).
 ;
 ; It installs for the user (no administrator needed), or for everyone when
 ; run as administrator, and adds the install directory to that user's or
@@ -28,11 +31,16 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayIcon={app}\mett.exe
+UninstallDisplayIcon={app}\mett.ico
 UninstallDisplayName=mett
 
 [Tasks]
 Name: addtopath; Description: "Add mett to the PATH, so it runs from any terminal"
+Name: desktopicon; Description: "A shortcut to mett on the desktop"; Flags: unchecked
+
+[Icons]
+Name: "{autoprograms}\mett"; Filename: "{app}\mett-gui.exe"; IconFilename: "{app}\mett.ico"; Comment: "Office365 mail, as mutt reads it"
+Name: "{autodesktop}\mett"; Filename: "{app}\mett-gui.exe"; IconFilename: "{app}\mett.ico"; Tasks: desktopicon
 
 [Files]
 Source: "{#Source}\*"; DestDir: "{app}"; Flags: ignoreversion
