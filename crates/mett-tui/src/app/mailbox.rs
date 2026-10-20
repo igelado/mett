@@ -1274,7 +1274,7 @@ fn messages(count: usize, noun: &str) -> String {
 
 /// Orders `folders` as a tree, each folder followed by its subfolders, by
 /// name, with the path the user would type for each.
-fn tree(folders: Vec<Folder>) -> Vec<BrowserEntry> {
+pub(super) fn tree(folders: Vec<Folder>) -> Vec<BrowserEntry> {
     let ids: HashSet<FolderId> = folders.iter().map(|f| f.id.clone()).collect();
     let mut children: HashMap<Option<FolderId>, Vec<Folder>> = HashMap::new();
     for folder in folders {

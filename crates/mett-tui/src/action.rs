@@ -95,6 +95,7 @@ actions! {
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";
+    SidebarFocus => "sidebar-focus", "Move the keys to the sidebar, or back";
     SidebarFirst => "sidebar-first", "Move the sidebar's highlight to the first mailbox";
     SidebarLast => "sidebar-last", "Move the sidebar's highlight to the last mailbox";
     SidebarNext => "sidebar-next", "Move the sidebar's highlight to the next mailbox";

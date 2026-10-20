@@ -1,5 +1,7 @@
 //! mutt's sidebar: the `mailboxes` in a column beside the menus, with
 //! their counts, and a cursor of its own that `sidebar-open` opens.
+//! Without `mailboxes`, it lists every folder instead (mett's), and
+//! `sidebar-focus` gives it the keys (mett's too).
 //!
 //! The entries (which mailboxes show, in what order, under what name) are
 //! made again only when what they show changes: the mailboxes are checked,
@@ -7,9 +9,13 @@
 //! open folder's change. Drawing them only formats the rows on screen
 //! (see `view/sidebar.rs`).
 
-use super::{AfterPurge, App, Effect, MailboxEntry};
+use mett_core::Folder;
+
+use super::mailbox::{BrowserEntry, tree};
+use super::{AfterPurge, App, Effect, MailboxEntry, effect_id};
 use crate::action::Action;
 use crate::config::mailbox::{FolderPath, same_name};
+use crate::worker::{Request, RequestId};
 
 /// How the sidebar's entries are ordered (`sidebar_sort_method`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -169,6 +175,16 @@ pub struct Sidebar {
     /// The open folder's unread and total counts, as the index has them,
     /// when they order the entries.
     open_counts: Option<(usize, usize)>,
+    /// Whether it has the keys (`sidebar-focus`).
+    focused: bool,
+    /// Every folder, in tree order, as last listed: the sidebar shows them
+    /// when there are no `mailboxes`.
+    folders: Option<Vec<BrowserEntry>>,
+    /// The request listing them, while it is pending.
+    listing: Option<RequestId>,
+    /// Whether they were listed since they last may have changed; until
+    /// then, they are listed again once the sidebar shows.
+    listed: bool,
 }
 
 /// The fewest columns the sidebar leaves the menus, unless
@@ -204,6 +220,11 @@ impl App {
         &self.sidebar
     }
 
+    /// Whether the sidebar has the keys: given them, and on screen.
+    pub fn sidebar_focused(&self) -> bool {
+        self.sidebar.focused && self.sidebar_shown()
+    }
+
     /// Takes in the sidebar's settings. A new order puts the cursor back
     /// on the open folder, as in mutt.
     pub(super) fn apply_sidebar(&mut self, settings: SidebarSettings) {
@@ -227,68 +248,12 @@ impl App {
     /// shown, or with `follow_open` (another folder opened), moves to the
     /// open one.
     pub(super) fn rebuild_sidebar(&mut self, follow_open: bool) {
+        let mut entries = if self.mailboxes.is_empty() {
+            self.folder_entries()
+        } else {
+            self.mailbox_entries_for_sidebar()
+        };
         let settings = &self.sidebar.settings;
-        let mut entries: Vec<(SidebarEntry, String, usize)> = self
-            .mailboxes
-            .iter()
-            .filter_map(|mailbox| {
-                let path = &mailbox.path;
-                let open = self
-                    .folder
-                    .as_ref()
-                    .filter(|open| self.folder_at(path) == Some(&open.id));
-                // A mailbox that isn't checked has the counts it had when
-                // it was opened.
-                let folder = self
-                    .mailbox_state
-                    .get(path)
-                    .and_then(|state| state.folder.as_ref())
-                    .or(open);
-                let entry = SidebarEntry {
-                    path: path.clone(),
-                    name: sidebar_name(mailbox, settings),
-                    open: open.is_some(),
-                    new: self.has_new_mail(mailbox),
-                    counts: folder.map(|f| (f.unread_count, f.total_count)),
-                    spoolfile: (settings.spoolfile.as_ref())
-                        .is_some_and(|spoolfile| self.same_mailbox(spoolfile, path)),
-                };
-                // Office365 doesn't count flagged mail: with
-                // `sidebar_new_mail_only`, only new and unread mail shows
-                // a mailbox (besides the open one and the whitelisted).
-                let shown = !settings.new_mail_only
-                    || entry.open
-                    || entry.has_mail()
-                    || (settings.whitelist.iter()).any(|listed| self.same_mailbox(listed, path));
-                if !shown {
-                    return None;
-                }
-                // `alpha` by the label, or the path as `%B` shows it
-                // (relative to `folder`); `path` by the whole path.
-                let key = match (settings.sort.method, &mailbox.label) {
-                    (SortMethod::Alpha, Some(label)) => label.clone(),
-                    (SortMethod::Alpha, None) => mailbox
-                        .text
-                        .strip_prefix('=')
-                        .unwrap_or(&mailbox.text)
-                        .to_owned(),
-                    _ => crate::config::mailbox::expand_shortcut(&mailbox.text, &self.mailbox_root),
-                }
-                .to_lowercase();
-                // The open folder's as the index has them, if they are
-                // followed.
-                let counts = match self.sidebar.open_counts.filter(|_| entry.open) {
-                    Some(live) => Some(live),
-                    None => entry.counts.map(|(u, t)| (u as usize, t as usize)),
-                };
-                let count = match (settings.sort.method, counts) {
-                    (SortMethod::Count, Some((_, total))) => total,
-                    (SortMethod::Unread, Some((unread, _))) => unread,
-                    _ => 0,
-                };
-                Some((entry, key, count))
-            })
-            .collect();
         let sort = settings.sort;
         if sort.method == SortMethod::Unsorted {
             if sort.reverse {
@@ -320,6 +285,159 @@ impl App {
         }
         .unwrap_or(0);
         self.sidebar.entries = entries;
+    }
+
+    /// The `mailboxes`, as the sidebar shows them, each with what orders
+    /// it: its name or path, and its count.
+    fn mailbox_entries_for_sidebar(&self) -> Vec<(SidebarEntry, String, usize)> {
+        let settings = &self.sidebar.settings;
+        self.mailboxes
+            .iter()
+            .filter_map(|mailbox| {
+                let path = &mailbox.path;
+                let open = self
+                    .folder
+                    .as_ref()
+                    .filter(|open| self.folder_at(path) == Some(&open.id));
+                // A mailbox that isn't checked has the counts it had when
+                // it was opened.
+                let folder = self
+                    .mailbox_state
+                    .get(path)
+                    .and_then(|state| state.folder.as_ref())
+                    .or(open);
+                let entry = SidebarEntry {
+                    path: path.clone(),
+                    name: sidebar_name(mailbox, settings),
+                    open: open.is_some(),
+                    new: self.has_new_mail(mailbox),
+                    counts: folder.map(|f| (f.unread_count, f.total_count)),
+                    spoolfile: (settings.spoolfile.as_ref())
+                        .is_some_and(|spoolfile| self.same_mailbox(spoolfile, path)),
+                };
+                // Office365 doesn't count flagged mail: with
+                // `sidebar_new_mail_only`, only new and unread mail shows
+                // a mailbox (besides the open one and the whitelisted).
+                if !self.shows(&entry) {
+                    return None;
+                }
+                // `alpha` by the label, or the path as `%B` shows it
+                // (relative to `folder`); `path` by the whole path.
+                let key = match (settings.sort.method, &mailbox.label) {
+                    (SortMethod::Alpha, Some(label)) => label.clone(),
+                    (SortMethod::Alpha, None) => mailbox
+                        .text
+                        .strip_prefix('=')
+                        .unwrap_or(&mailbox.text)
+                        .to_owned(),
+                    _ => crate::config::mailbox::expand_shortcut(&mailbox.text, &self.mailbox_root),
+                }
+                .to_lowercase();
+                let count = self.sort_count(&entry);
+                Some((entry, key, count))
+            })
+            .collect()
+    }
+
+    /// Every folder, as listed, as the sidebar shows them (when there are
+    /// no `mailboxes`), each with what orders it: its path, and its count.
+    fn folder_entries(&self) -> Vec<(SidebarEntry, String, usize)> {
+        let settings = &self.sidebar.settings;
+        let open = self.folder.as_ref().map(|f| &f.id);
+        (self.sidebar.folders.iter().flatten())
+            .filter_map(|folder| {
+                let entry = SidebarEntry {
+                    path: folder.target.clone(),
+                    name: folder_name(folder, settings),
+                    open: open.is_some() && folder.id.as_ref() == open,
+                    // Unread mail shows by its count.
+                    new: false,
+                    counts: folder.counts,
+                    spoolfile: (settings.spoolfile.as_ref())
+                        .is_some_and(|spoolfile| self.same_mailbox(spoolfile, &folder.target)),
+                };
+                if !self.shows(&entry) {
+                    return None;
+                }
+                let count = self.sort_count(&entry);
+                Some((entry, folder.path.to_lowercase(), count))
+            })
+            .collect()
+    }
+
+    /// Whether the sidebar shows `entry`: all of them, unless
+    /// `sidebar_new_mail_only`.
+    fn shows(&self, entry: &SidebarEntry) -> bool {
+        let settings = &self.sidebar.settings;
+        // Office365 doesn't count flagged mail: with
+        // `sidebar_new_mail_only`, only new and unread mail shows a
+        // mailbox (besides the open one and the whitelisted).
+        !settings.new_mail_only
+            || entry.open
+            || entry.has_mail()
+            || (settings.whitelist.iter()).any(|listed| self.same_mailbox(listed, &entry.path))
+    }
+
+    /// The count `sidebar_sort_method` orders `entry` by, if any.
+    fn sort_count(&self, entry: &SidebarEntry) -> usize {
+        // The open folder's as the index has them, if they are followed.
+        let counts = match self.sidebar.open_counts.filter(|_| entry.open) {
+            Some(live) => Some(live),
+            None => entry.counts.map(|(u, t)| (u as usize, t as usize)),
+        };
+        match (self.sidebar.settings.sort.method, counts) {
+            (SortMethod::Count, Some((_, total))) => total,
+            (SortMethod::Unread, Some((unread, _))) => unread,
+            _ => 0,
+        }
+    }
+
+    /// Lists every folder for the sidebar, if it shows them and they may
+    /// have changed since last listed. Not while the user is to sign in,
+    /// or after a failed sign-in: background requests would only ask
+    /// again and again.
+    pub(super) fn list_sidebar_folders(&mut self) -> Vec<Effect> {
+        let wanted = self.mailboxes.is_empty()
+            && !self.sidebar.listed
+            && self.sidebar.listing.is_none()
+            && self.sidebar_shown()
+            && self.folder.is_some()
+            && !self.quit
+            && !self.poll_paused
+            && self.sign_in.is_none();
+        if !wanted {
+            return Vec::new();
+        }
+        let request = self.request(Request::ListFolders);
+        self.sidebar.listing = Some(effect_id(&request));
+        vec![request]
+    }
+
+    /// The request listing the sidebar's folders, while it is pending.
+    pub(super) fn sidebar_request(&self) -> Option<RequestId> {
+        self.sidebar.listing
+    }
+
+    /// Takes in the folders listed for the sidebar. If they couldn't be,
+    /// those it has stay, until they are listed again.
+    pub(super) fn on_sidebar_listed(&mut self, result: mett_core::Result<Vec<Folder>>) {
+        self.sidebar.listing = None;
+        self.sidebar.listed = true;
+        if let Ok(folders) = result {
+            let folders = tree(folders);
+            for folder in &folders {
+                if let Some(id) = &folder.id {
+                    self.folder_ids.insert(folder.target.clone(), id.clone());
+                }
+            }
+            self.sidebar.folders = Some(folders);
+            self.rebuild_sidebar(false);
+        }
+    }
+
+    /// The folders' counts may have changed: they are listed again.
+    pub(super) fn sidebar_outdated(&mut self) {
+        self.sidebar.listed = false;
     }
 
     /// Brings the sidebar up to date before the screen is drawn: ordered
@@ -365,6 +483,16 @@ impl App {
         };
         let to = match action {
             Action::SidebarToggleVisible => return Some(self.toggle_sidebar()),
+            Action::SidebarFocus => {
+                if self.sidebar.settings.too_narrow(self.terminal_width) {
+                    self.status = self.narrow_note();
+                } else if !self.sidebar_shown() {
+                    self.fail("The sidebar is hidden: set sidebar_visible to show it.");
+                } else {
+                    self.sidebar.focused = true;
+                }
+                return Some(Vec::new());
+            }
             Action::SidebarFirst
             | Action::SidebarLast
             | Action::SidebarNext
@@ -417,6 +545,23 @@ impl App {
         Some(Vec::new())
     }
 
+    /// Handles the actions of the sidebar while it has the keys: they
+    /// move its cursor, and opening its mailbox, or leaving, gives the
+    /// keys back.
+    pub(super) fn on_sidebar_menu_action(&mut self, action: Action) -> Vec<Effect> {
+        match action {
+            Action::Exit | Action::SidebarFocus => {
+                self.sidebar.focused = false;
+                Vec::new()
+            }
+            Action::SidebarOpen => {
+                self.sidebar.focused = false;
+                self.on_sidebar_action(action).unwrap_or_default()
+            }
+            _ => self.on_sidebar_action(action).unwrap_or_default(),
+        }
+    }
+
     /// Says how wide the terminal has to be for the sidebar.
     fn narrow_note(&self) -> String {
         let settings = &self.sidebar.settings;
@@ -429,6 +574,8 @@ impl App {
     /// settings take.
     fn toggle_sidebar(&mut self) -> Vec<Effect> {
         self.sidebar.settings.visible = !self.sidebar.settings.visible;
+        // Shown again, it hasn't the keys.
+        self.sidebar.focused = false;
         self.relayout();
         if self.sidebar.settings.too_narrow(self.terminal_width) {
             self.after_configured = Some(self.narrow_note());
@@ -536,10 +683,30 @@ fn sidebar_name(mailbox: &MailboxEntry, settings: &SidebarSettings) -> String {
     }
 }
 
+/// What `%B` shows for a folder listed for the sidebar: its path from
+/// the top (`Inbox/Projects`), with `sidebar_short_path` only its name,
+/// and with `sidebar_folder_indent` indented by its depth.
+fn folder_name(folder: &BrowserEntry, settings: &SidebarSettings) -> String {
+    let name = if settings.short_path {
+        &folder.name
+    } else {
+        &folder.path
+    };
+    if settings.folder_indent && folder.depth > 0 {
+        format!("{}{name}", settings.indent_string.repeat(folder.depth))
+    } else {
+        name.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use ratatui::crossterm::event::KeyCode;
+
     use super::*;
     use crate::app::testing::*;
+    use crate::app::{Msg, Timer};
+    use crate::keymap::Menu;
     use crate::worker::{Event, Request};
 
     /// The names of the entries, `*` marking the cursor's.
@@ -890,5 +1057,204 @@ mod tests {
         }
         app.before_draw();
         assert_eq!(shown(&app), ["Work", "*Inbox", "Lists"]);
+    }
+
+    /// An app without `mailboxes` and with `sidebar`, `width` columns
+    /// wide, that has opened the Inbox; returns it and the effects of the
+    /// opening.
+    fn folders_app_at(sidebar: SidebarSettings, width: u16) -> (App, Vec<Effect>) {
+        let settings = crate::app::Settings {
+            sync_interval: Some(std::time::Duration::from_secs(60)),
+            sidebar,
+            ..crate::app::Settings::default()
+        };
+        let (mut app, effects) = App::open(width, 24, inbox(), settings);
+        let open = first_request(&effects);
+        let inbox = mett_core::mock::folder("in", "Inbox", None);
+        let effects = respond(&mut app, open, Event::FolderOpened(Ok(inbox)));
+        (app, effects)
+    }
+
+    /// [`folders_app_at`] 120 columns, with `sidebar` visible.
+    fn folders_app(sidebar: SidebarSettings) -> (App, Vec<Effect>) {
+        let visible = SidebarSettings {
+            visible: true,
+            ..sidebar
+        };
+        folders_app_at(visible, 120)
+    }
+
+    /// The request listing the folders among `effects`.
+    fn folders_listing(effects: &[Effect]) -> Option<RequestId> {
+        let requests = requests(effects);
+        let mut listings = requests
+            .iter()
+            .filter(|(_, request)| *request == Request::ListFolders);
+        let listing = listings.next().map(|(id, _)| *id);
+        assert!(listings.next().is_none(), "listed once");
+        listing
+    }
+
+    /// Inbox, with 2 unread of 5, its subfolder Projects and Archive.
+    fn every_folder() -> Vec<Folder> {
+        let folder = |id: &str, name: &str, parent: Option<&str>, unread| Folder {
+            parent: parent.map(mett_core::FolderId::new),
+            unread_count: unread,
+            total_count: 5,
+            ..mett_core::mock::folder(id, name, None)
+        };
+        vec![
+            folder("in", "Inbox", None, 2),
+            folder("p", "Projects", Some("in"), 0),
+            folder("arc", "Archive", None, 1),
+        ]
+    }
+
+    /// [`folders_app`], its folders listed.
+    fn folders_listed(sidebar: SidebarSettings) -> App {
+        let (mut app, effects) = folders_app(sidebar);
+        let listing = folders_listing(&effects).expect("folders listed");
+        respond(&mut app, listing, Event::FoldersListed(Ok(every_folder())));
+        app
+    }
+
+    #[test]
+    fn lists_every_folder_without_mailboxes() {
+        let mut app = folders_listed(SidebarSettings::default());
+        assert_eq!(shown(&app), ["Archive", "*Inbox", "Inbox/Projects"]);
+        assert!(app.sidebar.entries[1].open);
+        assert_eq!(app.sidebar.entries[0].counts, Some((1, 5)));
+        assert!(app.sidebar.entries[0].has_mail());
+        // Listed once, until they may have changed: the next check.
+        assert_eq!(folders_listing(&act(&mut app, Action::SidebarNext)), None);
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let listing = folders_listing(&effects).expect("listed again");
+        let mut fewer = every_folder();
+        fewer.pop();
+        respond(&mut app, listing, Event::FoldersListed(Ok(fewer)));
+        assert_eq!(
+            shown(&app),
+            ["Inbox", "*Inbox/Projects"],
+            "the cursor stays"
+        );
+        // A failed listing keeps them, until the next check.
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        let listing = folders_listing(&effects).expect("listed again");
+        respond(&mut app, listing, Event::FoldersListed(Err(offline())));
+        assert_eq!(shown(&app), ["Inbox", "*Inbox/Projects"]);
+        assert_eq!(folders_listing(&act(&mut app, Action::SidebarNext)), None);
+    }
+
+    #[test]
+    fn opens_a_listed_folder() {
+        let mut app = folders_listed(SidebarSettings::default());
+        act(&mut app, Action::SidebarLast);
+        let effects = act(&mut app, Action::SidebarOpen);
+        let projects = FolderPath::Named(vec!["Inbox".into(), "Projects".into()]);
+        assert!(
+            matches!(&requests(&effects)[..], [(_, Request::OpenFolder(path))] if *path == projects),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn shortens_and_indents_listed_folders() {
+        let app = folders_listed(SidebarSettings {
+            short_path: true,
+            folder_indent: true,
+            ..SidebarSettings::default()
+        });
+        assert_eq!(shown(&app), ["Archive", "*Inbox", "  Projects"]);
+    }
+
+    #[test]
+    fn lists_folders_only_when_shown_without_mailboxes() {
+        let (_, effects) = folders_app_at(SidebarSettings::default(), 120);
+        assert_eq!(folders_listing(&effects), None, "hidden");
+        let visible = SidebarSettings {
+            visible: true,
+            ..SidebarSettings::default()
+        };
+        let (mut app, effects) = folders_app_at(visible, 80);
+        assert_eq!(folders_listing(&effects), None, "too narrow");
+        let effects = app.update(Msg::Resize {
+            width: 120,
+            height: 24,
+        });
+        assert!(folders_listing(&effects).is_some(), "widened");
+        // The mailboxes are shown instead, if there are any.
+        let visible = SidebarSettings {
+            visible: true,
+            ..SidebarSettings::default()
+        };
+        let (mut app, _) = mailboxes_app(with_mailboxes(visible), 120, 24);
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        assert_eq!(folders_listing(&effects), None);
+    }
+
+    #[test]
+    fn tab_gives_the_sidebar_the_keys() {
+        let mut app = shown_app(SidebarSettings::default(), 24, &[]);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.menu(), Menu::Sidebar);
+        assert!(app.sidebar_focused());
+        // The index's keys move the sidebar's cursor instead.
+        let selected = app.selected;
+        key(&mut app, KeyCode::Char('j'));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(shown(&app), ["Inbox", "Work", "*Lists"]);
+        key(&mut app, KeyCode::Char('k'));
+        assert_eq!(shown(&app), ["Inbox", "*Work", "Lists"]);
+        assert_eq!(app.selected, selected);
+        // Tab, or Esc, gives the keys back.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.menu(), Menu::Index);
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.menu(), Menu::Index);
+        // Enter opens the folder, and gives the keys back.
+        key(&mut app, KeyCode::Tab);
+        let effects = key(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&requests(&effects)[..], [(_, Request::OpenFolder(path))] if *path == mailbox_path("Work")),
+            "{effects:?}"
+        );
+        assert_eq!(app.menu(), Menu::Index);
+    }
+
+    #[test]
+    fn the_pager_gives_the_sidebar_the_keys_too() {
+        let mut app = shown_app(SidebarSettings::default(), 24, &[]);
+        let text = crate::app::TextView::new("notes.txt".into(), vec!["a".into()], 50);
+        app.screens.push(crate::app::Screen::Text(text));
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.menu(), Menu::Sidebar);
+        key(&mut app, KeyCode::Char('j'));
+        assert_eq!(shown(&app), ["Inbox", "*Work", "Lists"]);
+        key(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.menu(), Menu::Pager);
+        assert!(matches!(app.screen(), crate::app::Screen::Text(_)));
+    }
+
+    #[test]
+    fn a_hidden_sidebar_does_not_take_the_keys() {
+        let (mut app, _) = mailboxes_app(with_mailboxes(SidebarSettings::default()), 120, 24);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.menu(), Menu::Index);
+        assert!(app.status.contains("sidebar_visible"), "{}", app.status);
+        // Hidden while it had them, it gives them back.
+        let mut app = shown_app(SidebarSettings::default(), 24, &[]);
+        key(&mut app, KeyCode::Tab);
+        act(&mut app, Action::SidebarToggleVisible);
+        assert_eq!(app.menu(), Menu::Index);
+        // Too narrow, it says how wide the terminal has to be.
+        let mut app = shown_app(SidebarSettings::default(), 24, &[]);
+        app.update(Msg::Resize {
+            width: 80,
+            height: 24,
+        });
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.menu(), Menu::Index);
+        assert!(app.status.contains("columns wide"), "{}", app.status);
     }
 }

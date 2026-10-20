@@ -385,6 +385,7 @@ impl App {
         if !self.poll_paused && self.sign_in.is_none() {
             effects.extend(self.poll_folder());
             effects.extend(self.check_mailboxes());
+            self.sidebar_outdated();
         }
         effects.extend(self.arm_poll());
         effects
@@ -975,6 +976,8 @@ impl App {
                 state.folder = Some(open.clone());
             }
         }
+        // The folder left may have been read.
+        self.sidebar_outdated();
         self.rebuild_sidebar(true);
     }
 
