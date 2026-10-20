@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use mett_core::{Error, FlagsUpdate, Folder, FolderId, MessageId, Page};
+use mett_core::{Error, FlagsUpdate, Folder, FolderId, MessageId, Page, WellKnownFolder};
 
 use super::composing::{Input, Question};
 use super::{App, Effect, Screen, Target, effect_id};
@@ -93,6 +93,8 @@ pub struct BrowserEntry {
     /// The same path, by folder names: unlike the text, it can't be
     /// mistaken for a well-known folder (a folder named `@archive`).
     pub target: FolderPath,
+    /// The well-known folder it is, if listed as one.
+    pub well_known: Option<WellKnownFolder>,
 }
 
 /// What choosing a folder in the browser does.
@@ -1309,6 +1311,7 @@ pub(super) fn tree(folders: Vec<Folder>) -> Vec<BrowserEntry> {
             new: folder.unread_count > 0,
             path: names.join("/"),
             target: FolderPath::Named(names),
+            well_known: folder.well_known,
         });
     }
     entries

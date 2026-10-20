@@ -377,9 +377,22 @@ impl App {
             .collect()
     }
 
-    /// Whether `path` names the listed `folder`: as written, or as found.
+    /// Whether `path` names the listed `folder`: as written, below the
+    /// listed well-known folder it names (`=@sentitems`), or as found.
     fn names_folder(&self, path: &FolderPath, folder: &BrowserEntry) -> bool {
+        let below_well_known = match path {
+            FolderPath::WellKnown(role, below) => (self.sidebar.folders.iter().flatten())
+                .find(|listed| listed.well_known == Some(*role))
+                .and_then(|listed| match &listed.target {
+                    FolderPath::Named(names) => Some(FolderPath::Named(
+                        names.iter().chain(below).cloned().collect(),
+                    )),
+                    _ => None,
+                }),
+            _ => None,
+        };
         same_path(path, &folder.target)
+            || below_well_known.is_some_and(|named| same_path(&named, &folder.target))
             || folder
                 .id
                 .as_ref()
@@ -1336,5 +1349,35 @@ mod tests {
         let gone = mett_core::Error::not_found("folder", "Inbox");
         let effects = respond(&mut app, open, Event::FolderOpened(Err(gone)));
         assert!(folders_listing(&effects).is_some(), "to choose another");
+    }
+
+    #[test]
+    fn well_known_paths_name_listed_folders() {
+        let (mut app, effects) = folders_app(SidebarSettings {
+            new_mail_only: true,
+            whitelist: vec![FolderPath::WellKnown(
+                mett_core::WellKnownFolder::SentItems,
+                vec!["Old".into()],
+            )],
+            ..SidebarSettings::default()
+        });
+        let listing = folders_listing(&effects).expect("folders listed");
+        let sent = Folder {
+            well_known: Some(mett_core::WellKnownFolder::SentItems),
+            ..mett_core::mock::folder("sent", "Sent Items", None)
+        };
+        let old = Folder {
+            parent: Some(mett_core::FolderId::new("sent")),
+            ..mett_core::mock::folder("old", "Old", None)
+        };
+        let quiet = mett_core::mock::folder("q", "Quiet", None);
+        let folders = vec![
+            mett_core::mock::folder("in", "Inbox", None),
+            sent,
+            old,
+            quiet,
+        ];
+        respond(&mut app, listing, Event::FoldersListed(Ok(folders)));
+        assert_eq!(shown(&app), ["*Inbox", "Sent Items/Old"]);
     }
 }

@@ -1025,6 +1025,7 @@ impl App {
                     new: self.has_new_mail(m),
                     path: m.text.clone(),
                     target: m.path.clone(),
+                    well_known: folder.and_then(|f| f.well_known),
                 }
             })
             .collect()
