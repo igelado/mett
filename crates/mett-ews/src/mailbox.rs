@@ -1621,10 +1621,16 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                     DraftOrigin::Forward(id) => (id, "ForwardItem"),
                     DraftOrigin::Recalled(_) => unreachable!("updated above"),
                 };
+                // Exchange Online answers to a version of the original:
+                // without its change key, it refuses
+                // (`ErrorChangeKeyRequiredForWriteOperations`).
+                let change_key = self.change_key(original).await?;
                 (
                     format!(
-                        "<t:{element}><t:ReferenceItemId Id=\"{}\"/></t:{element}>",
-                        escape(original.as_str())
+                        "<t:{element}><t:ReferenceItemId Id=\"{}\" ChangeKey=\"{}\"/>\
+                         </t:{element}>",
+                        escape(original.as_str()),
+                        escape(&change_key)
                     ),
                     About::message(original.as_str()),
                 )
@@ -1914,7 +1920,8 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
         self.update_item(id, &updates).await
     }
 
-    /// The current change key of item `id`, which sending it takes.
+    /// The current change key of item `id`, which sending it, and
+    /// replying to or forwarding it, take.
     async fn change_key(&self, id: &MessageId) -> Result<String> {
         let about = About::message(id.as_str());
         let xml = self.get_items(&[id.to_string()], &[], false, about).await?;
