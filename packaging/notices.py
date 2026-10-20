@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Writes the notices of what the mett binary for TARGET links in.
 
+TARGET may be several, comma-separated, for a binary built for each (a
+universal macOS binary): the notices are those of every one.
+
 The binary is linked statically, so the copyright and license notices of
 the Rust crates it is built from (as `cargo tree` lists them for TARGET),
-and of musl, go with it. Each crate's own license files are copied; one
+and of musl on Linux, go with it. Each crate's own license files are copied; one
 without any is listed with its license expression. Bundled C code (SQLite
 in libsqlite3-sys, AWS-LC in aws-lc-sys) comes with its crate's files.
 
-Usage: notices.py TARGET MUSL_COPYRIGHT_FILE > THIRD-PARTY-NOTICES
+Usage: notices.py TARGET [MUSL_COPYRIGHT_FILE] > THIRD-PARTY-NOTICES
+
+(macOS and Windows binaries link their system's C library, which isn't
+redistributed with them: they have no MUSL_COPYRIGHT_FILE.)
 """
 
 import json
@@ -19,19 +25,23 @@ LICENSE_FILES = ("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT", "UNLICE
 
 
 def main() -> None:
-    target, musl = sys.argv[1], Path(sys.argv[2])
-    tree = subprocess.run(
-        ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
-         "--target", target, "--prefix", "none", "-f", "{p}"],
-        check=True, capture_output=True, text=True,
-    ).stdout
+    # UTF-8, whatever the system's encoding (Windows' isn't).
+    sys.stdout.reconfigure(encoding="utf-8")
+    targets = sys.argv[1].split(",")
+    musl = Path(sys.argv[2]) if len(sys.argv) > 2 else None
     linked = set()
-    for line in tree.splitlines():
-        name, version = line.split()[:2]
-        linked.add((name, version.lstrip("v")))
+    for target in targets:
+        tree = subprocess.run(
+            ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
+             "--target", target, "--prefix", "none", "-f", "{p}"],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        ).stdout
+        for line in tree.splitlines():
+            name, version = line.split()[:2]
+            linked.add((name, version.lstrip("v")))
     metadata = json.loads(subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout)
     workspace = set(metadata["workspace_members"])
     out = sys.stdout
@@ -56,9 +66,10 @@ def main() -> None:
             out.write(f"\nLicensed under {package.get('license')}.\n")
         for file in files:
             out.write(f"\n--- {file.name} ---\n\n")
-            out.write(file.read_text(errors="replace"))
-    out.write(f"\n{'=' * 72}\nmusl libc (statically linked)\n{'=' * 72}\n\n")
-    out.write(musl.read_text(errors="replace"))
+            out.write(file.read_text(encoding="utf-8", errors="replace"))
+    if musl:
+        out.write(f"\n{'=' * 72}\nmusl libc (statically linked)\n{'=' * 72}\n\n")
+        out.write(musl.read_text(encoding="utf-8", errors="replace"))
 
 
 if __name__ == "__main__":

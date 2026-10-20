@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
 
 use lexer::{Command, Expander, Lexer, Word};
 pub use vars::{Kind, Quad, VARS, Value, expand_home};
@@ -1022,13 +1021,17 @@ impl Expander for Expand<'_> {
         if let Some(value) = self.config.user.get(name) {
             return Some(value.clone());
         }
+        // The home mett found, which on Windows may not be `$HOME`.
+        if name == "HOME"
+            && let Some(home) = self.config.home()
+        {
+            return Some(home.to_owned());
+        }
         std::env::var(name).ok()
     }
 
     fn command(&self, command: &str) -> Result<String, String> {
-        let output = Process::new("sh")
-            .arg("-c")
-            .arg(command)
+        let output = crate::platform::sh(command, "A backtick command")?
             .output()
             .map_err(|e| e.to_string())?;
         if !output.status.success() {
@@ -1167,6 +1170,13 @@ mod tests {
             config.string("spoolfile"),
             "msgraph://alice@contoso.com/@inbox"
         );
+    }
+
+    #[test]
+    fn home_is_the_one_mett_found() {
+        // `/home/a`, whatever `$HOME` is (on Windows, often unset).
+        let config = load("set my_sig=$HOME/.sig\n");
+        assert_eq!(config.user.get("my_sig").unwrap(), "/home/a/.sig");
     }
 
     #[test]
@@ -1664,12 +1674,14 @@ mod tests {
             new_user_file(&env),
             Some(PathBuf::from("/home/a/.config/mett/mettrc"))
         );
+        // An absolute path, on Windows too.
+        let x = PathBuf::from(if cfg!(windows) { r"C:\x" } else { "/x" });
         let env = |name: &str| match name {
             "HOME" => Some(OsString::from("/home/a")),
-            "XDG_CONFIG_HOME" => Some(OsString::from("/x")),
+            "XDG_CONFIG_HOME" => Some(x.clone().into_os_string()),
             _ => None,
         };
-        assert_eq!(new_user_file(&env), Some(PathBuf::from("/x/mett/mettrc")));
+        assert_eq!(new_user_file(&env), Some(x.join("mett").join("mettrc")));
     }
 
     #[test]

@@ -293,6 +293,8 @@ fn lock_file(path: &Path) -> io::Result<fs::File> {
 
 /// Options that create a file readable only by the user.
 fn private_options() -> fs::OpenOptions {
+    // Changed on Unix only.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = fs::OpenOptions::new();
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
@@ -511,9 +513,15 @@ mod tests {
         let path = |xdg: Option<&str>, home: Option<&str>| {
             default_path_in(&alice, xdg.map(Into::into), home.map(Into::into))
         };
+        // An absolute path, on Windows too.
+        let state = if cfg!(windows) { r"C:\state" } else { "/state" };
         assert_eq!(
-            path(Some("/state"), Some("/home/a")),
-            Some(PathBuf::from("/state/mett/alice@contoso.com.tokens"))
+            path(Some(state), Some("/home/a")),
+            Some(
+                PathBuf::from(state)
+                    .join("mett")
+                    .join("alice@contoso.com.tokens")
+            )
         );
         // Unset, empty or relative XDG_STATE_HOME falls back to HOME.
         let fallback = Some(PathBuf::from(
@@ -525,6 +533,8 @@ mod tests {
         assert_eq!(path(None, None), None);
     }
 
+    // The file store is for Unix only, where there is a $HOME.
+    #[cfg(unix)]
     #[test]
     fn default_path_is_under_the_state_dir() {
         let path = FileStore::default_path(&"alice@contoso.com".into()).unwrap();

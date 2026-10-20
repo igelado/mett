@@ -238,7 +238,8 @@ pub fn cached(
         config,
         url,
         std::env::var_os("XDG_CACHE_HOME"),
-        std::env::var_os("HOME"),
+        // The home mett found, which on Windows may not be `$HOME`.
+        config.home().map(Into::into),
     );
     let Some(path) = path else {
         return (CachedStore::new(mailbox, None), None);
@@ -408,6 +409,10 @@ fn is_loopback(url: &Url) -> bool {
 pub fn token_store(config: &Config, url: &MailboxUrl) -> Result<AnyStore, String> {
     match config.string("office365_token_store") {
         "keyring" => Ok(AnyStore::Keyring(KeyringStore)),
+        // The file is kept private with Unix permissions only.
+        "file" if !cfg!(unix) => {
+            Err("office365_token_store = file works only on Unix: use keyring (the default)".into())
+        }
         "file" => {
             let path = match config.string("office365_token_file") {
                 "" => FileStore::default_path(&url.account).ok_or(
@@ -628,9 +633,11 @@ mod tests {
             path("", None),
             Some(PathBuf::from("/home/a/.cache/mett").join(file))
         );
+        // An absolute path, on Windows too.
+        let xdg = if cfg!(windows) { r"C:\xdg" } else { "/xdg" };
         assert_eq!(
-            path("", Some("/xdg")),
-            Some(PathBuf::from("/xdg/mett").join(file))
+            path("", Some(xdg)),
+            Some(PathBuf::from(xdg).join("mett").join(file))
         );
         assert_eq!(
             path("", Some("rel")),
@@ -655,13 +662,16 @@ mod tests {
             token_store(&config(""), &url()),
             Ok(AnyStore::Keyring(_))
         ));
-        assert!(matches!(
-            token_store(
-                &config("set office365_token_store=file office365_token_file=~/t\n"),
-                &url()
-            ),
-            Ok(AnyStore::File(_))
-        ));
+        // A file only on Unix, where it can be kept private.
+        let file = token_store(
+            &config("set office365_token_store=file office365_token_file=~/t\n"),
+            &url(),
+        );
+        if cfg!(unix) {
+            assert!(matches!(file, Ok(AnyStore::File(_))));
+        } else {
+            assert!(file.is_err());
+        }
         assert!(token_store(&config("set office365_token_store=vault\n"), &url()).is_err());
     }
 }

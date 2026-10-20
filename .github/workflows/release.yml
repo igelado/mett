@@ -1,9 +1,11 @@
 # Release packages, run by GitHub Actions (see docs/RELEASING.md).
 #
 # Pushing a tag vX.Y.Z builds the Debian/Ubuntu, Arch Linux and tarball
-# packages for x86_64 and aarch64, and publishes them as that tag's release.
-# Running it by hand (workflow_dispatch) only builds them, to check that
-# they build, and keeps them as the run's artifact; it publishes nothing.
+# packages for x86_64 and aarch64 Linux, the macOS archives (aarch64,
+# x86_64) and disk image (an installer for both), and the Windows archive
+# and installer (x86_64), and publishes them as that tag's release. Running it by hand (workflow_dispatch) only builds them, to check
+# that they build, and keeps them as the run's artifacts; it publishes
+# nothing.
 
 name: release
 on:
@@ -27,6 +29,9 @@ jobs:
         with:
           # The whole history, to tell whether the tag is on main.
           fetch-depth: 0
+      # The checkout belongs to another user than the container's: git
+      # (for the tag checks, and the packages' dates) must trust it.
+      - run: git config --global --add safe.directory "$PWD"
       - uses: actions/cache@v4
         with:
           path: |
@@ -54,7 +59,6 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          git config --global --add safe.directory "$PWD"
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$TAG^{commit}" FETCH_HEAD; then
             echo "tag $TAG isn't on main: tag the merge on main"
@@ -63,14 +67,53 @@ jobs:
       - run: packaging/package.sh x86_64 aarch64
       - uses: actions/upload-artifact@v4
         with:
-          name: packages
+          name: packages-linux
+          path: dist/
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >
+          rustup toolchain install 1.95 --profile minimal
+          -t aarch64-apple-darwin -t x86_64-apple-darwin
+          && rustup default 1.95
+      - run: packaging/archive.sh aarch64-apple-darwin x86_64-apple-darwin
+      - run: packaging/macos-installer.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-macos
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The C runtime linked in: no Visual C++ runtime to install.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
+      - run: packaging/archive.sh x86_64-pc-windows-msvc
+      - name: Install Inno Setup, if the runner hasn't it
+        run: >
+          command -v iscc || [ -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]
+          || choco install innosetup --no-progress -y
+      - run: packaging/windows-installer.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-windows
           path: dist/
           if-no-files-found: error
 
   # Apart from the build, so that only this job may write the repository.
   publish:
     if: github.event_name == 'push'
-    needs: packages
+    needs: [packages, macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,8 +121,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: packages
+          pattern: packages-*
+          merge-multiple: true
           path: dist/
+      # One list for every system's packages.
+      - run: cd dist && rm -f SHA256SUMS && sha256sum -- * >SHA256SUMS && cat SHA256SUMS
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}

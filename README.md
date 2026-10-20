@@ -23,8 +23,30 @@ for x86_64 and aarch64:
 
 - **Debian, Ubuntu:** `sudo apt install ./mett_<version>-1_<amd64|arm64>.deb`
 - **Arch Linux:** `sudo pacman -U mett-<version>-1-<x86_64|aarch64>.pkg.tar.zst`
-- **Other Linux:** the `.tar.gz` holds the `mett` binary, which needs
+- **Other Linux:** the `-linux.tar.gz` holds the `mett` binary, which needs
   nothing else.
+- **macOS** (Apple silicon or Intel): open `mett-<version>-macos.dmg` and
+  run *Install mett.pkg*, which installs `/usr/local/bin/mett`. The
+  installer isn't signed yet, so macOS stops it the first time: open
+  **System Settings › Privacy & Security** and choose **Open Anyway**
+  (or run `sudo installer -pkg "/Volumes/mett <version>/Install mett.pkg"
+  -target /`). To remove it: `sudo rm -r /usr/local/bin/mett
+  /usr/local/share/doc/mett && sudo pkgutil --forget io.github.igelado.mett`.
+  The `-aarch64-macos.tar.gz` and `-x86_64-macos.tar.gz` hold the binary
+  alone (if macOS refuses to run it, `xattr -d com.apple.quarantine mett`).
+- **Windows** (x86_64): run `mett-<version>-x86_64-windows-setup.exe`. It
+  installs for you alone (or for everyone, as administrator), adds mett to
+  the `PATH`, and is uninstalled from Windows' **Installed apps**. It isn't
+  signed yet, so SmartScreen may warn: choose **More info › Run anyway**.
+  The `-windows.zip` holds `mett.exe` alone. Run mett in Windows Terminal. It reads `mettrc` from
+  `%USERPROFILE%\.config\mett\` (or `%USERPROFILE%\.mettrc`), keeps sign-ins
+  in the Windows Credential Manager, and edits messages with Notepad
+  unless `editor` says otherwise. `query_command` and backticks in the
+  mettrc need a POSIX `sh`, such as [Git for Windows](https://gitforwindows.org/)'.
+  The header cache is Unix-only (file permissions keep it private), so
+  add `unset header_cache` to the mettrc to skip its warning. In the
+  mettrc, `\` is an escape, as in mutt: write paths with `/`
+  (`C:/Users/me/.signature`), or in single quotes.
 
 [docs/RELEASING.md](https://github.com/igelado/mett/blob/main/docs/RELEASING.md) explains how releases are made.
 
