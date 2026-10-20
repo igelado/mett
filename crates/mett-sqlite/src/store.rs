@@ -196,12 +196,19 @@ fn private_place(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Elsewhere, mett can't make sure only its owner can read the cache.
+/// Elsewhere (Windows), the cache is used without making sure only its
+/// owner can read it: its directory is created if it isn't there, and the
+/// file there must not be a symbolic link. (In the user's profile, the
+/// default place, others can't read it anyway.)
 #[cfg(not(unix))]
-fn private_place(_path: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "the cache can be kept private only on Unix",
-    ))
+fn private_place(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other("it is a symbolic link"));
+    }
+    Ok(())
 }
 
 impl<S: MailStore> CachedStore<S> {
