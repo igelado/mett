@@ -126,6 +126,7 @@ pub const VARS: &[Var] = &[
     var("askbcc", Kind::Bool, "no"),
     var("askcc", Kind::Bool, "no"),
     var("attribution", Kind::String, "On %d, %n wrote:"),
+    var("collapse_links", Kind::Bool, "yes"),
     var("copy", Kind::Quad, "yes"),
     var(
         "date_format",

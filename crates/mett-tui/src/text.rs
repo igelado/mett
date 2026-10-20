@@ -5,6 +5,7 @@
 //! replace it.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use chrono::Local;
 use mett_core::{Address, Body, BodyKind, Message};
@@ -19,6 +20,106 @@ pub fn pager_lines(message: &Message) -> Vec<String> {
     lines.push(String::new());
     lines.extend(body_lines(&message.body));
     lines
+}
+
+/// A link in the pager's text: the bytes of a line drawn underlined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    /// The line it is on.
+    pub line: usize,
+    /// The bytes of the line it takes.
+    pub range: Range<usize>,
+}
+
+/// [`pager_lines`], with the body's links found. With `collapse`, a link
+/// written as its text followed by the URL in angle brackets
+/// (`text<https://...>`, as Exchange writes them in text bodies, and as
+/// [`body_lines`] writes HTML links) shows only its text; otherwise the
+/// URLs are shown. Either way, what shows each link is underlined: its
+/// text when collapsed, or the URL.
+pub fn pager_view(message: &Message, collapse: bool) -> (Vec<String>, Vec<Link>) {
+    let mut lines = pager_lines(message);
+    let body = lines.iter().position(String::is_empty).map_or(0, |i| i + 1);
+    let mut links = Vec::new();
+    for (i, line) in lines.iter_mut().enumerate().skip(body) {
+        let (shown, ranges) = find_links(line, collapse);
+        *line = shown;
+        links.extend(ranges.into_iter().map(|range| Link { line: i, range }));
+    }
+    (lines, links)
+}
+
+/// The URL schemes links are found with.
+const SCHEMES: &[&str] = &["https://", "http://", "ftp://", "mailto:"];
+
+/// How long the URL scheme at the start of `text` is, if one is there.
+fn scheme_len(text: &str) -> Option<usize> {
+    SCHEMES
+        .iter()
+        .find(|scheme| {
+            text.get(..scheme.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+        })
+        .map(|scheme| scheme.len())
+}
+
+/// `line` with its links collapsed (with `collapse`), and the byte ranges
+/// of the result that show them: see [`pager_view`].
+fn find_links(line: &str, collapse: bool) -> (String, Vec<Range<usize>>) {
+    let mut out = String::with_capacity(line.len());
+    let mut links: Vec<Range<usize>> = Vec::new();
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        // A URL in angle brackets: `<https://...>`, with no space in it.
+        let bracketed = rest
+            .strip_prefix('<')
+            .filter(|after| scheme_len(after).is_some())
+            .and_then(|after| {
+                let end = after.find(['>', '<', ' ', '\t'])?;
+                after[end..].starts_with('>').then_some(end)
+            });
+        if let Some(len) = bracketed {
+            // Right after a word, it is that word's link.
+            let attached = out.chars().next_back().is_some_and(|c| !c.is_whitespace());
+            if collapse && attached {
+                let start = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                // Opening punctuation isn't part of the link's text.
+                let start = start + out[start..].len()
+                    - out[start..].trim_start_matches(['(', '[', '"', '\'']).len();
+                // The text may be a URL found already, as in
+                // `https://a<https://b>`.
+                if start < out.len() && links.last().is_none_or(|l| l.end != out.len()) {
+                    links.push(start..out.len());
+                }
+            } else {
+                out.push('<');
+                links.push(out.len()..out.len() + len);
+                out.push_str(&rest[1..=len]);
+                out.push('>');
+            }
+            rest = &rest[len + 2..];
+            continue;
+        }
+        // A URL on its own, at the start of a word.
+        if scheme_len(rest).is_some()
+            && out.chars().next_back().is_none_or(|c| !c.is_alphanumeric())
+        {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"')
+                .unwrap_or(rest.len());
+            // Punctuation after a URL usually ends the sentence.
+            let url = rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '\'']);
+            if url.len() > scheme_len(url).unwrap_or(0) {
+                links.push(out.len()..out.len() + url.len());
+                out.push_str(url);
+                rest = &rest[url.len()..];
+                continue;
+            }
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    (out, links)
 }
 
 /// The headers the pager shows. `bcc` includes the `Bcc:` recipients,
@@ -172,6 +273,8 @@ fn expand_tabs(line: &str) -> String {
 fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
+    // The link being read: its URL, and where its text starts in `out`.
+    let mut anchor: Option<(String, usize)> = None;
     while let Some(start) = rest.find('<') {
         out.push_str(&decode_entities(&rest[..start]));
         rest = &rest[start..];
@@ -194,7 +297,8 @@ fn html_to_text(html: &str) -> String {
             rest = "";
             break;
         };
-        let tag = rest[1..end].trim().to_ascii_lowercase();
+        let raw = &rest[1..end];
+        let tag = raw.trim().to_ascii_lowercase();
         rest = &rest[end + 1..];
         let name = tag
             .trim_start_matches('/')
@@ -202,6 +306,26 @@ fn html_to_text(html: &str) -> String {
             .next()
             .unwrap_or("");
         match name {
+            "a" if !tag.starts_with('/') => {
+                anchor = attribute(raw, "href")
+                    .map(|href| decode_entities(href).into_owned())
+                    .filter(|href| scheme_len(href).is_some())
+                    .map(|href| (href, out.len()));
+            }
+            // The link's URL follows its text, as Exchange writes links in
+            // text bodies, unless the text is the URL. A link without text
+            // (an image's) is left out.
+            "a" => {
+                if let Some((href, start)) = anchor.take() {
+                    let text = out[start..].trim();
+                    if !text.is_empty() && text != href {
+                        out.truncate(out.trim_end().len());
+                        out.push('<');
+                        out.push_str(&href);
+                        out.push('>');
+                    }
+                }
+            }
             // Separate table cells, so they don't run together.
             "td" | "th" if !tag.starts_with('/') && !out.is_empty() && !out.ends_with('\n') => {
                 out.push('\t');
@@ -239,6 +363,41 @@ fn tag_end(html: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// The value of attribute `name` (in lowercase ASCII) in `tag`, the text
+/// between a tag's angle brackets, quoted or not.
+fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = tag.split_once(char::is_whitespace)?.1;
+    loop {
+        rest = rest.trim_start();
+        let key_end = rest.find(|c: char| c == '=' || c == '/' || c.is_whitespace())?;
+        let key = &rest[..key_end];
+        rest = rest[key_end..].trim_start();
+        let Some(after) = rest.strip_prefix('=') else {
+            // An attribute without a value.
+            rest = rest.strip_prefix('/').unwrap_or(rest);
+            if rest.is_empty() {
+                return None;
+            }
+            continue;
+        };
+        let after = after.trim_start();
+        let (value, next) = match after.chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let end = after[1..].find(q).map_or(after.len(), |i| i + 1);
+                (&after[1..end], after.get(end + 1..).unwrap_or(""))
+            }
+            _ => {
+                let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                (&after[..end], &after[end..])
+            }
+        };
+        if key.eq_ignore_ascii_case(name) {
+            return Some(value);
+        }
+        rest = next;
+    }
 }
 
 /// Where `needle` (in lowercase ASCII) first is in `haystack`, in any
@@ -375,6 +534,78 @@ mod tests {
         );
         // Found in any case, after text that isn't ASCII.
         assert_eq!(html("<script>é()</ScRiPt><p>ünï</p>"), ["ünï"]);
+    }
+
+    /// `line` with its links collapsed or not, and the text of each link.
+    fn links(line: &str, collapse: bool) -> (String, Vec<String>) {
+        let (shown, ranges) = find_links(line, collapse);
+        let texts = ranges.iter().map(|r| shown[r.clone()].to_owned()).collect();
+        (shown, texts)
+    }
+
+    #[test]
+    fn links_collapse_to_their_text() {
+        let line = "See the docs<https://example.com/a?b=c> or (mail Bob<mailto:bob@x.org>).";
+        assert_eq!(
+            links(line, true),
+            (
+                "See the docs or (mail Bob).".to_owned(),
+                vec!["docs".to_owned(), "Bob".to_owned()]
+            )
+        );
+        assert_eq!(
+            links(line, false),
+            (
+                line.to_owned(),
+                vec![
+                    "https://example.com/a?b=c".to_owned(),
+                    "mailto:bob@x.org".to_owned()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn urls_on_their_own_stay_and_are_underlined() {
+        let line = "Go to https://example.com/x. Or <http://a.org/y>, not xhttp://b";
+        for collapse in [true, false] {
+            assert_eq!(
+                links(line, collapse),
+                (
+                    line.to_owned(),
+                    vec![
+                        "https://example.com/x".to_owned(),
+                        "http://a.org/y".to_owned()
+                    ]
+                )
+            );
+        }
+        // A URL followed by its link (as Exchange writes `<a>` whose text
+        // is its URL) is one link.
+        assert_eq!(
+            links("https://a.org<https://safe.links/?u=a.org>", true),
+            ("https://a.org".to_owned(), vec!["https://a.org".to_owned()])
+        );
+        // Not a URL: no scheme, or nothing after the scheme.
+        for line in ["a<b@x.org>", "see https:// here"] {
+            assert_eq!(links(line, true), (line.to_owned(), Vec::new()));
+        }
+    }
+
+    #[test]
+    fn html_links_are_followed_by_their_url() {
+        let link = r#"Read <A class=x HREF="https://e.com/?a=1&amp;b=2">the <b>news</b></a>,"#;
+        let same = "<a href='https://e.com'>https://e.com</a>,";
+        let image = "<a href=https://e.com/i><img src=x></a>";
+        let relative = r#"<a href="/relative">here</a>."#;
+        assert_eq!(
+            html(&format!("<p>{link}<br>{same}<br>{image}{relative}</p>")),
+            [
+                "Read the news<https://e.com/?a=1&b=2>,",
+                "https://e.com,",
+                "here."
+            ]
+        );
     }
 
     #[test]

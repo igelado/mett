@@ -27,6 +27,8 @@ pub struct Display {
     /// `pager_index_lines`: the rows of the index shown above the pager
     /// (see [`Display::mini_index_rows`]).
     pub pager_index_lines: usize,
+    /// `collapse_links`: the pager shows links' text, not their URLs.
+    pub collapse_links: bool,
 }
 
 /// The fewest rows the pager keeps for the message when the mini-index
@@ -103,6 +105,7 @@ impl Default for Display {
             colors: Colors::default(),
             wrap: 0,
             pager_index_lines: 0,
+            collapse_links: true,
         }
     }
 }
