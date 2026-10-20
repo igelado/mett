@@ -4,7 +4,8 @@
 ;
 ; It installs for the user (no administrator needed), or for everyone when
 ; run as administrator, and adds the install directory to that user's or
-; the system's PATH; uninstalling takes it out again.
+; the system's PATH; uninstalling takes it out again, if it put it there
+; (as the file path-added in the install directory says).
 
 [Setup]
 ; Never change: Windows tells installs of mett apart from other programs by it.
@@ -36,6 +37,9 @@ Name: addtopath; Description: "Add mett to the PATH, so it runs from any termina
 [Files]
 Source: "{#Source}\*"; DestDir: "{app}"; Flags: ignoreversion
 
+[UninstallDelete]
+Type: files; Name: "{app}\path-added"
+
 [Code]
 { The environment's registry key: the system's when installing for
   everyone, else the user's. }
@@ -50,6 +54,8 @@ begin
   end;
 end;
 
+{ Adds Dir to the PATH, unless it is there already; and if it added it,
+  says so in Dir\path-added, for uninstalling. }
 procedure AddToPath(Dir: String);
 var
   Root: Integer;
@@ -62,7 +68,8 @@ begin
     exit;
   if (Path <> '') and (Path[Length(Path)] <> ';') then
     Path := Path + ';';
-  RegWriteExpandStringValue(Root, Key, 'Path', Path + Dir);
+  if RegWriteExpandStringValue(Root, Key, 'Path', Path + Dir) then
+    SaveStringToFile(Dir + '\path-added', '', False);
 end;
 
 procedure RemoveFromPath(Dir: String);
@@ -89,6 +96,7 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usPostUninstall then
+  { Before the files go, path-added among them. }
+  if (CurUninstallStep = usUninstall) and FileExists(ExpandConstant('{app}\path-added')) then
     RemoveFromPath(ExpandConstant('{app}'));
 end;

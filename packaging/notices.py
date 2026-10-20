@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Writes the notices of what the mett binary for TARGET links in.
 
+TARGET may be several, comma-separated, for a binary built for each (a
+universal macOS binary): the notices are those of every one.
+
 The binary is linked statically, so the copyright and license notices of
 the Rust crates it is built from (as `cargo tree` lists them for TARGET),
 and of musl on Linux, go with it. Each crate's own license files are copied; one
@@ -22,17 +25,18 @@ LICENSE_FILES = ("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT", "UNLICE
 
 
 def main() -> None:
-    target = sys.argv[1]
+    targets = sys.argv[1].split(",")
     musl = Path(sys.argv[2]) if len(sys.argv) > 2 else None
-    tree = subprocess.run(
-        ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
-         "--target", target, "--prefix", "none", "-f", "{p}"],
-        check=True, capture_output=True, text=True,
-    ).stdout
     linked = set()
-    for line in tree.splitlines():
-        name, version = line.split()[:2]
-        linked.add((name, version.lstrip("v")))
+    for target in targets:
+        tree = subprocess.run(
+            ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
+             "--target", target, "--prefix", "none", "-f", "{p}"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        for line in tree.splitlines():
+            name, version = line.split()[:2]
+            linked.add((name, version.lstrip("v")))
     metadata = json.loads(subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1"],
         check=True, capture_output=True, text=True,
