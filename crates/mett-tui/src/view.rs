@@ -892,8 +892,10 @@ fn render_pager(
                 });
             }
             for (_, found) in found.iter().filter(|(r, _)| r == row) {
-                restyle(range.start + found.start, range.start + found.end, &|_| {
-                    style.patch(colors.search)
+                // Over a link, still underlined.
+                restyle(range.start + found.start, range.start + found.end, &|s| {
+                    let link = s.add_modifier & Modifier::UNDERLINED;
+                    style.patch(colors.search).add_modifier(link)
                 });
             }
             let row_text = &text[range.clone()];
@@ -1659,6 +1661,16 @@ mod tests {
         let underlined = |x: u16| buffer[(x, 4)].modifier.contains(Modifier::UNDERLINED);
         assert!((9..13).all(underlined), "the link's text");
         assert!(!underlined(8) && !underlined(13));
+
+        // Found by a search, it is still underlined.
+        act(&mut app, Action::Search);
+        typed(&mut app, "the d");
+        key(&mut app, KeyCode::Enter);
+        let buffer = drawn(&app, WIDTH, HEIGHT);
+        let found = |x: u16| buffer[(x, 4)].modifier.contains(Modifier::REVERSED);
+        let underlined = |x: u16| buffer[(x, 4)].modifier.contains(Modifier::UNDERLINED);
+        assert!((5..10).all(found), "the match");
+        assert!((9..13).all(underlined) && !underlined(5) && !underlined(8));
 
         act(&mut app, Action::ToggleLinks);
         assert_eq!(screen(&app)[4], "Read the docs<https://example.com>.");

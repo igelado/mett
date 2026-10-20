@@ -33,12 +33,34 @@ pub fn pager_view(message: &Message, collapse: bool) -> (Vec<String>, Vec<Link>)
     let mut lines = header_lines(message, true);
     lines.push(String::new());
     let mut links = Vec::new();
+    let marks = message.body.kind == BodyKind::Html;
+    // Where the text of an HTML link starts, while its URL is on a line
+    // still to come: as a line and a byte offset in it.
+    let mut open: Option<(usize, usize)> = None;
     for line in body_text(&message.body).lines() {
-        let (shown, ranges) = find_links(line, collapse);
         let i = lines.len();
-        links.extend(ranges.into_iter().map(|range| Link { line: i, range }));
-        lines.push(shown);
+        let found = find_links(line, collapse, marks, open.is_some());
+        if found.ended_open {
+            // When collapsed, its text on the lines before is underlined.
+            if let Some((first, start)) = open.take().filter(|_| collapse) {
+                for (at, text) in lines.iter().enumerate().skip(first) {
+                    let start = if at == first { start } else { 0 };
+                    if start < text.len() {
+                        links.push(Link {
+                            line: at,
+                            range: start..text.len(),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(start) = found.opened {
+            open = Some((i, start));
+        }
+        links.extend(found.links.into_iter().map(|range| Link { line: i, range }));
+        lines.push(found.shown);
     }
+    links.sort_by_key(|link| (link.line, link.range.start));
     (lines, links)
 }
 
@@ -61,18 +83,40 @@ fn scheme_len(text: &str) -> Option<usize> {
         .map(|scheme| scheme.len())
 }
 
-/// `line` with its links collapsed (with `collapse`) and its tabs expanded,
-/// as shown (so that tab stops count what is shown), and the byte ranges of
-/// the result that show the links: see [`pager_view`].
-fn find_links(line: &str, collapse: bool) -> (String, Vec<Range<usize>>) {
+/// What [`find_links`] found in a line.
+struct Found {
+    /// The line as shown: its links collapsed (with `collapse`) and its
+    /// tabs expanded, so that tab stops count what is shown.
+    shown: String,
+    /// The bytes of `shown` that show links.
+    links: Vec<Range<usize>>,
+    /// The line ends the link whose text started on a line before (which
+    /// is underlined too, when collapsed).
+    ended_open: bool,
+    /// Where the text of a link whose URL is on a line still to come
+    /// starts.
+    opened: Option<usize>,
+}
+
+/// Finds the links in `line`: see [`pager_view`]. With `marks`, the line is
+/// from an HTML body, where [`LINK_START`] marks where each link's text
+/// starts; with `open`, a link's text started on a line before.
+fn find_links(line: &str, collapse: bool, marks: bool, open: bool) -> Found {
     let mut out = String::with_capacity(line.len());
     let mut links: Vec<Range<usize>> = Vec::new();
     let mut rest = line;
-    // Where the text of the link whose URL comes next starts, if known.
+    // Where the text of the link whose URL comes next starts, if a mark
+    // said so.
     let mut text_start = None;
+    let mut open = open;
+    let mut ended_open = false;
+    // The display column at a byte offset of `out`, to expand tabs without
+    // measuring the whole line each time.
+    let mut measured = (0, 0);
     while let Some(c) = rest.chars().next() {
-        if c == LINK_START {
+        if marks && c == LINK_START {
             text_start = Some(out.len());
+            open = false;
             rest = &rest[c.len_utf8()..];
             continue;
         }
@@ -85,17 +129,24 @@ fn find_links(line: &str, collapse: bool) -> (String, Vec<Range<usize>>) {
                 after[end..].starts_with('>').then_some(end)
             });
         if let Some(len) = bracketed {
-            // The link's text: from where an HTML link said it starts, or
-            // else the word right before it, without opening punctuation.
-            let start = text_start.take().unwrap_or_else(|| {
-                let word = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-                out.len() - out[word..].trim_start_matches(['(', '[', '"', '\'']).len()
-            });
+            // The link's text: from where an HTML link said it starts
+            // (maybe on a line before), or else the word right before it,
+            // without opening punctuation.
+            let earlier = text_start.is_none() && std::mem::take(&mut open);
+            ended_open |= earlier;
+            let start = match text_start.take() {
+                Some(start) => start,
+                None if earlier => 0,
+                None => {
+                    let word = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                    out.len() - out[word..].trim_start_matches(['(', '[', '"', '\'']).len()
+                }
+            };
             // Without text (as in `(<https://...>)`), the URL is shown.
-            if collapse && start < out.len() {
+            if collapse && (start < out.len() || earlier) {
                 // The text may be a URL found already, as in
                 // `https://a<https://b>`.
-                if links.last().is_none_or(|l| l.end != out.len()) {
+                if start < out.len() && links.last().is_none_or(|l| l.end != out.len()) {
                     links.push(start..out.len());
                 }
             } else {
@@ -125,13 +176,21 @@ fn find_links(line: &str, collapse: bool) -> (String, Vec<Range<usize>>) {
         }
         if c == '\t' {
             // Tabs would be dropped by the terminal buffer, so expand them.
-            out.extend(std::iter::repeat_n(' ', 8 - out.width() % 8));
+            let column = measured.1 + out[measured.0..].width();
+            let spaces = 8 - column % 8;
+            out.extend(std::iter::repeat_n(' ', spaces));
+            measured = (out.len(), column + spaces);
         } else {
             out.push(c);
         }
         rest = &rest[c.len_utf8()..];
     }
-    (out, links)
+    Found {
+        shown: out,
+        links,
+        ended_open,
+        opened: text_start,
+    }
 }
 
 /// The headers the pager shows. `bcc` includes the `Bcc:` recipients,
@@ -250,9 +309,16 @@ pub fn truncate(text: &str, width: usize) -> String {
 
 /// The body as plain-text lines.
 pub fn body_lines(body: &Body) -> Vec<String> {
+    let html = body.kind == BodyKind::Html;
     body_text(body)
         .lines()
-        .map(|line| expand_tabs(&line.replace(LINK_START, "")))
+        .map(|line| {
+            if html {
+                expand_tabs(&line.replace(LINK_START, ""))
+            } else {
+                expand_tabs(line)
+            }
+        })
         .collect()
 }
 
@@ -295,7 +361,7 @@ fn html_to_text(html: &str) -> String {
     // The link being read: its URL, and where its text starts in `out`.
     let mut anchor: Option<(String, usize)> = None;
     while let Some(start) = rest.find('<') {
-        out.push_str(&decode_entities(&rest[..start]));
+        push_text(&mut out, &rest[..start]);
         rest = &rest[start..];
         if let Some(after) = rest.strip_prefix("<!--") {
             rest = after.find("-->").map_or("", |end| &after[end + 3..]);
@@ -332,7 +398,7 @@ fn html_to_text(html: &str) -> String {
                 }
                 anchor = attribute(raw, "href")
                     .map(|href| decode_entities(href).into_owned())
-                    .filter(|href| scheme_len(href).is_some())
+                    .filter(|href| scheme_len(href).is_some() && !href.contains(LINK_START))
                     .map(|href| (href, out.len()));
                 if anchor.is_some() {
                     out.push(LINK_START);
@@ -376,12 +442,42 @@ fn html_to_text(html: &str) -> String {
             _ => {}
         }
     }
-    out.push_str(&decode_entities(rest));
+    push_text(&mut out, rest);
     if let Some((_, start)) = anchor {
         // A link never closed has no URL to follow it.
         out.remove(start);
     }
-    collapse_blank_lines(&out)
+    collapse_blank_lines(&settle_marks(&out))
+}
+
+/// Adds the text between tags, `html`, to `out`, decoded. It can't have
+/// link marks: a [`LINK_START`] in it is shown as U+FFFD.
+fn push_text(out: &mut String, html: &str) {
+    let text = decode_entities(html);
+    if text.contains(LINK_START) {
+        out.push_str(&text.replace(LINK_START, "\u{FFFD}"));
+    } else {
+        out.push_str(&text);
+    }
+}
+
+/// Moves each link mark in `text` past the spaces and line breaks after
+/// it, to the text it marks, so that it is never alone on a line.
+fn settle_marks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending = false;
+    for c in text.chars() {
+        if c == LINK_START {
+            pending = true;
+            continue;
+        }
+        if pending && !c.is_whitespace() {
+            out.push(LINK_START);
+            pending = false;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The offset of the `>` that closes the tag at the start of `html`,
@@ -573,7 +669,11 @@ mod tests {
 
     /// `line` with its links collapsed or not, and the text of each link.
     fn links(line: &str, collapse: bool) -> (String, Vec<String>) {
-        let (shown, ranges) = find_links(line, collapse);
+        let Found {
+            shown,
+            links: ranges,
+            ..
+        } = find_links(line, collapse, false, false);
         let texts = ranges.iter().map(|r| shown[r.clone()].to_owned()).collect();
         (shown, texts)
     }
@@ -693,6 +793,80 @@ mod tests {
         ] {
             assert!(!html_view(body, true).0.contains(LINK_START), "{body}");
         }
+    }
+
+    /// A message's body in the pager, every line, and the line and text of
+    /// each link.
+    fn view_lines(body: Body, collapse: bool) -> (Vec<String>, Vec<(usize, String)>) {
+        let mut message = mett_core::mock::message("m", "in", "s", chrono::DateTime::UNIX_EPOCH);
+        message.body = body;
+        let (lines, links) = pager_view(&message, collapse);
+        let start = lines.iter().position(String::is_empty).unwrap() + 1;
+        let texts = links
+            .iter()
+            .map(|l| (l.line - start, lines[l.line][l.range.clone()].to_owned()))
+            .collect();
+        (lines[start..].to_vec(), texts)
+    }
+
+    #[test]
+    fn html_links_over_several_lines_are_underlined_whole() {
+        let html = |content: &str| Body {
+            kind: BodyKind::Html,
+            content: content.into(),
+        };
+        let body =
+            html(r#"<p>See <a href="https://e.com"><p>the first<br>and second</p></a> line</p>"#);
+        assert_eq!(
+            view_lines(body.clone(), true),
+            (
+                vec![
+                    "See".to_owned(),
+                    "the first".to_owned(),
+                    "and second".to_owned(),
+                    " line".to_owned()
+                ],
+                vec![(1, "the first".to_owned()), (2, "and second".to_owned())]
+            )
+        );
+        assert_eq!(
+            view_lines(body, false),
+            (
+                vec![
+                    "See".to_owned(),
+                    "the first".to_owned(),
+                    "and second<https://e.com>".to_owned(),
+                    " line".to_owned()
+                ],
+                vec![(2, "https://e.com".to_owned())]
+            )
+        );
+    }
+
+    #[test]
+    fn private_use_characters_in_messages_are_kept() {
+        let text = Body {
+            kind: BodyKind::Text,
+            content: "a\u{E000}b<https://e.com>".into(),
+        };
+        assert_eq!(body_lines(&text), ["a\u{E000}b<https://e.com>"]);
+        assert_eq!(
+            view_lines(text, true),
+            (
+                vec!["a\u{E000}b".to_owned()],
+                vec![(0, "a\u{E000}b".to_owned())]
+            )
+        );
+        // In HTML, where it would read as a link's mark, it is replaced.
+        let html = Body {
+            kind: BodyKind::Html,
+            content: "a\u{E000}b <a href='https://e.com'>c</a>".into(),
+        };
+        assert_eq!(body_lines(&html), ["a\u{FFFD}b c<https://e.com>"]);
+        assert_eq!(
+            view_lines(html, true),
+            (vec!["a\u{FFFD}b c".to_owned()], vec![(0, "c".to_owned())])
+        );
     }
 
     #[test]
