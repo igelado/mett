@@ -685,10 +685,11 @@ async fn run_query(
 ) -> std::result::Result<Vec<mett_core::Address>, String> {
     // Killed, with whatever it started, if the lookup is given up or mett
     // quits first: a command that hangs doesn't keep it from exiting.
-    let mut shell = tokio::process::Command::new("sh");
+    let mut shell = tokio::process::Command::from(crate::platform::sh(
+        &query_script(command),
+        "query_command",
+    )?);
     shell
-        .arg("-c")
-        .arg(query_script(command))
         .env("METT_QUERY", text)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

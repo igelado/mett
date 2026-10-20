@@ -23,8 +23,18 @@ for x86_64 and aarch64:
 
 - **Debian, Ubuntu:** `sudo apt install ./mett_<version>-1_<amd64|arm64>.deb`
 - **Arch Linux:** `sudo pacman -U mett-<version>-1-<x86_64|aarch64>.pkg.tar.zst`
-- **Other Linux:** the `.tar.gz` holds the `mett` binary, which needs
+- **Other Linux:** the `-linux.tar.gz` holds the `mett` binary, which needs
   nothing else.
+- **macOS:** the `-aarch64-macos.tar.gz` (Apple silicon) or
+  `-x86_64-macos.tar.gz` (Intel) holds the `mett` binary: put it on your
+  `PATH`. It isn't signed: if macOS refuses to open it, run
+  `xattr -d com.apple.quarantine mett` once.
+- **Windows (x86_64):** the `-windows.zip` holds `mett.exe`: put it on your
+  `PATH` and run it in Windows Terminal. It reads `mettrc` from
+  `%USERPROFILE%\.config\mett\` (or `%USERPROFILE%\.mettrc`), keeps sign-ins
+  in the Windows Credential Manager, and edits messages with Notepad
+  unless `editor` says otherwise. `query_command` and backticks in the
+  mettrc need a POSIX `sh`, such as [Git for Windows](https://gitforwindows.org/)'.
 
 [docs/RELEASING.md](https://github.com/igelado/mett/blob/main/docs/RELEASING.md) explains how releases are made.
 

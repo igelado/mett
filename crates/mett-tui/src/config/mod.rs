@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
 
 use lexer::{Command, Expander, Lexer, Word};
 pub use vars::{Kind, Quad, VARS, Value, expand_home};
@@ -1026,9 +1025,7 @@ impl Expander for Expand<'_> {
     }
 
     fn command(&self, command: &str) -> Result<String, String> {
-        let output = Process::new("sh")
-            .arg("-c")
-            .arg(command)
+        let output = crate::platform::sh(command, "A backtick command")?
             .output()
             .map_err(|e| e.to_string())?;
         if !output.status.success() {

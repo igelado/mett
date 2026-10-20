@@ -71,7 +71,8 @@ GitHub enforces this workflow:
 
 - `main` is protected, for administrators too. Nobody can push to it
   directly or force-push; changes go in through PRs.
-- A PR can be merged only if its required checks (the `docs` and `rust` jobs)
+- A PR can be merged only if its required checks (the `docs`, `rust`,
+  `macos` and `windows` jobs)
   succeed, and once every review conversation is resolved.
 - The head branch is deleted after merge by default.
 - CI is defined in `.github/workflows/ci.yml` and runs with GitHub Actions

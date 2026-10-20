@@ -1,7 +1,8 @@
 #!/bin/sh
-# Publishes the packages in dist/ as the GitHub release of tag $1: creates
-# the release (or reuses it, when the workflow runs again) and uploads every
-# file, replacing one of the same name.
+# Publishes the packages in dist/ (every file there, with SHA256SUMS) as
+# the GitHub release of tag $1: creates the release (or reuses it, when the
+# workflow runs again) and uploads every file, replacing one of the same
+# name.
 #
 # Needs: gh, and in the environment GH_TOKEN, a token that may write the
 # repository's releases, and GH_REPO (igelado/mett) outside a clone of it.
@@ -22,7 +23,8 @@ if ! gh release view "$tag" >/dev/null 2>&1; then
     # --verify-tag: the tag must have been pushed; never create one.
     gh release create "$tag" --verify-tag $prerelease \
         --title "mett ${tag#v}" \
-        --notes 'Packages for Debian and Ubuntu (`.deb`), Arch Linux (`.pkg.tar.zst`) and other distributions (`.tar.gz`), for x86_64 and aarch64. Check them against `SHA256SUMS`.'
+        --notes 'Packages for Linux: Debian and Ubuntu (`.deb`), Arch Linux (`.pkg.tar.zst`) and other distributions (`-linux.tar.gz`), for x86_64 and aarch64. For macOS (`-macos.tar.gz`), Apple silicon (aarch64) and Intel (x86_64). For Windows (`-windows.zip`), x86_64. Check them against `SHA256SUMS`.'
 fi
-gh release upload "$tag" --clobber *.deb *.pkg.tar.zst *.tar.gz SHA256SUMS
+[ -f SHA256SUMS ] || { echo "$0: dist/SHA256SUMS is missing" >&2; exit 1; }
+gh release upload "$tag" --clobber -- *
 echo "Published $(gh release view "$tag" --json url --jq .url)"

@@ -5,7 +5,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The editor command and where its temporary files go.
@@ -19,14 +18,15 @@ pub struct Editor {
 
 impl Editor {
     /// The editor from mutt's `editor` variable, else `$VISUAL`, else
-    /// `$EDITOR`, else `vi`; temporary files go in `tmpdir`, else the
+    /// `$EDITOR`, else `vi` (Notepad on Windows); temporary files go in
+    /// `tmpdir`, else the
     /// system's temporary directory (`$TMPDIR`).
     pub fn new(editor: &str, tmpdir: &str, env: &dyn Fn(&str) -> Option<String>) -> Self {
         let command = [Some(editor.to_owned()), env("VISUAL"), env("EDITOR")]
             .into_iter()
             .flatten()
             .find(|c| !c.trim().is_empty())
-            .unwrap_or_else(|| "vi".to_owned());
+            .unwrap_or_else(|| crate::platform::DEFAULT_EDITOR.to_owned());
         let tmpdir = if tmpdir.is_empty() {
             std::env::temp_dir()
         } else {
@@ -97,13 +97,8 @@ impl Editor {
 
     fn run(&self, path: &Path) -> Result<String, String> {
         // The command may have arguments (`vim +star`), so the shell runs
-        // it. The file name is passed as a separate argument, so it needs
-        // no quoting.
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!("{} \"$1\"", self.command))
-            .arg("mett")
-            .arg(path)
+        // it.
+        let status = crate::platform::editor(&self.command, path)
             .status()
             .map_err(|e| format!("cannot run the editor: {e}"))?;
         if !status.success() {
@@ -129,7 +124,10 @@ mod tests {
         let env = |name: &str| (name == "EDITOR").then(|| "nano".to_owned());
         assert_eq!(Editor::new("", "", &env).command, "nano");
         assert_eq!(Editor::new("emacs -nw", "", &env).command, "emacs -nw");
-        assert_eq!(Editor::new("", "/x", &|_| None).command, "vi");
+        assert_eq!(
+            Editor::new("", "/x", &|_| None).command,
+            crate::platform::DEFAULT_EDITOR
+        );
         assert_eq!(Editor::new("", "/x", &|_| None).tmpdir, PathBuf::from("/x"));
     }
 

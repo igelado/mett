@@ -19,6 +19,7 @@ mod format;
 mod keymap;
 mod lineedit;
 mod pattern;
+mod platform;
 mod signin;
 mod sort;
 mod text;
@@ -96,9 +97,12 @@ fn main() -> ExitCode {
 
     // The demo mailbox needs no configuration.
     if !options.demo {
-        let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
-        let mut config = config::Config::new(home);
-        let env = |name: &str| std::env::var_os(name);
+        let home = platform::home();
+        let mut config = config::Config::new(home.clone());
+        let env = |name: &str| match name {
+            "HOME" => home.clone().map(Into::into),
+            _ => std::env::var_os(name),
+        };
         let files = config::locate(&options.files, &env);
         // The user's own file is the one given (`-F`), or the last one
         // read (not /etc/mettrc), or the one they would have.
@@ -198,7 +202,7 @@ fn main() -> ExitCode {
     // The demo mailbox never signs in, so nothing is ever sent here.
     let (_, sign_in) = mpsc::unbounded_channel();
     // The demo reads no mettrc, but `:` commands work on the defaults.
-    let (config, settings) = demo_config(std::env::var("HOME").ok().filter(|h| !h.is_empty()));
+    let (config, settings) = demo_config(platform::home());
     let session = Session {
         folder: FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new()),
         account: settings.account.clone(),

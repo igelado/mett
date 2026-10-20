@@ -3,11 +3,14 @@
 
 The binary is linked statically, so the copyright and license notices of
 the Rust crates it is built from (as `cargo tree` lists them for TARGET),
-and of musl, go with it. Each crate's own license files are copied; one
+and of musl on Linux, go with it. Each crate's own license files are copied; one
 without any is listed with its license expression. Bundled C code (SQLite
 in libsqlite3-sys, AWS-LC in aws-lc-sys) comes with its crate's files.
 
-Usage: notices.py TARGET MUSL_COPYRIGHT_FILE > THIRD-PARTY-NOTICES
+Usage: notices.py TARGET [MUSL_COPYRIGHT_FILE] > THIRD-PARTY-NOTICES
+
+(macOS and Windows binaries link their system's C library, which isn't
+redistributed with them: they have no MUSL_COPYRIGHT_FILE.)
 """
 
 import json
@@ -19,7 +22,8 @@ LICENSE_FILES = ("LICENSE", "LICENCE", "COPYING", "NOTICE", "COPYRIGHT", "UNLICE
 
 
 def main() -> None:
-    target, musl = sys.argv[1], Path(sys.argv[2])
+    target = sys.argv[1]
+    musl = Path(sys.argv[2]) if len(sys.argv) > 2 else None
     tree = subprocess.run(
         ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
          "--target", target, "--prefix", "none", "-f", "{p}"],
@@ -57,8 +61,9 @@ def main() -> None:
         for file in files:
             out.write(f"\n--- {file.name} ---\n\n")
             out.write(file.read_text(errors="replace"))
-    out.write(f"\n{'=' * 72}\nmusl libc (statically linked)\n{'=' * 72}\n\n")
-    out.write(musl.read_text(errors="replace"))
+    if musl:
+        out.write(f"\n{'=' * 72}\nmusl libc (statically linked)\n{'=' * 72}\n\n")
+        out.write(musl.read_text(errors="replace"))
 
 
 if __name__ == "__main__":

@@ -5,14 +5,22 @@ Releases are built and published by GitHub Actions
 
 ## What a release has
 
-For x86_64 and aarch64:
-
 | File | For |
 |------|-----|
 | `mett_<version>-1_<amd64\|arm64>.deb` | Debian and Ubuntu: `sudo apt install ./mett_….deb` |
 | `mett-<version>-1-<x86_64\|aarch64>.pkg.tar.zst` | Arch Linux: `sudo pacman -U mett-….pkg.tar.zst` |
-| `mett-<version>-<arch>-linux.tar.gz` | Any other Linux: the binary, the README and the licenses |
+| `mett-<version>-<x86_64\|aarch64>-linux.tar.gz` | Any other Linux: the binary, the README and the licenses |
+| `mett-<version>-<aarch64\|x86_64>-macos.tar.gz` | macOS on Apple silicon or Intel: the same, for macOS |
+| `mett-<version>-x86_64-windows.zip` | Windows on x86_64: `mett.exe`, the README and the licenses |
 | `SHA256SUMS` | Checking the files: `sha256sum -c SHA256SUMS --ignore-missing` |
+
+The macOS and Windows binaries are built on GitHub's macOS and Windows
+runners by `packaging/archive.sh` (the archives by `packaging/archive.py`,
+reproducibly). They link their system's C library: macOS's, and on
+Windows the C runtime statically, so nothing needs installing. They
+aren't signed or notarized.
+
+The Linux packages:
 
 The binary is linked statically against musl, so the same one runs on
 every distribution release, and the packages depend on nothing. It is
@@ -54,17 +62,18 @@ the release and replaces files of the same name.
 ## Building the packages without releasing
 
 Run by hand, the workflow builds the packages from a branch, to check that
-they build, and publishes nothing: it keeps them as the run's `packages`
-artifact.
+they build, and publishes nothing: it keeps them as the run's
+`packages-linux`, `packages-macos` and `packages-windows` artifacts.
 
 ```sh
 gh workflow run release --ref igelado/my-branch
 gh run watch                        # pick the run
-gh run download <run-id> -n packages -D dist/
+gh run download <run-id> -D dist/   # a directory for each artifact
 ```
 
 (Or from the web interface: **Actions** › **release** › **Run workflow**.)
-To build them locally instead, install the tools and run the script:
+To build the Linux packages locally instead, install the tools and run
+the script:
 
 ```sh
 pipx install cargo-zigbuild       # also installs zig (pip refuses outside a venv on Debian)
