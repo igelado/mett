@@ -164,8 +164,8 @@ fn private_file(path: &Path) -> std::io::Result<()> {
 /// directory private (created so if it isn't there), and the file there
 /// not a symbolic link (created readable only by its owner if it isn't
 /// there; SQLite gives its journal files the database's permissions).
+#[cfg(unix)]
 fn private_place(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
@@ -193,16 +193,15 @@ fn private_place(path: &Path) -> std::io::Result<()> {
             .mode(0o600)
             .open(path)?;
     }
-    // Elsewhere, mett can't make sure only its owner can read it.
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        return Err(std::io::Error::other(
-            "the cache can be kept private only on Unix",
-        ));
-    }
-    #[cfg(unix)]
     Ok(())
+}
+
+/// Elsewhere, mett can't make sure only its owner can read the cache.
+#[cfg(not(unix))]
+fn private_place(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "the cache can be kept private only on Unix",
+    ))
 }
 
 impl<S: MailStore> CachedStore<S> {

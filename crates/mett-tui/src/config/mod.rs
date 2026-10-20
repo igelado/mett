@@ -1674,12 +1674,14 @@ mod tests {
             new_user_file(&env),
             Some(PathBuf::from("/home/a/.config/mett/mettrc"))
         );
+        // An absolute path, on Windows too.
+        let x = PathBuf::from(if cfg!(windows) { r"C:\x" } else { "/x" });
         let env = |name: &str| match name {
             "HOME" => Some(OsString::from("/home/a")),
-            "XDG_CONFIG_HOME" => Some(OsString::from("/x")),
+            "XDG_CONFIG_HOME" => Some(x.clone().into_os_string()),
             _ => None,
         };
-        assert_eq!(new_user_file(&env), Some(PathBuf::from("/x/mett/mettrc")));
+        assert_eq!(new_user_file(&env), Some(x.join("mett").join("mettrc")));
     }
 
     #[test]

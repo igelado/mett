@@ -43,6 +43,8 @@ for x86_64 and aarch64:
   in the Windows Credential Manager, and edits messages with Notepad
   unless `editor` says otherwise. `query_command` and backticks in the
   mettrc need a POSIX `sh`, such as [Git for Windows](https://gitforwindows.org/)'.
+  The header cache is Unix-only (file permissions keep it private), so
+  add `unset header_cache` to the mettrc to skip its warning.
 
 [docs/RELEASING.md](https://github.com/igelado/mett/blob/main/docs/RELEASING.md) explains how releases are made.
 

@@ -150,6 +150,22 @@ async fn handle(stream: TcpStream, state: &str) -> io::Result<Option<HashMap<Str
         stream.shutdown().await
     }
     .await;
+    // Closing with input left unread resets the connection, which can lose
+    // the response before the client reads it (as on macOS): read what is
+    // left of an oversized request first, a bounded amount for a moment.
+    if sent.is_ok() && !complete {
+        let drain = async {
+            let mut buf = [0; 4096];
+            let mut left = 4 * MAX_HEAD_BYTES;
+            while left > 0 {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => left = left.saturating_sub(n as u64),
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
+    }
     // Once a valid redirect has arrived, answering the browser is best
     // effort: it may already have closed the connection.
     match params {
