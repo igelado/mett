@@ -412,12 +412,10 @@ impl Gui {
         }
     }
 
-    /// Sends the app the system clipboard's text, pasted.
+    /// Tells the app to paste: the clipboard's text is read there, where
+    /// the built-in editor's own is if the system's can't be.
     fn paste(&mut self) {
-        let text = crate::platform::with_clipboard(|clipboard| clipboard.get_text()).ok();
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
-            self.send(UserEvent::Term(TermEvent::Paste(text)));
-        }
+        self.send(UserEvent::Paste);
     }
 
     /// Draws what is shown.
@@ -632,8 +630,8 @@ fn key(
                 // its own (`@` on German keyboards): it is just typed.
                 return Some(KeyEvent::from(KeyCode::Char(typed)));
             } else if ctrl {
-                // Control and a letter, as a terminal has it.
-                base.to_ascii_lowercase()
+                // Control and a key, as a terminal reports it.
+                return Some(control(base.to_ascii_lowercase(), held));
             } else if alt {
                 // Meta: the key itself, not what Option makes of it on a
                 // Mac.
@@ -655,6 +653,26 @@ fn key(
             Some(KeyEvent::new(KeyCode::Char(c), held))
         }
     }
+}
+
+/// Control and `c` (and the other modifiers `held`), as a terminal reports
+/// it: `^M` is Enter, `^I` Tab, `^[` Esc; `^\\`, `^]`, `^^`, `^_` (and
+/// `^/`) are the bytes crossterm reads as Control-4 to Control-7, and `^@`
+/// is Control-Space.
+fn control(c: char, held: KeyModifiers) -> KeyEvent {
+    let without = held.difference(KeyModifiers::CONTROL);
+    let code = match c {
+        'm' => return KeyEvent::new(KeyCode::Enter, without),
+        'i' => return KeyEvent::new(KeyCode::Tab, without),
+        '[' => return KeyEvent::new(KeyCode::Esc, without),
+        '\\' => '4',
+        ']' => '5',
+        '^' => '6',
+        '_' | '/' => '7',
+        '@' | '2' => ' ',
+        c => c,
+    };
+    KeyEvent::new(KeyCode::Char(code), held)
 }
 
 /// Whether the key `plain`, with `modifiers` held, pastes: Command+V on a
@@ -865,6 +883,32 @@ mod tests {
                 ModifiersState::SHIFT
             ),
             event(KeyCode::Left, KeyModifiers::SHIFT)
+        );
+    }
+
+    #[test]
+    fn control_keys_are_those_a_terminal_reports() {
+        let event = |code, modifiers| Some(KeyEvent::new(code, modifiers));
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            press(ch("m"), ch("m"), None, ctrl),
+            event(KeyCode::Enter, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            press(ch("i"), ch("i"), None, ctrl),
+            event(KeyCode::Tab, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            press(ch("["), ch("["), None, ctrl),
+            event(KeyCode::Esc, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            press(ch("/"), ch("/"), None, ctrl),
+            event(KeyCode::Char('7'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            press(ch("g"), ch("g"), None, ctrl),
+            event(KeyCode::Char('g'), KeyModifiers::CONTROL)
         );
     }
 

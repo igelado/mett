@@ -734,6 +734,19 @@ impl App {
         }
     }
 
+    /// Pastes the clipboard's text where the user is typing: the system's,
+    /// or, in the built-in editor, its own if the system's can't be read.
+    pub(super) fn paste_clipboard(&mut self) {
+        if self.sign_in.is_some() {
+            return;
+        }
+        if let Some(editing) = &mut self.editing {
+            editing.get_mut().paste_from_clipboard();
+        } else if let Some(text) = crate::platform::clipboard_text() {
+            self.paste(&text);
+        }
+    }
+
     /// Lets the user edit `text`, in the built-in editor or (through the
     /// main loop) in their own; [`Msg::Edited`] brings it back.
     pub(super) fn edit(&mut self, text: String) -> Vec<Effect> {
@@ -1232,6 +1245,22 @@ mod tests {
         app.update(Msg::Paste("Hello\n".into()));
         let editor = app.editing.as_ref().expect("the built-in editor");
         assert!(editor.borrow().text().starts_with("Hello\n"));
+        // From the clipboard: the editor's own, where the system's can't
+        // be read (here, out of a window).
+        let shift_end = KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT);
+        app.update(Msg::Key(KeyEvent::from(KeyCode::Up)));
+        app.update(Msg::Key(shift_end));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        app.update(Msg::Key(KeyEvent::from(KeyCode::End)));
+        app.update(Msg::PasteClipboard);
+        let editor = app.editing.as_ref().expect("the built-in editor");
+        assert!(
+            editor.borrow().text().starts_with("HelloHello\n"),
+            "{editor:?}"
+        );
     }
 
     #[test]

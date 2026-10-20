@@ -43,6 +43,16 @@ pub fn with_clipboard<T>(
     f(clipboard.as_mut().expect("just set")).map_err(|e| e.to_string())
 }
 
+/// The text on the system's clipboard, if it can be read (only in a
+/// window: in a terminal, text is pasted through it).
+pub fn clipboard_text() -> Option<String> {
+    #[cfg(feature = "gui")]
+    if gui() {
+        return with_clipboard(|clipboard| clipboard.get_text()).ok();
+    }
+    None
+}
+
 /// The user's home directory: `$HOME`, else (on Windows, where it is
 /// usually unset) `%USERPROFILE%`.
 pub fn home() -> Option<String> {

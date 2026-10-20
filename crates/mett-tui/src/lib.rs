@@ -598,6 +598,9 @@ pub(crate) enum UserEvent {
     /// The window was closed.
     #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     Close,
+    /// The user asked to paste from the clipboard (in the window).
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    Paste,
 }
 
 /// Runs the app on `store`, drawn on `screen`, with input from `input_rx`.
@@ -765,6 +768,10 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                         Msg::Paste(text)
                     }
                     UserEvent::Close => Msg::Close,
+                    UserEvent::Paste => {
+                        app.typed();
+                        Msg::PasteClipboard
+                    }
                     // Nothing changed: nothing to draw again.
                     UserEvent::Term(_) => continue,
                 },

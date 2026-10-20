@@ -656,6 +656,15 @@ impl Builtin {
         }
     }
 
+    /// Pastes the clipboard's text (the system's, else its own) as
+    /// [`Builtin::paste`] does.
+    pub fn paste_from_clipboard(&mut self) {
+        let text = self.clipboard.get();
+        if !text.is_empty() {
+            self.paste(&text);
+        }
+    }
+
     /// Inserts the clipboard's text at the cursor, as typed (edtui's
     /// paste takes text starting with a line end as whole lines, as vim
     /// does), as one change to undo.

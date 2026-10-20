@@ -192,8 +192,10 @@ pub enum Msg {
     },
     /// The user closed the window (the GUI's).
     Close,
-    /// The user pasted text (in the GUI's window).
+    /// The user pasted text.
     Paste(String),
+    /// The user asked to paste from the clipboard (in the GUI's window).
+    PasteClipboard,
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -1084,6 +1086,10 @@ impl App {
             Msg::Close => self.close(),
             Msg::Paste(text) => {
                 self.paste(&text);
+                Vec::new()
+            }
+            Msg::PasteClipboard => {
+                self.paste_clipboard();
                 Vec::new()
             }
             Msg::FileSaved(op, outcome) => self.on_file_saved(op, outcome),
