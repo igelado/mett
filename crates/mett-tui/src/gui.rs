@@ -649,23 +649,19 @@ fn key(
         _ => {
             let typed = character(logical)?;
             let base = character(plain).unwrap_or(typed);
-            let c = if ctrl && alt && typed != base && !typed.is_control() {
-                // AltGr (Control and Alt on Windows) typed a character of
-                // its own (`@` on German keyboards): it is just typed.
+            // A character of the layout's own, typed with AltGr (Control
+            // and Alt on Windows) or a Mac's Option: `@` on German
+            // keyboards. It is just typed, as a Mac's Terminal does
+            // (Escape and the key is still Meta).
+            let own = !typed.eq_ignore_ascii_case(&base);
+            let c = if alt && own && !typed.is_control() {
                 return Some(KeyEvent::from(KeyCode::Char(typed)));
             } else if ctrl {
                 // Control and a key, as a terminal reports it.
                 return Some(control(base.to_ascii_lowercase(), held));
             } else if alt {
-                // Meta: the key itself, not what Option makes of it on a
-                // Mac.
-                if typed.is_ascii() {
-                    typed
-                } else if shift {
-                    base.to_ascii_uppercase()
-                } else {
-                    base
-                }
+                // Meta and the key.
+                typed
             } else {
                 // What it types, after a dead key too (`´` then `e`).
                 text.and_then(single)
@@ -939,14 +935,24 @@ mod tests {
     #[test]
     fn meta_altgr_and_dead_keys() {
         let event = |code, modifiers| Some(KeyEvent::new(code, modifiers));
-        // Option+x on a Mac types `≈`; it is Meta and `x`.
-        assert_eq!(
-            press(ch("≈"), ch("x"), Some("≈"), ModifiersState::ALT),
-            event(KeyCode::Char('x'), KeyModifiers::ALT)
-        );
+        // Alt and a key that types nothing else is Meta and the key.
         assert_eq!(
             press(ch("x"), ch("x"), Some("x"), ModifiersState::ALT),
             event(KeyCode::Char('x'), KeyModifiers::ALT)
+        );
+        assert_eq!(
+            press(
+                ch("X"),
+                ch("x"),
+                Some("X"),
+                ModifiersState::ALT | ModifiersState::SHIFT
+            ),
+            event(KeyCode::Char('X'), KeyModifiers::ALT | KeyModifiers::SHIFT)
+        );
+        // Option+L on a German Mac types `@`, as Terminal does.
+        assert_eq!(
+            press(ch("@"), ch("l"), Some("@"), ModifiersState::ALT),
+            event(KeyCode::Char('@'), KeyModifiers::NONE)
         );
         // AltGr+Q on a German keyboard, on Windows: `@`.
         assert_eq!(
