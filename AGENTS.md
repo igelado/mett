@@ -59,6 +59,13 @@ pull requests, comments, checks, merges and releases.
    review conversation is resolved. To hold a PR back, open it as a draft,
    or turn auto-merge off (`gh pr merge --disable-auto`); turn it back on
    with `gh pr merge --auto --merge`.
+7. Every PR removes its branch after merge. The repository's "Automatically
+   delete head branches" setting does this for GitHub's merges; keep it on
+   (`gh api repos/igelado/mett --jq .delete_branch_on_merge` prints `true`;
+   `gh repo edit --delete-branch-on-merge` turns it back on). A PR merged
+   any other way is merged with `gh pr merge --delete-branch`. Once merged,
+   delete the local branch too: switch to `main`, bring it up to date
+   (`git switch main && git pull`), then `git branch -d <branch>`.
 
 While a PR waits for checks or review, start the next feature on its own
 branch instead of waiting. Return to the waiting PR when its results arrive.
@@ -74,7 +81,7 @@ GitHub enforces this workflow:
 - A PR can be merged only if its required checks (the `docs`, `rust`,
   `macos` and `windows` jobs)
   succeed, and once every review conversation is resolved.
-- The head branch is deleted after merge by default.
+- The head branch is deleted after merge (see step 7).
 - CI is defined in `.github/workflows/ci.yml` and runs with GitHub Actions
   on every pull request (and each push to one), and on `main`. A branch
   without a PR gets no CI, so open the PR to have it checked. Every CI job
