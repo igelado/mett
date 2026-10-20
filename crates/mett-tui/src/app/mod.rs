@@ -354,6 +354,28 @@ impl Pager {
         self.layout(width);
     }
 
+    /// Shows the message's links collapsed or not, keeping the line at the
+    /// top of the screen there.
+    fn collapse_links(&mut self, collapse: bool, width: usize) {
+        if self.collapse_links == collapse {
+            return;
+        }
+        self.collapse_links = collapse;
+        let Some(message) = self.message.take() else {
+            // It is laid out as chosen once it arrives.
+            return;
+        };
+        let top = (self.scroll < self.row_count()).then(|| self.line_of(self.scroll));
+        self.show(&message, width);
+        self.message = Some(message);
+        if let Some(line) = top {
+            self.scroll = self.line_rows[line];
+        }
+        // Where the last search found text has moved.
+        self.search_match = None;
+        self.highlight = None;
+    }
+
     /// Re-wraps the message if the width changed.
     fn layout(&mut self, width: usize) {
         if self.rows_width != Some(width) {
@@ -1679,23 +1701,9 @@ impl App {
     /// the line at the top of the screen there.
     fn toggle_links(&mut self) {
         let width = self.wrap_width();
-        let Some(Screen::Pager(pager)) = self.screens.last_mut() else {
-            return;
-        };
-        pager.collapse_links = !pager.collapse_links;
-        let Some(message) = pager.message.take() else {
-            // It is laid out as chosen once it arrives.
-            return;
-        };
-        let top = (pager.scroll < pager.row_count()).then(|| pager.line_of(pager.scroll));
-        pager.show(&message, width);
-        pager.message = Some(message);
-        if let Some(line) = top {
-            pager.scroll = pager.line_rows[line];
+        if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
+            pager.collapse_links(!pager.collapse_links, width);
         }
-        // Where the last search found text has moved.
-        pager.search_match = None;
-        pager.highlight = None;
         self.clamp_scroll();
     }
 
@@ -2374,7 +2382,19 @@ impl App {
         self.delete = settings.delete;
         self.resolve = settings.resolve;
         self.shortcuts = settings.shortcuts;
+        let collapse = settings.display.collapse_links;
+        let changed = collapse != self.display.collapse_links;
         self.display = settings.display;
+        if changed {
+            // Open messages follow `collapse_links` (also those shown as
+            // `toggle-links` chose).
+            let width = self.wrap_width();
+            for screen in &mut self.screens {
+                if let Screen::Pager(pager) = screen {
+                    pager.collapse_links(collapse, width);
+                }
+            }
+        }
         self.apply_sidebar(settings.sidebar);
         // `wrap` may have changed: the pager and text views wrap again.
         self.clamp_scroll();
@@ -3285,6 +3305,29 @@ mod tests {
         act(&mut app, Action::Exit);
         act(&mut app, Action::DisplayMessage);
         assert!(pager(&app).collapse_links);
+    }
+
+    #[test]
+    fn the_open_message_follows_collapse_links() {
+        let mut app = loaded(1);
+        let fetch = first_request(&act(&mut app, Action::DisplayMessage));
+        let mut message = message("m0", 0);
+        message.body.content = "the docs<https://example.com>".into();
+        respond(&mut app, fetch, Event::MessageFetched(Ok(message)));
+        let last = pager(&app).lines.len() - 1;
+        assert_eq!(pager(&app).lines[last], "the docs");
+
+        let mut settings = Settings::default();
+        settings.display.collapse_links = false;
+        app.apply_settings(settings.clone());
+        assert_eq!(pager(&app).lines[last], "the docs<https://example.com>");
+        // Shown as toggle-links chose, until the setting changes again.
+        act(&mut app, Action::ToggleLinks);
+        app.apply_settings(settings.clone());
+        assert_eq!(pager(&app).lines[last], "the docs");
+        settings.display.collapse_links = true;
+        app.apply_settings(settings);
+        assert_eq!(pager(&app).lines[last], "the docs");
     }
 
     #[test]

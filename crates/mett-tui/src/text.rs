@@ -69,6 +69,11 @@ pub fn pager_view(message: &Message, collapse: bool) -> (Vec<String>, Vec<Link>)
 /// don't say where a link's text starts.
 const LINK_START: char = '\u{E000}';
 
+/// What opens an HTML link's URL after its text, in place of `<`, in the
+/// text [`body_text`] makes of HTML: a `<https://...>` in the link's text
+/// isn't its URL.
+const LINK_URL: char = '\u{E001}';
+
 /// The URL schemes links are found with.
 const SCHEMES: &[&str] = &["https://", "http://", "ftp://", "mailto:"];
 
@@ -121,14 +126,18 @@ fn find_links(line: &str, collapse: bool, marks: bool, open: bool) -> Found {
             continue;
         }
         // A URL in angle brackets: `<https://...>`, with no space in it.
+        // In HTML, only a link's own URL (after LINK_URL) is one.
+        let generated = marks && c == LINK_URL;
         let bracketed = rest
-            .strip_prefix('<')
+            .strip_prefix(['<', LINK_URL])
+            .filter(|_| generated || (c == '<' && !marks))
             .filter(|after| scheme_len(after).is_some())
             .and_then(|after| {
                 let end = after.find(['>', '<', ' ', '\t'])?;
                 after[end..].starts_with('>').then_some(end)
             });
         if let Some(len) = bracketed {
+            let rest_url = &rest[c.len_utf8()..];
             // The link's text: from where an HTML link said it starts
             // (maybe on a line before), or else the word right before it,
             // without opening punctuation.
@@ -138,7 +147,10 @@ fn find_links(line: &str, collapse: bool, marks: bool, open: bool) -> Found {
                 Some(start) => start,
                 None if earlier => 0,
                 None => {
-                    let word = out.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                    let word = out
+                        .char_indices()
+                        .rfind(|(_, c)| c.is_whitespace())
+                        .map_or(0, |(i, c)| i + c.len_utf8());
                     out.len() - out[word..].trim_start_matches(['(', '[', '"', '\'']).len()
                 }
             };
@@ -152,10 +164,10 @@ fn find_links(line: &str, collapse: bool, marks: bool, open: bool) -> Found {
             } else {
                 out.push('<');
                 links.push(out.len()..out.len() + len);
-                out.push_str(&rest[1..=len]);
+                out.push_str(&rest_url[..len]);
                 out.push('>');
             }
-            rest = &rest[len + 2..];
+            rest = &rest_url[len + 1..];
             continue;
         }
         // A URL on its own, at the start of a word.
@@ -314,7 +326,7 @@ pub fn body_lines(body: &Body) -> Vec<String> {
         .lines()
         .map(|line| {
             if html {
-                expand_tabs(&line.replace(LINK_START, ""))
+                expand_tabs(&line.replace(LINK_START, "").replace(LINK_URL, "<"))
             } else {
                 expand_tabs(line)
             }
@@ -398,7 +410,9 @@ fn html_to_text(html: &str) -> String {
                 }
                 anchor = attribute(raw, "href")
                     .map(|href| decode_entities(href).into_owned())
-                    .filter(|href| scheme_len(href).is_some() && !href.contains(LINK_START))
+                    .filter(|href| {
+                        scheme_len(href).is_some() && !href.contains([LINK_START, LINK_URL])
+                    })
                     .map(|href| (href, out.len()));
                 if anchor.is_some() {
                     out.push(LINK_START);
@@ -414,7 +428,7 @@ fn html_to_text(html: &str) -> String {
                         // Spaces after the text stay after the URL.
                         let spaces = out[out.trim_end().len()..].to_owned();
                         out.truncate(out.trim_end().len());
-                        out.push('<');
+                        out.push(LINK_URL);
                         out.push_str(&href);
                         out.push('>');
                         out.push_str(&spaces);
@@ -451,11 +465,11 @@ fn html_to_text(html: &str) -> String {
 }
 
 /// Adds the text between tags, `html`, to `out`, decoded. It can't have
-/// link marks: a [`LINK_START`] in it is shown as U+FFFD.
+/// link marks: a [`LINK_START`] or [`LINK_URL`] in it is shown as U+FFFD.
 fn push_text(out: &mut String, html: &str) {
     let text = decode_entities(html);
-    if text.contains(LINK_START) {
-        out.push_str(&text.replace(LINK_START, "\u{FFFD}"));
+    if text.contains([LINK_START, LINK_URL]) {
+        out.push_str(&text.replace([LINK_START, LINK_URL], "\u{FFFD}"));
     } else {
         out.push_str(&text);
     }
@@ -728,6 +742,21 @@ mod tests {
     }
 
     #[test]
+    fn links_may_follow_any_space() {
+        assert_eq!(
+            links("See\u{a0}docs<https://e.com>", true),
+            ("See\u{a0}docs".to_owned(), vec!["docs".to_owned()])
+        );
+        assert_eq!(
+            links("See\u{3000}<https://e.com>", true),
+            (
+                "See\u{3000}<https://e.com>".to_owned(),
+                vec!["https://e.com".to_owned()]
+            )
+        );
+    }
+
+    #[test]
     fn urls_without_text_are_never_collapsed() {
         let line = "(<https://example.com>) and \"<https://b.org>\"";
         assert_eq!(
@@ -840,6 +869,33 @@ mod tests {
                 ],
                 vec![(2, "https://e.com".to_owned())]
             )
+        );
+    }
+
+    #[test]
+    fn urls_in_html_link_text_are_part_of_it() {
+        let body = Body {
+            kind: BodyKind::Html,
+            content: r#"<a href="https://target">See &lt;https://example.com&gt;</a>"#.into(),
+        };
+        assert_eq!(
+            body_lines(&body),
+            ["See <https://example.com><https://target>"]
+        );
+        assert_eq!(
+            view_lines(body.clone(), true),
+            (
+                vec!["See <https://example.com>".to_owned()],
+                // The whole text, and the URL in it.
+                vec![
+                    (0, "See <https://example.com>".to_owned()),
+                    (0, "https://example.com".to_owned())
+                ]
+            )
+        );
+        assert_eq!(
+            view_lines(body, false).0,
+            ["See <https://example.com><https://target>"]
         );
     }
 
