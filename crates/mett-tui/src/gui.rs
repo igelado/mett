@@ -224,7 +224,7 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
         modifiers: ModifiersState::empty(),
         composing: false,
         typed: None,
-        clipboard: None,
+        cell: winit::dpi::PhysicalSize::new(1, 1),
         fallbacks: Vec::new(),
         code: ExitCode::SUCCESS,
     };
@@ -260,8 +260,8 @@ struct Gui {
     /// The text the last key press typed, which an input method may
     /// commit again.
     typed: Option<String>,
-    /// The system's clipboard, once pasted from.
-    clipboard: Option<arboard::Clipboard>,
+    /// A cell's size, in pixels: the window is never smaller.
+    cell: winit::dpi::PhysicalSize<u32>,
     /// The system's fonts the font falls back on.
     fallbacks: Vec<Font<'static>>,
     /// How the app ended.
@@ -312,7 +312,6 @@ impl Gui {
                     cursor: None,
                 })
                 .map_err(|e| e.to_string())?,
-                clipboard: None,
             };
             let proxy = self.proxy.clone();
             std::thread::spawn(move || {
@@ -337,7 +336,7 @@ impl Gui {
     /// The font's size in `window`'s pixels; the window grows and shrinks
     /// by cells of that font, where the system lets it (the cells are
     /// drawn from its top left corner).
-    fn font_px(&self, window: &Window) -> Result<u32, String> {
+    fn font_px(&mut self, window: &Window) -> Result<u32, String> {
         let aspect = f64::from(aspect(self.fonts.main).ok_or("the font has no `m`")?);
         // Points to pixels: a point is 1/72 inch, a logical pixel 1/96.
         // Cells at least a pixel wide (ratatui-wgpu divides by their
@@ -345,8 +344,11 @@ impl Gui {
         let font_px = (f64::from(self.fonts.size) * 96.0 / 72.0 * window.scale_factor())
             .round()
             .clamp((1.0 / aspect).ceil() + 1.0, 512.0);
-        let cell = winit::dpi::PhysicalSize::new((aspect * font_px).floor(), font_px);
+        // Whole numbers: clamped above.
+        let cell = winit::dpi::PhysicalSize::new((aspect * font_px).floor() as u32, font_px as u32);
         window.set_resize_increments(Some(cell));
+        window.set_min_inner_size(Some(cell));
+        self.cell = cell;
         // A whole number, clamped above.
         Ok(font_px as u32)
     }
@@ -380,7 +382,12 @@ impl Gui {
         let Some(terminal) = &mut self.terminal else {
             return;
         };
-        terminal.backend_mut().resize(size.width, size.height);
+        // At least a cell, where the system lets it be smaller.
+        let (width, height) = (
+            size.width.max(self.cell.width),
+            size.height.max(self.cell.height),
+        );
+        terminal.backend_mut().resize(width, height);
         if let Ok(cells) = terminal.size() {
             let changed = {
                 let mut shared = self.size.lock().expect("not poisoned");
@@ -407,10 +414,7 @@ impl Gui {
 
     /// Sends the app the system clipboard's text, pasted.
     fn paste(&mut self) {
-        if self.clipboard.is_none() {
-            self.clipboard = arboard::Clipboard::new().ok();
-        }
-        let text = self.clipboard.as_mut().and_then(|c| c.get_text().ok());
+        let text = crate::platform::with_clipboard(|clipboard| clipboard.get_text()).ok();
         if let Some(text) = text.filter(|text| !text.is_empty()) {
             self.send(UserEvent::Term(TermEvent::Paste(text)));
         }
@@ -421,6 +425,13 @@ impl Gui {
         let Some(terminal) = &mut self.terminal else {
             return;
         };
+        // Not even a cell fits (ratatui-wgpu would panic).
+        if terminal
+            .size()
+            .is_ok_and(|size| size.width == 0 || size.height == 0)
+        {
+            return;
+        }
         let shown = &self.shown;
         let drawn = terminal.draw(|frame| match shown {
             Shown::Starting => {}
@@ -683,8 +694,6 @@ pub(crate) struct WindowScreen {
     proxy: EventLoopProxy<Shown>,
     /// Draws a screen into cells.
     capture: Terminal<Capture>,
-    /// The system's clipboard, once used.
-    clipboard: Option<arboard::Clipboard>,
 }
 
 impl crate::Frontend for WindowScreen {
@@ -717,11 +726,8 @@ impl crate::Frontend for WindowScreen {
     }
 
     fn copy(&mut self, text: &str) -> std::io::Result<()> {
-        if self.clipboard.is_none() {
-            self.clipboard = Some(arboard::Clipboard::new().map_err(std::io::Error::other)?);
-        }
-        let clipboard = self.clipboard.as_mut().expect("just set");
-        clipboard.set_text(text).map_err(std::io::Error::other)
+        crate::platform::with_clipboard(|clipboard| clipboard.set_text(text))
+            .map_err(std::io::Error::other)
     }
 }
 

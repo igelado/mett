@@ -671,11 +671,9 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 stale = true;
             }
         }
-        for text in deferred.copies.drain(..) {
-            if let Err(e) = screen.copy(&text) {
-                app.status = format!("Could not copy: {e}");
-                stale = true;
-            }
+        if !deferred.copies.is_empty() {
+            copy_all(&mut screen, &mut app, std::mem::take(&mut deferred.copies));
+            stale = true;
         }
         // The editor runs between messages, with the terminal handed over.
         commands.queue.extend(deferred.commands.drain(..));
@@ -829,7 +827,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             // A macro run in the sign-in window plays there.
             while let Some(msg) = app.next_sign_in_stroke() {
                 let effects = app.update(msg);
-                carry_out(&mut app, effects);
+                let copies = carry_out(&mut app, effects).copies;
+                copy_all(&mut screen, &mut app, copies);
                 stale = true;
             }
             stale |= app.take_redraw();
@@ -859,6 +858,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     Some(UserEvent::Term(TermEvent::Resize(width, height))) => {
                         Msg::Resize { width, height }
                     }
+                    // Closing the window again: no more waiting.
+                    Some(UserEvent::Close) => break,
                     // Already quitting.
                     Some(_) => continue,
                 },
@@ -906,8 +907,10 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             let window_was_open = app.sign_in.is_some();
             let effects = app.update(msg);
             stale = true;
-            // Nothing is edited, nor configured, any more.
-            let _ = carry_out(&mut app, effects);
+            // Nothing is edited, nor configured, any more; the sign-in
+            // window may copy its link.
+            let copies = carry_out(&mut app, effects).copies;
+            copy_all(&mut screen, &mut app, copies);
             // The wait starts again once the user is done signing in.
             // (Still with what a throttled save has left to wait.)
             if window_was_open || app.sign_in.is_some() {
@@ -945,6 +948,15 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         )));
     }
     Ok(())
+}
+
+/// Puts each of `copies` on the clipboard, saying why one couldn't be.
+fn copy_all(screen: &mut impl Frontend, app: &mut App, copies: Vec<String>) {
+    for text in copies {
+        if let Err(e) = screen.copy(&text) {
+            app.status = format!("Could not copy: {e}");
+        }
+    }
 }
 
 /// What the main loop takes in next. Each is handled at once, so the

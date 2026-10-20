@@ -85,26 +85,17 @@ pub enum Bottom {
 #[derive(Clone, Default)]
 struct Clipboard {
     own: Rc<RefCell<String>>,
-    #[cfg(feature = "gui")]
-    system: Option<Rc<RefCell<arboard::Clipboard>>>,
 }
 
 impl Clipboard {
     fn new() -> Self {
-        Self {
-            own: Rc::default(),
-            #[cfg(feature = "gui")]
-            system: crate::platform::gui()
-                .then(|| arboard::Clipboard::new().ok())
-                .flatten()
-                .map(|system| Rc::new(RefCell::new(system))),
-        }
+        Self::default()
     }
 
     fn get(&self) -> String {
         #[cfg(feature = "gui")]
-        if let Some(system) = &self.system
-            && let Ok(text) = system.borrow_mut().get_text()
+        if crate::platform::gui()
+            && let Ok(text) = crate::platform::with_clipboard(|system| system.get_text())
         {
             return text;
         }
@@ -113,8 +104,8 @@ impl Clipboard {
 
     fn set(&self, text: String) {
         #[cfg(feature = "gui")]
-        if let Some(system) = &self.system {
-            let _ = system.borrow_mut().set_text(text.clone());
+        if crate::platform::gui() {
+            let _ = crate::platform::with_clipboard(|system| system.set_text(text.clone()));
         }
         *self.own.borrow_mut() = text;
     }

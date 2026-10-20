@@ -27,6 +27,22 @@ pub fn set_gui() {
     GUI.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Runs `f` on the system's clipboard. It stays open for as long as mett
+/// runs: on X11, what mett copied is only there while it is.
+#[cfg(feature = "gui")]
+pub fn with_clipboard<T>(
+    f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
+) -> Result<T, String> {
+    static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+    let mut clipboard = CLIPBOARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if clipboard.is_none() {
+        *clipboard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
+    }
+    f(clipboard.as_mut().expect("just set")).map_err(|e| e.to_string())
+}
+
 /// The user's home directory: `$HOME`, else (on Windows, where it is
 /// usually unset) `%USERPROFILE%`.
 pub fn home() -> Option<String> {
