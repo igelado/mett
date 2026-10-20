@@ -1,9 +1,9 @@
-# Release packages, run by Forgejo Actions (see docs/RELEASING.md).
+# Release packages, run by GitHub Actions (see docs/RELEASING.md).
 #
 # Pushing a tag vX.Y.Z builds the Debian/Ubuntu, Arch Linux and tarball
 # packages for x86_64 and aarch64, and publishes them as that tag's release.
 # Running it by hand (workflow_dispatch) only builds them, to check that
-# they build, and publishes nothing.
+# they build, and keeps them as the run's artifact; it publishes nothing.
 
 name: release
 on:
@@ -11,20 +11,23 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   packages:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: rust:1.95
     steps:
       - run: >
           apt-get update && apt-get install -y --no-install-recommends
-          nodejs python3-pip libarchive-tools zstd jq
-      - uses: https://code.forgejo.org/actions/checkout@v4
+          python3-pip libarchive-tools zstd
+      - uses: actions/checkout@v4
         with:
           # The whole history, to tell whether the tag is on main.
           fetch-depth: 0
-      - uses: https://code.forgejo.org/actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             /usr/local/cargo/registry
@@ -36,9 +39,9 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       # The tag goes to the scripts as data, never as shell code.
       - name: The tag is the version in Cargo.toml
-        if: forgejo.event_name == 'push'
+        if: github.event_name == 'push'
         env:
-          TAG: ${{ forgejo.ref_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           version=$(packaging/version.sh)
           if [ "$TAG" != "v$version" ]; then
@@ -47,9 +50,9 @@ jobs:
           fi
       # Only what was merged (reviewed, checked) is released.
       - name: The tag is on main
-        if: forgejo.event_name == 'push'
+        if: github.event_name == 'push'
         env:
-          TAG: ${{ forgejo.ref_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           git config --global --add safe.directory "$PWD"
           git fetch --no-tags origin main
@@ -58,14 +61,28 @@ jobs:
             exit 1
           fi
       - run: packaging/package.sh x86_64 aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/
+          if-no-files-found: error
+
+  # Apart from the build, so that only this job may write the repository.
+  publish:
+    if: github.event_name == 'push'
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist/
       - name: Publish the release
-        if: forgejo.event_name == 'push'
         env:
-          FORGEJO_URL: ${{ forgejo.server_url }}
-          FORGEJO_REPOSITORY: ${{ forgejo.repository }}
-          FORGEJO_TOKEN: ${{ forgejo.token }}
-          TAG: ${{ forgejo.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: packaging/release.sh "$TAG"
-      - name: List the packages
-        if: forgejo.event_name == 'workflow_dispatch'
-        run: ls -l dist/

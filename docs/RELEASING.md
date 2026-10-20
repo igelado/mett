@@ -1,7 +1,7 @@
 # Releasing mett
 
-Releases are built and published by Forgejo Actions
-(`.forgejo/workflows/release.yml`) when a version tag is pushed.
+Releases are built and published by GitHub Actions
+(`.github/workflows/release.yml`) when a version tag is pushed.
 
 ## What a release has
 
@@ -44,21 +44,27 @@ musl's copyright.
 3. The `release` workflow checks that the tag is the version in
    `Cargo.toml` and that it is on `main` (only what was merged is
    released), builds the packages, and publishes them as the tag's
-   release on Forgejo (https://git.gelado.org/igelado/mett/releases). A
-   version with a pre-release part (`v0.2.0-rc.1`) is published as a
-   pre-release.
+   release on GitHub (https://github.com/igelado/mett/releases), with
+   `packaging/release.sh` and `gh`. A version with a pre-release part
+   (`v0.2.0-rc.1`) is published as a pre-release.
 
 If the workflow fails after publishing some files, run it again: it reuses
 the release and replaces files of the same name.
 
 ## Building the packages without releasing
 
-From the Forgejo web interface (**Actions** › **release** › **Run
-workflow**), the workflow builds the packages from a branch, to check that
-they build, and publishes nothing. (It doesn't keep them as an artifact:
-git.gelado.org's artifact storage fails uploads.) To get the packages
-without releasing, build them locally: install the tools and run the
-script:
+Run by hand, the workflow builds the packages from a branch, to check that
+they build, and publishes nothing: it keeps them as the run's `packages`
+artifact.
+
+```sh
+gh workflow run release --ref igelado/my-branch
+gh run watch                        # pick the run
+gh run download <run-id> -n packages -D dist/
+```
+
+(Or from the web interface: **Actions** › **release** › **Run workflow**.)
+To build them locally instead, install the tools and run the script:
 
 ```sh
 pipx install cargo-zigbuild       # also installs zig (pip refuses outside a venv on Debian)
