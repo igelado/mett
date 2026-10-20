@@ -190,6 +190,8 @@ pub enum Msg {
         /// How many messages.
         taken: u64,
     },
+    /// The user closed the window (the GUI's).
+    Close,
     /// The terminal was resized.
     Resize {
         /// Terminal width, in cells.
@@ -1077,6 +1079,7 @@ impl App {
             Msg::Key(key) => self.on_key_press(key),
             Msg::Configured(reconfigured) => self.reconfigure(reconfigured),
             Msg::Edited(result) => self.on_edited(result),
+            Msg::Close => self.close(),
             Msg::FileSaved(op, outcome) => self.on_file_saved(op, outcome),
             Msg::FileRead(op, path, result) => self.on_file_read(op, path, result),
             Msg::Failed(why) => {

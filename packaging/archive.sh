@@ -37,7 +37,8 @@ for target in "$@"; do
     *) usage ;;
     esac
     echo "Building mett $version for $target"
-    cargo build --release --locked -p mett-tui --target "$target"
+    # The packages hold mett, the terminal program, alone: not mett-gui.
+    cargo build --release --locked -p mett-tui --no-default-features --target "$target"
     tree=$work/$name
     rm -rf "$tree"
     mkdir -p "$tree"

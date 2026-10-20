@@ -11,6 +11,22 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Whether mett runs in a window of its own (`mett-gui`) rather than in a
+/// terminal.
+static GUI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether mett runs in a window of its own: then there is no terminal for
+/// an editor of the user's own.
+pub fn gui() -> bool {
+    GUI.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Notes that mett runs in a window of its own.
+#[cfg(feature = "gui")]
+pub fn set_gui() {
+    GUI.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The user's home directory: `$HOME`, else (on Windows, where it is
 /// usually unset) `%USERPROFILE%`.
 pub fn home() -> Option<String> {

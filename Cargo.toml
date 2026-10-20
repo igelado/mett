@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.92"
 publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/igelado/mett"
@@ -25,6 +25,13 @@ encoding_rs = "0.8.35"
 getrandom = "0.4.3"
 keyring = "4.2.0"
 open = "5.4.4"
+# The GUI (mett-gui): drawing, windows, the clipboard, fonts.
+arboard = { version = "3.7.0", default-features = false }
+fontdb = "0.24.0"
+pollster = "1.0.1"
+ratatui-wgpu = "0.6.0"
+ttf-parser = "0.25.1"
+winit = "0.30.13"
 ratatui = "0.30.2"
 regex = "1.13.1"
 roxmltree = "0.21.1"

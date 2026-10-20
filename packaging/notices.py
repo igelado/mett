@@ -32,7 +32,10 @@ def main() -> None:
     linked = set()
     for target in targets:
         tree = subprocess.run(
+            # The packages hold mett alone, built without the `gui`
+            # feature (mett-gui's).
             ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
+             "--no-default-features",
              "--target", target, "--prefix", "none", "-f", "{p}"],
             check=True, capture_output=True, text=True, encoding="utf-8",
         ).stdout

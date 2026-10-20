@@ -51,13 +51,20 @@ for x86_64 and aarch64:
 
 ### From source
 
-mett needs Rust 1.89 or later, a C compiler (for the SQLite it builds
+mett needs Rust 1.92 or later, a C compiler (for the SQLite it builds
 in) and Git; nothing else.
+
+Two programs are built: `mett`, in the terminal, and `mett-gui`, which
+opens a window of its own, with the same screens and keys, and the same
+mettrc. In the window, messages are always written in mett's built-in
+editor (see [MUTTRC.md](docs/MUTTRC.md) §4.11). On Linux, `mett-gui`
+needs X11 or Wayland and the system's Vulkan or OpenGL drivers (Mesa's do)
+to run; nothing more to build.
 
 1. Install Rust with [rustup](https://rustup.rs/) (or `rustup update` an
    older one), then a C compiler and Git: `sudo apt install build-essential
    git` on Debian and Ubuntu, `sudo pacman -S base-devel git` on Arch.
-2. Get the source and install the `mett` binary:
+2. Get the source and install the `mett` and `mett-gui` binaries:
 
    ```sh
    git clone https://github.com/igelado/mett.git
@@ -65,12 +72,15 @@ in) and Git; nothing else.
    cargo install --locked --path crates/mett-tui
    ```
 
-   It goes to `~/.cargo/bin/mett`; rustup puts that directory on your
+   For `mett` alone (no window, nor the graphics libraries it is built
+   with, say on a server), add `--no-default-features`.
+
+   They go to `~/.cargo/bin/`; rustup puts that directory on your
    `PATH`. For another place, add `--root <dir>` (say `--root ~/.local`
    for `~/.local/bin/mett`), and make sure `<dir>/bin` is on your `PATH`
    too.
 3. Check it: `mett -v` prints the version, and `mett --demo` opens a
-   sample mailbox.
+   sample mailbox (`mett-gui --demo`, in a window).
 
 To update, `git pull` in the checkout and run the same `cargo install`
 again. `cargo uninstall mett-tui` removes it (with the same `--root`, if

@@ -705,6 +705,22 @@ impl App {
         }
     }
 
+    /// The window was closed: mett quits as `q` in the index does (asking
+    /// to purge deleted messages, as set), unless a message is being
+    /// written, which would be lost.
+    pub(super) fn close(&mut self) -> Vec<Effect> {
+        let writing = self.editing.is_some()
+            || self.composing.is_some()
+            || self.screens.iter().any(|s| matches!(s, Screen::Compose(_)));
+        if writing {
+            self.fail("A message is being written: send or postpone it first.");
+            return Vec::new();
+        }
+        // A question asked meanwhile goes unanswered.
+        self.input = None;
+        self.leave_folder(super::mailbox::AfterPurge::Quit)
+    }
+
     /// Lets the user edit `text`, in the built-in editor or (through the
     /// main loop) in their own; [`Msg::Edited`] brings it back.
     pub(super) fn edit(&mut self, text: String) -> Vec<Effect> {
@@ -1154,6 +1170,37 @@ mod tests {
         };
         // The editor opens with the cursor at the start.
         assert_eq!(sent.body, "HelloHi! \n-- \nMe\n");
+    }
+
+    #[test]
+    fn closing_the_window_quits_unless_a_message_is_being_written() {
+        // In the index, it quits.
+        let mut index = app(settings());
+        index.update(Msg::Close);
+        assert!(index.quit);
+
+        let mut app = app(compose::Settings {
+            builtin_editor: Some(crate::editor::Keys::Vim),
+            ..settings()
+        });
+        act(&mut app, Action::Mail);
+        answer(&mut app, "bob@x.org");
+        answer(&mut app, "Hi");
+        app.update(Msg::Close);
+        assert!(!app.quit);
+        assert!(app.editing.is_some(), "still writing");
+        assert_eq!(
+            app.status,
+            "A message is being written: send or postpone it first."
+        );
+        typed(&mut app, "iHello");
+        key(&mut app, KeyCode::Esc);
+        typed(&mut app, ":wq");
+        key(&mut app, KeyCode::Enter);
+        // In the compose menu, too.
+        app.update(Msg::Close);
+        assert!(!app.quit);
+        assert_eq!(app.menu(), Menu::Compose);
     }
 
     #[test]
