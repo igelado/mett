@@ -8,4 +8,4 @@ Icon=mett
 Terminal=false
 Categories=Network;Email;
 Keywords=mail;email;Office365;Outlook;mutt;
-StartupWMClass=mett-gui
+StartupWMClass=mett

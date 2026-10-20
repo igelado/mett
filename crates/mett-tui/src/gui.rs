@@ -313,6 +313,15 @@ impl Gui {
             .with_title("mett")
             .with_window_icon(icon())
             .with_inner_size(WINDOW_SIZE);
+        // The name mett.desktop knows the window by: its Wayland app ID,
+        // its X11 class.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attributes = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            let attributes = WindowAttributesExtWayland::with_name(attributes, "mett", "mett");
+            WindowAttributesExtX11::with_name(attributes, "mett", "mett")
+        };
         let window = Arc::new(
             event_loop
                 .create_window(attributes)

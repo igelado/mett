@@ -2,8 +2,8 @@
 """Archives DIR as OUT: a .zip, or else a .tar.gz, holding DIR itself.
 
 Reproducible: entries are sorted, dated SOURCE_DATE_EPOCH, owned by root,
-and their modes are 755 for executables (any `mett`/`mett.exe`) and 644
-for the rest, wherever the archive is made.
+and their modes are 755 for executables (`mett` and `mett-gui`, with
+`.exe` on Windows) and 644 for the rest, wherever the archive is made.
 
 Usage: archive.py OUT DIR
 """
@@ -23,7 +23,8 @@ def main() -> None:
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
     files = sorted(p for p in root.rglob("*") if p.is_file())
     entry = lambda p: f"{root.name}/{p.relative_to(root).as_posix()}"
-    mode = lambda p: 0o755 if p.name in ("mett", "mett.exe") else 0o644
+    executables = ("mett", "mett.exe", "mett-gui", "mett-gui.exe")
+    mode = lambda p: 0o755 if p.name in executables else 0o644
     if out.suffix == ".zip":
         # Zip dates have no zone (UTC here), and start in 1980.
         date = time.gmtime(max(epoch, 315532800))[:6]
