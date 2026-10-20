@@ -81,6 +81,7 @@ impl PartialEq for Display {
             && self.colors == other.colors
             && self.wrap == other.wrap
             && self.pager_index_lines == other.pager_index_lines
+            && self.collapse_links == other.collapse_links
     }
 }
 
@@ -323,6 +324,16 @@ mod tests {
 
     use super::*;
     use crate::format::expand;
+
+    #[test]
+    fn displays_differ_in_how_links_are_shown() {
+        let collapsed = Display::default();
+        let expanded = Display {
+            collapse_links: false,
+            ..Display::default()
+        };
+        assert_ne!(collapsed, expanded);
+    }
 
     #[test]
     fn index_expandos() {
