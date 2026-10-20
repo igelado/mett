@@ -694,7 +694,9 @@ async fn run_query(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        // On Windows, KillGroup kills the shell with what it started: it
+        // must still be there for that.
+        .kill_on_drop(!cfg!(windows));
     #[cfg(unix)]
     shell.process_group(0);
     let child = shell.spawn().map_err(|e| format!("query_command: {e}"))?;
@@ -739,19 +741,28 @@ async fn run_query(
 
 /// Kills the process group of a query command when dropped while it runs
 /// (the lookup was given up): `kill_on_drop` alone leaves what the shell
-/// started.
+/// started. On Windows, which has no process groups, it kills the shell's
+/// process tree.
 struct KillGroup(Option<u32>);
 
 impl Drop for KillGroup {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0 {
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", "--", &format!("-{pid}")])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        let Some(pid) = self.0 else {
+            return;
+        };
+        let mut kill = if cfg!(windows) {
+            let mut kill = std::process::Command::new("taskkill");
+            kill.args(["/T", "/F", "/PID", &pid.to_string()]);
+            kill
+        } else {
+            let mut kill = std::process::Command::new("kill");
+            kill.args(["-TERM", "--", &format!("-{pid}")]);
+            kill
+        };
+        let _ = kill
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
