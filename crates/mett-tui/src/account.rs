@@ -238,7 +238,8 @@ pub fn cached(
         config,
         url,
         std::env::var_os("XDG_CACHE_HOME"),
-        std::env::var_os("HOME"),
+        // The home mett found, which on Windows may not be `$HOME`.
+        config.home().map(Into::into),
     );
     let Some(path) = path else {
         return (CachedStore::new(mailbox, None), None);
