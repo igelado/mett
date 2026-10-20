@@ -326,7 +326,9 @@ impl App {
                 // Office365 doesn't count flagged mail: with
                 // `sidebar_new_mail_only`, only new and unread mail shows
                 // a mailbox (besides the open one and the whitelisted).
-                if !self.shows(&entry) {
+                let whitelisted =
+                    || (settings.whitelist.iter()).any(|listed| self.same_mailbox(listed, path));
+                if !self.shows(&entry, whitelisted) {
                     return None;
                 }
                 // `alpha` by the label, or the path as `%B` shows it
@@ -362,9 +364,11 @@ impl App {
                     new: false,
                     counts: folder.counts,
                     spoolfile: (settings.spoolfile.as_ref())
-                        .is_some_and(|spoolfile| self.same_mailbox(spoolfile, &folder.target)),
+                        .is_some_and(|spoolfile| self.names_folder(spoolfile, folder)),
                 };
-                if !self.shows(&entry) {
+                let whitelisted =
+                    || (settings.whitelist.iter()).any(|listed| self.names_folder(listed, folder));
+                if !self.shows(&entry, whitelisted) {
                     return None;
                 }
                 let count = self.sort_count(&entry);
@@ -373,17 +377,22 @@ impl App {
             .collect()
     }
 
-    /// Whether the sidebar shows `entry`: all of them, unless
-    /// `sidebar_new_mail_only`.
-    fn shows(&self, entry: &SidebarEntry) -> bool {
-        let settings = &self.sidebar.settings;
+    /// Whether `path` names the listed `folder`: as written, or as found.
+    fn names_folder(&self, path: &FolderPath, folder: &BrowserEntry) -> bool {
+        same_path(path, &folder.target)
+            || folder
+                .id
+                .as_ref()
+                .is_some_and(|id| self.folder_at(path) == Some(id))
+    }
+
+    /// Whether the sidebar shows `entry`, `whitelisted` or not: all of
+    /// them, unless `sidebar_new_mail_only`.
+    fn shows(&self, entry: &SidebarEntry, whitelisted: impl FnOnce() -> bool) -> bool {
         // Office365 doesn't count flagged mail: with
         // `sidebar_new_mail_only`, only new and unread mail shows a
         // mailbox (besides the open one and the whitelisted).
-        !settings.new_mail_only
-            || entry.open
-            || entry.has_mail()
-            || (settings.whitelist.iter()).any(|listed| self.same_mailbox(listed, &entry.path))
+        !self.sidebar.settings.new_mail_only || entry.open || entry.has_mail() || whitelisted()
     }
 
     /// The count `sidebar_sort_method` orders `entry` by, if any.
@@ -410,7 +419,6 @@ impl App {
             && !self.sidebar.failed
             && self.sidebar.listing.is_none()
             && self.sidebar_shown()
-            && self.folder.is_some()
             && !self.quit
             && !self.poll_paused
             && self.sign_in.is_none();
@@ -419,6 +427,8 @@ impl App {
         }
         let request = self.request(Request::ListFolders);
         self.sidebar.listing = Some((effect_id(&request), self.poll_epoch));
+        // Up to date once listed, unless they change meanwhile.
+        self.sidebar.listed = true;
         vec![request]
     }
 
@@ -436,17 +446,11 @@ impl App {
         };
         match result {
             Ok(folders) => {
-                self.sidebar.listed = true;
-                let folders = tree(folders);
-                for folder in &folders {
-                    if let Some(id) = &folder.id {
-                        self.folder_ids.insert(folder.target.clone(), id.clone());
-                    }
-                }
-                self.sidebar.folders = Some(folders);
+                self.sidebar.folders = Some(tree(folders));
                 self.rebuild_sidebar(false);
             }
             Err(e) => {
+                self.sidebar.listed = false;
                 self.sidebar.failed = true;
                 self.background_error(e, epoch);
             }
@@ -1306,5 +1310,31 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.menu(), Menu::Index);
         assert!(app.status.contains("columns wide"), "{}", app.status);
+    }
+
+    #[test]
+    fn lists_the_folders_again_if_they_changed_while_listed() {
+        let (mut app, effects) = folders_app(SidebarSettings::default());
+        let listing = folders_listing(&effects).expect("folders listed");
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        assert_eq!(folders_listing(&effects), None, "one at a time");
+        let effects = respond(&mut app, listing, Event::FoldersListed(Ok(every_folder())));
+        assert!(folders_listing(&effects).is_some(), "maybe outdated");
+    }
+
+    #[test]
+    fn lists_the_folders_if_the_folder_fails_to_open() {
+        let settings = crate::app::Settings {
+            sidebar: SidebarSettings {
+                visible: true,
+                ..SidebarSettings::default()
+            },
+            ..crate::app::Settings::default()
+        };
+        let (mut app, effects) = App::open(120, 24, inbox(), settings);
+        let open = first_request(&effects);
+        let gone = mett_core::Error::not_found("folder", "Inbox");
+        let effects = respond(&mut app, open, Event::FolderOpened(Err(gone)));
+        assert!(folders_listing(&effects).is_some(), "to choose another");
     }
 }
