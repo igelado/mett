@@ -987,6 +987,9 @@ impl App {
 
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        if matches!(msg, Msg::Action(_)) {
+            self.retry_sidebar();
+        }
         let mut effects = self.handle(msg);
         // A search given up on (the user moved on, or left the message it
         // waited for) stops saying it is searching.

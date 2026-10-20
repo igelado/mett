@@ -180,11 +180,15 @@ pub struct Sidebar {
     /// Every folder, in tree order, as last listed: the sidebar shows them
     /// when there are no `mailboxes`.
     folders: Option<Vec<BrowserEntry>>,
-    /// The request listing them, while it is pending.
-    listing: Option<RequestId>,
+    /// The request listing them, while it is pending, and the checks'
+    /// epoch when it was made.
+    listing: Option<(RequestId, u64)>,
     /// Whether they were listed since they last may have changed; until
     /// then, they are listed again once the sidebar shows.
     listed: bool,
+    /// Whether listing them failed: they are listed again once the user
+    /// does something, rather than over and over.
+    failed: bool,
 }
 
 /// The fewest columns the sidebar leaves the menus, unless
@@ -239,6 +243,10 @@ impl App {
     pub(super) fn relayout(&mut self) {
         let sidebar = self.sidebar.settings.columns(self.terminal_width);
         self.width = self.terminal_width - sidebar;
+        // Hidden, it gives the keys back: shown again, it hasn't them.
+        if sidebar == 0 {
+            self.sidebar.focused = false;
+        }
         self.clamp_scroll();
         self.clamp_sign_in_scroll();
     }
@@ -399,6 +407,7 @@ impl App {
     pub(super) fn list_sidebar_folders(&mut self) -> Vec<Effect> {
         let wanted = self.mailboxes.is_empty()
             && !self.sidebar.listed
+            && !self.sidebar.failed
             && self.sidebar.listing.is_none()
             && self.sidebar_shown()
             && self.folder.is_some()
@@ -409,35 +418,50 @@ impl App {
             return Vec::new();
         }
         let request = self.request(Request::ListFolders);
-        self.sidebar.listing = Some(effect_id(&request));
+        self.sidebar.listing = Some((effect_id(&request), self.poll_epoch));
         vec![request]
     }
 
     /// The request listing the sidebar's folders, while it is pending.
     pub(super) fn sidebar_request(&self) -> Option<RequestId> {
-        self.sidebar.listing
+        self.sidebar.listing.map(|(id, _)| id)
     }
 
     /// Takes in the folders listed for the sidebar. If they couldn't be,
-    /// those it has stay, until they are listed again.
+    /// those it has stay, and the failure is reported as a check's; they
+    /// are listed again once the user does something.
     pub(super) fn on_sidebar_listed(&mut self, result: mett_core::Result<Vec<Folder>>) {
-        self.sidebar.listing = None;
-        self.sidebar.listed = true;
-        if let Ok(folders) = result {
-            let folders = tree(folders);
-            for folder in &folders {
-                if let Some(id) = &folder.id {
-                    self.folder_ids.insert(folder.target.clone(), id.clone());
+        let Some((_, epoch)) = self.sidebar.listing.take() else {
+            return;
+        };
+        match result {
+            Ok(folders) => {
+                self.sidebar.listed = true;
+                let folders = tree(folders);
+                for folder in &folders {
+                    if let Some(id) = &folder.id {
+                        self.folder_ids.insert(folder.target.clone(), id.clone());
+                    }
                 }
+                self.sidebar.folders = Some(folders);
+                self.rebuild_sidebar(false);
             }
-            self.sidebar.folders = Some(folders);
-            self.rebuild_sidebar(false);
+            Err(e) => {
+                self.sidebar.failed = true;
+                self.background_error(e, epoch);
+            }
         }
     }
 
     /// The folders' counts may have changed: they are listed again.
     pub(super) fn sidebar_outdated(&mut self) {
         self.sidebar.listed = false;
+    }
+
+    /// The user did something: folders that failed to list are listed
+    /// again.
+    pub(super) fn retry_sidebar(&mut self) {
+        self.sidebar.failed = false;
     }
 
     /// Brings the sidebar up to date before the screen is drawn: ordered
@@ -574,8 +598,6 @@ impl App {
     /// settings take.
     fn toggle_sidebar(&mut self) -> Vec<Effect> {
         self.sidebar.settings.visible = !self.sidebar.settings.visible;
-        // Shown again, it hasn't the keys.
-        self.sidebar.focused = false;
         self.relayout();
         if self.sidebar.settings.too_narrow(self.terminal_width) {
             self.after_configured = Some(self.narrow_note());
@@ -1137,12 +1159,32 @@ mod tests {
             ["Inbox", "*Inbox/Projects"],
             "the cursor stays"
         );
-        // A failed listing keeps them, until the next check.
+        // A failed listing keeps them, says why, and is tried again once
+        // the user does something, not by itself.
         let effects = app.update(Msg::Timer(Timer::Poll(0)));
         let listing = folders_listing(&effects).expect("listed again");
         respond(&mut app, listing, Event::FoldersListed(Err(offline())));
         assert_eq!(shown(&app), ["Inbox", "*Inbox/Projects"]);
-        assert_eq!(folders_listing(&act(&mut app, Action::SidebarNext)), None);
+        assert!(!app.status.is_empty(), "the failure is reported");
+        let effects = app.update(Msg::Timer(Timer::Poll(0)));
+        assert_eq!(folders_listing(&effects), None);
+        assert!(folders_listing(&act(&mut app, Action::SidebarFirst)).is_some());
+    }
+
+    #[test]
+    fn lists_the_folders_again_once_the_mailboxes_go() {
+        let mut app = folders_listed(SidebarSettings::default());
+        let visible = SidebarSettings {
+            visible: true,
+            ..SidebarSettings::default()
+        };
+        let mut settings = with_mailboxes(visible);
+        let effects = app.update(configured(settings.clone()));
+        assert_eq!(folders_listing(&effects), None);
+        assert_eq!(shown(&app), ["*Inbox", "Work", "Lists"]);
+        settings.mailboxes.clear();
+        let effects = app.update(configured(settings));
+        assert!(folders_listing(&effects).is_some(), "maybe changed since");
     }
 
     #[test]
@@ -1247,6 +1289,14 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         act(&mut app, Action::SidebarToggleVisible);
         assert_eq!(app.menu(), Menu::Index);
+        // Hidden by a narrower terminal, it gives them back too, and
+        // hasn't them once shown again.
+        let mut app = shown_app(SidebarSettings::default(), 24, &[]);
+        key(&mut app, KeyCode::Tab);
+        for width in [80, 120] {
+            app.update(Msg::Resize { width, height: 24 });
+            assert_eq!(app.menu(), Menu::Index);
+        }
         // Too narrow, it says how wide the terminal has to be.
         let mut app = shown_app(SidebarSettings::default(), 24, &[]);
         app.update(Msg::Resize {
