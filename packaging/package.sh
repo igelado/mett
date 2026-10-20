@@ -3,11 +3,17 @@
 # aarch64): a Debian/Ubuntu package (.deb), an Arch Linux package
 # (.pkg.tar.zst) and a plain tarball, all in dist/, with their SHA-256 sums.
 #
-# The binary is linked statically against musl with cargo-zigbuild, so the
-# same one runs on every distribution release and needs no dependencies.
+# mett is linked statically against musl with cargo-zigbuild, so the same
+# binary runs on every distribution release and needs no dependencies.
+# mett-gui, mett in a window, loads the system's graphics libraries (X11 or
+# Wayland, Vulkan or OpenGL), which a static binary can't: it is linked
+# against glibc 2.28 (Debian 10, RHEL 8 and later). The packages recommend
+# those libraries, and install a launcher for it (mett.desktop) and its
+# icon.
 #
-# Needs: cargo-zigbuild (and zig), the Rust musl targets, dpkg-deb, bsdtar
-# (libarchive-tools), zstd, gzip and sha256sum. See docs/RELEASING.md.
+# Needs: cargo-zigbuild (and zig), the Rust musl and gnu targets, dpkg-deb,
+# bsdtar (libarchive-tools), zstd, gzip and sha256sum. See
+# docs/RELEASING.md.
 # pipefail: an archiver that fails fails the build, even piped into a
 # compressor that doesn't.
 set -euo pipefail
@@ -24,7 +30,7 @@ version=$(packaging/version.sh)
 release=1
 maintainer=${METT_MAINTAINER:-"Isaac Gelado <igelado@nvidia.com>"}
 homepage=https://github.com/igelado/mett
-summary="mutt-like terminal mail client for Office365"
+summary="mutt-like mail client for Office365, in a terminal or a window"
 # Reproducible: everything is dated when the commit was made.
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
 export SOURCE_DATE_EPOCH
@@ -66,6 +72,9 @@ print(re.search(r"lib_dir\"?\s*[:=]\s*\"([^\"]+)\"", sys.stdin.read()).group(1))
 # the rest of the documentation online.
 install_files() {
     install -Dm755 "$binary" "$1/usr/bin/mett"
+    install -Dm755 "$gui" "$1/usr/bin/mett-gui"
+    install -Dm644 packaging/linux/mett.desktop "$1/usr/share/applications/mett.desktop"
+    install -Dm644 packaging/icons/mett-256.png "$1/usr/share/icons/hicolor/256x256/apps/mett.png"
     # The binary links its dependencies in: their notices go with it.
     install -Dm644 "$notices" "$1/usr/share/doc/mett/THIRD-PARTY-NOTICES"
     for doc in README.md docs/CONFIG-OFFICE365.md docs/MUTTRC.md; do
@@ -112,13 +121,17 @@ Version: $deb_version
 Architecture: $deb_arch
 Maintainer: $maintainer
 Installed-Size: $(du -sk --apparent-size "$tree/usr" | cut -f1)
-Depends: ca-certificates
+Depends: ca-certificates, libc6 (>= 2.28)
+Recommends: libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6,
+ libx11-xcb1, libxcursor1, libxi6, libxrandr2, libvulkan1 | libegl1
 Section: mail
 Priority: optional
 Homepage: $homepage
 Description: $summary
  mett brings mutt's keyboard-driven, terminal-first way of reading mail
  to Office365 accounts, through Microsoft Graph or Exchange Web Services.
+ mett-gui shows the same screens in a window of its own; the recommended
+ libraries are its.
 EOF
     stamp "$tree"
     dpkg-deb --root-owner-group -Zxz --build "$tree" \
@@ -146,6 +159,15 @@ arch = $arch
 license = MIT
 license = Apache-2.0
 depend = ca-certificates
+depend = glibc
+optdepend = libxkbcommon: mett-gui, mett in a window
+optdepend = libxkbcommon-x11: mett-gui on X11
+optdepend = wayland: mett-gui on Wayland
+optdepend = libx11: mett-gui on X11
+optdepend = libxcursor: mett-gui on X11
+optdepend = libxi: mett-gui on X11
+optdepend = libxrandr: mett-gui on X11
+optdepend = vulkan-icd-loader: mett-gui's drawing (or libglvnd, for OpenGL)
 EOF
     stamp "$tree"
     # As makepkg does: an mtree of the package, then the package itself,
@@ -169,7 +191,10 @@ tarball() {
     tree=$work/tar-$arch/mett-$version-$arch-linux
     rm -rf "$work/tar-$arch"
     install -Dm755 "$binary" "$tree/mett"
-    install -m644 README.md LICENSE-MIT LICENSE-APACHE "$tree/"
+    install -Dm755 "$gui" "$tree/mett-gui"
+    install -m644 packaging/linux/mett.desktop README.md LICENSE-MIT LICENSE-APACHE "$tree/"
+    # Named as mett.desktop asks for it (in ~/.local/share/icons/hicolor/256x256/apps/).
+    install -m644 packaging/icons/mett-256.png "$tree/mett.png"
     install -m644 "$notices" "$tree/THIRD-PARTY-NOTICES"
     stamp "$tree"
     tar -C "$work/tar-$arch" --owner=0 --group=0 --numeric-owner --sort=name \
@@ -183,14 +208,16 @@ for arch in "$@"; do
     *) usage ;;
     esac
     target=$arch-unknown-linux-musl
+    gnu=$arch-unknown-linux-gnu
     echo "Building mett $version for $arch"
-    # mett alone: mett-gui (the default `gui` feature) needs the system's
-    # graphics libraries, which a static binary can't load.
+    # mett, static: without the `gui` feature, which is mett-gui's.
     cargo zigbuild --release --locked -p mett-tui --no-default-features --target "$target"
     binary=${CARGO_TARGET_DIR:-target}/$target/release/mett
+    cargo zigbuild --release --locked -p mett-tui --bin mett-gui --target "$gnu.2.28"
+    gui=${CARGO_TARGET_DIR:-target}/$gnu/release/mett-gui
     notices=$work/THIRD-PARTY-NOTICES-$arch
     mkdir -p "$work"
-    python3 -I packaging/notices.py "$target" "$musl_copyright" >"$notices"
+    python3 -I packaging/notices.py "$target,$gnu" "$musl_copyright" >"$notices"
     deb
     pacman
     tarball

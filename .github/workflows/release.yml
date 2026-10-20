@@ -41,7 +41,10 @@ jobs:
           restore-keys: release-
       # cargo-zigbuild brings zig, which links for any architecture.
       - run: pip install --break-system-packages cargo-zigbuild==0.23.4
-      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      # musl for mett, glibc for mett-gui (see packaging/package.sh).
+      - run: >
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
       # The tag goes to the scripts as data, never as shell code.
       - name: The tag is the version in Cargo.toml
         if: github.event_name == 'push'

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=mett
+GenericName=Mail Client
+Comment=Office365 mail, as mutt reads it
+Exec=mett-gui
+Icon=mett
+Terminal=false
+Categories=Network;Email;
+Keywords=mail;email;Office365;Outlook;mutt;
+StartupWMClass=mett

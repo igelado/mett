@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Writes the notices of what the mett binary for TARGET links in.
+"""Writes the notices of what the mett and mett-gui binaries for TARGET
+are built from.
 
 TARGET may be several, comma-separated, for a binary built for each (a
 universal macOS binary): the notices are those of every one.
@@ -9,6 +10,8 @@ the Rust crates it is built from (as `cargo tree` lists them for TARGET),
 and of musl on Linux, go with it. Each crate's own license files are copied; one
 without any is listed with its license expression. Bundled C code (SQLite
 in libsqlite3-sys, AWS-LC in aws-lc-sys) comes with its crate's files.
+mett-gui also has a font in it, Cascadia Mono, under the SIL Open Font
+License.
 
 Usage: notices.py TARGET [MUSL_COPYRIGHT_FILE] > THIRD-PARTY-NOTICES
 
@@ -32,10 +35,8 @@ def main() -> None:
     linked = set()
     for target in targets:
         tree = subprocess.run(
-            # The packages hold mett alone, built without the `gui`
-            # feature (mett-gui's).
+            # With the default `gui` feature: mett-gui's crates too.
             ["cargo", "tree", "--locked", "-p", "mett-tui", "-e", "normal",
-             "--no-default-features",
              "--target", target, "--prefix", "none", "-f", "{p}"],
             check=True, capture_output=True, text=True, encoding="utf-8",
         ).stdout
@@ -49,8 +50,9 @@ def main() -> None:
     workspace = set(metadata["workspace_members"])
     out = sys.stdout
     out.write(
-        "Notices of the software the mett binary is built from, as their\n"
-        "licenses ask. mett's own license is in LICENSE-MIT and LICENSE-APACHE.\n"
+        "Notices of the software the mett and mett-gui binaries are built\n"
+        "from, as their licenses ask.\n"
+        "mett's own license is in LICENSE-MIT and LICENSE-APACHE.\n"
     )
     packages = sorted(
         (p for p in metadata["packages"]
@@ -70,6 +72,9 @@ def main() -> None:
         for file in files:
             out.write(f"\n--- {file.name} ---\n\n")
             out.write(file.read_text(encoding="utf-8", errors="replace"))
+    font = Path(__file__).parent.parent / "crates/mett-tui/assets/fonts/CascadiaOFL.txt"
+    out.write(f"\n{'=' * 72}\nCascadia Mono (font, in mett-gui) (OFL-1.1)\n{'=' * 72}\n\n")
+    out.write(font.read_text(encoding="utf-8"))
     if musl:
         out.write(f"\n{'=' * 72}\nmusl libc (statically linked)\n{'=' * 72}\n\n")
         out.write(musl.read_text(encoding="utf-8", errors="replace"))
