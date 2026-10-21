@@ -17,11 +17,11 @@ use ratatui::backend::{Backend, ClearType, WindowSize};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Position, Size};
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_wgpu::shaders::AspectPreservingDefaultPostProcessor;
-use ratatui_wgpu::{Builder, Dimensions, Font, WgpuBackend};
+use ratatui_wgpu::{Builder, ColorTable, Dimensions, Font, WgpuBackend};
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, WindowEvent};
@@ -33,6 +33,27 @@ use winit::window::{Window, WindowId};
 use crate::app::App;
 use crate::editor::Editor;
 use crate::{InputEvents, Launch, Session, UserEvent};
+
+/// The colors of a terminal (xterm's), so that the window, like most
+/// terminals, shows light text on black.
+const PALETTE: ColorTable = ColorTable {
+    BLACK: [0, 0, 0],
+    RED: [205, 0, 0],
+    GREEN: [0, 205, 0],
+    YELLOW: [205, 205, 0],
+    BLUE: [0, 0, 238],
+    MAGENTA: [205, 0, 205],
+    CYAN: [0, 205, 205],
+    GRAY: [229, 229, 229],
+    DARKGRAY: [127, 127, 127],
+    LIGHTRED: [255, 0, 0],
+    LIGHTGREEN: [0, 255, 0],
+    LIGHTYELLOW: [255, 255, 0],
+    LIGHTBLUE: [92, 92, 255],
+    LIGHTMAGENTA: [255, 0, 255],
+    LIGHTCYAN: [0, 255, 255],
+    WHITE: [255, 255, 255],
+};
 
 /// The window's icon (the packages' launchers have it too).
 static ICON: &[u8] = include_bytes!("../assets/icon-64.png");
@@ -339,6 +360,9 @@ impl Gui {
             .with_regular_fonts([font])
             .with_regular_fonts(self.fallbacks.clone())
             .with_font_size_px(font_px)
+            .with_bg_color(Color::Black)
+            .with_fg_color(Color::Rgb(229, 229, 229))
+            .with_color_table(PALETTE)
             .with_width_and_height(Dimensions {
                 width: NonZeroU32::new(size.width.max(1)).expect("not zero"),
                 height: NonZeroU32::new(size.height.max(1)).expect("not zero"),
