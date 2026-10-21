@@ -124,7 +124,17 @@ impl Speller {
     pub fn check(&self, word: &str) -> bool {
         self.dictionaries.is_empty()
             || self.dictionaries.iter().any(|d| d.check(word))
-            || self.own.read().is_ok_and(|own| own.contains(word))
+            || self.own.read().is_ok_and(|own| {
+                // As in a dictionary: a word added in lower case is right
+                // capitalized too (starting a sentence); a name added
+                // capitalized, only so.
+                let mut chars = word.chars();
+                let lowered = chars
+                    .next()
+                    .filter(|first| first.is_uppercase())
+                    .map(|first| first.to_lowercase().chain(chars).collect::<String>());
+                own.contains(word) || lowered.is_some_and(|lowered| own.contains(&lowered))
+            })
     }
 
     /// Words `word` may have been meant to be, best first.
@@ -391,6 +401,9 @@ mod tests {
         assert!(speller.suggest("helo").iter().any(|s| s == "hello"));
         speller.add("mett");
         assert!(speller.check("mett"));
+        assert!(speller.check("Mett"), "starting a sentence");
+        speller.add("Gelado");
+        assert!(!speller.check("gelado"), "a name, capitalized");
     }
 
     #[test]
