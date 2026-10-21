@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use mett_core::{
     AccountId, Address, Answer, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder,
     FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, SyncState, WellKnownFolder,
+    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, Scope, SyncState, WellKnownFolder,
 };
 use tokio::time::Instant;
 
@@ -786,8 +786,22 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         invitation: &Invitation,
         answer: &Answer,
     ) -> Result<()> {
-        // What is kept of the meeting is asked again when it is shown.
-        self.inner.answer_invitation(id, invitation, answer).await
+        self.inner.answer_invitation(id, invitation, answer).await?;
+        // What is kept of the meeting is asked again when it is shown, but
+        // is what is shown without the server: it says the answer too, when
+        // it is the answer of the meeting itself (not of one occurrence).
+        if self.caching() && (answer.scope == Scope::Series || !invitation.repeats()) {
+            let _ = self.with_cache(|db| {
+                if let Some(mut message) = db.message(id)? {
+                    if let Some(kept) = &mut message.invitation {
+                        kept.reply = answer.rsvp.reply();
+                    }
+                    db.keep_body(&message)?;
+                }
+                Ok(())
+            });
+        }
+        Ok(())
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {

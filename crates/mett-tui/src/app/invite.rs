@@ -203,7 +203,16 @@ impl App {
             self.report(e);
             return Vec::new();
         }
-        self.status = done(answering.rsvp).into();
+        // An answer for one occurrence leaves the series' as it was.
+        let own = answering.scope == Scope::Series || !answering.invitation.repeats();
+        self.status = if own {
+            done(answering.rsvp).into()
+        } else {
+            format!(
+                "{} (this occurrence only).",
+                done(answering.rsvp).trim_end_matches('.')
+            )
+        };
         // The message shows the new answer, if it is still open.
         let width = self.wrap_width();
         for screen in &mut self.screens {
@@ -214,7 +223,7 @@ impl App {
                 continue;
             }
             if let Some(mut message) = pager.message.take() {
-                if let Some(invitation) = &mut message.invitation {
+                if let Some(invitation) = message.invitation.as_mut().filter(|_| own) {
                     invitation.reply = answering.rsvp.reply();
                 }
                 pager.show(&message, width);
@@ -337,6 +346,30 @@ mod tests {
         assert_eq!(answer.scope, Scope::Occurrence);
         assert_eq!(answer.comment, None);
         assert!(!answer.notify);
+    }
+
+    #[test]
+    fn an_answer_for_one_occurrence_leaves_the_series_reply() {
+        let mut app = showing(Some(invitation(true)));
+        act(&mut app, Action::AcceptInvite);
+        key(&mut app, KeyCode::Char('o'));
+        key(&mut app, KeyCode::Enter);
+        let (id, _) = answer_request(&key(&mut app, KeyCode::Enter));
+        respond(&mut app, id, Event::InvitationAnswered(Ok(())));
+        assert_eq!(app.status, "Accepted (this occurrence only).");
+        assert!(
+            lines(&app).contains("Your reply: not answered"),
+            "{}",
+            lines(&app)
+        );
+        // The series can be answered next.
+        act(&mut app, Action::DeclineInvite);
+        key(&mut app, KeyCode::Char('s'));
+        key(&mut app, KeyCode::Enter);
+        let (id, _) = answer_request(&key(&mut app, KeyCode::Enter));
+        respond(&mut app, id, Event::InvitationAnswered(Ok(())));
+        assert_eq!(app.status, "Declined.");
+        assert!(lines(&app).contains("Your reply: declined"));
     }
 
     #[test]

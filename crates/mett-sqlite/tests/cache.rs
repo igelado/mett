@@ -219,6 +219,44 @@ async fn a_meeting_is_asked_again_and_kept_when_the_server_cannot_say() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_answer_is_kept_for_when_the_server_cannot_say() {
+    use mett_core::{Answer, Invitation, InvitationKind, Reply, Rsvp, Scope};
+    let invitation = Invitation {
+        kind: InvitationKind::Request,
+        title: None,
+        start: Some(at(0)),
+        end: None,
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: None,
+        reply: Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        event: None,
+    };
+    let store = cached(mailbox(1)).unwrap();
+    listing(&store, 10).await;
+    let id = MessageId::new("m0");
+    store.inner().set_invitation(&id, Some(invitation.clone()));
+    store.fetch_message(&id).await.unwrap();
+    let answer = Answer {
+        rsvp: Rsvp::Decline,
+        scope: Scope::Series,
+        comment: None,
+        notify: true,
+    };
+    store
+        .answer_invitation(&id, &invitation, &answer)
+        .await
+        .unwrap();
+    store.inner().delete_message(&id).await.unwrap();
+    let kept = store.fetch_message(&id).await.unwrap();
+    assert_eq!(kept.invitation.unwrap().reply, Reply::Declined);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_stale_sync_starts_over() {
     let store = cached(mailbox(3)).unwrap();
     listing(&store, 10).await;
