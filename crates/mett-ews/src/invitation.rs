@@ -142,28 +142,38 @@ pub(crate) fn occurrence_view(start: DateTime<Utc>, end: Option<DateTime<Utc>>) 
 }
 
 /// The ID of the occurrence among the items a calendar view found that
-/// belongs to the series with `uid` and starts at `start` (or, if none
-/// starts then, the first that belongs to it).
+/// belongs to the series with `uid` and is the one the invitation is about,
+/// which starts at `start` (a meeting of whole days is by its date, as
+/// `start` is the midnight (UTC) that starts it). No other is taken for it:
+/// answering another occurrence would tell the organizer the wrong thing.
 pub(crate) fn find_occurrence(
     items: Node<'_, '_>,
     uid: &str,
-    start: Option<DateTime<Utc>>,
+    start: DateTime<Utc>,
+    all_day: bool,
 ) -> Option<String> {
-    let ours: Vec<_> = items
+    let starts = |item: &Node<'_, '_>| {
+        let time = |name: &str| {
+            child_text(*item, name)
+                .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
+                .map(|t| t.with_timezone(&Utc))
+        };
+        if !all_day {
+            return time("Start") == Some(start);
+        }
+        // The date in the zone the meeting was made in, if the server says
+        // it.
+        let wall = child_text(*item, "StartWallClock")
+            .and_then(|t| NaiveDate::parse_from_str(t.trim().get(..10)?, "%Y-%m-%d").ok());
+        wall.or_else(|| time("Start").map(|t| whole_day(t).date_naive()))
+            == Some(start.date_naive())
+    };
+    let found = items
         .children()
         .filter(Node::is_element)
-        .filter(|item| child_text(item.to_owned(), "UID").as_deref() == Some(uid))
-        .collect();
-    let at = |item: &Node<'_, '_>| {
-        child_text(*item, "Start")
-            .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
-            .map(|t| t.with_timezone(&Utc))
-    };
-    let chosen = ours
-        .iter()
-        .find(|item| start.is_some() && at(item) == start)
-        .or(ours.first())?;
-    child(*chosen, "ItemId")
+        .filter(|item| child_text(*item, "UID").as_deref() == Some(uid))
+        .find(starts)?;
+    child(found, "ItemId")
         .and_then(|id| id.attribute("Id"))
         .map(str::to_owned)
 }
@@ -519,15 +529,38 @@ mod tests {
             .with_timezone(&Utc);
         let items = doc.root_element();
         assert_eq!(
-            find_occurrence(items, "series", Some(start)).as_deref(),
+            find_occurrence(items, "series", start, false).as_deref(),
             Some("week1")
         );
-        // Not at that time, the first of the series is the nearest there is.
+        // At another time, no other occurrence is taken for it.
+        let other = start + Duration::days(1);
+        assert_eq!(find_occurrence(items, "series", other, false), None);
+        assert_eq!(find_occurrence(items, "nothing", start, false), None);
+    }
+
+    #[test]
+    fn finds_an_occurrence_of_whole_days_by_its_date() {
+        // Occurrences made in Los Angeles: shifted to 08:00 UTC, so the
+        // one of the day before overlaps the window of the day.
+        let xml = "<Items xmlns:t=\"urn:t\">\
+            <t:CalendarItem><t:ItemId Id=\"day2\"/><t:UID>series</t:UID><t:Start>2026-11-02T08:00:00Z</t:Start><t:StartWallClock>2026-11-02T00:00:00</t:StartWallClock></t:CalendarItem>\
+            <t:CalendarItem><t:ItemId Id=\"day3\"/><t:UID>series</t:UID><t:Start>2026-11-03T08:00:00Z</t:Start><t:StartWallClock>2026-11-03T00:00:00</t:StartWallClock></t:CalendarItem>\
+            </Items>";
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-11-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert_eq!(
-            find_occurrence(items, "series", None).as_deref(),
-            Some("week2")
+            find_occurrence(doc.root_element(), "series", start, true).as_deref(),
+            Some("day3")
         );
-        assert_eq!(find_occurrence(items, "nothing", Some(start)), None);
+        // Without the wall clock, the shifted time gives the date.
+        let xml = xml.replace("StartWallClock", "Other");
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        assert_eq!(
+            find_occurrence(doc.root_element(), "series", start, true).as_deref(),
+            Some("day3")
+        );
     }
 
     #[test]

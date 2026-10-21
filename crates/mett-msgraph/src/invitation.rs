@@ -89,17 +89,18 @@ struct Instance {
 }
 
 impl Instances {
-    /// The instance that starts at `start`, or else the first found.
-    pub(crate) fn at(&self, start: DateTime<Utc>) -> Option<&str> {
+    /// The instance that starts at `start` (for a meeting of whole days,
+    /// on its date), and no other: answering another would tell the
+    /// organizer the wrong thing.
+    pub(crate) fn at(&self, start: DateTime<Utc>, all_day: bool) -> Option<&str> {
         self.value
             .iter()
             .find(|i| {
                 i.start
                     .as_ref()
-                    .and_then(|s| s.parse(false))
+                    .and_then(|s| s.parse(all_day))
                     .is_some_and(|s| s == start)
             })
-            .or(self.value.first())
             .map(|i| i.id.as_str())
     }
 }
@@ -609,9 +610,22 @@ mod tests {
         ]}))
         .unwrap();
         let start = Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap();
-        assert_eq!(instances.at(start), Some("w1"));
+        assert_eq!(instances.at(start, false), Some("w1"));
+        // At another time, no other instance is taken for it.
         let other = Utc.with_ymd_and_hms(2026, 11, 4, 14, 0, 0).unwrap();
-        assert_eq!(instances.at(other), Some("w2"));
+        assert_eq!(instances.at(other, false), None);
+    }
+
+    #[test]
+    fn picks_an_instance_of_whole_days_by_its_date() {
+        // Midnights in Los Angeles, shifted to UTC.
+        let instances: Instances = serde_json::from_value(json!({"value": [
+            {"id": "d2", "start": {"dateTime": "2026-11-02T08:00:00.0000000", "timeZone": "UTC"}},
+            {"id": "d3", "start": {"dateTime": "2026-11-03T08:00:00.0000000", "timeZone": "UTC"}},
+        ]}))
+        .unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap();
+        assert_eq!(instances.at(start, true), Some("d3"));
     }
 
     #[test]

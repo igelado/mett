@@ -1119,7 +1119,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         let request = self.request(Method::GET, url).header("Prefer", PREFER_UTC);
         let instances: Instances = self.json(request, about).await?;
         instances
-            .at(start)
+            .at(start, invitation.all_day)
             .map(str::to_owned)
             .ok_or_else(|| Error::Backend("that occurrence isn't in your calendar".into()))
     }

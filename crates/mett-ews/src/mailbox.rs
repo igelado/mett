@@ -737,7 +737,10 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             "<m:FindItem Traversal=\"Shallow\">{}<m:CalendarView {}/>\
              <m:ParentFolderIds><t:DistinguishedFolderId Id=\"calendar\"/></m:ParentFolderIds>\
              </m:FindItem>",
-            item_shape(&["calendar:UID", "calendar:Start"], None),
+            item_shape(
+                &["calendar:UID", "calendar:Start", "calendar:StartWallClock"],
+                None
+            ),
             occurrence_view(start, invitation.end),
         );
         let xml = self.call(&body, about).await?;
@@ -746,7 +749,7 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
         let items = descendant(message, "RootFolder")
             .and_then(|root| child(root, "Items"))
             .ok_or_else(|| unexpected("FindItem", "no Items"))?;
-        find_occurrence(items, &uid, Some(start))
+        find_occurrence(items, &uid, start, invitation.all_day)
             .ok_or_else(|| Error::Backend("that occurrence isn't in your calendar".into()))
     }
 
