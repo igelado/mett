@@ -7,6 +7,7 @@
 //! one asks the server only for what changed (`docs/DESIGN.md` §5.5).
 
 mod db;
+mod invitation;
 mod store;
 
 pub use store::{Cache, CacheError, CachedStore, Progress};

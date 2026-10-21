@@ -98,6 +98,14 @@ impl MemoryStore {
         self
     }
 
+    /// Changes what a message says about a meeting, as its organizer or an
+    /// answer from another client does.
+    pub fn set_invitation(&self, id: &MessageId, invitation: Option<crate::Invitation>) {
+        if let Ok(message) = self.state().message_mut(id) {
+            message.invitation = invitation;
+        }
+    }
+
     /// Makes every sync state handed out so far stale.
     pub fn forget_syncs(&self) {
         self.state().sync_epoch += 1;
@@ -265,6 +273,7 @@ impl State {
                 kind: BodyKind::Text,
                 content: draft.body.clone(),
             },
+            invitation: None,
         });
         Ok(id)
     }
@@ -678,6 +687,7 @@ pub fn message(id: &str, folder: &str, subject: &str, received: DateTime<Utc>) -
             kind: BodyKind::Text,
             content: format!("Body of {subject}"),
         },
+        invitation: None,
     }
 }
 

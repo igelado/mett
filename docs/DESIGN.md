@@ -336,6 +336,20 @@ themselves, leads to `Rc<RefCell<…>>` throughout, runtime borrow panics and
 tangled lifetimes in Rust. The Elm Architecture plus channels (§5.2, §5.4)
 covers the same needs more cleanly.
 
+### 5.10 Meeting invitations
+
+Exchange delivers an invitation as a native meeting item, not as an
+iCalendar attachment, so mett takes what the server says and does not parse
+`.ics` files. A `Message` has an optional `Invitation` (`mett-core`): what
+the message is (request, update, cancellation, or an attendee's reply), when
+and where the meeting is, who organizes and attends, how it repeats
+(`Recurrence`, shown as text such as "Weekly on Tue, Thu"), and how the user
+answered. Each adapter fills it from its own API (EWS `MeetingRequest`,
+`MeetingCancellation` and `MeetingResponse` items; Graph `eventMessage`
+with its `event`), and the cache stores it with the message body. The
+pager shows it among the headers. Times of a meeting of whole days are
+midnights (UTC) of its dates, so they show as dates in any time zone.
+
 ## 6. Example flow: opening a message
 
 1. The user presses `Enter` in the index. The index keymap resolves it to

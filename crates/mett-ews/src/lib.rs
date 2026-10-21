@@ -10,6 +10,7 @@
 //! Exchange Online, `mett-msgraph`'s, asking for the `EWS.AccessAsUser.All`
 //! scope (see `docs/CONFIG-OFFICE365.md`).
 
+mod invitation;
 mod mailbox;
 mod soap;
 mod stream;

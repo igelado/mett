@@ -19,6 +19,7 @@ use reqwest::StatusCode;
 use roxmltree::Node;
 use url::Url;
 
+use crate::invitation::{INVITATION_FIELDS, invitation};
 use crate::soap::{
     About, check, child, child_text, children, coded_fault, descendant, envelope, escape,
     only_message, parse, response_code, response_messages, text,
@@ -1025,6 +1026,7 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
         let fields: Vec<&str> = SUMMARY_FIELDS
             .iter()
             .chain(MESSAGE_FIELDS)
+            .chain(INVITATION_FIELDS)
             .copied()
             .collect();
         // EWS converts HTML bodies to text, better than mett could.
@@ -2357,7 +2359,7 @@ fn recipients(item: Node<'_, '_>, element: &str) -> Vec<Address> {
 }
 
 /// A `Mailbox` element as an address.
-fn address(mailbox: Node<'_, '_>) -> Address {
+pub(crate) fn address(mailbox: Node<'_, '_>) -> Address {
     Address {
         name: child_text(mailbox, "Name").filter(|n| !n.is_empty()),
         email: child_text(mailbox, "EmailAddress").unwrap_or_default(),
@@ -2436,6 +2438,7 @@ fn full_message(item: Node<'_, '_>) -> Result<Message> {
             },
             content: body.and_then(|b| b.text()).unwrap_or_default().to_owned(),
         },
+        invitation: invitation(item),
     })
 }
 

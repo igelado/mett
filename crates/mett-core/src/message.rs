@@ -5,6 +5,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 
 use crate::ids::{FolderId, MessageId};
+use crate::invitation::Invitation;
 
 /// An e-mail address with an optional display name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +271,8 @@ pub struct Message {
     pub internet_message_id: Option<String>,
     /// The body.
     pub body: Body,
+    /// What the message says about a meeting, if it is about one.
+    pub invitation: Option<Invitation>,
 }
 
 #[cfg(test)]

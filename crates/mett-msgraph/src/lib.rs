@@ -8,6 +8,7 @@
 //!   user's mailbox.
 
 mod authenticator;
+mod invitation;
 mod loopback;
 mod mailbox;
 mod oauth;

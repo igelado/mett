@@ -177,6 +177,48 @@ async fn keeps_the_messages_read() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_meeting_is_asked_again_and_kept_when_the_server_cannot_say() {
+    use mett_core::{Invitation, InvitationKind, Reply};
+    let invitation = |reply| Invitation {
+        kind: InvitationKind::Request,
+        title: None,
+        start: Some(at(0)),
+        end: None,
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: None,
+        reply,
+        out_of_date: false,
+        response_requested: true,
+        event: None,
+    };
+    let store = cached(mailbox(1)).unwrap();
+    listing(&store, 10).await;
+    let id = MessageId::new("m0");
+    store
+        .inner()
+        .set_invitation(&id, Some(invitation(Reply::None)));
+    // Answered elsewhere: the message didn't change, the meeting did.
+    let reply = |message: mett_core::Message| message.invitation.unwrap().reply;
+    assert_eq!(reply(store.fetch_message(&id).await.unwrap()), Reply::None);
+    store
+        .inner()
+        .set_invitation(&id, Some(invitation(Reply::Accepted)));
+    assert_eq!(
+        reply(store.fetch_message(&id).await.unwrap()),
+        Reply::Accepted
+    );
+    // Gone from the server, what was kept is shown.
+    store.inner().delete_message(&id).await.unwrap();
+    assert_eq!(
+        reply(store.fetch_message(&id).await.unwrap()),
+        Reply::Accepted
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_stale_sync_starts_over() {
     let store = cached(mailbox(3)).unwrap();
     listing(&store, 10).await;
