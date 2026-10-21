@@ -6,14 +6,16 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use mett_core::{
     AccountId, Address, Body, BodyKind, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId,
-    Message, MessageId, MessageSummary, SyncState, ThreadPosition, WellKnownFolder,
+    Invitation, Message, MessageId, MessageSummary, SyncState, ThreadPosition, WellKnownFolder,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+use crate::invitation::StoredInvitation;
+
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Marks mett's caches (SQLite's `application_id`): "mett".
 const APPLICATION_ID: i64 = 0x6D65_7474;
@@ -887,6 +889,7 @@ struct StoredExtras {
     internet_message_id: Option<String>,
     html: bool,
     content: String,
+    invitation: Option<StoredInvitation>,
 }
 
 impl From<&Message> for StoredExtras {
@@ -899,6 +902,7 @@ impl From<&Message> for StoredExtras {
             internet_message_id: m.internet_message_id.clone(),
             html: m.body.kind == BodyKind::Html,
             content: m.body.content.clone(),
+            invitation: m.invitation.as_ref().map(StoredInvitation::from),
         }
     }
 }
@@ -920,6 +924,7 @@ impl StoredExtras {
                 },
                 content: self.content,
             },
+            invitation: self.invitation.map(Invitation::from),
         }
     }
 }

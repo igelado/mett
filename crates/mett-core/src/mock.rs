@@ -265,6 +265,7 @@ impl State {
                 kind: BodyKind::Text,
                 content: draft.body.clone(),
             },
+            invitation: None,
         });
         Ok(id)
     }
@@ -678,6 +679,7 @@ pub fn message(id: &str, folder: &str, subject: &str, received: DateTime<Utc>) -
             kind: BodyKind::Text,
             content: format!("Body of {subject}"),
         },
+        invitation: None,
     }
 }
 

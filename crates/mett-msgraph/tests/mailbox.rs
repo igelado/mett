@@ -841,7 +841,10 @@ async fn fetches_a_message_as_text() {
     body["internetMessageId"] = json!("<abc@contoso.com>");
     body["body"] = json!({ "contentType": "text", "content": "Hello" });
     route("GET", "/me/messages/m1")
-        .and(header("prefer", "outlook.body-content-type=\"text\""))
+        .and(wiremock::matchers::header_regex(
+            "prefer",
+            r#"^outlook\.body-content-type="text", outlook\.timezone="UTC"$"#,
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&server)
         .await;
@@ -858,6 +861,42 @@ async fn fetches_a_message_as_text() {
         message.internet_message_id.as_deref(),
         Some("<abc@contoso.com>")
     );
+}
+
+#[tokio::test]
+async fn fetches_a_meeting_request_with_its_event() {
+    let server = MockServer::start().await;
+    let mut body = message("m1", "2026-10-13T10:00:00Z");
+    body["@odata.type"] = json!("#microsoft.graph.eventMessageRequest");
+    body["meetingMessageType"] = json!("meetingRequest");
+    body["body"] = json!({ "contentType": "text", "content": "Join us" });
+    body["event"] = json!({
+        "id": "event-1",
+        "start": { "dateTime": "2026-11-03T14:00:00.0000000", "timeZone": "UTC" },
+        "end": { "dateTime": "2026-11-03T15:00:00.0000000", "timeZone": "UTC" },
+        "location": { "displayName": "Room 4A" },
+        "responseStatus": { "response": "notResponded" },
+    });
+    route("GET", "/me/messages/m1")
+        .and(wiremock::matchers::query_param(
+            "$expand",
+            "microsoft.graph.eventMessage/event(\
+             $select=id,start,end,isAllDay,location,organizer,attendees,recurrence,\
+             responseStatus,responseRequested,type,seriesMasterId)",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let message = store(&server)
+        .fetch_message(&MessageId::new("m1"))
+        .await
+        .unwrap();
+    let invitation = message.invitation.expect("an invitation");
+    assert_eq!(invitation.kind, mett_core::InvitationKind::Request);
+    assert_eq!(invitation.location.as_deref(), Some("Room 4A"));
+    assert_eq!(invitation.event.as_deref(), Some("event-1"));
+    assert!(invitation.can_answer());
 }
 
 #[tokio::test]

@@ -7,8 +7,8 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use chrono::Local;
-use mett_core::{Address, Body, BodyKind, Message};
+use chrono::{DateTime, Duration, Local, Utc};
+use mett_core::{Address, Body, BodyKind, Invitation, InvitationKind, Message};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -31,6 +31,9 @@ pub struct Link {
 /// text when collapsed, or the URL.
 pub fn pager_view(message: &Message, collapse: bool) -> (Vec<String>, Vec<Link>) {
     let mut lines = header_lines(message, true);
+    if let Some(invitation) = &message.invitation {
+        lines.extend(invitation_lines(invitation));
+    }
     lines.push(String::new());
     let mut links = Vec::new();
     let marks = message.body.kind == BodyKind::Html;
@@ -211,6 +214,89 @@ fn find_links(line: &str, collapse: bool, marks: bool, open: bool) -> Found {
         ended_open,
         opened: text_start,
     }
+}
+
+/// The lines the pager shows for a meeting message, as headers: what the
+/// message is, when and where the meeting is, who is in it, and how the
+/// owner answered.
+pub fn invitation_lines(invitation: &Invitation) -> Vec<String> {
+    let kind = match invitation.kind {
+        InvitationKind::Request => "invitation",
+        InvitationKind::Update => "updated invitation",
+        InvitationKind::Cancellation => "cancelled",
+        InvitationKind::Accepted => "an attendee accepted",
+        InvitationKind::Tentative => "an attendee tentatively accepted",
+        InvitationKind::Declined => "an attendee declined",
+    };
+    let outdated = if invitation.out_of_date {
+        " (out of date)"
+    } else {
+        ""
+    };
+    let mut lines = vec![format!("Meeting: {kind}{outdated}")];
+    if let Some(when) = meeting_time(invitation) {
+        lines.push(format!("When: {when}"));
+    }
+    if let Some(recurrence) = &invitation.recurrence {
+        lines.push(format!("Repeats: {recurrence}"));
+    }
+    if let Some(location) = &invitation.location {
+        lines.push(format!("Where: {location}"));
+    }
+    if let Some(organizer) = &invitation.organizer {
+        lines.push(format!("Organizer: {organizer}"));
+    }
+    if !invitation.attendees.is_empty() {
+        let attendees: Vec<_> = invitation
+            .attendees
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        lines.push(format!("Attendees: {}", attendees.join(", ")));
+    }
+    if invitation.kind.is_open() {
+        lines.push(format!("Your reply: {}", invitation.reply));
+    }
+    lines
+}
+
+/// When a meeting is, in the local time zone (a meeting of whole days is
+/// by its dates).
+fn meeting_time(invitation: &Invitation) -> Option<String> {
+    let day = "%a %d %b %Y";
+    let start = invitation.start?;
+    if invitation.all_day {
+        let first = start.date_naive();
+        // The end is the midnight that ends the last day.
+        let last = invitation
+            .end
+            .map_or(first, |end| (end - Duration::seconds(1)).date_naive())
+            .max(first);
+        return Some(if first == last {
+            format!("{} (all day)", first.format(day))
+        } else {
+            format!("{} - {} (all day)", first.format(day), last.format(day))
+        });
+    }
+    let local = |time: DateTime<Utc>| time.with_timezone(&Local);
+    let from = local(start);
+    let zone = from.format("%Z");
+    let Some(end) = invitation.end.map(local) else {
+        return Some(format!("{} {zone}", from.format(&format!("{day} %H:%M"))));
+    };
+    Some(if from.date_naive() == end.date_naive() {
+        format!(
+            "{} - {} {zone}",
+            from.format(&format!("{day} %H:%M")),
+            end.format("%H:%M")
+        )
+    } else {
+        format!(
+            "{} - {} {zone}",
+            from.format(&format!("{day} %H:%M")),
+            end.format(&format!("{day} %H:%M"))
+        )
+    })
 }
 
 /// The headers the pager shows. `bcc` includes the `Bcc:` recipients,
@@ -1002,5 +1088,108 @@ mod tests {
         assert_eq!(wrap("aaaa  bb", 4), ["aaaa", " bb"]);
         assert_eq!(wrap_ranges("one two three", 8), [0..7, 8..13]);
         assert_eq!(wrap_ranges("", 4).len(), 1);
+    }
+
+    /// A request for a meeting from 14:00 to 15:00 (UTC) on 3 November 2026.
+    fn invitation() -> Invitation {
+        use chrono::TimeZone;
+        Invitation {
+            kind: InvitationKind::Request,
+            title: None,
+            start: Some(Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap()),
+            end: Some(Utc.with_ymd_and_hms(2026, 11, 3, 15, 0, 0).unwrap()),
+            all_day: false,
+            location: Some("Room 4A".into()),
+            organizer: Some(Address::new("alice@x.com").with_name("Alice")),
+            attendees: vec![Address::new("bob@x.com"), Address::new("carol@x.com")],
+            recurrence: None,
+            reply: mett_core::Reply::None,
+            out_of_date: false,
+            response_requested: true,
+            event: None,
+        }
+    }
+
+    #[test]
+    fn shows_an_invitation_with_the_headers() {
+        use chrono::TimeZone;
+        let from = Utc
+            .with_ymd_and_hms(2026, 11, 3, 14, 0, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let to = Utc
+            .with_ymd_and_hms(2026, 11, 3, 15, 0, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        let mut invitation = invitation();
+        invitation.recurrence = Some(mett_core::Recurrence::new(
+            mett_core::RecurrenceUnit::Week,
+            1,
+        ));
+        let mut message =
+            mett_core::mock::message("m", "in", "Planning", chrono::DateTime::UNIX_EPOCH);
+        message.invitation = Some(invitation);
+        let (lines, _) = pager_view(&message, true);
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("Meeting:"))
+            .unwrap();
+        assert!(
+            at > 0 && lines[at - 1].starts_with("Subject:"),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines[at..at + 7],
+            [
+                "Meeting: invitation".to_owned(),
+                format!(
+                    "When: {} - {} {}",
+                    from.format("%a %d %b %Y %H:%M"),
+                    to.format("%H:%M"),
+                    from.format("%Z")
+                ),
+                "Repeats: Weekly".to_owned(),
+                "Where: Room 4A".to_owned(),
+                "Organizer: Alice <alice@x.com>".to_owned(),
+                "Attendees: bob@x.com, carol@x.com".to_owned(),
+                "Your reply: not answered".to_owned(),
+            ]
+        );
+        // The invitation is above the body, with the headers.
+        assert_eq!(lines[at + 7], "");
+    }
+
+    #[test]
+    fn shows_meetings_of_whole_days_by_their_dates() {
+        use chrono::TimeZone;
+        let mut invitation = invitation();
+        invitation.all_day = true;
+        invitation.start = Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap());
+        invitation.end = Some(Utc.with_ymd_and_hms(2026, 11, 4, 0, 0, 0).unwrap());
+        assert_eq!(
+            meeting_time(&invitation).unwrap(),
+            "Tue 03 Nov 2026 (all day)"
+        );
+        invitation.end = Some(Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap());
+        assert_eq!(
+            meeting_time(&invitation).unwrap(),
+            "Tue 03 Nov 2026 - Thu 05 Nov 2026 (all day)"
+        );
+    }
+
+    #[test]
+    fn says_what_a_cancelled_or_old_invitation_is() {
+        let mut invitation = invitation();
+        invitation.kind = InvitationKind::Cancellation;
+        let lines = invitation_lines(&invitation);
+        assert_eq!(lines[0], "Meeting: cancelled");
+        // Nothing to answer, so no reply is shown.
+        assert!(lines.iter().all(|l| !l.starts_with("Your reply")));
+        invitation.kind = InvitationKind::Update;
+        invitation.out_of_date = true;
+        invitation.reply = mett_core::Reply::Accepted;
+        let lines = invitation_lines(&invitation);
+        assert_eq!(lines[0], "Meeting: updated invitation (out of date)");
+        assert_eq!(lines.last().unwrap(), "Your reply: accepted");
     }
 }

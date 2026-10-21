@@ -11,9 +11,9 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body, BodyKind,
-    Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId, MailSender,
-    MailStore, Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page,
-    PageCursor, RECENT_UNREAD, Result, SyncState, ThreadPosition, WellKnownFolder,
+    Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId, Invitation,
+    MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment,
+    Page, PageCursor, RECENT_UNREAD, Result, SyncState, ThreadPosition, WellKnownFolder,
     join_bounded_until,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 
+use crate::invitation::{EVENT_EXPAND, MEETING_FIELDS, MeetingMessage, PREFER_UTC};
 use crate::settings::{AuthSettings, Cloud, with_segments};
 
 /// Upper bound on each Graph request.
@@ -802,12 +803,19 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         let mut url = self.url(&["me", "messages", id.as_str()]);
         url.query_pairs_mut().append_pair(
             "$select",
-            &format!("{SUMMARY_FIELDS},ccRecipients,bccRecipients,replyTo,internetMessageId,body"),
+            &format!(
+                "{SUMMARY_FIELDS},ccRecipients,bccRecipients,replyTo,internetMessageId,body,\
+                 {MEETING_FIELDS}"
+            ),
         );
+        url.query_pairs_mut().append_pair("$expand", EVENT_EXPAND);
         let request = self
             .request(Method::GET, url)
             // Graph converts HTML bodies to text, better than mett could.
-            .header("Prefer", "outlook.body-content-type=\"text\"");
+            .header(
+                "Prefer",
+                format!("outlook.body-content-type=\"text\", {PREFER_UTC}"),
+            );
         let message: GraphMessage = self.json(request, About::message(id.as_str())).await?;
         message.into_message()
     }
@@ -2049,6 +2057,11 @@ struct GraphMessage {
     /// Base64: a 22-byte header, then 5 bytes for each reply down the
     /// conversation.
     conversation_index: Option<String>,
+    #[serde(rename = "@odata.type")]
+    odata_type: Option<String>,
+    /// What a meeting message says (all missing for other messages).
+    #[serde(flatten)]
+    meeting: MeetingMessage,
 }
 
 #[derive(Deserialize)]
@@ -2058,9 +2071,9 @@ struct Recipient {
 }
 
 #[derive(Deserialize)]
-struct EmailAddress {
-    name: Option<String>,
-    address: Option<String>,
+pub(crate) struct EmailAddress {
+    pub(crate) name: Option<String>,
+    pub(crate) address: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2098,6 +2111,7 @@ impl GraphMessage {
             bcc: addresses(rest.bcc),
             reply_to: addresses(rest.reply_to),
             internet_message_id: rest.internet_message_id,
+            invitation: rest.invitation,
             body: rest.body.map_or(
                 Body {
                     kind: BodyKind::Text,
@@ -2156,6 +2170,7 @@ impl GraphMessage {
             }),
         };
         let rest = Rest {
+            invitation: self.meeting.invitation(self.odata_type.as_deref()),
             cc: self.cc_recipients,
             bcc: self.bcc_recipients,
             reply_to: self.reply_to,
@@ -2201,6 +2216,7 @@ fn thread_path(index: &str) -> Vec<Vec<u8>> {
 
 /// The parts of a [`GraphMessage`] that only a full [`Message`] needs.
 struct Rest {
+    invitation: Option<Invitation>,
     cc: Vec<Recipient>,
     bcc: Vec<Recipient>,
     reply_to: Vec<Recipient>,
