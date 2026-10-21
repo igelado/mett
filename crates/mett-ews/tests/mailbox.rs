@@ -1735,6 +1735,46 @@ async fn answers_without_telling_the_organizer_by_dropping_the_saved_response() 
 }
 
 #[tokio::test]
+async fn answers_the_series_of_an_occurrence_through_its_master() {
+    let server = MockServer::start().await;
+    ews("<m:GetItem")
+        .and(body_string_contains("<t:ItemId Id=\"req-1\"/>"))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:MeetingRequest>\
+             <t:AssociatedCalendarItemId Id=\"occurrence-now\"/>\
+             </t:MeetingRequest></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<t:RecurringMasterItemId OccurrenceId=\"occurrence-now\"/>")
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:CalendarItem><t:ItemId Id=\"master\"/></t:CalendarItem></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<t:AcceptItem>")
+        .and(body_string_contains("<t:ReferenceItemId Id=\"master\"/>"))
+        .respond_with(success("CreateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut invitation = meeting(false);
+    invitation.in_series = true;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &invitation,
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Series, true),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn answering_quietly_never_deletes_the_calendar_item() {
     let server = MockServer::start().await;
     // Exchange may give back the calendar item the answer updated.

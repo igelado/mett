@@ -716,19 +716,15 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             .ok_or_else(|| unexpected(operation, "no new item ID"))
     }
 
-    /// The calendar item of the occurrence an invitation to a series is
-    /// about: the one of the series that starts when the invitation says.
-    async fn occurrence_item(
+    /// The calendar item a meeting message is about. It can be made again
+    /// with another ID when a meeting is answered, so the message says
+    /// which it is now.
+    async fn associated_item(
         &self,
         id: &MessageId,
         invitation: &Invitation,
         about: About<'_>,
     ) -> Result<String> {
-        let Some(start) = invitation.start else {
-            return Err(Error::Backend("the meeting has no start".into()));
-        };
-        // The calendar item can be made again with another ID when a
-        // meeting is answered, so the message says which it is now.
         let xml = self
             .get_items(
                 &[id.to_string()],
@@ -742,11 +738,45 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             .and_then(|item| child(item, "AssociatedCalendarItemId"))
             .and_then(|item| item.attribute("Id"))
             .map(str::to_owned);
-        let Some(event) = associated.or_else(|| invitation.event.clone()) else {
-            return Err(Error::Backend(
-                "the meeting isn't in your calendar yet".into(),
-            ));
+        associated
+            .or_else(|| invitation.event.clone())
+            .ok_or_else(|| Error::Backend("the meeting isn't in your calendar yet".into()))
+    }
+
+    /// The calendar item of the series that the occurrence a message is
+    /// about belongs to.
+    async fn series_item(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        about: About<'_>,
+    ) -> Result<String> {
+        let occurrence = self.associated_item(id, invitation, about).await?;
+        let body = format!(
+            "<m:GetItem>{}<m:ItemIds><t:RecurringMasterItemId OccurrenceId=\"{}\"/>\
+             </m:ItemIds></m:GetItem>",
+            item_shape(&[], None),
+            escape(&occurrence)
+        );
+        let xml = self.call(&body, about).await?;
+        let doc = parse(&xml)?;
+        first_item(only_message(&doc, about)?)
+            .and_then(item_id)
+            .ok_or_else(|| Error::Backend("the meeting's series isn't in your calendar".into()))
+    }
+
+    /// The calendar item of the occurrence an invitation to a series is
+    /// about: the one of the series that starts when the invitation says.
+    async fn occurrence_item(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        about: About<'_>,
+    ) -> Result<String> {
+        let Some(start) = invitation.start else {
+            return Err(Error::Backend("the meeting has no start".into()));
         };
+        let event = self.associated_item(id, invitation, about).await?;
         // The series' occurrences share its UID, and are in the calendar it
         // is in (which may not be the default one).
         let fields = ["calendar:UID", "item:ParentFolderId"];
@@ -1220,6 +1250,11 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
         // occurrence of a series is answered through its calendar item.
         let reference = if answer.scope == Scope::Occurrence && invitation.repeats() {
             self.occurrence_item(id, invitation, about).await?
+        } else if answer.scope == Scope::Series && invitation.in_series && !invitation.series_master
+        {
+            // The message is about one occurrence: the series is another
+            // item, which is answered instead.
+            self.series_item(id, invitation, about).await?
         } else {
             id.to_string()
         };
