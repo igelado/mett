@@ -177,6 +177,9 @@ pub struct Builtin {
     spell: bool,
     /// Lines' misspelled words (their columns), by the lines' text.
     misspelled: HashMap<String, Vec<(usize, usize)>>,
+    /// The text as last checked: a key that didn't change it (moving the
+    /// cursor, say) needs no checking.
+    checked: Option<Lines>,
     /// Words offered for a misspelled one.
     suggesting: Option<Suggesting>,
     /// A question on the bottom line.
@@ -246,6 +249,7 @@ impl Builtin {
             speller: None,
             spell: false,
             misspelled: HashMap::new(),
+            checked: None,
             suggesting: None,
             question: None,
             prefix: None,
@@ -265,6 +269,7 @@ impl Builtin {
         self.speller = speller;
         self.spell = check;
         self.misspelled.clear();
+        self.checked = None;
         self.recheck();
     }
 
@@ -459,8 +464,13 @@ impl Builtin {
             if !self.state.highlights.is_empty() {
                 self.state.clear_highlights();
             }
+            self.checked = None;
             return;
         };
+        if self.checked.as_ref() == Some(&self.state.lines) {
+            return;
+        }
+        self.checked = Some(self.state.lines.clone());
         let rows = self.rows();
         // Lines edited away are forgotten, now and then.
         if self.misspelled.len() > 4 * rows.len() + 1000 {
@@ -593,6 +603,7 @@ impl Builtin {
         }
         // Lines with it are checked again.
         self.misspelled.clear();
+        self.checked = None;
         self.note = Some(format!("\"{word}\" added to your words"));
         Outcome::AddWord(word)
     }

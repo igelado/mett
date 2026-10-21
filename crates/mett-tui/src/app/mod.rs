@@ -592,9 +592,10 @@ pub struct App {
     )>,
     /// The settings whose dictionaries are being loaded.
     speller_loading: Option<crate::editor::spell::Settings>,
-    /// The words the user added since mett started: dictionaries loaded
-    /// later may have read `spell_words` before they were written.
-    added_words: Vec<String>,
+    /// The words the user added since mett started, with the `spell_words`
+    /// they went to: dictionaries loaded later may have read it before
+    /// they were written.
+    added_words: Vec<(Option<std::path::PathBuf>, String)>,
     /// The request fetching a message to reply to or forward.
     compose_fetch: Option<(RequestId, Kind, MessageId)>,
     /// The reply or forward whose message couldn't be fetched for want of
