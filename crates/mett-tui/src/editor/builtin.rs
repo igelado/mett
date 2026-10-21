@@ -182,6 +182,10 @@ pub struct Builtin {
     checked: Option<Lines>,
     /// What isn't checked: quotes, the signature.
     unchecked: spell::Unchecked,
+    /// Each line's misspelled words, as last checked.
+    spans: Vec<Vec<(usize, usize)>>,
+    /// The text's height on the screen, as last drawn.
+    height: usize,
     /// Words offered for a misspelled one.
     suggesting: Option<Suggesting>,
     /// A question on the bottom line.
@@ -253,6 +257,8 @@ impl Builtin {
             misspelled: HashMap::new(),
             checked: None,
             unchecked: spell::Unchecked::default(),
+            spans: Vec::new(),
+            height: 50,
             suggesting: None,
             question: None,
             prefix: None,
@@ -474,6 +480,7 @@ impl Builtin {
             if !self.state.highlights.is_empty() {
                 self.state.clear_highlights();
             }
+            self.spans.clear();
             self.checked = None;
             return;
         };
@@ -486,40 +493,51 @@ impl Builtin {
         if self.misspelled.len() > 4 * rows.len() + 1000 {
             self.misspelled.clear();
         }
+        let checked = self.unchecked.rows(&rows);
+        self.spans = rows
+            .iter()
+            .zip(checked)
+            .map(|(line, checked)| match checked {
+                true => self
+                    .misspelled
+                    .entry(line.clone())
+                    .or_insert_with(|| speller.misspelled(line))
+                    .clone(),
+                false => Vec::new(),
+            })
+            .collect();
+        self.underline();
+    }
+
+    /// Underlines the misspelled words on the screen and around it:
+    /// edtui looks each cell up in them, so not in the whole text.
+    fn underline(&mut self) {
         let style = Style::new()
             .add_modifier(Modifier::UNDERLINED)
             .underline_color(Color::Red);
-        let mut highlights = Vec::new();
-        for (row, (line, checked)) in rows.iter().zip(self.unchecked.rows(&rows)).enumerate() {
-            if !checked {
-                continue;
-            }
-            let spans = self
-                .misspelled
-                .entry(line.clone())
-                .or_insert_with(|| speller.misspelled(line));
-            for &(start, end) in spans.iter() {
-                let (start, end) = (Index2::new(row, start), Index2::new(row, end));
-                highlights.push(Highlight::new(start, end, style));
-            }
-        }
+        let top = self.state.viewport_offset().1.min(self.state.cursor.row);
+        let rows = top.saturating_sub(self.height)..top + 2 * self.height;
+        let highlights = self
+            .spans
+            .iter()
+            .enumerate()
+            .skip(rows.start)
+            .take(rows.len())
+            .flat_map(|(row, spans)| {
+                spans.iter().map(move |&(start, end)| {
+                    Highlight::new(Index2::new(row, start), Index2::new(row, end), style)
+                })
+            })
+            .collect();
         self.state.set_highlights(highlights);
     }
 
     /// The misspelled words, in order: their rows, first and last columns.
     fn misspellings(&self) -> Vec<(usize, usize, usize)> {
-        let rows = self.rows();
-        let checked = self.unchecked.rows(&rows);
-        rows.iter()
+        self.spans
+            .iter()
             .enumerate()
-            .filter(|(row, _)| checked[*row])
-            .flat_map(|(row, line)| {
-                self.misspelled
-                    .get(line)
-                    .into_iter()
-                    .flatten()
-                    .map(move |&(start, end)| (row, start, end))
-            })
+            .flat_map(|(row, spans)| spans.iter().map(move |&(start, end)| (row, start, end)))
             .collect()
     }
 
@@ -1181,6 +1199,11 @@ impl Builtin {
         text: Style,
         selection: Style,
     ) -> Option<Position> {
+        // Underlined where the text is now shown.
+        self.height = usize::from(area.height);
+        if self.spell && !self.spans.is_empty() {
+            self.underline();
+        }
         let theme = EditorTheme::default()
             .base(text)
             .cursor_style(text.add_modifier(ratatui::style::Modifier::REVERSED))
@@ -1751,12 +1774,9 @@ mod tests {
         assert_eq!(notepad.text(), "Zb\n");
     }
 
-    /// The en_US dictionary, loaded once for the tests.
+    /// The en_US dictionary, for one test: words added go to it alone.
     fn speller() -> Arc<Speller> {
-        static SPELLER: std::sync::OnceLock<Arc<Speller>> = std::sync::OnceLock::new();
-        SPELLER
-            .get_or_init(|| Arc::new(Speller::load(&spell::Settings::default(), None).unwrap()))
-            .clone()
+        Arc::new(Speller::load(&spell::Settings::default(), None).unwrap())
     }
 
     fn spelling(text: &str, keys: Keys) -> Builtin {
