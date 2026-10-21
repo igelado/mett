@@ -239,8 +239,10 @@ pub fn words(line: &str) -> Vec<(usize, usize)> {
         }
         let token = &chars[start..i];
         let text: String = token.iter().collect();
-        // A web or mail address: with a scheme, `@`, or a dot between
-        // letters (`mett.dev/path`), past what ends a sentence.
+        // A web or mail address, or a path: with a scheme, `@`, a dot
+        // between letters (`mett.dev/path`, past what ends a sentence), or
+        // starting as a path does (`/usr`, `~/x`, `./x`). `and/or` is
+        // words.
         let bare = text.trim_end_matches(['.', ',', '!', '?', ':', ';', ')']);
         let dotted = bare.char_indices().any(|(i, c)| {
             c == '.'
@@ -253,7 +255,8 @@ pub fn words(line: &str) -> Vec<(usize, usize)> {
                     .next()
                     .is_some_and(char::is_alphanumeric)
         });
-        let address = text.contains("://") || text.contains('@') || dotted || text.contains('/');
+        let path = ["/", "~/", "./", "../"].iter().any(|p| text.starts_with(p));
+        let address = text.contains("://") || text.contains('@') || dotted || path;
         if !address {
             words.extend(words_in(token).map(|(s, e)| (start + s, start + e)));
         }
@@ -337,13 +340,12 @@ impl Unchecked {
         };
         let dashes = lines.iter().position(|line| line == "-- ");
         let n = self.signature.len();
-        let own = (n > 0)
-            .then(|| {
-                (0..=lines.len().saturating_sub(n))
-                    .rev()
-                    .find(|&i| lines.get(i..i + n) == Some(self.signature.as_slice()))
-            })
-            .flatten();
+        // The signature ends the message: only blank lines after it.
+        let end = lines
+            .iter()
+            .rposition(|line| !line.trim().is_empty())
+            .map_or(0, |last| last + 1);
+        let own = (n > 0 && end >= n && lines[end - n..end] == self.signature[..]).then(|| end - n);
         let signature = [dashes, own]
             .into_iter()
             .flatten()
@@ -389,8 +391,8 @@ mod tests {
         assert_eq!(words("l’été"), [(0, 4)]);
         // Bare addresses, and words in scripts without capitals.
         assert_eq!(
-            words("see mett.dev/path or a/b, end."),
-            [(0, 2), (18, 19), (26, 28)]
+            words("see mett.dev/path or ~/x and/or, end."),
+            [(0, 2), (18, 19), (25, 27), (29, 30), (33, 35)]
         );
         assert_eq!(words("שלום עולם"), [(0, 3), (5, 8)]);
         // A word beside an address is still one.
@@ -408,11 +410,14 @@ mod tests {
         assert_eq!(default.rows(&text), [true, false, true, false, false]);
         // Another indent_string, and a signature without dashes.
         let unchecked = Unchecked::new("| ", Some("Mee\nACME\n"));
-        let text = lines(&["Hi", "| qoted", "Mee", "", "Mee", "ACME"]);
+        let text = lines(&["Hi", "| qoted", "Mee", "", "Mee", "ACME", ""]);
         assert_eq!(
             unchecked.rows(&text),
-            [true, false, true, true, false, false]
+            [true, false, true, true, false, false, false]
         );
+        // Written below it, it isn't the signature any more.
+        let text = lines(&["Mee", "ACME", "PS: more"]);
+        assert_eq!(unchecked.rows(&text), [true, true, true]);
     }
 
     #[test]

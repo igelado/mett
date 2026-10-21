@@ -328,11 +328,10 @@ impl Builtin {
         Outcome::Done(if text == held { given } else { text })
     }
 
-    /// Applies a key press.
+    /// Applies a key press. (The spelling is checked when the text is
+    /// drawn next: once for keys that come at once.)
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
-        let outcome = self.press(key);
-        self.recheck();
-        outcome
+        self.press(key)
     }
 
     fn press(&mut self, key: KeyEvent) -> Outcome {
@@ -546,6 +545,7 @@ impl Builtin {
     /// before), from the other end past the last; and offers others for
     /// it, if `suggest`.
     fn next_misspelling(&mut self, forward: bool, suggest: bool) {
+        self.recheck();
         if !self.spell || self.speller.is_none() {
             self.note = Some("Spell checking is off".into());
             return;
@@ -1002,7 +1002,6 @@ impl Builtin {
     /// selection), or in the command being typed.
     pub fn paste(&mut self, text: &str) {
         self.paste_text(text);
-        self.recheck();
     }
 
     fn paste_text(&mut self, text: &str) {
@@ -1204,8 +1203,9 @@ impl Builtin {
         text: Style,
         selection: Style,
     ) -> Option<Position> {
-        // Underlined where the text is now shown.
+        // Checked as it now is, and underlined where it is shown.
         self.height = usize::from(area.height);
+        self.recheck();
         if self.spell && !self.spans.is_empty() {
             self.underline();
         }
@@ -1790,7 +1790,9 @@ mod tests {
         editor
     }
 
-    fn underlined(editor: &Builtin) -> Vec<(usize, usize, usize)> {
+    fn underlined(editor: &mut Builtin) -> Vec<(usize, usize, usize)> {
+        // As drawing does.
+        editor.recheck();
         editor
             .state
             .highlights
@@ -1803,20 +1805,20 @@ mod tests {
     fn misspelled_words_are_underlined() {
         let mut vim = spelling("Thsi is fine.\n> qoted\n-- \nMee\n", Keys::Vim);
         // Not in quotes, nor in the signature.
-        assert_eq!(underlined(&vim), [(0, 0, 3)]);
+        assert_eq!(underlined(&mut vim), [(0, 0, 3)]);
         press(&mut vim, &chars("A wrnog\x1b"));
-        assert_eq!(underlined(&vim), [(0, 0, 3), (0, 14, 18)]);
+        assert_eq!(underlined(&mut vim), [(0, 0, 3), (0, 14, 18)]);
         // Off and on again; mett's settings follow.
         assert_eq!(
             press(&mut vim, &chars(":set nospell\n")),
             Outcome::Configure("set spell_check=no".into())
         );
-        assert_eq!(underlined(&vim), []);
+        assert_eq!(underlined(&mut vim), []);
         assert_eq!(
             press(&mut vim, &chars(":set spell!\n")),
             Outcome::Configure("set spell_check=yes".into())
         );
-        assert_eq!(underlined(&vim).len(), 2);
+        assert_eq!(underlined(&mut vim).len(), 2);
         assert_eq!(
             press(&mut vim, &chars(":set spelllang=en_us,es_es\n")),
             Outcome::Configure("set spell_check=yes spell_lang=\"en_us,es_es\"".into())
@@ -1830,7 +1832,7 @@ mod tests {
         let mut notepad = spelling("Fine\n", Keys::Notepad);
         // At the cursor, at the start: " wrnogFine".
         notepad.paste(" wrnog");
-        assert_eq!(underlined(&notepad), [(0, 1, 9)]);
+        assert_eq!(underlined(&mut notepad), [(0, 1, 9)]);
     }
 
     #[test]
@@ -1852,7 +1854,7 @@ mod tests {
             press(&mut vim, &chars("zg")),
             Outcome::AddWord("Thsi".into())
         );
-        assert_eq!(underlined(&vim), []);
+        assert_eq!(underlined(&mut vim), []);
         // Undoing the replacement brings the misspelled word back.
         press(&mut vim, &chars("u"));
         assert_eq!(vim.text(), "Thsi is a mispeled line.\n");
@@ -1866,7 +1868,7 @@ mod tests {
         press(&mut emacs, &[alt('$')]);
         assert!(matches!(emacs.bottom(80), Bottom::Prompt { prompt, .. } if prompt == "twoo: "));
         press(&mut emacs, &chars("a"));
-        assert_eq!(underlined(&emacs), []);
+        assert_eq!(underlined(&mut emacs), []);
         press(&mut emacs, &[alt('x')]);
         assert_eq!(
             press(&mut emacs, &chars("flyspell-mode\n")),
