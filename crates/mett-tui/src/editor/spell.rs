@@ -82,6 +82,10 @@ impl Speller {
     /// one is found), and the user's words. It takes a moment: not on the
     /// UI's thread.
     pub fn load(settings: &Settings, home: Option<&str>) -> Result<Self, String> {
+        // Without dictionaries, every word would do.
+        if settings.langs.is_empty() {
+            return Err("spell_lang: no dictionary named".into());
+        }
         let mut dictionaries = Vec::new();
         for lang in &settings.langs {
             let found = dirs(settings, home)
@@ -148,12 +152,10 @@ impl Speller {
     /// Where `line`'s misspelled words are: their first and last
     /// characters' columns.
     pub fn misspelled(&self, line: &str) -> Vec<(usize, usize)> {
+        let chars: Vec<char> = line.chars().collect();
         words(line)
             .into_iter()
-            .filter(|&(start, end)| {
-                let word: String = line.chars().skip(start).take(end + 1 - start).collect();
-                !self.check(&word)
-            })
+            .filter(|&(start, end)| !self.check(&chars[start..=end].iter().collect::<String>()))
             .collect()
     }
 }
@@ -396,6 +398,8 @@ mod tests {
         assert_eq!(settings.words, None);
         // en_us is mett's own en_US.
         assert!(Speller::load(&settings, None).is_err_and(|e| e.contains("zz_ZZ")));
+        // No dictionaries: no checking, rather than every word right.
+        assert!(Speller::load(&Settings::new(true, ", ,", "", "", None), None).is_err());
         let only = Settings::new(true, "en_us", "", "", None);
         // `~` in the paths is the home directory.
         let home = Settings::new(true, "en_US", "~/dicts", "", Some("/home/me"));
