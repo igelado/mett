@@ -155,6 +155,29 @@ fn weekday_name(day: Weekday) -> &'static str {
     }
 }
 
+const WEEK: [Weekday; 7] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+    Weekday::Sat,
+    Weekday::Sun,
+];
+const WEEKDAYS: [Weekday; 5] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+];
+const WEEKEND: [Weekday; 2] = [Weekday::Sat, Weekday::Sun];
+
+/// Whether `days` are exactly `set` (in any order).
+fn is_set(days: &[Weekday], set: &[Weekday]) -> bool {
+    days.len() == set.len() && set.iter().all(|d| days.contains(d))
+}
+
 fn ordinal(n: u32) -> String {
     let suffix = match (n % 100, n % 10) {
         (11..=13, _) => "th",
@@ -196,7 +219,21 @@ impl fmt::Display for Recurrence {
         let of_month = month.map_or(String::new(), |m| format!(" of {m}"));
         match (self.unit, self.nth, self.day_of_month) {
             (_, Some(n), _) if !days.is_empty() => {
-                write!(f, " on the {} {days}{of_month}", nth(n))?;
+                // The n-th of a set of days is one day of the set: the
+                // last weekday, not the last of each.
+                let which = match self.weekdays.as_slice() {
+                    [_] => days,
+                    set if is_set(set, &WEEK) => "day".to_owned(),
+                    set if is_set(set, &WEEKDAYS) => "weekday".to_owned(),
+                    set if is_set(set, &WEEKEND) => "weekend day".to_owned(),
+                    _ => self
+                        .weekdays
+                        .iter()
+                        .map(|d| weekday_name(*d))
+                        .collect::<Vec<_>>()
+                        .join(" or "),
+                };
+                write!(f, " on the {} {which}{of_month}", nth(n))?;
             }
             (RecurrenceUnit::Month | RecurrenceUnit::Year, _, Some(day)) => {
                 write!(f, " on the {}{of_month}", ordinal(day))?;
@@ -289,6 +326,16 @@ mod tests {
             nth.to_string(),
             "Every 3 months on the last Fri, until Fri 29 Jan 2027"
         );
+
+        let mut weekday = Recurrence::new(RecurrenceUnit::Month, 1);
+        weekday.weekdays = WEEKDAYS.to_vec();
+        weekday.nth = Some(-1);
+        assert_eq!(weekday.to_string(), "Monthly on the last weekday");
+        weekday.weekdays = vec![Weekday::Sat, Weekday::Sun];
+        weekday.nth = Some(1);
+        assert_eq!(weekday.to_string(), "Monthly on the 1st weekend day");
+        weekday.weekdays = vec![Weekday::Mon, Weekday::Wed];
+        assert_eq!(weekday.to_string(), "Monthly on the 1st Mon or Wed");
 
         let mut yearly = Recurrence::new(RecurrenceUnit::Year, 1);
         yearly.day_of_month = Some(5);
