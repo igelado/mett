@@ -180,6 +180,8 @@ pub struct Builtin {
     /// The text as last checked: a key that didn't change it (moving the
     /// cursor, say) needs no checking.
     checked: Option<Lines>,
+    /// What isn't checked: quotes, the signature.
+    unchecked: spell::Unchecked,
     /// Words offered for a misspelled one.
     suggesting: Option<Suggesting>,
     /// A question on the bottom line.
@@ -250,6 +252,7 @@ impl Builtin {
             spell: false,
             misspelled: HashMap::new(),
             checked: None,
+            unchecked: spell::Unchecked::default(),
             suggesting: None,
             question: None,
             prefix: None,
@@ -264,10 +267,17 @@ impl Builtin {
         String::from(self.state.lines.clone())
     }
 
-    /// Checks the spelling with `speller` (once loaded), if `check`.
-    pub fn set_spelling(&mut self, speller: Option<Arc<Speller>>, check: bool) {
+    /// Checks the spelling with `speller` (once loaded), if `check`, but
+    /// not in what is `unchecked`.
+    pub fn set_spelling(
+        &mut self,
+        speller: Option<Arc<Speller>>,
+        check: bool,
+        unchecked: spell::Unchecked,
+    ) {
         self.speller = speller;
         self.spell = check;
+        self.unchecked = unchecked;
         self.misspelled.clear();
         self.checked = None;
         self.recheck();
@@ -480,7 +490,7 @@ impl Builtin {
             .add_modifier(Modifier::UNDERLINED)
             .underline_color(Color::Red);
         let mut highlights = Vec::new();
-        for (row, (line, checked)) in rows.iter().zip(spell::checked_rows(&rows)).enumerate() {
+        for (row, (line, checked)) in rows.iter().zip(self.unchecked.rows(&rows)).enumerate() {
             if !checked {
                 continue;
             }
@@ -499,7 +509,7 @@ impl Builtin {
     /// The misspelled words, in order: their rows, first and last columns.
     fn misspellings(&self) -> Vec<(usize, usize, usize)> {
         let rows = self.rows();
-        let checked = spell::checked_rows(&rows);
+        let checked = self.unchecked.rows(&rows);
         rows.iter()
             .enumerate()
             .filter(|(row, _)| checked[*row])
@@ -1751,7 +1761,7 @@ mod tests {
 
     fn spelling(text: &str, keys: Keys) -> Builtin {
         let mut editor = Builtin::new(text, keys);
-        editor.set_spelling(Some(speller()), true);
+        editor.set_spelling(Some(speller()), true, spell::Unchecked::default());
         editor
     }
 

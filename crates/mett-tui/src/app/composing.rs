@@ -770,7 +770,7 @@ impl App {
             Some(keys) => {
                 let mut editor = crate::editor::builtin::Builtin::new(&text, keys);
                 let (speller, effects) = self.speller();
-                editor.set_spelling(speller, self.settings.spell.check);
+                editor.set_spelling(speller, self.settings.spell.check, self.unchecked());
                 self.editing = Some(std::cell::RefCell::new(editor));
                 effects
             }
@@ -815,10 +815,20 @@ impl App {
         }
         let (speller, effects) = self.speller();
         let check = self.settings.spell.check;
+        let unchecked = self.unchecked();
         if let Some(editing) = &mut self.editing {
-            editing.get_mut().set_spelling(speller, check);
+            editing.get_mut().set_spelling(speller, check, unchecked);
         }
         effects
+    }
+
+    /// What spelling isn't checked in: quotes and the signature, as the
+    /// settings write them.
+    fn unchecked(&self) -> crate::editor::spell::Unchecked {
+        crate::editor::spell::Unchecked::new(
+            &self.settings.indent_string,
+            self.settings.signature.as_deref(),
+        )
     }
 
     /// Takes in dictionaries loaded for `settings`, or why they couldn't

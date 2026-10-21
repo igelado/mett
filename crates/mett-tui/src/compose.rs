@@ -153,6 +153,7 @@ impl Settings {
                 config.string("spell_lang"),
                 config.string("spell_dict_path"),
                 config.string("spell_words"),
+                config.home(),
             ),
         })
     }

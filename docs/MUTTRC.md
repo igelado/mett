@@ -356,7 +356,8 @@ message, which `abort_unmodified` aborts).
 
 **Spelling.** With `spell_check` set (the default), the built-in editor
 underlines misspelled words, in red where the terminal can: not in quoted
-lines (`>`), the signature, web and mail addresses, words with digits, or
+lines (`>`, or `indent_string`), the signature (after `-- `, or your
+`signature` itself), web and mail addresses, words with digits, or
 in capitals (`HTML`). Suggestions show on the bottom line: a digit puts one
 in place of the word, `a` adds it to your words (`spell_words`, one a
 line), any other key leaves it. Turning spelling on or off, or changing

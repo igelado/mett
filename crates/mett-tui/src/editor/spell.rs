@@ -39,8 +39,9 @@ impl Default for Settings {
 
 impl Settings {
     /// The settings from `spell_check`, `spell_lang` (comma-separated),
-    /// `spell_dict_path` (as the system's `PATH`) and `spell_words`.
-    pub fn new(check: bool, langs: &str, dirs: &str, words: &str) -> Self {
+    /// `spell_dict_path` (as the system's `PATH`, `~` the `home`
+    /// directory) and `spell_words`.
+    pub fn new(check: bool, langs: &str, dirs: &str, words: &str, home: Option<&str>) -> Self {
         Self {
             check,
             langs: langs
@@ -51,6 +52,10 @@ impl Settings {
                 .collect(),
             dirs: std::env::split_paths(dirs)
                 .filter(|dir| !dir.as_os_str().is_empty())
+                .map(|dir| match (dir.strip_prefix("~"), home) {
+                    (Ok(rest), Some(home)) => Path::new(home).join(rest),
+                    _ => dir,
+                })
                 .collect(),
             words: Some(PathBuf::from(words)).filter(|path| !path.as_os_str().is_empty()),
         }
@@ -271,17 +276,65 @@ fn words_in(token: &[char]) -> impl Iterator<Item = (usize, usize)> + '_ {
     })
 }
 
-/// Whether `lines[row]` is worth checking: not quoted (`> `), nor in the
-/// signature (after a `-- ` line).
-pub fn checked_rows(lines: &[String]) -> Vec<bool> {
-    let mut signature = false;
-    lines
-        .iter()
-        .map(|line| {
-            signature |= line == "-- ";
-            !signature && !line.trim_start().starts_with('>')
-        })
-        .collect()
+/// What isn't checked in a message: quoted lines and the signature, as
+/// the compose settings write them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unchecked {
+    /// What quoted lines start with (`indent_string`, without the spaces
+    /// after it); lines starting with `>` are quoted too.
+    pub quote: String,
+    /// The signature's lines, as they end the message (without `-- `,
+    /// which marks it anyway).
+    pub signature: Vec<String>,
+}
+
+impl Default for Unchecked {
+    fn default() -> Self {
+        Self {
+            quote: ">".into(),
+            signature: Vec::new(),
+        }
+    }
+}
+
+impl Unchecked {
+    /// From `indent_string` and the signature.
+    pub fn new(indent_string: &str, signature: Option<&str>) -> Self {
+        Self {
+            quote: indent_string.trim_end().to_owned(),
+            signature: signature
+                .map(|text| text.lines().map(str::to_owned).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether each of `lines` is worth checking: not quoted, nor in the
+    /// signature (after a `-- ` line, or the signature's own lines).
+    pub fn rows(&self, lines: &[String]) -> Vec<bool> {
+        let quoted = |line: &String| {
+            line.trim_start().starts_with('>')
+                || (!self.quote.is_empty() && line.starts_with(&self.quote))
+        };
+        let dashes = lines.iter().position(|line| line == "-- ");
+        let n = self.signature.len();
+        let own = (n > 0)
+            .then(|| {
+                (0..=lines.len().saturating_sub(n))
+                    .rev()
+                    .find(|&i| lines.get(i..i + n) == Some(self.signature.as_slice()))
+            })
+            .flatten();
+        let signature = [dashes, own]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(lines.len());
+        lines
+            .iter()
+            .enumerate()
+            .map(|(row, line)| row < signature && !quoted(line))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -323,20 +376,30 @@ mod tests {
 
     #[test]
     fn quotes_and_signatures_are_not_checked() {
-        let lines: Vec<String> = ["Hi", "> quoted", "", "-- ", "Me"]
-            .map(String::from)
-            .to_vec();
-        assert_eq!(checked_rows(&lines), [true, false, true, false, false]);
+        let lines = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let default = Unchecked::default();
+        let text = lines(&["Hi", "> quoted", "", "-- ", "Me"]);
+        assert_eq!(default.rows(&text), [true, false, true, false, false]);
+        // Another indent_string, and a signature without dashes.
+        let unchecked = Unchecked::new("| ", Some("Mee\nACME\n"));
+        let text = lines(&["Hi", "| qoted", "Mee", "", "Mee", "ACME"]);
+        assert_eq!(
+            unchecked.rows(&text),
+            [true, false, true, true, false, false]
+        );
     }
 
     #[test]
     fn settings_from_the_configuration() {
-        let settings = Settings::new(true, "en_us, zz_ZZ", "", "");
+        let settings = Settings::new(true, "en_us, zz_ZZ", "", "", None);
         assert_eq!(settings.langs, ["en_us", "zz_ZZ"]);
         assert_eq!(settings.words, None);
         // en_us is mett's own en_US.
         assert!(Speller::load(&settings, None).is_err_and(|e| e.contains("zz_ZZ")));
-        let only = Settings::new(true, "en_us", "", "");
+        let only = Settings::new(true, "en_us", "", "", None);
+        // `~` in the paths is the home directory.
+        let home = Settings::new(true, "en_US", "~/dicts", "", Some("/home/me"));
+        assert_eq!(home.dirs, [PathBuf::from("/home/me/dicts")]);
         assert!(Speller::load(&only, None).is_ok());
     }
 
