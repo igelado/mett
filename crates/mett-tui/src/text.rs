@@ -280,22 +280,22 @@ fn meeting_time(invitation: &Invitation) -> Option<String> {
     }
     let local = |time: DateTime<Utc>| time.with_timezone(&Local);
     let from = local(start);
-    let zone = from.format("%Z");
+    let zone = from.format("%Z").to_string();
     let Some(end) = invitation.end.map(local) else {
         return Some(format!("{} {zone}", from.format(&format!("{day} %H:%M"))));
     };
-    Some(if from.date_naive() == end.date_naive() {
+    // A meeting can end after the clocks change.
+    let end_zone = end.format("%Z").to_string();
+    let first = from.format(&format!("{day} %H:%M")).to_string();
+    Some(if end_zone != zone {
         format!(
-            "{} - {} {zone}",
-            from.format(&format!("{day} %H:%M")),
-            end.format("%H:%M")
-        )
-    } else {
-        format!(
-            "{} - {} {zone}",
-            from.format(&format!("{day} %H:%M")),
+            "{first} {zone} - {} {end_zone}",
             end.format(&format!("{day} %H:%M"))
         )
+    } else if from.date_naive() == end.date_naive() {
+        format!("{first} - {} {zone}", end.format("%H:%M"))
+    } else {
+        format!("{first} - {} {zone}", end.format(&format!("{day} %H:%M")))
     })
 }
 

@@ -72,6 +72,8 @@ struct Event {
 #[serde(rename_all = "camelCase")]
 struct DateTimeZone {
     date_time: String,
+    /// The zone `date_time` is in: UTC, as asked for with `Prefer`.
+    time_zone: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +226,16 @@ impl DateTimeZone {
     fn parse(&self, all_day: bool) -> Option<DateTime<Utc>> {
         let time = NaiveDateTime::parse_from_str(&self.date_time, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
         let time = time.and_utc();
+        let utc = self
+            .time_zone
+            .as_deref()
+            .is_none_or(|zone| zone.eq_ignore_ascii_case("UTC"));
+        if !utc {
+            // Not the zone asked for, and mett has no zone data: the hour
+            // would be wrong, so it isn't shown. A day's date is right in
+            // whatever zone it is.
+            return all_day.then(|| time.date_naive().and_time(chrono::NaiveTime::MIN).and_utc());
+        }
         // An all-day time asked for in UTC may come as the day's midnight
         // in another zone, shifted: 13 hours later is on the day's date for
         // the zones from UTC-10 to UTC+13 (as in `mett-ews`).
@@ -464,6 +476,25 @@ mod tests {
         assert_eq!(
             invitation.end,
             Some(Utc.with_ymd_and_hms(2026, 11, 4, 0, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn times_in_another_zone_are_not_taken_for_utc() {
+        let mut message = request();
+        message["event"] = json!(null);
+        message["startDateTime"]["timeZone"] = json!("Pacific Standard Time");
+        message["endDateTime"]["timeZone"] = json!("Pacific Standard Time");
+        let invitation = read(message.clone()).unwrap();
+        assert_eq!((invitation.start, invitation.end), (None, None));
+        // Whole days keep their dates.
+        message["isAllDay"] = json!(true);
+        message["startDateTime"]["dateTime"] = json!("2026-11-03T00:00:00.0000000");
+        message["endDateTime"]["dateTime"] = json!("2026-11-04T00:00:00.0000000");
+        let invitation = read(message).unwrap();
+        assert_eq!(
+            invitation.start,
+            Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap())
         );
     }
 

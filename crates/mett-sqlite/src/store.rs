@@ -701,12 +701,22 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
+        let mut cached = None;
         if self.caching()
             && let Ok(Some(message)) = self.with_cache(|db| db.message(id))
         {
-            return Ok(message);
+            // A meeting changes without its message changing (an answer
+            // from another client, the organizer moving it), so the server
+            // is asked again, and the cache serves only when it can't say.
+            if message.invitation.is_none() {
+                return Ok(message);
+            }
+            cached = Some(message);
         }
-        let message = self.inner.fetch_message(id).await?;
+        let message = match self.inner.fetch_message(id).await {
+            Ok(message) => message,
+            Err(e) => return cached.ok_or(e),
+        };
         if self.caching() {
             // Failing to keep it costs only fetching it again.
             let _ = self.with_cache(|db| db.keep_body(&message));

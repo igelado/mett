@@ -98,6 +98,14 @@ impl MemoryStore {
         self
     }
 
+    /// Changes what a message says about a meeting, as its organizer or an
+    /// answer from another client does.
+    pub fn set_invitation(&self, id: &MessageId, invitation: Option<crate::Invitation>) {
+        if let Ok(message) = self.state().message_mut(id) {
+            message.invitation = invitation;
+        }
+    }
+
     /// Makes every sync state handed out so far stale.
     pub fn forget_syncs(&self) {
         self.state().sync_epoch += 1;
