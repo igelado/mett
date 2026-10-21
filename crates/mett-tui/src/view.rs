@@ -394,6 +394,11 @@ fn render_input(input: &Input, prompt_style: Style, frame: &mut Frame, area: Rec
             let line = Line::from(vec![Span::styled(prompt, prompt_style), Span::raw(text)]);
             (line, cursor)
         }
+        Input::Choice { prompt, .. } => {
+            let line = truncate(prompt, width);
+            let cursor = line.width();
+            (Line::styled(line, prompt_style), cursor)
+        }
         Input::YesNo {
             prompt, default, ..
         } => {

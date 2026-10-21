@@ -110,6 +110,14 @@ pub fn mailbox() -> MemoryStore {
                 ),
             }
         };
+        // Two invitations to answer: a meeting, and a weekly one.
+        if matches!(i, 1 | 2) {
+            message.invitation = Some(demo_invitation(i == 2, now, name, email));
+            message.summary.subject = format!(
+                "Invitation: {}",
+                if i == 2 { "Team sync" } else { "Design review" }
+            );
+        }
         let attached = message.summary.has_attachments;
         store = store.with_message(message);
         // Something to look at with `v`.
@@ -132,6 +140,35 @@ pub fn mailbox() -> MemoryStore {
         }
     }
     store
+}
+
+/// An invitation to a meeting tomorrow at this time (weekly if `weekly`),
+/// from `name` at `email`.
+fn demo_invitation(
+    weekly: bool,
+    now: chrono::DateTime<chrono::Utc>,
+    name: &str,
+    email: &str,
+) -> mett_core::Invitation {
+    use mett_core::{Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply};
+    let start = now + TimeDelta::days(1);
+    let mut recurrence = Recurrence::new(RecurrenceUnit::Week, 1);
+    recurrence.weekdays = vec![chrono::Datelike::weekday(&start)];
+    Invitation {
+        kind: InvitationKind::Request,
+        title: None,
+        start: Some(start),
+        end: Some(start + TimeDelta::hours(1)),
+        all_day: false,
+        location: Some("Room 4A".into()),
+        organizer: Some(Address::new(email).with_name(name)),
+        attendees: vec![Address::new(YOU).with_name("You")],
+        recurrence: weekly.then_some(recurrence),
+        reply: Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        event: Some("demo-event".into()),
+    }
 }
 
 #[cfg(test)]

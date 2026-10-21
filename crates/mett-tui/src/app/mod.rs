@@ -7,6 +7,7 @@
 
 mod attachments;
 mod composing;
+mod invite;
 mod keys;
 mod mailbox;
 mod newmail;
@@ -774,6 +775,8 @@ pub struct App {
     last_draft: u64,
     /// How many messages to request per page.
     page_size: u32,
+    /// An answer to an invitation being asked about, or sent.
+    answering: Option<invite::Answering>,
     /// The attachment being fetched, and what for.
     fetching: Option<attachments::Fetching>,
     /// The attachment that failed to be fetched for want of a sign-in,
@@ -986,6 +989,7 @@ impl App {
             next_request: 0,
             last_draft: 0,
             page_size: settings.page_size,
+            answering: None,
             fetching: None,
             unfetched_attachment: None,
             file_wait: None,
@@ -1634,6 +1638,7 @@ impl App {
             .on_mailbox_action(action)
             .or_else(|| self.on_thread_action(action))
             .or_else(|| self.on_search_action(action))
+            .or_else(|| self.on_invite_action(action))
             .or_else(|| self.on_sidebar_action(action))
         {
             return Some(effects);
@@ -1982,6 +1987,7 @@ impl App {
             Event::FoldersListed(result) => return self.on_folders_listed(id, result),
             Event::AttachmentsListed(result) => return self.on_attachments_listed(id, result),
             Event::AttachmentFetched(result) => return self.on_attachment_fetched(id, result),
+            Event::InvitationAnswered(result) => return self.on_invitation_answered(id, result),
             Event::Queried(result) => return self.on_queried(id, result),
             Event::MailboxesChecked(checked) => {
                 let mut effects = self.on_mailboxes_checked(id, checked);

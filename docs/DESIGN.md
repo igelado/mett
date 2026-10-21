@@ -347,7 +347,12 @@ and where the meeting is, who organizes and attends, how it repeats
 answered. Each adapter fills it from its own API (EWS `MeetingRequest`,
 `MeetingCancellation` and `MeetingResponse` items; Graph `eventMessage`
 with its `event`), and the cache stores it with the message body. The
-pager shows it among the headers. Times of a meeting of whole days are
+pager shows it among the headers. The user answers it (accept, tentative,
+decline) with `MailStore::answer_invitation`: the adapter sends the answer
+through the server (EWS response objects; Graph's event actions), so
+Exchange updates the calendar and tells the organizer. An answer covers the
+series or one occurrence; for one occurrence, EWS finds the occurrence's
+calendar item in a calendar view and Graph finds the series' instance. Times of a meeting of whole days are
 midnights (UTC) of its dates, so they show as dates in any time zone.
 
 ## 6. Example flow: opening a message

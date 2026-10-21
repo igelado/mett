@@ -51,6 +51,15 @@ pub enum Request {
     FetchMessage(MessageId),
     /// Change a message's flags.
     UpdateFlags(MessageId, FlagsUpdate),
+    /// Answer the meeting a message invites to.
+    AnswerInvitation {
+        /// The message.
+        id: MessageId,
+        /// What it says about the meeting.
+        invitation: Invitation,
+        /// The answer.
+        answer: Answer,
+    },
     /// List a message's attachments.
     ListAttachments(MessageId),
     /// Fetch an attachment's content.
@@ -125,6 +134,8 @@ pub enum Event {
     MessageFetched(Result<Message>),
     /// Outcome of [`Request::UpdateFlags`].
     FlagsUpdated(Result<()>),
+    /// Outcome of [`Request::AnswerInvitation`].
+    InvitationAnswered(Result<()>),
     /// Outcome of [`Request::ListAttachments`].
     AttachmentsListed(Result<Vec<Attachment>>),
     /// Outcome of [`Request::FetchAttachment`].
@@ -452,6 +463,11 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             }))
         }
         Request::FetchMessage(id) => Event::MessageFetched(store.fetch_message(&id).await),
+        Request::AnswerInvitation {
+            id,
+            invitation,
+            answer,
+        } => Event::InvitationAnswered(store.answer_invitation(&id, &invitation, &answer).await),
         Request::ListAttachments(id) => Event::AttachmentsListed(store.list_attachments(&id).await),
         Request::FetchAttachment(id, attachment) => {
             Event::AttachmentFetched(store.fetch_attachment(&id, &attachment).await)

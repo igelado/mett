@@ -727,7 +727,7 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
         };
         // The series' occurrences share its UID.
         let xml = self
-            .get_items(&[event.clone()], &["calendar:UID"], false, about)
+            .get_items(std::slice::from_ref(event), &["calendar:UID"], false, about)
             .await?;
         let doc = parse(&xml)?;
         let uid = first_item(only_message(&doc, about)?)

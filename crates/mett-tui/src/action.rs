@@ -93,6 +93,9 @@ actions! {
     AttachFile => "attach-file", "Attach a file to the message";
     DetachFile => "detach-file", "Take the attached file off the message";
     ToggleLinks => "toggle-links", "Show or hide the URLs of the message's links";
+    AcceptInvite => "accept-invite", "Accept the meeting the message invites to";
+    TentativeInvite => "tentative-invite", "Tentatively accept the meeting the message invites to";
+    DeclineInvite => "decline-invite", "Decline the meeting the message invites to";
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";
