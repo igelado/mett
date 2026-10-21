@@ -1107,6 +1107,7 @@ mod tests {
             out_of_date: false,
             response_requested: true,
             in_series: false,
+            series_master: false,
             event: None,
         }
     }

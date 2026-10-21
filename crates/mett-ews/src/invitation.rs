@@ -102,6 +102,10 @@ pub(crate) fn invitation(item: Node<'_, '_>) -> Option<Invitation> {
         out_of_date: child_text(item, "IsOutOfDate").as_deref() == Some("true")
             || child_text(item, "MeetingRequestType").as_deref() == Some("Outdated"),
         response_requested: child_text(item, "IsResponseRequested").as_deref() != Some("false"),
+        series_master: matches!(
+            child_text(item, "CalendarItemType").as_deref(),
+            Some("RecurringMaster")
+        ) || child(item, "Recurrence").is_some(),
         in_series: matches!(
             child_text(item, "CalendarItemType").as_deref(),
             Some("Occurrence" | "Exception" | "RecurringMaster")
@@ -386,11 +390,10 @@ mod tests {
         }
         // A pattern says it too.
         let series = r#"<t:Recurrence><t:DailyRecurrence><t:Interval>1</t:Interval></t:DailyRecurrence></t:Recurrence>"#;
-        assert!(
-            read(&REQUEST.replace("RECURRENCE", series))
-                .unwrap()
-                .in_series
-        );
+        let invitation = read(&REQUEST.replace("RECURRENCE", series)).unwrap();
+        assert!(invitation.in_series && invitation.series_master);
+        assert!(!read(&item("Occurrence")).unwrap().series_master);
+        assert!(read(&item("RecurringMaster")).unwrap().series_master);
     }
 
     #[test]

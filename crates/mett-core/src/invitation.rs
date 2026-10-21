@@ -300,6 +300,10 @@ pub struct Invitation {
     /// is about, or the series itself), so an answer can cover the series
     /// or only this one.
     pub in_series: bool,
+    /// Whether the meeting is the series itself, rather than one of its
+    /// occurrences (a series has a recurrence pattern, which can still be
+    /// missing here, if the backend gave none).
+    pub series_master: bool,
     /// What the backend needs to find the meeting again to answer it
     /// (its calendar item), if it isn't the message.
     pub event: Option<String>,
@@ -316,7 +320,7 @@ impl Invitation {
     /// not when the message is about the series and the answer is for one
     /// occurrence of it.
     pub fn answer_changes_reply(&self, scope: Scope) -> bool {
-        !(scope == Scope::Occurrence && self.recurrence.is_some())
+        !(scope == Scope::Occurrence && (self.series_master || self.recurrence.is_some()))
     }
 
     /// Why the message can't be answered, if it can't.
@@ -400,6 +404,7 @@ mod tests {
             out_of_date: false,
             response_requested: true,
             in_series: false,
+            series_master: false,
             event: None,
         };
         assert!(!invitation.repeats());
@@ -410,9 +415,11 @@ mod tests {
         assert!(invitation.answer_changes_reply(Scope::Series));
         assert!(invitation.answer_changes_reply(Scope::Occurrence));
         // About the series: an answer for one occurrence leaves it.
-        invitation.recurrence = Some(Recurrence::new(RecurrenceUnit::Day, 1));
+        invitation.series_master = true;
         assert!(invitation.answer_changes_reply(Scope::Series));
         assert!(!invitation.answer_changes_reply(Scope::Occurrence));
+        // Even if its pattern wasn't given or understood.
+        assert!(invitation.recurrence.is_none());
     }
 
     #[test]
@@ -431,6 +438,7 @@ mod tests {
             out_of_date: false,
             response_requested: true,
             in_series: false,
+            series_master: false,
             event: None,
         };
         assert!(invitation.can_answer());

@@ -22,6 +22,8 @@ pub(crate) struct StoredInvitation {
     /// Missing in what was stored before it was known.
     #[serde(default)]
     in_series: bool,
+    #[serde(default)]
+    series_master: bool,
     event: Option<String>,
 }
 
@@ -112,6 +114,7 @@ impl From<&Invitation> for StoredInvitation {
             out_of_date: i.out_of_date,
             response_requested: i.response_requested,
             in_series: i.in_series,
+            series_master: i.series_master,
             event: i.event.clone(),
         }
     }
@@ -147,6 +150,7 @@ impl From<StoredInvitation> for Invitation {
             out_of_date: s.out_of_date,
             response_requested: s.response_requested,
             in_series: s.in_series,
+            series_master: s.series_master,
             event: s.event,
         }
     }
@@ -179,6 +183,7 @@ mod tests {
             out_of_date: true,
             response_requested: false,
             in_series: true,
+            series_master: false,
             event: Some("cal-1".into()),
         };
         let json = serde_json::to_string(&StoredInvitation::from(&invitation)).unwrap();

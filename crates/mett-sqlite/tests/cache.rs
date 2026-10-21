@@ -193,6 +193,7 @@ async fn a_meeting_is_asked_again_and_kept_when_the_server_cannot_say() {
         out_of_date: false,
         response_requested: true,
         in_series: false,
+        series_master: false,
         event: None,
     };
     let store = cached(mailbox(1)).unwrap();
@@ -236,6 +237,7 @@ async fn an_answer_is_kept_for_when_the_server_cannot_say() {
         out_of_date: false,
         response_requested: true,
         in_series: false,
+        series_master: false,
         event: None,
     };
     let store = cached(mailbox(1)).unwrap();
@@ -276,6 +278,7 @@ async fn an_answer_for_one_occurrence_leaves_the_series_reply_in_the_store() {
         out_of_date: false,
         response_requested: true,
         in_series: false,
+        series_master: false,
         event: None,
     };
     let store = cached(mailbox(1)).unwrap();
@@ -320,6 +323,7 @@ async fn a_declined_meeting_stays_declined_once_its_event_is_gone() {
         out_of_date: false,
         response_requested: true,
         in_series: false,
+        series_master: false,
         event: event.map(str::to_owned),
     };
     let store = cached(mailbox(1)).unwrap();

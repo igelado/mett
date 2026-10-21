@@ -222,8 +222,9 @@ impl MeetingMessage {
             return None;
         }
         let kind = match self.meeting_message_type.as_deref() {
-            // An update says what it changed: Graph has no property for
-            // which it is.
+            // An update says what it changed: Graph's v1.0 has no property
+            // that says it is one, so an update that changes neither the
+            // time nor the place (the attendees, say) shows as a request.
             Some("meetingRequest")
                 if self.previous_start_date_time.is_some()
                     || self.previous_end_date_time.is_some()
@@ -259,14 +260,12 @@ impl MeetingMessage {
             .and_then(|e| e.recurrence.as_ref())
             .or(self.recurrence.as_ref())
             .and_then(GraphRecurrence::recurrence);
-        let in_series = recurrence.is_some()
-            || matches!(
-                event
-                    .as_ref()
-                    .and_then(|e| e.kind.as_deref())
-                    .or(self.kind.as_deref()),
-                Some("occurrence" | "exception" | "seriesMaster")
-            );
+        let event_type = event
+            .as_ref()
+            .and_then(|e| e.kind.as_deref())
+            .or(self.kind.as_deref());
+        let series_master = recurrence.is_some() || event_type == Some("seriesMaster");
+        let in_series = series_master || matches!(event_type, Some("occurrence" | "exception"));
         Some(Invitation {
             kind,
             title: None,
@@ -307,6 +306,7 @@ impl MeetingMessage {
                 .or(event.as_ref().and_then(|e| e.response_requested))
                 .unwrap_or(true),
             in_series,
+            series_master,
             event: event.and_then(|e| e.id),
         })
     }
@@ -542,6 +542,14 @@ mod tests {
         message["event"]["type"] = json!("occurrence");
         let invitation = read(message).unwrap();
         assert!(invitation.in_series && invitation.recurrence.is_none());
+        assert!(!invitation.series_master);
+        // A series is still one when its pattern is missing.
+        let mut message = request();
+        message["event"]["type"] = json!("seriesMaster");
+        assert!(read(message).unwrap().series_master);
+        let mut message = request();
+        message["event"]["type"] = json!("occurrence");
+        let invitation = read(message).unwrap();
         assert!(invitation.repeats());
         // The message says it too, when the event is gone.
         let mut message = request();
