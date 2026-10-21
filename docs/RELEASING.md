@@ -53,7 +53,8 @@ The packages install `/usr/bin/mett`, `/usr/bin/mett-gui`, its launcher
 `copyright` file. As the binary links its dependencies in, every package
 also has `THIRD-PARTY-NOTICES`: the license files of each crate it is
 built from (as `cargo tree` lists them; `packaging/notices.py`), the
-license of the font in mett-gui (Cascadia Mono, OFL), and musl's
+license of the font in mett-gui (Cascadia Mono, OFL), that of the
+English dictionary in both (SCOWL's en_US, MIT and BSD), and musl's
 copyright.
 
 ## Making a release

@@ -1483,6 +1483,23 @@ fn dispatch(
                 Some(app::Msg::FileRead(op, path, read))
             }),
             Effect::Command(command) => deferred.commands.push(command),
+            // Loading dictionaries takes a moment: on a thread of its own.
+            Effect::LoadSpeller(settings) => spawn_file(files, false, move || {
+                let home = platform::home();
+                let loaded = editor::spell::Speller::load(&settings, home.as_deref());
+                Some(Msg::SpellerLoaded(settings, loaded.map(Arc::new)))
+            }),
+            Effect::AddWord { path, word } => spawn_file(files, true, move || {
+                // One at a time, each on a line of its own: two words added
+                // at once don't run together.
+                static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _writing = WRITING
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                append_line(&path, &format!("{word}\n"))
+                    .err()
+                    .map(|e| Msg::Failed(format!("spell_words: {}: {e}", path.display())))
+            }),
             Effect::Later(after, timer) => {
                 let timers = timers.clone();
                 tokio::spawn(async move {

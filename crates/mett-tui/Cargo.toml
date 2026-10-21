@@ -45,6 +45,7 @@ open.workspace = true
 ratatui.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+spellbook.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 unicode-segmentation.workspace = true
 unicode-width.workspace = true

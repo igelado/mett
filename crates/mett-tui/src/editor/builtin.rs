@@ -2,7 +2,9 @@
 //! vim's, emacs's or Notepad's keys ([`Keys`]). The editing itself is
 //! `edtui`'s, an editor widget for ratatui; mett adds what leaves the
 //! editor (vim's `:wq` and `:q!`, emacs's `C-x C-c`, Notepad's `^S` and
-//! Esc), emacs's region, and selecting with Shift in Notepad's keys.
+//! Esc), emacs's region, selecting with Shift in Notepad's keys, and spell
+//! checking ([`spell`]): misspelled words are underlined, and each set of
+//! keys has its own to go to them, suggest others and turn it on or off.
 //!
 //! As with an external editor, the text it hands back is the text as last
 //! saved: quitting without saving gives back what was saved before (at
@@ -12,6 +14,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use edtui::actions::motion::{MoveToFirstRow, MoveToLastRow};
 use edtui::actions::search::StartSearch;
@@ -23,14 +26,18 @@ use edtui::actions::{
 };
 use edtui::clipboard::ClipboardTrait;
 use edtui::events::{KeyEventHandler, KeyEventRegister, KeyInput};
-use edtui::{EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, Index2, Lines};
+use edtui::{
+    EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, Highlight, Index2, Lines,
+    RowIndex,
+};
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use super::Keys;
+use super::spell::{self, Speller};
 use crate::lineedit::{self, LineEditor};
 
 /// What a key press did.
@@ -40,6 +47,32 @@ pub enum Outcome {
     Editing,
     /// The user left the editor: the text as last saved.
     Done(String),
+    /// Still editing; and a mettrc command to run: the user changed a
+    /// spelling setting (vim's `:set spell`, say).
+    Configure(String),
+    /// Still editing; and `word` goes to the user's own words.
+    AddWord(String),
+}
+
+/// What the line typed on the bottom line is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asking {
+    /// A command: vim's `:`, emacs's `M-x`.
+    Command,
+    /// The dictionaries to use (emacs's `ispell-change-dictionary`).
+    Dictionary,
+}
+
+/// Words a misspelled one may have been meant to be, offered on the
+/// bottom line: a digit picks one.
+#[derive(Clone, Debug)]
+struct Suggesting {
+    row: usize,
+    /// The word's first and last columns.
+    start: usize,
+    end: usize,
+    word: String,
+    words: Vec<String>,
 }
 
 /// A yes-or-no question on the bottom line.
@@ -137,6 +170,28 @@ pub struct Builtin {
     /// A command being typed on the bottom line (vim's `:`, emacs's
     /// `M-x`).
     command: Option<LineEditor>,
+    /// What it is for.
+    asking: Asking,
+    /// The dictionaries, once loaded.
+    speller: Option<Arc<Speller>>,
+    /// Whether misspelled words are underlined (`spell_check`).
+    spell: bool,
+    /// Lines' misspelled words (their columns), by the lines' text.
+    misspelled: HashMap<String, Vec<(usize, usize)>>,
+    /// The lines as last checked: only those changed since are checked
+    /// again. (As characters, to compare quickly, and as text.)
+    chars: Vec<Vec<char>>,
+    lines: Vec<String>,
+    /// Which of them were checked (not quoted, nor the signature).
+    checked: Vec<bool>,
+    /// What isn't checked: quotes, the signature.
+    unchecked: spell::Unchecked,
+    /// Each of them's misspelled words.
+    spans: Vec<Vec<(usize, usize)>>,
+    /// The text's height on the screen, as last drawn.
+    height: usize,
+    /// Words offered for a misspelled one.
+    suggesting: Option<Suggesting>,
     /// A question on the bottom line.
     question: Option<Question>,
     /// The first key of a two-key command (vim's `Z`, emacs's `C-x`).
@@ -200,6 +255,17 @@ impl Builtin {
             given: (text.to_owned(), held),
             meta: false,
             command: None,
+            asking: Asking::Command,
+            speller: None,
+            spell: false,
+            misspelled: HashMap::new(),
+            chars: Vec::new(),
+            lines: Vec::new(),
+            checked: Vec::new(),
+            unchecked: spell::Unchecked::default(),
+            spans: Vec::new(),
+            height: 50,
+            suggesting: None,
             question: None,
             prefix: None,
             last: None,
@@ -211,6 +277,22 @@ impl Builtin {
     /// The text being edited.
     pub fn text(&self) -> String {
         String::from(self.state.lines.clone())
+    }
+
+    /// Checks the spelling with `speller` (once loaded), if `check`, but
+    /// not in what is `unchecked`.
+    pub fn set_spelling(
+        &mut self,
+        speller: Option<Arc<Speller>>,
+        check: bool,
+        unchecked: spell::Unchecked,
+    ) {
+        self.speller = speller;
+        self.spell = check;
+        self.unchecked = unchecked;
+        self.misspelled.clear();
+        self.forget();
+        self.recheck();
     }
 
     /// Says `note` on the bottom line, until the next key.
@@ -252,9 +334,17 @@ impl Builtin {
         Outcome::Done(if text == held { given } else { text })
     }
 
-    /// Applies a key press.
+    /// Applies a key press. (The spelling is checked when the text is
+    /// drawn next: once for keys that come at once.)
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
+        self.press(key)
+    }
+
+    fn press(&mut self, key: KeyEvent) -> Outcome {
         self.note = None;
+        if self.suggesting.is_some() {
+            return self.choose(key);
+        }
         if let Some(question) = self.question {
             return self.answer(question, key);
         }
@@ -267,7 +357,10 @@ impl Builtin {
                 }
                 lineedit::Outcome::Done(line) => {
                     self.command = None;
-                    self.run(line.trim())
+                    match self.asking {
+                        Asking::Command => self.run(line.trim()),
+                        Asking::Dictionary => self.set_langs(line.trim()),
+                    }
                 }
             };
         }
@@ -314,6 +407,15 @@ impl Builtin {
                 self.leave_asking(Question::SaveChanges)
             }
             (Keys::Emacs, "kill-buffer") => self.leave_asking(Question::DiscardChanges),
+            (Keys::Emacs, "flyspell-mode") => self.toggle_spell(None),
+            (Keys::Emacs, "ispell-change-dictionary") => {
+                self.ask(Asking::Dictionary);
+                Outcome::Editing
+            }
+            (Keys::Vim, command) if vim_set(command).is_some() => {
+                let setting = vim_set(command).unwrap_or_default();
+                self.vim_set(setting)
+            }
             (Keys::Vim, _) => {
                 self.note = Some(format!("E492: Not an editor command: {command}"));
                 Outcome::Editing
@@ -322,6 +424,292 @@ impl Builtin {
                 self.note = Some(format!("{command}: no such command"));
                 Outcome::Editing
             }
+        }
+    }
+
+    /// Opens the bottom line for typing what `asking` is for.
+    fn ask(&mut self, asking: Asking) {
+        self.asking = asking;
+        self.command = Some(LineEditor::new(""));
+    }
+
+    /// vim's `:set` of `setting`: spelling's (`spell`, `nospell`, `spell!`,
+    /// `spelllang=`).
+    fn vim_set(&mut self, setting: &str) -> Outcome {
+        match setting {
+            "spell" => self.toggle_spell(Some(true)),
+            "nospell" => self.toggle_spell(Some(false)),
+            "spell!" | "invspell" => self.toggle_spell(None),
+            _ => match setting
+                .strip_prefix("spelllang=")
+                .or_else(|| setting.strip_prefix("spl="))
+            {
+                Some(langs) => self.set_langs(langs),
+                None => {
+                    self.note = Some(format!("E518: Unknown option: {setting}"));
+                    Outcome::Editing
+                }
+            },
+        }
+    }
+
+    /// Turns spell checking on or off (`on`), or the other way (`None`);
+    /// mett's `spell_check` follows.
+    fn toggle_spell(&mut self, on: Option<bool>) -> Outcome {
+        let on = on.unwrap_or(!self.spell);
+        self.spell = on;
+        self.note = Some(format!("Spell checking {}", if on { "on" } else { "off" }));
+        Outcome::Configure(format!("set spell_check={}", if on { "yes" } else { "no" }))
+    }
+
+    /// Checks with the dictionaries `langs` names (`en_US,es_ES`); mett's
+    /// `spell_lang` follows.
+    fn set_langs(&mut self, langs: &str) -> Outcome {
+        let valid = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ',');
+        if langs.is_empty() || !langs.chars().all(valid) {
+            self.note = Some(format!("{langs:?}: not dictionary names"));
+            return Outcome::Editing;
+        }
+        self.spell = true;
+        Outcome::Configure(format!("set spell_check=yes spell_lang=\"{langs}\""))
+    }
+
+    /// The text's lines.
+    fn rows(&self) -> Vec<String> {
+        self.text().split('\n').map(str::to_owned).collect()
+    }
+
+    /// Underlines the misspelled words, checking the lines that changed.
+    fn recheck(&mut self) {
+        let Some(speller) = self.speller.clone().filter(|_| self.spell) else {
+            if !self.state.highlights.is_empty() {
+                self.state.clear_highlights();
+            }
+            self.forget();
+            return;
+        };
+        // The lines changed since: from the first that differs from the
+        // top, to the last that differs from the bottom.
+        let lines = &self.state.lines;
+        let (new, old) = (lines.len(), self.chars.len());
+        let same = |row: usize, was: &Vec<char>| {
+            lines
+                .get(RowIndex::new(row))
+                .is_some_and(|line| line.as_slice() == was.as_slice())
+        };
+        let mut top = 0;
+        while top < new.min(old) && same(top, &self.chars[top]) {
+            top += 1;
+        }
+        if top == new && new == old {
+            return;
+        }
+        let mut bottom = 0;
+        while bottom < (new - top).min(old - top)
+            && same(new - 1 - bottom, &self.chars[old - 1 - bottom])
+        {
+            bottom += 1;
+        }
+        let changed: Vec<Vec<char>> = (top..new - bottom)
+            .map(|row| {
+                lines
+                    .get(RowIndex::new(row))
+                    .map(|line| line.as_slice().to_vec())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let count = changed.len();
+        let text: Vec<String> = changed.iter().map(|line| line.iter().collect()).collect();
+        self.chars.splice(top..old - bottom, changed);
+        self.lines.splice(top..old - bottom, text);
+        self.spans
+            .splice(top..old - bottom, std::iter::repeat_n(Vec::new(), count));
+        // (Changed lines are checked whatever they were.)
+        self.checked
+            .splice(top..old - bottom, std::iter::repeat_n(false, count));
+        // Lines edited away are forgotten, now and then.
+        if self.misspelled.len() > 4 * new + 1000 {
+            self.misspelled.clear();
+        }
+        // Quoting and the signature may have changed for others too.
+        let checked = self.unchecked.rows(&self.lines);
+        for (row, &now) in checked.iter().enumerate() {
+            if (top..top + count).contains(&row) || now != self.checked[row] {
+                let line = &self.lines[row];
+                self.spans[row] = if now {
+                    self.misspelled
+                        .entry(line.clone())
+                        .or_insert_with(|| speller.misspelled(line))
+                        .clone()
+                } else {
+                    Vec::new()
+                };
+            }
+        }
+        self.checked = checked;
+        self.underline();
+    }
+
+    /// Forgets the lines as last checked: all are checked again.
+    fn forget(&mut self) {
+        self.chars.clear();
+        self.lines.clear();
+        self.checked.clear();
+        self.spans.clear();
+    }
+
+    /// Underlines the misspelled words on the screen and around it:
+    /// edtui looks each cell up in them, so not in the whole text.
+    fn underline(&mut self) {
+        let style = Style::new()
+            .add_modifier(Modifier::UNDERLINED)
+            .underline_color(Color::Red);
+        // The screen follows the cursor: it is within a screen of it.
+        let at = self.state.cursor.row;
+        let rows = at.saturating_sub(2 * self.height)..at + 2 * self.height;
+        let highlights = self
+            .spans
+            .iter()
+            .enumerate()
+            .skip(rows.start)
+            .take(rows.len())
+            .flat_map(|(row, spans)| {
+                spans.iter().map(move |&(start, end)| {
+                    Highlight::new(Index2::new(row, start), Index2::new(row, end), style)
+                })
+            })
+            .collect();
+        self.state.set_highlights(highlights);
+    }
+
+    /// The misspelled words, in order: their rows, first and last columns.
+    fn misspellings(&self) -> Vec<(usize, usize, usize)> {
+        self.spans
+            .iter()
+            .enumerate()
+            .flat_map(|(row, spans)| spans.iter().map(move |&(start, end)| (row, start, end)))
+            .collect()
+    }
+
+    /// Goes to the next misspelled word (or, not `forward`, the one
+    /// before), from the other end past the last; and offers others for
+    /// it, if `suggest`.
+    fn next_misspelling(&mut self, forward: bool, suggest: bool) {
+        self.recheck();
+        if !self.spell || self.speller.is_none() {
+            self.note = Some("Spell checking is off".into());
+            return;
+        }
+        let all = self.misspellings();
+        let at = (self.state.cursor.row, self.state.cursor.col);
+        let found = if forward {
+            all.iter().find(|(r, s, _)| (*r, *s) > at).or(all.first())
+        } else {
+            all.iter()
+                .rev()
+                .find(|(r, s, _)| (*r, *s) < at)
+                .or(all.last())
+        };
+        let Some(&(row, start, end)) = found else {
+            self.note = Some("No misspelled words".into());
+            return;
+        };
+        self.deselect();
+        self.state.cursor = Index2::new(row, start);
+        if suggest {
+            self.suggest(row, start, end);
+        }
+    }
+
+    /// The word at the cursor (or just before it): its row, first and last
+    /// columns.
+    fn word_at_cursor(&self) -> Option<(usize, usize, usize)> {
+        let Index2 { row, col } = self.state.cursor;
+        let line = self.rows().into_iter().nth(row)?;
+        spell::words(&line)
+            .into_iter()
+            .find(|&(start, end)| start <= col && col <= end + 1)
+            .map(|(start, end)| (row, start, end))
+    }
+
+    /// Offers others for the word at the cursor.
+    fn suggest_at_cursor(&mut self) {
+        match self.word_at_cursor() {
+            Some((row, start, end)) => self.suggest(row, start, end),
+            None => self.note = Some("No word here".into()),
+        }
+    }
+
+    /// Offers others for the word in `row` from `start` to `end`.
+    fn suggest(&mut self, row: usize, start: usize, end: usize) {
+        let Some(speller) = self.speller.clone() else {
+            self.note = Some("The dictionaries aren't loaded yet".into());
+            return;
+        };
+        let word: String = self.rows()[row]
+            .chars()
+            .skip(start)
+            .take(end + 1 - start)
+            .collect();
+        let mut words = speller.suggest(&word);
+        words.truncate(9);
+        self.suggesting = Some(Suggesting {
+            row,
+            start,
+            end,
+            word,
+            words,
+        });
+    }
+
+    /// Takes the word at the cursor as spelled right from now on.
+    fn add_word_at_cursor(&mut self) -> Outcome {
+        let Some((row, start, end)) = self.word_at_cursor() else {
+            self.note = Some("No word here".into());
+            return Outcome::Editing;
+        };
+        let word: String = self.rows()[row]
+            .chars()
+            .skip(start)
+            .take(end + 1 - start)
+            .collect();
+        self.add_word(word)
+    }
+
+    fn add_word(&mut self, word: String) -> Outcome {
+        if let Some(speller) = &self.speller {
+            speller.add(&word);
+        }
+        // Lines with it are checked again.
+        self.misspelled.clear();
+        self.forget();
+        self.note = Some(format!("\"{word}\" added to your words"));
+        Outcome::AddWord(word)
+    }
+
+    /// Answers the words offered: a digit puts that one in place of the
+    /// misspelled word, `a` adds it to the user's words; any other key
+    /// gives up.
+    fn choose(&mut self, key: KeyEvent) -> Outcome {
+        let Some(offer) = self.suggesting.take() else {
+            return Outcome::Editing;
+        };
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') if plain(key) => {
+                let index = c as usize - '1' as usize;
+                if let Some(word) = offer.words.get(index) {
+                    let region = (
+                        Index2::new(offer.row, offer.start),
+                        Index2::new(offer.row, offer.end + 1),
+                    );
+                    self.deselect();
+                    self.delete(region);
+                    self.insert(word);
+                }
+                Outcome::Editing
+            }
+            KeyCode::Char('a') if plain(key) => self.add_word(offer.word),
+            _ => Outcome::Editing,
         }
     }
 
@@ -349,19 +737,33 @@ impl Builtin {
         self.last = Some(key);
         if !argument {
             if let Some(prefix) = self.prefix.take() {
-                match (prefix.code, key.code) {
-                    (_, KeyCode::Char('Z')) => return self.save_and_leave(),
-                    (_, KeyCode::Char('Q')) => return self.leave(),
-                    // `Z` and another key: neither does anything.
-                    _ => return Outcome::Editing,
-                }
+                return match (prefix.code, key.code) {
+                    (KeyCode::Char('Z'), KeyCode::Char('Z')) => self.save_and_leave(),
+                    (KeyCode::Char('Z'), KeyCode::Char('Q')) => self.leave(),
+                    (KeyCode::Char(']'), KeyCode::Char('s')) => {
+                        self.next_misspelling(true, false);
+                        Outcome::Editing
+                    }
+                    (KeyCode::Char('['), KeyCode::Char('s')) => {
+                        self.next_misspelling(false, false);
+                        Outcome::Editing
+                    }
+                    (KeyCode::Char('z'), KeyCode::Char('=')) => {
+                        self.suggest_at_cursor();
+                        Outcome::Editing
+                    }
+                    (KeyCode::Char('z'), KeyCode::Char('g')) => self.add_word_at_cursor(),
+                    // A prefix and another key: neither does anything.
+                    _ => Outcome::Editing,
+                };
             }
             match key.code {
                 KeyCode::Char(':') if plain(key) => {
-                    self.command = Some(LineEditor::new(""));
+                    self.ask(Asking::Command);
                     return Outcome::Editing;
                 }
-                KeyCode::Char('Z') => {
+                // `ZZ`, `ZQ`; `]s`, `[s`; `z=`, `zg`.
+                KeyCode::Char('Z' | ']' | '[' | 'z') if plain(key) => {
                     self.prefix = Some(key);
                     return Outcome::Editing;
                 }
@@ -373,7 +775,20 @@ impl Builtin {
     }
 
     fn emacs(&mut self, key: KeyEvent) -> Outcome {
-        if let Some(_prefix) = self.prefix.take() {
+        if self
+            .prefix
+            .take_if(|prefix| prefix.modifiers == KeyModifiers::ALT)
+            .is_some()
+        {
+            // `M-g n`, `M-g p`: the next or previous misspelled word.
+            match key.code {
+                KeyCode::Char('n') => self.next_misspelling(true, false),
+                KeyCode::Char('p') => self.next_misspelling(false, false),
+                _ if is_ctrl(key, 'g') => {}
+                _ => self.note = Some(format!("M-g {} is undefined", describe(key))),
+            }
+            return Outcome::Editing;
+        } else if let Some(_prefix) = self.prefix.take() {
             if is_ctrl(key, 'c') {
                 return self.leave_asking(Question::SaveChanges);
             }
@@ -400,10 +815,13 @@ impl Builtin {
         } else {
             key
         };
-        if is_ctrl(key, 'x') {
+        let meta = |c: char| key.code == KeyCode::Char(c) && key.modifiers == KeyModifiers::ALT;
+        if is_ctrl(key, 'x') || meta('g') {
             self.prefix = Some(key);
-        } else if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::ALT {
-            self.command = Some(LineEditor::new(""));
+        } else if meta('x') {
+            self.ask(Asking::Command);
+        } else if meta('$') {
+            self.suggest_at_cursor();
         } else if is_ctrl(key, ' ') || is_ctrl(key, '@') {
             self.anchor = Some(self.state.cursor);
             self.state.selection = None;
@@ -454,9 +872,25 @@ impl Builtin {
         if key.code == KeyCode::Esc && key.modifiers.is_empty() {
             return self.leave_asking(Question::DiscardChanges);
         }
-        if key.code == KeyCode::F(3) {
-            self.find_again(!key.modifiers.contains(KeyModifiers::SHIFT));
-            return Outcome::Editing;
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::F(3) => {
+                self.find_again(!shift);
+                return Outcome::Editing;
+            }
+            // F7 turns spelling on and off; F8 goes to the next misspelled
+            // word, and offers others; `^.` offers them for the word at the
+            // cursor.
+            KeyCode::F(7) => return self.toggle_spell(None),
+            KeyCode::F(8) => {
+                self.next_misspelling(!shift, true);
+                return Outcome::Editing;
+            }
+            _ if is_ctrl(key, '.') => {
+                self.suggest_at_cursor();
+                return Outcome::Editing;
+            }
+            _ => {}
         }
         let selected = self.region();
         if moves(key) && key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -617,9 +1051,15 @@ impl Builtin {
     /// Inserts pasted `text` at the cursor (in place of Notepad's
     /// selection), or in the command being typed.
     pub fn paste(&mut self, text: &str) {
+        self.paste_text(text);
+    }
+
+    fn paste_text(&mut self, text: &str) {
         if self.question.is_some() {
             return;
         }
+        // The words offered were for text that may move.
+        self.suggesting = None;
         if let Some(command) = &mut self.command {
             command.insert_text(text);
             return;
@@ -736,8 +1176,36 @@ impl Builtin {
                 cursor: 0,
             };
         }
+        if let Some(offer) = &self.suggesting {
+            // As many as fit, the best first.
+            let prompt_width = offer.word.chars().count() + 2;
+            let add = "  (a: add it to your words)";
+            let room = width.saturating_sub(prompt_width + add.len());
+            let mut offered = String::new();
+            for (i, word) in offer.words.iter().enumerate() {
+                let item = format!("{}{} {word}", if i > 0 { "  " } else { "" }, i + 1);
+                if i > 0 && offered.chars().count() + item.chars().count() > room {
+                    break;
+                }
+                offered.push_str(&item);
+            }
+            if offered.is_empty() {
+                offered = "no suggestions".to_owned();
+            }
+            let text = format!("{offered}{add}");
+            return Bottom::Prompt {
+                prompt: format!("{}: ", offer.word),
+                // The cursor after it all, waiting for the choice.
+                cursor: unicode_width::UnicodeWidthStr::width(text.as_str()),
+                text,
+            };
+        }
         if let Some(command) = &self.command {
-            let prompt = if self.keys == Keys::Vim { ":" } else { "M-x " };
+            let prompt = match (self.asking, self.keys) {
+                (Asking::Dictionary, _) => "Use new dictionary: ",
+                (Asking::Command, Keys::Vim) => ":",
+                (Asking::Command, _) => "M-x ",
+            };
             let (text, cursor) = command.view(width.saturating_sub(prompt.len()));
             return Bottom::Prompt {
                 prompt: prompt.into(),
@@ -785,6 +1253,12 @@ impl Builtin {
         text: Style,
         selection: Style,
     ) -> Option<Position> {
+        // Checked as it now is, and underlined where it is shown.
+        self.height = usize::from(area.height);
+        self.recheck();
+        if self.spell && !self.spans.is_empty() {
+            self.underline();
+        }
         let theme = EditorTheme::default()
             .base(text)
             .cursor_style(text.add_modifier(ratatui::style::Modifier::REVERSED))
@@ -796,6 +1270,7 @@ impl Builtin {
             .render(area, buf);
         let typing_below = self.question.is_some()
             || self.command.is_some()
+            || self.suggesting.is_some()
             || self.state.mode == EditorMode::Search;
         if typing_below {
             None
@@ -803,6 +1278,15 @@ impl Builtin {
             self.state.cursor_screen_position()
         }
     }
+}
+
+/// The setting vim's `command` sets (`set spell`, `setlocal spell`,
+/// `se spell`), if it sets one.
+fn vim_set(command: &str) -> Option<&str> {
+    ["set ", "setlocal ", "se ", "setl "]
+        .iter()
+        .find_map(|set| command.strip_prefix(set))
+        .map(str::trim)
 }
 
 /// Notepad's keys, as those of most graphical editors. Selecting with
@@ -1343,6 +1827,133 @@ mod tests {
         );
         notepad.paste("x");
         assert_eq!(notepad.text(), "Zb\n");
+    }
+
+    /// The en_US dictionary, for one test: words added go to it alone.
+    fn speller() -> Arc<Speller> {
+        Arc::new(Speller::load(&spell::Settings::default(), None).unwrap())
+    }
+
+    fn spelling(text: &str, keys: Keys) -> Builtin {
+        let mut editor = Builtin::new(text, keys);
+        editor.set_spelling(Some(speller()), true, spell::Unchecked::default());
+        editor
+    }
+
+    fn underlined(editor: &mut Builtin) -> Vec<(usize, usize, usize)> {
+        // As drawing does.
+        editor.recheck();
+        editor
+            .state
+            .highlights
+            .iter()
+            .map(|h| (h.start().row, h.start().col, h.end().col))
+            .collect()
+    }
+
+    #[test]
+    fn misspelled_words_are_underlined() {
+        let mut vim = spelling("Thsi is fine.\n> qoted\n-- \nMee\n", Keys::Vim);
+        // Not in quotes, nor in the signature.
+        assert_eq!(underlined(&mut vim), [(0, 0, 3)]);
+        press(&mut vim, &chars("A wrnog\x1b"));
+        assert_eq!(underlined(&mut vim), [(0, 0, 3), (0, 14, 18)]);
+        // Off and on again; mett's settings follow.
+        assert_eq!(
+            press(&mut vim, &chars(":set nospell\n")),
+            Outcome::Configure("set spell_check=no".into())
+        );
+        assert_eq!(underlined(&mut vim), []);
+        assert_eq!(
+            press(&mut vim, &chars(":set spell!\n")),
+            Outcome::Configure("set spell_check=yes".into())
+        );
+        assert_eq!(underlined(&mut vim).len(), 2);
+        assert_eq!(
+            press(&mut vim, &chars(":set spelllang=en_us,es_es\n")),
+            Outcome::Configure("set spell_check=yes spell_lang=\"en_us,es_es\"".into())
+        );
+        press(&mut vim, &chars(":set spelllang=x\"y\n"));
+        assert!(matches!(vim.bottom(80), Bottom::Note(n) if n.contains("not dictionary names")));
+    }
+
+    #[test]
+    fn pasted_text_is_checked() {
+        let mut notepad = spelling("Fine\n", Keys::Notepad);
+        // At the cursor, at the start: " wrnogFine".
+        notepad.paste(" wrnog");
+        assert_eq!(underlined(&mut notepad), [(0, 1, 9)]);
+    }
+
+    #[test]
+    fn vim_goes_to_misspelled_words_and_suggests() {
+        let mut vim = spelling("Thsi is a mispeled line.\n", Keys::Vim);
+        press(&mut vim, &chars("]s"));
+        assert_eq!(vim.state.cursor, Index2::new(0, 10));
+        press(&mut vim, &chars("]s"));
+        assert_eq!(vim.state.cursor, Index2::new(0, 0), "from the start again");
+        press(&mut vim, &chars("[s"));
+        assert_eq!(vim.state.cursor, Index2::new(0, 10));
+        press(&mut vim, &chars("z="));
+        assert!(matches!(vim.bottom(80), Bottom::Prompt { prompt, .. } if prompt == "mispeled: "));
+        press(&mut vim, &chars("1"));
+        assert_eq!(vim.text(), "Thsi is a misspelled line.\n");
+        // `zg` takes the word as spelled right.
+        press(&mut vim, &chars("0"));
+        assert_eq!(
+            press(&mut vim, &chars("zg")),
+            Outcome::AddWord("Thsi".into())
+        );
+        assert_eq!(underlined(&mut vim), []);
+        // Undoing the replacement brings the misspelled word back.
+        press(&mut vim, &chars("u"));
+        assert_eq!(vim.text(), "Thsi is a mispeled line.\n");
+    }
+
+    #[test]
+    fn emacs_and_notepad_spelling_keys() {
+        let mut emacs = spelling("one twoo\n", Keys::Emacs);
+        press(&mut emacs, &[alt('g'), KeyEvent::from(KeyCode::Char('n'))]);
+        assert_eq!(emacs.state.cursor, Index2::new(0, 4));
+        press(&mut emacs, &[alt('$')]);
+        assert!(matches!(emacs.bottom(80), Bottom::Prompt { prompt, .. } if prompt == "twoo: "));
+        press(&mut emacs, &chars("a"));
+        assert_eq!(underlined(&mut emacs), []);
+        press(&mut emacs, &[alt('x')]);
+        assert_eq!(
+            press(&mut emacs, &chars("flyspell-mode\n")),
+            Outcome::Configure("set spell_check=no".into())
+        );
+        press(&mut emacs, &[alt('x')]);
+        press(&mut emacs, &chars("ispell-change-dictionary\n"));
+        assert!(
+            matches!(emacs.bottom(80), Bottom::Prompt { prompt, .. } if prompt == "Use new dictionary: ")
+        );
+        assert_eq!(
+            press(&mut emacs, &chars("en_GB\n")),
+            Outcome::Configure("set spell_check=yes spell_lang=\"en_GB\"".into())
+        );
+
+        let mut notepad = spelling("Fine wrods\n", Keys::Notepad);
+        // F8 goes to the next, and offers others; a digit picks one.
+        press(&mut notepad, &[KeyEvent::from(KeyCode::F(8))]);
+        assert_eq!(notepad.state.cursor, Index2::new(0, 5));
+        let words = match notepad.bottom(80) {
+            Bottom::Prompt { text, .. } => text,
+            other => panic!("{other:?}"),
+        };
+        assert!(words.starts_with("1 words"), "{words}");
+        press(&mut notepad, &chars("1"));
+        assert_eq!(notepad.text(), "Fine words\n");
+        assert_eq!(
+            press(&mut notepad, &[KeyEvent::from(KeyCode::F(7))]),
+            Outcome::Configure("set spell_check=no".into())
+        );
+        press(&mut notepad, &[KeyEvent::from(KeyCode::F(8))]);
+        assert_eq!(
+            notepad.bottom(80),
+            Bottom::Note("Spell checking is off".into())
+        );
     }
 
     #[test]

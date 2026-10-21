@@ -60,6 +60,26 @@ impl App {
                     self.editing = None;
                     self.on_edited(Ok(text))
                 }
+                // `:set spell`, say: mett's own settings follow.
+                crate::editor::builtin::Outcome::Configure(command) => {
+                    self.configuring += 1;
+                    vec![Effect::Command(command)]
+                }
+                crate::editor::builtin::Outcome::AddWord(word) => {
+                    // Also in the dictionaries kept for later, which the
+                    // editor may not have (with spelling off).
+                    if let Some((loaded, speller)) = &self.speller
+                        && loaded.words == self.settings.spell.words
+                    {
+                        speller.add(&word);
+                    }
+                    let file = self.settings.spell.words.clone();
+                    self.added_words.push((file, word.clone()));
+                    match self.settings.spell.words.clone() {
+                        Some(path) => vec![Effect::AddWord { path, word }],
+                        None => Vec::new(),
+                    }
+                }
             };
         }
         // Keys wait for a file being read or saved; `^G` gives up on it.
@@ -414,8 +434,11 @@ impl App {
         } else {
             self.fail(problems.join("; "));
         }
+        // The spelling settings may have changed.
+        let mut effects = self.respell();
         // Checking for new mail may have been turned on.
-        self.arm_poll()
+        effects.extend(self.arm_poll());
+        effects
     }
 }
 
