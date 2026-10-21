@@ -28,6 +28,7 @@ use edtui::clipboard::ClipboardTrait;
 use edtui::events::{KeyEventHandler, KeyEventRegister, KeyInput};
 use edtui::{
     EditorEventHandler, EditorMode, EditorState, EditorTheme, EditorView, Highlight, Index2, Lines,
+    RowIndex,
 };
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -177,12 +178,15 @@ pub struct Builtin {
     spell: bool,
     /// Lines' misspelled words (their columns), by the lines' text.
     misspelled: HashMap<String, Vec<(usize, usize)>>,
-    /// The text as last checked: a key that didn't change it (moving the
-    /// cursor, say) needs no checking.
-    checked: Option<Lines>,
+    /// The lines as last checked: only those changed since are checked
+    /// again. (As characters, to compare quickly, and as text.)
+    chars: Vec<Vec<char>>,
+    lines: Vec<String>,
+    /// Which of them were checked (not quoted, nor the signature).
+    checked: Vec<bool>,
     /// What isn't checked: quotes, the signature.
     unchecked: spell::Unchecked,
-    /// Each line's misspelled words, as last checked.
+    /// Each of them's misspelled words.
     spans: Vec<Vec<(usize, usize)>>,
     /// The text's height on the screen, as last drawn.
     height: usize,
@@ -255,7 +259,9 @@ impl Builtin {
             speller: None,
             spell: false,
             misspelled: HashMap::new(),
-            checked: None,
+            chars: Vec::new(),
+            lines: Vec::new(),
+            checked: Vec::new(),
             unchecked: spell::Unchecked::default(),
             spans: Vec::new(),
             height: 50,
@@ -285,7 +291,7 @@ impl Builtin {
         self.spell = check;
         self.unchecked = unchecked;
         self.misspelled.clear();
-        self.checked = None;
+        self.forget();
         self.recheck();
     }
 
@@ -479,33 +485,77 @@ impl Builtin {
             if !self.state.highlights.is_empty() {
                 self.state.clear_highlights();
             }
-            self.spans.clear();
-            self.checked = None;
+            self.forget();
             return;
         };
-        if self.checked.as_ref() == Some(&self.state.lines) {
+        // The lines changed since: from the first that differs from the
+        // top, to the last that differs from the bottom.
+        let lines = &self.state.lines;
+        let (new, old) = (lines.len(), self.chars.len());
+        let same = |row: usize, was: &Vec<char>| {
+            lines
+                .get(RowIndex::new(row))
+                .is_some_and(|line| line.as_slice() == was.as_slice())
+        };
+        let mut top = 0;
+        while top < new.min(old) && same(top, &self.chars[top]) {
+            top += 1;
+        }
+        if top == new && new == old {
             return;
         }
-        self.checked = Some(self.state.lines.clone());
-        let rows = self.rows();
-        // Lines edited away are forgotten, now and then.
-        if self.misspelled.len() > 4 * rows.len() + 1000 {
-            self.misspelled.clear();
+        let mut bottom = 0;
+        while bottom < (new - top).min(old - top)
+            && same(new - 1 - bottom, &self.chars[old - 1 - bottom])
+        {
+            bottom += 1;
         }
-        let checked = self.unchecked.rows(&rows);
-        self.spans = rows
-            .iter()
-            .zip(checked)
-            .map(|(line, checked)| match checked {
-                true => self
-                    .misspelled
-                    .entry(line.clone())
-                    .or_insert_with(|| speller.misspelled(line))
-                    .clone(),
-                false => Vec::new(),
+        let changed: Vec<Vec<char>> = (top..new - bottom)
+            .map(|row| {
+                lines
+                    .get(RowIndex::new(row))
+                    .map(|line| line.as_slice().to_vec())
+                    .unwrap_or_default()
             })
             .collect();
+        let count = changed.len();
+        let text: Vec<String> = changed.iter().map(|line| line.iter().collect()).collect();
+        self.chars.splice(top..old - bottom, changed);
+        self.lines.splice(top..old - bottom, text);
+        self.spans
+            .splice(top..old - bottom, std::iter::repeat_n(Vec::new(), count));
+        // (Changed lines are checked whatever they were.)
+        self.checked
+            .splice(top..old - bottom, std::iter::repeat_n(false, count));
+        // Lines edited away are forgotten, now and then.
+        if self.misspelled.len() > 4 * new + 1000 {
+            self.misspelled.clear();
+        }
+        // Quoting and the signature may have changed for others too.
+        let checked = self.unchecked.rows(&self.lines);
+        for (row, &now) in checked.iter().enumerate() {
+            if (top..top + count).contains(&row) || now != self.checked[row] {
+                let line = &self.lines[row];
+                self.spans[row] = if now {
+                    self.misspelled
+                        .entry(line.clone())
+                        .or_insert_with(|| speller.misspelled(line))
+                        .clone()
+                } else {
+                    Vec::new()
+                };
+            }
+        }
+        self.checked = checked;
         self.underline();
+    }
+
+    /// Forgets the lines as last checked: all are checked again.
+    fn forget(&mut self) {
+        self.chars.clear();
+        self.lines.clear();
+        self.checked.clear();
+        self.spans.clear();
     }
 
     /// Underlines the misspelled words on the screen and around it:
@@ -632,7 +682,7 @@ impl Builtin {
         }
         // Lines with it are checked again.
         self.misspelled.clear();
-        self.checked = None;
+        self.forget();
         self.note = Some(format!("\"{word}\" added to your words"));
         Outcome::AddWord(word)
     }
