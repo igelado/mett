@@ -15,6 +15,7 @@ pub(crate) const MEETING_FIELDS: &str = "microsoft.graph.eventMessage/meetingMes
     microsoft.graph.eventMessageRequest/meetingRequestType,\
     microsoft.graph.eventMessageRequest/isOutOfDate,\
     microsoft.graph.eventMessageRequest/isAllDay,\
+    microsoft.graph.eventMessageRequest/responseType,\
     microsoft.graph.eventMessageRequest/responseRequested,\
     microsoft.graph.eventMessageRequest/startDateTime,\
     microsoft.graph.eventMessageRequest/endDateTime,\
@@ -123,6 +124,9 @@ pub(crate) struct MeetingMessage {
     meeting_request_type: Option<String>,
     #[serde(default)]
     is_out_of_date: bool,
+    /// How the owner answered, as the message says: all there is of it
+    /// once the event is gone from the calendar (declining removes it).
+    response_type: Option<String>,
     /// Whether the meeting lasts whole days, as the message says (the
     /// event, when it is there, says it too).
     is_all_day: Option<bool>,
@@ -275,6 +279,7 @@ impl MeetingMessage {
                 .as_ref()
                 .and_then(|e| e.response_status.as_ref())
                 .and_then(|s| s.response.as_deref())
+                .or(self.response_type.as_deref())
             {
                 Some("organizer") => Reply::Organizer,
                 Some("accepted") => Reply::Accepted,
@@ -490,6 +495,21 @@ mod tests {
         let mut message = request();
         message["event"]["responseStatus"]["response"] = json!("tentativelyAccepted");
         assert_eq!(read(message).unwrap().reply, Reply::Tentative);
+    }
+
+    #[test]
+    fn a_declined_meeting_leaves_the_calendar_but_stays_declined() {
+        let mut message = request();
+        message["event"] = json!(null);
+        message["responseType"] = json!("declined");
+        let invitation = read(message).unwrap();
+        assert_eq!(invitation.reply, Reply::Declined);
+        assert!(invitation.event.is_none());
+        // The event, when it is there, is what is believed.
+        let mut message = request();
+        message["responseType"] = json!("declined");
+        message["event"]["responseStatus"]["response"] = json!("accepted");
+        assert_eq!(read(message).unwrap().reply, Reply::Accepted);
     }
 
     #[test]

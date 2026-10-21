@@ -1062,8 +1062,9 @@ impl<A: Authenticator> GraphMailStore<A> {
     ) -> Result<()> {
         let about = About::message(id.as_str());
         let Some(event) = invitation.event.as_deref() else {
+            // Declining takes a meeting out of the calendar.
             return Err(Error::Backend(
-                "the meeting isn't in your calendar yet".into(),
+                "the meeting isn't in your calendar (declined ones leave it)".into(),
             ));
         };
         let target = if invitation.repeats() {
