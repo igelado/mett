@@ -14,6 +14,7 @@ use crate::mailbox::EmailAddress;
 /// documented types have: Graph refuses a `$select` of any other property,
 /// which would fail every message.)
 pub(crate) const MEETING_FIELDS: &str = "microsoft.graph.eventMessage/meetingMessageType,\
+    microsoft.graph.eventMessageRequest/type,\
     microsoft.graph.eventMessageRequest/isOutOfDate,\
     microsoft.graph.eventMessageRequest/previousStartDateTime,\
     microsoft.graph.eventMessageRequest/previousEndDateTime,\
@@ -122,6 +123,9 @@ impl Instances {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingMessage {
     meeting_message_type: Option<String>,
+    /// What kind of meeting it is, as the event says.
+    #[serde(rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     is_out_of_date: bool,
     /// What an update changed, which a new request doesn't have.
@@ -141,6 +145,9 @@ pub(crate) struct MeetingMessage {
 #[serde(rename_all = "camelCase")]
 struct Event {
     id: Option<String>,
+    /// `singleInstance`, `occurrence`, `exception` or `seriesMaster`.
+    #[serde(rename = "type")]
+    kind: Option<String>,
     start: Option<DateTimeZone>,
     end: Option<DateTimeZone>,
     #[serde(default)]
@@ -252,6 +259,14 @@ impl MeetingMessage {
             .and_then(|e| e.recurrence.as_ref())
             .or(self.recurrence.as_ref())
             .and_then(GraphRecurrence::recurrence);
+        let in_series = recurrence.is_some()
+            || matches!(
+                event
+                    .as_ref()
+                    .and_then(|e| e.kind.as_deref())
+                    .or(self.kind.as_deref()),
+                Some("occurrence" | "exception" | "seriesMaster")
+            );
         Some(Invitation {
             kind,
             title: None,
@@ -291,6 +306,7 @@ impl MeetingMessage {
                 .response_requested
                 .or(event.as_ref().and_then(|e| e.response_requested))
                 .unwrap_or(true),
+            in_series,
             event: event.and_then(|e| e.id),
         })
     }
@@ -517,6 +533,24 @@ mod tests {
         );
         assert!(invitation.organizer.is_none());
         assert!(invitation.event.is_none());
+    }
+
+    #[test]
+    fn an_occurrence_is_of_a_series_without_a_recurrence() {
+        assert!(!read(request()).unwrap().in_series);
+        let mut message = request();
+        message["event"]["type"] = json!("occurrence");
+        let invitation = read(message).unwrap();
+        assert!(invitation.in_series && invitation.recurrence.is_none());
+        assert!(invitation.repeats());
+        // The message says it too, when the event is gone.
+        let mut message = request();
+        message["event"] = json!(null);
+        message["type"] = json!("exception");
+        assert!(read(message).unwrap().in_series);
+        let mut message = request();
+        message["type"] = json!("singleInstance");
+        assert!(!read(message).unwrap().in_series);
     }
 
     #[test]

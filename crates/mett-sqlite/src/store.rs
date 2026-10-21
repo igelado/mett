@@ -11,8 +11,7 @@ use chrono::{DateTime, Utc};
 use mett_core::{
     AccountId, Address, Answer, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder,
     FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, RECENT_UNREAD, Reply, Result, Scope, SyncState,
-    WellKnownFolder,
+    MessageSummary, Page, PageCursor, RECENT_UNREAD, Reply, Result, SyncState, WellKnownFolder,
 };
 use tokio::time::Instant;
 
@@ -805,7 +804,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         // What is kept of the meeting is asked again when it is shown, but
         // is what is shown without the server: it says the answer too, when
         // it is the answer of the meeting itself (not of one occurrence).
-        if self.caching() && (answer.scope == Scope::Series || !invitation.repeats()) {
+        if self.caching() && invitation.answer_changes_reply(answer.scope) {
             let _ = self.with_cache(|db| {
                 if let Some(mut message) = db.message(id)? {
                     if let Some(kept) = &mut message.invitation {

@@ -167,6 +167,7 @@ fn demo_invitation(
         reply: Reply::None,
         out_of_date: false,
         response_requested: true,
+        in_series: false,
         event: Some("demo-event".into()),
     }
 }

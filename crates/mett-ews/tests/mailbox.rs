@@ -1669,6 +1669,7 @@ fn meeting(repeats: bool) -> mett_core::Invitation {
         reply: mett_core::Reply::None,
         out_of_date: false,
         response_requested: true,
+        in_series: false,
         event: Some("series-item".into()),
     }
 }

@@ -217,7 +217,7 @@ impl App {
             return Vec::new();
         }
         // An answer for one occurrence leaves the series' as it was.
-        let own = answering.scope == Scope::Series || !answering.invitation.repeats();
+        let own = answering.invitation.answer_changes_reply(answering.scope);
         self.status = if own {
             done(answering.rsvp).into()
         } else {
@@ -272,6 +272,7 @@ mod tests {
             reply: Reply::None,
             out_of_date: false,
             response_requested: true,
+            in_series: false,
             event: Some("ev".into()),
         }
     }
@@ -397,6 +398,27 @@ mod tests {
             prompt(&app).contains("[o]ccurrence 03 Nov,"),
             "{}",
             prompt(&app)
+        );
+    }
+
+    #[test]
+    fn a_message_about_one_occurrence_asks_too_and_shows_its_answer() {
+        let mut one = invitation(false);
+        one.in_series = true;
+        let mut app = showing(Some(one));
+        act(&mut app, Action::AcceptInvite);
+        assert!(prompt(&app).contains("[o]ccurrence"), "{}", prompt(&app));
+        key(&mut app, KeyCode::Char('o'));
+        key(&mut app, KeyCode::Enter);
+        let (id, answer) = answer_request(&key(&mut app, KeyCode::Enter));
+        assert_eq!(answer.scope, Scope::Occurrence);
+        respond(&mut app, id, Event::InvitationAnswered(Ok(())));
+        // What the message says is of that occurrence, so it changes.
+        assert_eq!(app.status, "Accepted.");
+        assert!(
+            lines(&app).contains("Your reply: accepted"),
+            "{}",
+            lines(&app)
         );
     }
 

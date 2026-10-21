@@ -296,16 +296,27 @@ pub struct Invitation {
     pub out_of_date: bool,
     /// Whether the organizer wants an answer.
     pub response_requested: bool,
+    /// Whether the meeting is one of a series (an occurrence the message
+    /// is about, or the series itself), so an answer can cover the series
+    /// or only this one.
+    pub in_series: bool,
     /// What the backend needs to find the meeting again to answer it
     /// (its calendar item), if it isn't the message.
     pub event: Option<String>,
 }
 
 impl Invitation {
-    /// Whether the meeting repeats, so an answer can cover only one
-    /// occurrence.
+    /// Whether the meeting is one of a series, so an answer can cover
+    /// only one occurrence.
     pub fn repeats(&self) -> bool {
-        self.recurrence.is_some()
+        self.recurrence.is_some() || self.in_series
+    }
+
+    /// Whether answering with `scope` changes the reply the message shows:
+    /// not when the message is about the series and the answer is for one
+    /// occurrence of it.
+    pub fn answer_changes_reply(&self, scope: Scope) -> bool {
+        !(scope == Scope::Occurrence && self.recurrence.is_some())
     }
 
     /// Why the message can't be answered, if it can't.
@@ -374,6 +385,37 @@ mod tests {
     }
 
     #[test]
+    fn tells_whether_an_answer_changes_the_reply_shown() {
+        let mut invitation = Invitation {
+            kind: InvitationKind::Request,
+            title: None,
+            start: None,
+            end: None,
+            all_day: false,
+            location: None,
+            organizer: None,
+            attendees: Vec::new(),
+            recurrence: None,
+            reply: Reply::None,
+            out_of_date: false,
+            response_requested: true,
+            in_series: false,
+            event: None,
+        };
+        assert!(!invitation.repeats());
+        assert!(invitation.answer_changes_reply(Scope::Series));
+        // The message is about an occurrence: what is said of it is its.
+        invitation.in_series = true;
+        assert!(invitation.repeats());
+        assert!(invitation.answer_changes_reply(Scope::Series));
+        assert!(invitation.answer_changes_reply(Scope::Occurrence));
+        // About the series: an answer for one occurrence leaves it.
+        invitation.recurrence = Some(Recurrence::new(RecurrenceUnit::Day, 1));
+        assert!(invitation.answer_changes_reply(Scope::Series));
+        assert!(!invitation.answer_changes_reply(Scope::Occurrence));
+    }
+
+    #[test]
     fn only_open_invitations_can_be_answered() {
         let mut invitation = Invitation {
             kind: InvitationKind::Request,
@@ -388,6 +430,7 @@ mod tests {
             reply: Reply::None,
             out_of_date: false,
             response_requested: true,
+            in_series: false,
             event: None,
         };
         assert!(invitation.can_answer());

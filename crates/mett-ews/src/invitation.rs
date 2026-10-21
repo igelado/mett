@@ -26,6 +26,7 @@ pub(crate) const INVITATION_FIELDS: &[&str] = &[
     "calendar:OptionalAttendees",
     "calendar:Recurrence",
     "calendar:IsResponseRequested",
+    "calendar:CalendarItemType",
 ];
 
 /// What `item` says about a meeting, if it is a meeting message.
@@ -101,6 +102,10 @@ pub(crate) fn invitation(item: Node<'_, '_>) -> Option<Invitation> {
         out_of_date: child_text(item, "IsOutOfDate").as_deref() == Some("true")
             || child_text(item, "MeetingRequestType").as_deref() == Some("Outdated"),
         response_requested: child_text(item, "IsResponseRequested").as_deref() != Some("false"),
+        in_series: matches!(
+            child_text(item, "CalendarItemType").as_deref(),
+            Some("Occurrence" | "Exception" | "RecurringMaster")
+        ) || child(item, "Recurrence").is_some(),
         event: child(item, "AssociatedCalendarItemId")
             .and_then(|id| id.attribute("Id"))
             .map(str::to_owned),
@@ -365,6 +370,27 @@ mod tests {
         assert!(invitation.response_requested);
         assert!(invitation.recurrence.is_none());
         assert!(invitation.can_answer());
+    }
+
+    #[test]
+    fn an_occurrence_is_of_a_series() {
+        let item = |kind: &str| {
+            REQUEST.replace(
+                "RECURRENCE",
+                &format!("<t:CalendarItemType>{kind}</t:CalendarItemType>"),
+            )
+        };
+        assert!(!read(&item("Single")).unwrap().in_series);
+        for kind in ["Occurrence", "Exception", "RecurringMaster"] {
+            assert!(read(&item(kind)).unwrap().in_series, "{kind}");
+        }
+        // A pattern says it too.
+        let series = r#"<t:Recurrence><t:DailyRecurrence><t:Interval>1</t:Interval></t:DailyRecurrence></t:Recurrence>"#;
+        assert!(
+            read(&REQUEST.replace("RECURRENCE", series))
+                .unwrap()
+                .in_series
+        );
     }
 
     #[test]
