@@ -68,7 +68,9 @@ impl App {
                 crate::editor::builtin::Outcome::AddWord(word) => {
                     // Also in the dictionaries kept for later, which the
                     // editor may not have (with spelling off).
-                    if let Some((_, speller)) = &self.speller {
+                    if let Some((loaded, speller)) = &self.speller
+                        && loaded.words == self.settings.spell.words
+                    {
                         speller.add(&word);
                     }
                     let file = self.settings.spell.words.clone();
