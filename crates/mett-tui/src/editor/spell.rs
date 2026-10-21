@@ -324,11 +324,21 @@ impl Default for Unchecked {
 impl Unchecked {
     /// From `indent_string` and the signature.
     pub fn new(indent_string: &str, signature: Option<&str>) -> Self {
+        // `> ` is `>`, but spaces alone are the prefix.
+        let quote = match indent_string.trim_end() {
+            "" => indent_string,
+            trimmed => trimmed,
+        };
+        let mut signature: Vec<String> = signature
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default();
+        // Blank lines it ends with end the message too: not compared.
+        while signature.last().is_some_and(|line| line.trim().is_empty()) {
+            signature.pop();
+        }
         Self {
-            quote: indent_string.trim_end().to_owned(),
-            signature: signature
-                .map(|text| text.lines().map(str::to_owned).collect())
-                .unwrap_or_default(),
+            quote: quote.to_owned(),
+            signature,
         }
     }
 
@@ -417,6 +427,10 @@ mod tests {
             unchecked.rows(&text),
             [true, false, true, true, false, false, false]
         );
+        // Spaces as indent_string; a signature ending with a blank line.
+        let unchecked = Unchecked::new("    ", Some("Me\n\n"));
+        let text = lines(&["Hi", "    qoted", "", "Me", ""]);
+        assert_eq!(unchecked.rows(&text), [true, false, true, false, false]);
         // Written below it, it isn't the signature any more.
         let text = lines(&["Mee", "ACME", "PS: more"]);
         assert_eq!(unchecked.rows(&text), [true, true, true]);
