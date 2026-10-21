@@ -841,6 +841,9 @@ impl App {
         }
         match result {
             Ok(speller) => {
+                for word in &self.added_words {
+                    speller.add(word);
+                }
                 self.speller = Some((settings, speller));
                 self.respell()
             }

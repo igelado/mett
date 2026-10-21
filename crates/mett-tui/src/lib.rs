@@ -1490,7 +1490,13 @@ fn dispatch(
                 Some(Msg::SpellerLoaded(settings, loaded.map(Arc::new)))
             }),
             Effect::AddWord { path, word } => spawn_file(files, true, move || {
-                append_line(&path, &word)
+                // One at a time, each on a line of its own: two words added
+                // at once don't run together.
+                static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let _writing = WRITING
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                append_line(&path, &format!("{word}\n"))
                     .err()
                     .map(|e| Msg::Failed(format!("spell_words: {}: {e}", path.display())))
             }),

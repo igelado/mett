@@ -969,6 +969,8 @@ impl Builtin {
         if self.question.is_some() {
             return;
         }
+        // The words offered were for text that may move.
+        self.suggesting = None;
         if let Some(command) = &mut self.command {
             command.insert_text(text);
             return;

@@ -220,10 +220,14 @@ pub fn words(line: &str) -> Vec<(usize, usize)> {
     let chars: Vec<char> = line.chars().collect();
     let mut words = Vec::new();
     let mut i = 0;
+    // Where a token ends: a space, or punctuation around an address
+    // (`word,bob@x.org`, `<https://x.org>`).
+    let ends = |c: char| {
+        c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')' | '<' | '>' | '"' | '[' | ']')
+    };
     while i < chars.len() {
-        // A token: up to the next space.
         let start = i;
-        while i < chars.len() && !chars[i].is_whitespace() {
+        while i < chars.len() && !ends(chars[i]) {
             i += 1;
         }
         let token = &chars[start..i];
@@ -232,7 +236,7 @@ pub fn words(line: &str) -> Vec<(usize, usize)> {
         if !address {
             words.extend(words_in(token).map(|(s, e)| (start + s, start + e)));
         }
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < chars.len() && ends(chars[i]) {
             i += 1;
         }
     }
@@ -310,6 +314,11 @@ mod tests {
             [(0, 2), (23, 24), (46, 50)]
         );
         assert_eq!(words("l’été"), [(0, 4)]);
+        // A word beside an address is still one.
+        assert_eq!(
+            words("Thsi,bob@x.org (see <https://x.org>)"),
+            [(0, 3), (16, 18)]
+        );
     }
 
     #[test]

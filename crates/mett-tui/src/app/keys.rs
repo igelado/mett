@@ -71,6 +71,7 @@ impl App {
                     if let Some((_, speller)) = &self.speller {
                         speller.add(&word);
                     }
+                    self.added_words.push(word.clone());
                     match self.settings.spell.words.clone() {
                         Some(path) => vec![Effect::AddWord { path, word }],
                         None => Vec::new(),
