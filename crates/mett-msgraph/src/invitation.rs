@@ -80,6 +80,9 @@ impl EventKind {
 #[derive(Deserialize)]
 pub(crate) struct Instances {
     value: Vec<Instance>,
+    /// The link to the next page, if there is one.
+    #[serde(rename = "@odata.nextLink")]
+    next: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +92,11 @@ struct Instance {
 }
 
 impl Instances {
+    /// The link to the next page of instances, if there is one.
+    pub(crate) fn next(&self) -> Option<&str> {
+        self.next.as_deref()
+    }
+
     /// The instance that starts at `start` (for a meeting of whole days,
     /// on its date), and no other: answering another would tell the
     /// organizer the wrong thing.

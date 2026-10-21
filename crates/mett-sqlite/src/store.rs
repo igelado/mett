@@ -787,6 +787,9 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         answer: &Answer,
     ) -> Result<()> {
         self.inner.answer_invitation(id, invitation, answer).await?;
+        // The server may have filed the response sent, or changed the
+        // calendar.
+        self.wrote();
         // What is kept of the meeting is asked again when it is shown, but
         // is what is shown without the server: it says the answer too, when
         // it is the answer of the meeting itself (not of one occurrence).

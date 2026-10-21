@@ -1116,12 +1116,27 @@ impl<A: Authenticator> GraphMailStore<A> {
                 &end.to_rfc3339_opts(SecondsFormat::Secs, true),
             )
             .append_pair("$select", "id,start");
-        let request = self.request(Method::GET, url).header("Prefer", PREFER_UTC);
-        let instances: Instances = self.json(request, about).await?;
-        instances
-            .at(start, invitation.all_day)
-            .map(str::to_owned)
-            .ok_or_else(|| Error::Backend("that occurrence isn't in your calendar".into()))
+        // Graph pages the instances (a daily series has many that overlap
+        // a window), so the pages are followed until it is found.
+        let mut pages = 0;
+        loop {
+            let request = self
+                .request(Method::GET, url.clone())
+                .header("Prefer", PREFER_UTC);
+            let instances: Instances = self.json(request, about).await?;
+            if let Some(found) = instances.at(start, invitation.all_day) {
+                return Ok(found.to_owned());
+            }
+            pages += 1;
+            match instances.next() {
+                Some(link) if pages < MAX_INSTANCE_PAGES => url = self.next_page_url(link)?,
+                _ => {
+                    return Err(Error::Backend(
+                        "that occurrence isn't in your calendar".into(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Moves or copies (`action`) message `id` to folder `to`, returning
@@ -1973,6 +1988,9 @@ async fn error_from(response: reqwest::Response, about: About<'_>) -> Error {
         _ => Error::Backend(detail),
     }
 }
+
+/// The most pages of a series' instances looked through for an occurrence.
+const MAX_INSTANCE_PAGES: usize = 20;
 
 /// How many changes Graph is asked for per delta page.
 const DELTA_PAGE_SIZE: u32 = 500;
