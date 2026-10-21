@@ -1209,7 +1209,11 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
         let doc = parse(&xml)?;
         let message = only_message(&doc, about)?;
         if !answer.notify
-            && let Some(saved) = first_item(message).and_then(item_id)
+            && let Some(saved) = first_item(message)
+            // Only the response saved is unwanted: the calendar item the
+            // answer updated, which Exchange may give back, is the answer.
+            && matches!(saved.tag_name().name(), "Message" | "MeetingResponse")
+            && let Some(saved) = item_id(saved)
         {
             // Failing to remove it leaves a draft, not a wrong answer.
             let _ = self.delete_item(&MessageId::new(saved)).await;

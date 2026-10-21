@@ -1733,6 +1733,33 @@ async fn answers_without_telling_the_organizer_by_dropping_the_saved_response() 
 }
 
 #[tokio::test]
+async fn answering_quietly_never_deletes_the_calendar_item() {
+    let server = MockServer::start().await;
+    // Exchange may give back the calendar item the answer updated.
+    ews("<m:CreateItem MessageDisposition=\"SaveOnly\">")
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:CalendarItem><t:ItemId Id=\"event\"/></t:CalendarItem></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:DeleteItem")
+        .respond_with(success("DeleteItem", ""))
+        .expect(0)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &meeting(false),
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Series, false),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn answers_one_occurrence_through_its_calendar_item() {
     let server = MockServer::start().await;
     ews("<m:GetItem")
