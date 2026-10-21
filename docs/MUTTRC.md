@@ -336,9 +336,9 @@ index and the pager (the pager, once the message is open), answer it:
 
 For a meeting that repeats, mett asks first whether the answer is for the
 `[o]ccurrence` the message is about (the first, for an invitation to a new
-series) or the `[s]eries`. Then it asks for a comment (optional) and, if the
-organizer asked for an answer, whether to send one; the answer is always
-put in your calendar. The pager shows the new `Your reply:` once it is
+series) or the `[s]eries`. If the organizer asked for an answer, mett then asks
+for a comment (optional) and whether to send the answer; if not, it only
+records it. The answer is always put in your calendar. The pager shows the new `Your reply:` once it is
 sent. A cancellation, an attendee's answer, a request that is out of date
 and a meeting you organize can't be answered.
 

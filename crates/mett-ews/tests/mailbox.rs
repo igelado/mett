@@ -1762,8 +1762,21 @@ async fn answering_quietly_never_deletes_the_calendar_item() {
 #[tokio::test]
 async fn answers_one_occurrence_through_its_calendar_item() {
     let server = MockServer::start().await;
+    // The message says which calendar item it is now (not the one it
+    // had when it was read).
     ews("<m:GetItem")
-        .and(body_string_contains("series-item"))
+        .and(body_string_contains("req-1"))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:MeetingRequest>\
+             <t:AssociatedCalendarItemId Id=\"series-item-now\"/>\
+             </t:MeetingRequest></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetItem")
+        .and(body_string_contains("series-item-now"))
         .respond_with(success(
             "GetItem",
             "<m:Items><t:CalendarItem><t:ParentFolderId Id=\"shared-calendar\"/>\
@@ -1813,6 +1826,10 @@ async fn answers_one_occurrence_through_its_calendar_item() {
 #[tokio::test]
 async fn an_occurrence_needs_the_meeting_in_the_calendar() {
     let server = MockServer::start().await;
+    ews("<m:GetItem")
+        .respond_with(success("GetItem", "<m:Items><t:MeetingRequest/></m:Items>"))
+        .mount(&server)
+        .await;
     let mut invitation = meeting(true);
     invitation.event = None;
     let e = store(&server)
@@ -1827,5 +1844,11 @@ async fn an_occurrence_needs_the_meeting_in_the_calendar() {
         matches!(e, Error::Backend(ref m) if m.contains("calendar")),
         "{e:?}"
     );
-    assert!(server.received_requests().await.unwrap().is_empty());
+    // Nothing was answered.
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("CreateItem"))
+    );
 }

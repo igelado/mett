@@ -10,12 +10,14 @@ use crate::mailbox::EmailAddress;
 
 /// What a message selects to tell about a meeting. The properties of
 /// `eventMessage` and `eventMessageRequest` are properties of derived
-/// types, so they are selected with the type's name.
+/// types, so they are selected with the type's name. (Only those the
+/// documented types have: Graph refuses a `$select` of any other property,
+/// which would fail every message.)
 pub(crate) const MEETING_FIELDS: &str = "microsoft.graph.eventMessage/meetingMessageType,\
-    microsoft.graph.eventMessageRequest/meetingRequestType,\
     microsoft.graph.eventMessageRequest/isOutOfDate,\
-    microsoft.graph.eventMessageRequest/isAllDay,\
-    microsoft.graph.eventMessageRequest/responseType,\
+    microsoft.graph.eventMessageRequest/previousStartDateTime,\
+    microsoft.graph.eventMessageRequest/previousEndDateTime,\
+    microsoft.graph.eventMessageRequest/previousLocation,\
     microsoft.graph.eventMessageRequest/responseRequested,\
     microsoft.graph.eventMessageRequest/startDateTime,\
     microsoft.graph.eventMessageRequest/endDateTime,\
@@ -120,16 +122,12 @@ impl Instances {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingMessage {
     meeting_message_type: Option<String>,
-    /// For a request: whether it is new, an update, or outdated.
-    meeting_request_type: Option<String>,
     #[serde(default)]
     is_out_of_date: bool,
-    /// How the owner answered, as the message says: all there is of it
-    /// once the event is gone from the calendar (declining removes it).
-    response_type: Option<String>,
-    /// Whether the meeting lasts whole days, as the message says (the
-    /// event, when it is there, says it too).
-    is_all_day: Option<bool>,
+    /// What an update changed, which a new request doesn't have.
+    previous_start_date_time: Option<DateTimeZone>,
+    previous_end_date_time: Option<DateTimeZone>,
+    previous_location: Option<Location>,
     response_requested: Option<bool>,
     start_date_time: Option<DateTimeZone>,
     end_date_time: Option<DateTimeZone>,
@@ -217,12 +215,16 @@ impl MeetingMessage {
             return None;
         }
         let kind = match self.meeting_message_type.as_deref() {
-            Some("meetingRequest") => match self.meeting_request_type.as_deref() {
-                Some("fullUpdate" | "informationalUpdate" | "silentUpdate") => {
-                    InvitationKind::Update
-                }
-                _ => InvitationKind::Request,
-            },
+            // An update says what it changed: Graph has no property for
+            // which it is.
+            Some("meetingRequest")
+                if self.previous_start_date_time.is_some()
+                    || self.previous_end_date_time.is_some()
+                    || self.previous_location.is_some() =>
+            {
+                InvitationKind::Update
+            }
+            Some("meetingRequest") => InvitationKind::Request,
             Some("meetingCancelled") => InvitationKind::Cancellation,
             Some("meetingAccepted") => InvitationKind::Accepted,
             // Graph spells it without the first "t".
@@ -233,11 +235,9 @@ impl MeetingMessage {
             _ => return None,
         };
         let event = self.event;
-        let all_day = event
-            .as_ref()
-            .map(|e| e.is_all_day)
-            .or(self.is_all_day)
-            .unwrap_or(false);
+        // Without the event (gone from the calendar), the message doesn't
+        // say it is of whole days: its times are taken as they are.
+        let all_day = event.as_ref().is_some_and(|e| e.is_all_day);
         let time = |from_event: Option<&DateTimeZone>, from_message: &Option<DateTimeZone>| {
             from_event
                 .or(from_message.as_ref())
@@ -279,7 +279,6 @@ impl MeetingMessage {
                 .as_ref()
                 .and_then(|e| e.response_status.as_ref())
                 .and_then(|s| s.response.as_deref())
-                .or(self.response_type.as_deref())
             {
                 Some("organizer") => Reply::Organizer,
                 Some("accepted") => Reply::Accepted,
@@ -287,8 +286,7 @@ impl MeetingMessage {
                 Some("declined") => Reply::Declined,
                 _ => Reply::None,
             },
-            out_of_date: self.is_out_of_date
-                || self.meeting_request_type.as_deref() == Some("outdated"),
+            out_of_date: self.is_out_of_date,
             response_requested: self
                 .response_requested
                 .or(event.as_ref().and_then(|e| e.response_requested))
@@ -462,20 +460,30 @@ mod tests {
     }
 
     #[test]
-    fn tells_updates_and_outdated_requests() {
-        for (kind, expected, outdated) in [
-            ("newMeetingRequest", InvitationKind::Request, false),
-            ("fullUpdate", InvitationKind::Update, false),
-            ("informationalUpdate", InvitationKind::Update, false),
-            ("silentUpdate", InvitationKind::Update, false),
-            ("outdated", InvitationKind::Request, true),
+    fn tells_updates_by_what_they_changed() {
+        assert_eq!(read(request()).unwrap().kind, InvitationKind::Request);
+        for (field, value) in [
+            (
+                "previousStartDateTime",
+                json!({"dateTime": "2026-11-03T13:00:00.0000000", "timeZone": "UTC"}),
+            ),
+            (
+                "previousEndDateTime",
+                json!({"dateTime": "2026-11-03T14:00:00.0000000", "timeZone": "UTC"}),
+            ),
+            ("previousLocation", json!({"displayName": "Room 2"})),
         ] {
             let mut message = request();
-            message["meetingRequestType"] = json!(kind);
-            let invitation = read(message).unwrap();
-            assert_eq!(invitation.kind, expected, "{kind}");
-            assert_eq!(invitation.out_of_date, outdated, "{kind}");
+            message[field] = value;
+            assert_eq!(
+                read(message).unwrap().kind,
+                InvitationKind::Update,
+                "{field}"
+            );
         }
+        let mut message = request();
+        message["isOutOfDate"] = json!(true);
+        assert!(read(message).unwrap().out_of_date);
     }
 
     #[test]
@@ -498,21 +506,6 @@ mod tests {
     }
 
     #[test]
-    fn a_declined_meeting_leaves_the_calendar_but_stays_declined() {
-        let mut message = request();
-        message["event"] = json!(null);
-        message["responseType"] = json!("declined");
-        let invitation = read(message).unwrap();
-        assert_eq!(invitation.reply, Reply::Declined);
-        assert!(invitation.event.is_none());
-        // The event, when it is there, is what is believed.
-        let mut message = request();
-        message["responseType"] = json!("declined");
-        message["event"]["responseStatus"]["response"] = json!("accepted");
-        assert_eq!(read(message).unwrap().reply, Reply::Accepted);
-    }
-
-    #[test]
     fn a_meeting_gone_from_the_calendar_still_shows_what_the_message_says() {
         let mut message = request();
         message["event"] = json!(null);
@@ -524,19 +517,6 @@ mod tests {
         );
         assert!(invitation.organizer.is_none());
         assert!(invitation.event.is_none());
-
-        // A meeting of whole days is still one, without its event.
-        let mut message = request();
-        message["event"] = json!(null);
-        message["isAllDay"] = json!(true);
-        message["startDateTime"]["dateTime"] = json!("2026-11-03T00:00:00.0000000");
-        message["endDateTime"]["dateTime"] = json!("2026-11-04T00:00:00.0000000");
-        let invitation = read(message).unwrap();
-        assert!(invitation.all_day);
-        assert_eq!(
-            invitation.start,
-            Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap())
-        );
     }
 
     #[test]
@@ -593,15 +573,6 @@ mod tests {
         message["endDateTime"]["timeZone"] = json!("Pacific Standard Time");
         let invitation = read(message.clone()).unwrap();
         assert_eq!((invitation.start, invitation.end), (None, None));
-        // Whole days keep their dates.
-        message["isAllDay"] = json!(true);
-        message["startDateTime"]["dateTime"] = json!("2026-11-03T00:00:00.0000000");
-        message["endDateTime"]["dateTime"] = json!("2026-11-04T00:00:00.0000000");
-        let invitation = read(message).unwrap();
-        assert_eq!(
-            invitation.start,
-            Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap())
-        );
     }
 
     #[test]

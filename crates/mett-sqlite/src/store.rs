@@ -11,7 +11,8 @@ use chrono::{DateTime, Utc};
 use mett_core::{
     AccountId, Address, Answer, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder,
     FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, Scope, SyncState, WellKnownFolder,
+    MessageSummary, Page, PageCursor, RECENT_UNREAD, Reply, Result, Scope, SyncState,
+    WellKnownFolder,
 };
 use tokio::time::Instant;
 
@@ -713,10 +714,21 @@ impl<S: MailStore> MailStore for CachedStore<S> {
             }
             cached = Some(message);
         }
-        let message = match self.inner.fetch_message(id).await {
+        let mut message = match self.inner.fetch_message(id).await {
             Ok(message) => message,
             Err(e) => return cached.ok_or(e),
         };
+        // Declining takes a meeting out of the calendar (with Graph), and
+        // with it what says it was declined: what was kept does.
+        if let (Some(fresh), Some(kept)) = (
+            &mut message.invitation,
+            cached.as_ref().and_then(|m| m.invitation.as_ref()),
+        ) && fresh.event.is_none()
+            && fresh.reply == Reply::None
+            && kept.reply == Reply::Declined
+        {
+            fresh.reply = Reply::Declined;
+        }
         if self.caching() {
             // Failing to keep it costs only fetching it again.
             let _ = self.with_cache(|db| db.keep_body(&message));

@@ -50,30 +50,29 @@ impl App {
             Action::DeclineInvite => Rsvp::Decline,
             _ => return None,
         };
-        self.begin_answer(rsvp);
-        Some(Vec::new())
+        Some(self.begin_answer(rsvp))
     }
 
-    fn begin_answer(&mut self, rsvp: Rsvp) {
+    fn begin_answer(&mut self, rsvp: Rsvp) -> Vec<Effect> {
         if self.answering.as_ref().is_some_and(|a| a.request.is_some()) {
             self.fail("Please wait: an answer is still being sent.");
-            return;
+            return Vec::new();
         }
         let Some(Screen::Pager(pager)) = self.screens.last() else {
             self.fail("Open the message to answer its invitation.");
-            return;
+            return Vec::new();
         };
         let Some(message) = &pager.message else {
             self.fail("The message is still loading.");
-            return;
+            return Vec::new();
         };
         let Some(invitation) = message.invitation.clone() else {
             self.fail("This message is not an invitation.");
-            return;
+            return Vec::new();
         };
         if let Some(why) = invitation.cannot_answer() {
             self.fail(format!("Nothing to answer: {why}."));
-            return;
+            return Vec::new();
         }
         let repeats = invitation.repeats();
         self.answering = Some(Answering {
@@ -86,8 +85,9 @@ impl App {
         });
         if repeats {
             self.ask_scope();
+            Vec::new()
         } else {
-            self.ask_comment();
+            self.ask_comment()
         }
     }
 
@@ -123,21 +123,31 @@ impl App {
         });
     }
 
-    fn ask_comment(&mut self) {
+    /// Asks for what is told with the answer, unless nobody is: a meeting
+    /// that asked for no answer gets none, so a comment would go nowhere.
+    fn ask_comment(&mut self) -> Vec<Effect> {
+        let tells = self
+            .answering
+            .as_ref()
+            .is_some_and(|a| a.invitation.response_requested);
+        if !tells {
+            return self.send_answer(false);
+        }
         self.ask(Question::InviteComment, "Comment (optional): ", "");
+        Vec::new()
     }
 
     /// The user chose what the answer covers.
     pub(super) fn answer_scope(&mut self, key: char) -> Vec<Effect> {
-        if let Some(answering) = &mut self.answering {
-            answering.scope = if key == 'o' {
-                Scope::Occurrence
-            } else {
-                Scope::Series
-            };
-            self.ask_comment();
-        }
-        Vec::new()
+        let Some(answering) = &mut self.answering else {
+            return Vec::new();
+        };
+        answering.scope = if key == 'o' {
+            Scope::Occurrence
+        } else {
+            Scope::Series
+        };
+        self.ask_comment()
     }
 
     /// The user typed the comment: now to whether the organizer is told.
@@ -147,10 +157,6 @@ impl App {
         };
         let text = text.trim();
         answering.comment = (!text.is_empty()).then(|| text.to_owned());
-        // Nobody who didn't ask for an answer is told one.
-        if !answering.invitation.response_requested {
-            return self.send_answer(false);
-        }
         let who = answering
             .invitation
             .organizer
@@ -411,9 +417,13 @@ mod tests {
         let mut invitation = invitation(false);
         invitation.response_requested = false;
         let mut app = showing(Some(invitation));
-        act(&mut app, Action::TentativeInvite);
-        let (_, answer) = answer_request(&key(&mut app, KeyCode::Enter));
-        assert_eq!((answer.rsvp, answer.notify), (Rsvp::Tentative, false));
+        // Nobody would read a comment, so none is asked for.
+        let (_, answer) = answer_request(&act(&mut app, Action::TentativeInvite));
+        assert_eq!(
+            (answer.rsvp, answer.notify, answer.comment),
+            (Rsvp::Tentative, false, None)
+        );
+        assert_eq!(prompt(&app), "");
     }
 
     #[test]
