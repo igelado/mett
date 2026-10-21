@@ -236,9 +236,11 @@ impl DateTimeZone {
             // whatever zone it is.
             return all_day.then(|| time.date_naive().and_time(chrono::NaiveTime::MIN).and_utc());
         }
-        // An all-day time asked for in UTC may come as the day's midnight
-        // in another zone, shifted: 13 hours later is on the day's date for
-        // the zones from UTC-10 to UTC+13 (as in `mett-ews`).
+        // Graph gives an all-day meeting's times as midnights, not shifted
+        // by the zone asked for (as far as is known: this wants checking
+        // against a real tenant). If it shifted them, 13 hours later is on
+        // the day's date for the zones from UTC-10 to UTC+13, so the date
+        // is right in both cases for nearly every zone.
         Some(if all_day {
             (time + Duration::hours(13))
                 .date_naive()

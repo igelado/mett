@@ -1,7 +1,7 @@
 //! Meeting invitations in EWS items: what `MeetingRequest`,
 //! `MeetingCancellation` and `MeetingResponse` items say.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc, Weekday};
 use mett_core::{Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply};
 use roxmltree::Node;
 
@@ -17,6 +17,8 @@ pub(crate) const INVITATION_FIELDS: &[&str] = &[
     "meetingRequest:MeetingRequestType",
     "calendar:Start",
     "calendar:End",
+    "calendar:StartWallClock",
+    "calendar:EndWallClock",
     "calendar:IsAllDayEvent",
     "calendar:Location",
     "calendar:Organizer",
@@ -56,7 +58,20 @@ pub(crate) fn invitation(item: Node<'_, '_>) -> Option<Invitation> {
             .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
             .map(|t| t.with_timezone(&Utc))
     };
-    let (start, end) = (time("Start"), time("End"));
+    // A meeting of whole days is by its dates, which the wall clock times
+    // (in the zone the meeting was made in) give exactly.
+    let wall = |name: &str| {
+        let text = child_text(item, name)?;
+        NaiveDate::parse_from_str(text.trim().get(..10)?, "%Y-%m-%d")
+            .ok()
+            .map(|d| d.and_time(NaiveTime::MIN).and_utc())
+    };
+    let day = |wall_clock: &str, utc: &str| wall(wall_clock).or_else(|| time(utc).map(whole_day));
+    let (start, end) = if all_day {
+        (day("StartWallClock", "Start"), day("EndWallClock", "End"))
+    } else {
+        (time("Start"), time("End"))
+    };
     let attendees = ["RequiredAttendees", "OptionalAttendees"]
         .into_iter()
         .filter_map(|list| child(item, list))
@@ -67,8 +82,8 @@ pub(crate) fn invitation(item: Node<'_, '_>) -> Option<Invitation> {
     Some(Invitation {
         kind,
         title: None,
-        start: start.map(|t| if all_day { whole_day(t) } else { t }),
-        end: end.map(|t| if all_day { whole_day(t) } else { t }),
+        start,
+        end,
         all_day,
         location: child_text(item, "Location").filter(|l| !l.is_empty()),
         organizer: child(item, "Organizer")
@@ -92,10 +107,11 @@ pub(crate) fn invitation(item: Node<'_, '_>) -> Option<Invitation> {
     })
 }
 
-/// The midnight (UTC) of the day an all-day meeting's time falls in.
-/// EWS gives it as its midnight in the time zone it was made in, shifted
-/// to UTC. Adding 13 hours gives the day's date for the zones from UTC-10
-/// (Hawaii) to UTC+13 (New Zealand in summer).
+/// The midnight (UTC) of the day an all-day meeting's time falls in, for
+/// a server that gave no wall clock time. EWS gives it as its midnight in
+/// the time zone it was made in, shifted to UTC. Adding 13 hours gives the
+/// day's date for the zones from UTC-10 (Hawaii) to UTC+13 (New Zealand
+/// in summer): a few zones beyond, such as UTC+14, are off by a day.
 fn whole_day(time: DateTime<Utc>) -> DateTime<Utc> {
     (time + Duration::hours(13))
         .date_naive()
@@ -346,6 +362,38 @@ mod tests {
                 .replace("2026-11-03T14:00:00Z", start)
                 .replace("2026-11-03T15:00:00Z", end)
                 .replace("<t:IsAllDayEvent>false", "<t:IsAllDayEvent>true");
+            let invitation = read(&item).unwrap();
+            assert_eq!(
+                invitation.start,
+                Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap()),
+                "{start}"
+            );
+            assert_eq!(
+                invitation.end,
+                Some(Utc.with_ymd_and_hms(2026, 11, 4, 0, 0, 0).unwrap()),
+                "{start}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_day_meetings_take_their_dates_from_the_wall_clock() {
+        // Midnights in Kiribati (UTC+14) and American Samoa (UTC-11),
+        // which no fixed shift of the UTC times gets right for both.
+        for (start, end) in [
+            ("2026-11-02T10:00:00Z", "2026-11-03T10:00:00Z"),
+            ("2026-11-03T11:00:00Z", "2026-11-04T11:00:00Z"),
+        ] {
+            let item = REQUEST
+                .replace("RECURRENCE", "")
+                .replace("2026-11-03T14:00:00Z", start)
+                .replace("2026-11-03T15:00:00Z", end)
+                .replace(
+                    "<t:IsAllDayEvent>false</t:IsAllDayEvent>",
+                    "<t:IsAllDayEvent>true</t:IsAllDayEvent>\
+                     <t:StartWallClock>2026-11-03T00:00:00</t:StartWallClock>\
+                     <t:EndWallClock>2026-11-04T00:00:00</t:EndWallClock>",
+                );
             let invitation = read(&item).unwrap();
             assert_eq!(
                 invitation.start,
