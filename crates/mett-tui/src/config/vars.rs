@@ -154,7 +154,7 @@ pub const VARS: &[Var] = &[
     var(
         "msgraph_scopes",
         Kind::String,
-        "Mail.ReadWrite Mail.Send User.Read User.ReadBasic.All People.Read offline_access",
+        "Mail.ReadWrite Mail.Send Calendars.ReadWrite User.Read User.ReadBasic.All People.Read offline_access",
     ),
     var("office365_auth_flow", Kind::String, "auth-code"),
     var("office365_client_id", Kind::String, ""),

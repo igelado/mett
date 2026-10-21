@@ -321,6 +321,30 @@ open mailbox; `indicator` until set), `sidebar_highlight` (the highlight;
 underlined by default), `sidebar_divider` and, from neomutt,
 `sidebar_ordinary` (the others; `normal` until set).
 
+### 4.12 Meeting invitations
+
+A message that invites to a meeting shows it with the headers in the pager:
+`Meeting:`, `When:` (in the local time zone), `Repeats:`, `Where:`,
+`Organizer:`, `Attendees:` and `Your reply:`. mett's own functions, in the
+index and the pager (the pager, once the message is open), answer it:
+
+| Function | Default key | Answer |
+|----------|-------------|--------|
+| `<accept-invite>` | `^A` | Accept. |
+| `<tentative-invite>` | `^T` | Accept tentatively. |
+| `<decline-invite>` | `^D` | Decline. |
+
+For a meeting that repeats, mett asks first whether the answer is for the
+`[o]ccurrence` the message is about (the first, for an invitation to a new
+series) or the `[s]eries`. If the organizer asked for an answer, mett then asks
+for a comment (optional) and whether to send the answer; if not, it only
+records it. The answer is always put in your calendar. The pager shows the new `Your reply:` once it is
+sent. A cancellation, an attendee's answer, a request that is out of date
+and a meeting you organize can't be answered.
+
+With Graph, answering needs the `Calendars.ReadWrite` permission
+(`msgraph_scopes`, see `CONFIG-OFFICE365.md`); EWS has it already.
+
 ### 4.11 The built-in editor
 
 mett has an editor of its own, which writes messages in mett's screen. It

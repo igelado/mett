@@ -101,7 +101,7 @@ pub(crate) fn answer(app: &mut App, text: &str) -> Vec<Effect> {
 pub(crate) fn prompt(app: &App) -> String {
     match &app.input {
         Some(Input::Line { prompt, editor, .. }) => format!("{prompt}{}", editor.text()),
-        Some(Input::YesNo { prompt, .. }) => prompt.clone(),
+        Some(Input::Choice { prompt, .. } | Input::YesNo { prompt, .. }) => prompt.clone(),
         None => String::new(),
     }
 }

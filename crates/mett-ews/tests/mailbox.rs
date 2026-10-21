@@ -1652,3 +1652,245 @@ async fn an_envelope_cut_short_by_a_broken_stream_is_told() {
     let folders = [FolderId::new("inbox-id"), FolderId::new("work-id")];
     assert_eq!(store.watch(&folders).await.unwrap(), folders);
 }
+
+/// A request for a meeting that repeats weekly (`repeats`) or not.
+fn meeting(repeats: bool) -> mett_core::Invitation {
+    use chrono::TimeZone;
+    mett_core::Invitation {
+        kind: mett_core::InvitationKind::Request,
+        title: None,
+        start: Some(Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap()),
+        end: Some(Utc.with_ymd_and_hms(2026, 11, 3, 15, 0, 0).unwrap()),
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: repeats.then(|| mett_core::Recurrence::new(mett_core::RecurrenceUnit::Week, 1)),
+        reply: mett_core::Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        in_series: false,
+        series_master: false,
+        event: Some("series-item".into()),
+    }
+}
+
+fn answer(rsvp: mett_core::Rsvp, scope: mett_core::Scope, notify: bool) -> mett_core::Answer {
+    mett_core::Answer {
+        rsvp,
+        scope,
+        comment: Some("See you".into()),
+        notify,
+    }
+}
+
+#[tokio::test]
+async fn answers_a_meeting_request_and_tells_the_organizer() {
+    let server = MockServer::start().await;
+    ews("<m:CreateItem MessageDisposition=\"SendAndSaveCopy\">")
+        .and(body_string_contains(
+            "<t:AcceptItem><t:Body BodyType=\"Text\">See you</t:Body>\
+             <t:ReferenceItemId Id=\"req-1\"/></t:AcceptItem>",
+        ))
+        .respond_with(success("CreateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &meeting(true),
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Series, true),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn answers_without_telling_the_organizer_by_dropping_the_saved_response() {
+    let server = MockServer::start().await;
+    ews("<m:CreateItem MessageDisposition=\"SaveOnly\">")
+        .and(body_string_contains("<t:DeclineItem>"))
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:Message><t:ItemId Id=\"response\"/></t:Message></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:DeleteItem")
+        .and(body_string_contains("Id=\"response\""))
+        .respond_with(success("DeleteItem", ""))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &meeting(false),
+            &answer(mett_core::Rsvp::Decline, mett_core::Scope::Series, false),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn answers_the_series_of_an_occurrence_through_its_master() {
+    let server = MockServer::start().await;
+    ews("<m:GetItem")
+        .and(body_string_contains("<t:ItemId Id=\"req-1\"/>"))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:MeetingRequest>\
+             <t:AssociatedCalendarItemId Id=\"occurrence-now\"/>\
+             </t:MeetingRequest></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<t:RecurringMasterItemId OccurrenceId=\"occurrence-now\"/>")
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:CalendarItem><t:ItemId Id=\"master\"/></t:CalendarItem></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<t:AcceptItem>")
+        .and(body_string_contains("<t:ReferenceItemId Id=\"master\"/>"))
+        .respond_with(success("CreateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut invitation = meeting(false);
+    invitation.in_series = true;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &invitation,
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Series, true),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn answering_quietly_never_deletes_the_calendar_item() {
+    let server = MockServer::start().await;
+    // Exchange may give back the calendar item the answer updated.
+    ews("<m:CreateItem MessageDisposition=\"SaveOnly\">")
+        .respond_with(success(
+            "CreateItem",
+            "<m:Items><t:CalendarItem><t:ItemId Id=\"event\"/></t:CalendarItem></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:DeleteItem")
+        .respond_with(success("DeleteItem", ""))
+        .expect(0)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &meeting(false),
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Series, false),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn answers_one_occurrence_through_its_calendar_item() {
+    let server = MockServer::start().await;
+    // The message says which calendar item it is now (not the one it
+    // had when it was read).
+    ews("<m:GetItem")
+        .and(body_string_contains("req-1"))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:MeetingRequest>\
+             <t:AssociatedCalendarItemId Id=\"series-item-now\"/>\
+             </t:MeetingRequest></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:GetItem")
+        .and(body_string_contains("series-item-now"))
+        .respond_with(success(
+            "GetItem",
+            "<m:Items><t:CalendarItem><t:ParentFolderId Id=\"shared-calendar\"/>\
+             <t:UID>uid-1</t:UID></t:CalendarItem></m:Items>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<m:FindItem")
+        .and(body_string_contains(
+            "<m:CalendarView StartDate=\"2026-11-03T14:00:00Z\" EndDate=\"2026-11-03T15:00:00Z\"/>",
+        ))
+        // The calendar the meeting is in, not the default one.
+        .and(body_string_contains("<t:FolderId Id=\"shared-calendar\"/>"))
+        .respond_with(success(
+            "FindItem",
+            "<m:RootFolder><t:Items>\
+             <t:CalendarItem><t:ItemId Id=\"week2\"/><t:UID>uid-1</t:UID>\
+             <t:Start>2026-11-10T14:00:00Z</t:Start></t:CalendarItem>\
+             <t:CalendarItem><t:ItemId Id=\"week1\"/><t:UID>uid-1</t:UID>\
+             <t:Start>2026-11-03T14:00:00Z</t:Start></t:CalendarItem>\
+             </t:Items></m:RootFolder>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    ews("<t:TentativelyAcceptItem>")
+        .and(body_string_contains("<t:ReferenceItemId Id=\"week1\"/>"))
+        .respond_with(success("CreateItem", "<m:Items/>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &meeting(true),
+            &answer(
+                mett_core::Rsvp::Tentative,
+                mett_core::Scope::Occurrence,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_occurrence_needs_the_meeting_in_the_calendar() {
+    let server = MockServer::start().await;
+    ews("<m:GetItem")
+        .respond_with(success("GetItem", "<m:Items><t:MeetingRequest/></m:Items>"))
+        .mount(&server)
+        .await;
+    let mut invitation = meeting(true);
+    invitation.event = None;
+    let e = store(&server)
+        .answer_invitation(
+            &MessageId::new("req-1"),
+            &invitation,
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Occurrence, true),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Backend(ref m) if m.contains("calendar")),
+        "{e:?}"
+    );
+    // Nothing was answered.
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("CreateItem"))
+    );
+}

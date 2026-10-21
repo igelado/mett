@@ -2,18 +2,23 @@
 //! with the calendar event it is about.
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc, Weekday};
-use mett_core::{Address, Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply};
+use mett_core::{Address, Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::mailbox::EmailAddress;
 
 /// What a message selects to tell about a meeting. The properties of
 /// `eventMessage` and `eventMessageRequest` are properties of derived
-/// types, so they are selected with the type's name.
+/// types, so they are selected with the type's name. (Only those the
+/// documented types have: Graph refuses a `$select` of any other property,
+/// which would fail every message.)
 pub(crate) const MEETING_FIELDS: &str = "microsoft.graph.eventMessage/meetingMessageType,\
-    microsoft.graph.eventMessageRequest/meetingRequestType,\
+    microsoft.graph.eventMessageRequest/type,\
     microsoft.graph.eventMessageRequest/isOutOfDate,\
-    microsoft.graph.eventMessageRequest/isAllDay,\
+    microsoft.graph.eventMessageRequest/previousStartDateTime,\
+    microsoft.graph.eventMessageRequest/previousEndDateTime,\
+    microsoft.graph.eventMessageRequest/previousLocation,\
     microsoft.graph.eventMessageRequest/responseRequested,\
     microsoft.graph.eventMessageRequest/startDateTime,\
     microsoft.graph.eventMessageRequest/endDateTime,\
@@ -29,19 +34,104 @@ pub(crate) const EVENT_EXPAND: &str = "microsoft.graph.eventMessage/event(\
 /// outlook.timezone`), so they are read as UTC.
 pub(crate) const PREFER_UTC: &str = "outlook.timezone=\"UTC\"";
 
+/// The Graph action that answers an event as `rsvp`.
+pub(crate) fn answer_action(rsvp: Rsvp) -> &'static str {
+    match rsvp {
+        Rsvp::Accept => "accept",
+        Rsvp::Tentative => "tentativelyAccept",
+        Rsvp::Decline => "decline",
+    }
+}
+
+/// The body of an answer: what is told to the organizer, and whether the
+/// organizer is told at all.
+pub(crate) fn answer_json(comment: Option<&str>, notify: bool) -> serde_json::Value {
+    json!({
+        "comment": comment.unwrap_or_default(),
+        "sendResponse": notify,
+    })
+}
+
+/// What kind of event a calendar event is, and which series it is of.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EventKind {
+    pub(crate) id: String,
+    /// `singleInstance`, `occurrence`, `exception` or `seriesMaster`.
+    #[serde(rename = "type")]
+    kind: String,
+    series_master_id: Option<String>,
+}
+
+impl EventKind {
+    /// The event that answers the whole series the event is of (itself,
+    /// if it is a series or doesn't repeat).
+    pub(crate) fn series(&self) -> &str {
+        match self.kind.as_str() {
+            "occurrence" | "exception" => self.series_master_id.as_deref().unwrap_or(&self.id),
+            _ => &self.id,
+        }
+    }
+
+    /// Whether the event is a series, whose occurrences are its
+    /// instances.
+    pub(crate) fn is_series(&self) -> bool {
+        self.kind == "seriesMaster"
+    }
+}
+
+/// The instances of a series found in a window.
+#[derive(Deserialize)]
+pub(crate) struct Instances {
+    value: Vec<Instance>,
+    /// The link to the next page, if there is one.
+    #[serde(rename = "@odata.nextLink")]
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Instance {
+    id: String,
+    start: Option<DateTimeZone>,
+}
+
+impl Instances {
+    /// The link to the next page of instances, if there is one.
+    pub(crate) fn next(&self) -> Option<&str> {
+        self.next.as_deref()
+    }
+
+    /// The instance that starts at `start` (for a meeting of whole days,
+    /// on its date), and no other: answering another would tell the
+    /// organizer the wrong thing.
+    pub(crate) fn at(&self, start: DateTime<Utc>, all_day: bool) -> Option<&str> {
+        self.value
+            .iter()
+            .find(|i| {
+                i.start
+                    .as_ref()
+                    .and_then(|s| s.parse(all_day))
+                    .is_some_and(|s| s == start)
+            })
+            .map(|i| i.id.as_str())
+    }
+}
+
 /// A meeting message's own properties, which are there only for
 /// `eventMessage` and its derived types.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingMessage {
     meeting_message_type: Option<String>,
-    /// For a request: whether it is new, an update, or outdated.
-    meeting_request_type: Option<String>,
+    /// What kind of meeting it is, as the event says.
+    #[serde(rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     is_out_of_date: bool,
-    /// Whether the meeting lasts whole days, as the message says (the
-    /// event, when it is there, says it too).
-    is_all_day: Option<bool>,
+    /// What an update changed, which a new request doesn't have.
+    previous_start_date_time: Option<DateTimeZone>,
+    previous_end_date_time: Option<DateTimeZone>,
+    previous_location: Option<Location>,
     response_requested: Option<bool>,
     start_date_time: Option<DateTimeZone>,
     end_date_time: Option<DateTimeZone>,
@@ -55,6 +145,9 @@ pub(crate) struct MeetingMessage {
 #[serde(rename_all = "camelCase")]
 struct Event {
     id: Option<String>,
+    /// `singleInstance`, `occurrence`, `exception` or `seriesMaster`.
+    #[serde(rename = "type")]
+    kind: Option<String>,
     start: Option<DateTimeZone>,
     end: Option<DateTimeZone>,
     #[serde(default)]
@@ -129,12 +222,17 @@ impl MeetingMessage {
             return None;
         }
         let kind = match self.meeting_message_type.as_deref() {
-            Some("meetingRequest") => match self.meeting_request_type.as_deref() {
-                Some("fullUpdate" | "informationalUpdate" | "silentUpdate") => {
-                    InvitationKind::Update
-                }
-                _ => InvitationKind::Request,
-            },
+            // An update says what it changed: Graph's v1.0 has no property
+            // that says it is one, so an update that changes neither the
+            // time nor the place (the attendees, say) shows as a request.
+            Some("meetingRequest")
+                if self.previous_start_date_time.is_some()
+                    || self.previous_end_date_time.is_some()
+                    || self.previous_location.is_some() =>
+            {
+                InvitationKind::Update
+            }
+            Some("meetingRequest") => InvitationKind::Request,
             Some("meetingCancelled") => InvitationKind::Cancellation,
             Some("meetingAccepted") => InvitationKind::Accepted,
             // Graph spells it without the first "t".
@@ -145,11 +243,9 @@ impl MeetingMessage {
             _ => return None,
         };
         let event = self.event;
-        let all_day = event
-            .as_ref()
-            .map(|e| e.is_all_day)
-            .or(self.is_all_day)
-            .unwrap_or(false);
+        // Without the event (gone from the calendar), the message doesn't
+        // say it is of whole days: its times are taken as they are.
+        let all_day = event.as_ref().is_some_and(|e| e.is_all_day);
         let time = |from_event: Option<&DateTimeZone>, from_message: &Option<DateTimeZone>| {
             from_event
                 .or(from_message.as_ref())
@@ -164,6 +260,12 @@ impl MeetingMessage {
             .and_then(|e| e.recurrence.as_ref())
             .or(self.recurrence.as_ref())
             .and_then(GraphRecurrence::recurrence);
+        let event_type = event
+            .as_ref()
+            .and_then(|e| e.kind.as_deref())
+            .or(self.kind.as_deref());
+        let series_master = recurrence.is_some() || event_type == Some("seriesMaster");
+        let in_series = series_master || matches!(event_type, Some("occurrence" | "exception"));
         Some(Invitation {
             kind,
             title: None,
@@ -198,12 +300,13 @@ impl MeetingMessage {
                 Some("declined") => Reply::Declined,
                 _ => Reply::None,
             },
-            out_of_date: self.is_out_of_date
-                || self.meeting_request_type.as_deref() == Some("outdated"),
+            out_of_date: self.is_out_of_date,
             response_requested: self
                 .response_requested
                 .or(event.as_ref().and_then(|e| e.response_requested))
                 .unwrap_or(true),
+            in_series,
+            series_master,
             event: event.and_then(|e| e.id),
         })
     }
@@ -373,20 +476,30 @@ mod tests {
     }
 
     #[test]
-    fn tells_updates_and_outdated_requests() {
-        for (kind, expected, outdated) in [
-            ("newMeetingRequest", InvitationKind::Request, false),
-            ("fullUpdate", InvitationKind::Update, false),
-            ("informationalUpdate", InvitationKind::Update, false),
-            ("silentUpdate", InvitationKind::Update, false),
-            ("outdated", InvitationKind::Request, true),
+    fn tells_updates_by_what_they_changed() {
+        assert_eq!(read(request()).unwrap().kind, InvitationKind::Request);
+        for (field, value) in [
+            (
+                "previousStartDateTime",
+                json!({"dateTime": "2026-11-03T13:00:00.0000000", "timeZone": "UTC"}),
+            ),
+            (
+                "previousEndDateTime",
+                json!({"dateTime": "2026-11-03T14:00:00.0000000", "timeZone": "UTC"}),
+            ),
+            ("previousLocation", json!({"displayName": "Room 2"})),
         ] {
             let mut message = request();
-            message["meetingRequestType"] = json!(kind);
-            let invitation = read(message).unwrap();
-            assert_eq!(invitation.kind, expected, "{kind}");
-            assert_eq!(invitation.out_of_date, outdated, "{kind}");
+            message[field] = value;
+            assert_eq!(
+                read(message).unwrap().kind,
+                InvitationKind::Update,
+                "{field}"
+            );
         }
+        let mut message = request();
+        message["isOutOfDate"] = json!(true);
+        assert!(read(message).unwrap().out_of_date);
     }
 
     #[test]
@@ -420,19 +533,32 @@ mod tests {
         );
         assert!(invitation.organizer.is_none());
         assert!(invitation.event.is_none());
+    }
 
-        // A meeting of whole days is still one, without its event.
+    #[test]
+    fn an_occurrence_is_of_a_series_without_a_recurrence() {
+        assert!(!read(request()).unwrap().in_series);
+        let mut message = request();
+        message["event"]["type"] = json!("occurrence");
+        let invitation = read(message).unwrap();
+        assert!(invitation.in_series && invitation.recurrence.is_none());
+        assert!(!invitation.series_master);
+        // A series is still one when its pattern is missing.
+        let mut message = request();
+        message["event"]["type"] = json!("seriesMaster");
+        assert!(read(message).unwrap().series_master);
+        let mut message = request();
+        message["event"]["type"] = json!("occurrence");
+        let invitation = read(message).unwrap();
+        assert!(invitation.repeats());
+        // The message says it too, when the event is gone.
         let mut message = request();
         message["event"] = json!(null);
-        message["isAllDay"] = json!(true);
-        message["startDateTime"]["dateTime"] = json!("2026-11-03T00:00:00.0000000");
-        message["endDateTime"]["dateTime"] = json!("2026-11-04T00:00:00.0000000");
-        let invitation = read(message).unwrap();
-        assert!(invitation.all_day);
-        assert_eq!(
-            invitation.start,
-            Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap())
-        );
+        message["type"] = json!("exception");
+        assert!(read(message).unwrap().in_series);
+        let mut message = request();
+        message["type"] = json!("singleInstance");
+        assert!(!read(message).unwrap().in_series);
     }
 
     #[test]
@@ -489,15 +615,58 @@ mod tests {
         message["endDateTime"]["timeZone"] = json!("Pacific Standard Time");
         let invitation = read(message.clone()).unwrap();
         assert_eq!((invitation.start, invitation.end), (None, None));
-        // Whole days keep their dates.
-        message["isAllDay"] = json!(true);
-        message["startDateTime"]["dateTime"] = json!("2026-11-03T00:00:00.0000000");
-        message["endDateTime"]["dateTime"] = json!("2026-11-04T00:00:00.0000000");
-        let invitation = read(message).unwrap();
+    }
+
+    #[test]
+    fn answers_by_action() {
+        assert_eq!(answer_action(Rsvp::Accept), "accept");
+        assert_eq!(answer_action(Rsvp::Tentative), "tentativelyAccept");
+        assert_eq!(answer_action(Rsvp::Decline), "decline");
         assert_eq!(
-            invitation.start,
-            Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap())
+            answer_json(Some("Late"), false),
+            json!({"comment": "Late", "sendResponse": false})
         );
+        assert_eq!(
+            answer_json(None, true),
+            json!({"comment": "", "sendResponse": true})
+        );
+    }
+
+    #[test]
+    fn tells_the_series_of_an_event() {
+        let kind = |value: serde_json::Value| serde_json::from_value::<EventKind>(value).unwrap();
+        let single = kind(json!({"id": "e", "type": "singleInstance"}));
+        assert_eq!((single.series(), single.is_series()), ("e", false));
+        let master = kind(json!({"id": "m", "type": "seriesMaster"}));
+        assert_eq!((master.series(), master.is_series()), ("m", true));
+        let occurrence = kind(json!({"id": "o", "type": "occurrence", "seriesMasterId": "m"}));
+        assert_eq!((occurrence.series(), occurrence.is_series()), ("m", false));
+    }
+
+    #[test]
+    fn picks_the_instance_that_starts_then() {
+        let instances: Instances = serde_json::from_value(json!({"value": [
+            {"id": "w2", "start": {"dateTime": "2026-11-10T14:00:00.0000000", "timeZone": "UTC"}},
+            {"id": "w1", "start": {"dateTime": "2026-11-03T14:00:00.0000000", "timeZone": "UTC"}},
+        ]}))
+        .unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap();
+        assert_eq!(instances.at(start, false), Some("w1"));
+        // At another time, no other instance is taken for it.
+        let other = Utc.with_ymd_and_hms(2026, 11, 4, 14, 0, 0).unwrap();
+        assert_eq!(instances.at(other, false), None);
+    }
+
+    #[test]
+    fn picks_an_instance_of_whole_days_by_its_date() {
+        // Midnights in Los Angeles, shifted to UTC.
+        let instances: Instances = serde_json::from_value(json!({"value": [
+            {"id": "d2", "start": {"dateTime": "2026-11-02T08:00:00.0000000", "timeZone": "UTC"}},
+            {"id": "d3", "start": {"dateTime": "2026-11-03T08:00:00.0000000", "timeZone": "UTC"}},
+        ]}))
+        .unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap();
+        assert_eq!(instances.at(start, true), Some("d3"));
     }
 
     #[test]

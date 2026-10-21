@@ -32,6 +32,17 @@ pub enum Input {
         /// What the answer is for.
         question: Question,
     },
+    /// One of a few keys.
+    Choice {
+        /// The question, with the keys it takes.
+        prompt: String,
+        /// The keys that choose (the answer is the one pressed, in lower
+        /// case); any other key waits, but for `^G` and Esc, which give
+        /// up and 'c', which also does.
+        keys: Vec<char>,
+        /// What the answer is for.
+        question: Question,
+    },
     /// Yes or no.
     YesNo {
         /// The question, such as `Postpone this message?`.
@@ -92,6 +103,12 @@ pub enum Question {
     SaveAttachment,
     /// Whether to replace a file that is there.
     Overwrite,
+    /// What an answer to an invitation covers.
+    InviteScope,
+    /// What is told with an answer to an invitation.
+    InviteComment,
+    /// Whether the organizer is told the answer.
+    InviteNotify,
     /// What to query for (`Q`).
     Query,
     /// The name of an alias being made (`a`).
@@ -506,6 +523,27 @@ impl App {
                     }
                 }
             }
+            Input::Choice { keys, question, .. } => {
+                let question = *question;
+                let KeyCode::Char(typed) = key.code else {
+                    if cancel {
+                        self.input = None;
+                        return self.cancel_question(question);
+                    }
+                    return Vec::new();
+                };
+                let typed = typed.to_ascii_lowercase();
+                let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                if (control && typed == 'g') || (!control && typed == 'c') {
+                    self.input = None;
+                    return self.cancel_question(question);
+                }
+                if control || !keys.contains(&typed) {
+                    return Vec::new();
+                }
+                self.input = None;
+                self.answer_scope(typed)
+            }
             Input::YesNo {
                 default, question, ..
             } => {
@@ -531,6 +569,9 @@ impl App {
     fn cancel_question(&mut self, question: Question) -> Vec<Effect> {
         match question {
             Question::Purge => self.cancel_purge(),
+            Question::InviteScope | Question::InviteComment | Question::InviteNotify => {
+                self.cancel_answer();
+            }
             // A folder chosen in the browser goes with the question.
             // So does a browser to open again after a sign-in.
             Question::OpenMailbox | Question::SaveTo | Question::CopyTo => {
@@ -561,6 +602,7 @@ impl App {
             Question::Command => return self.answer_command(text),
             Question::AttachFile => return self.answer_attach_file(text),
             Question::SaveAttachment => return self.answer_save_attachment(text),
+            Question::InviteComment => return self.answer_comment(text),
             Question::Query => return self.start_query(&text, super::query::Purpose::Mail),
             Question::AliasName => return self.answer_alias_name(text),
             Question::AliasAddress => return self.answer_alias_address(text),
@@ -636,6 +678,7 @@ impl App {
                 }
                 return self.deliver(Delivery::Send);
             }
+            Question::InviteNotify => return self.answer_notify(answer),
             Question::Purge => return self.answer_purge(answer),
             Question::Overwrite => return self.answer_overwrite(answer),
             Question::AbortNoSubject
@@ -651,6 +694,8 @@ impl App {
             | Question::Command
             | Question::AttachFile
             | Question::SaveAttachment
+            | Question::InviteScope
+            | Question::InviteComment
             | Question::Query
             | Question::AliasName
             | Question::AliasAddress => {}

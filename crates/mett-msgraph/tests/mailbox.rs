@@ -2956,3 +2956,236 @@ async fn an_expired_delta_link_starts_over() {
         .unwrap_err();
     assert!(matches!(e, Error::StaleSync), "{e:?}");
 }
+
+/// A request for a meeting that repeats weekly (`repeats`) or not, whose
+/// event is `event`.
+fn meeting(repeats: bool, event: &str) -> mett_core::Invitation {
+    use chrono::TimeZone;
+    mett_core::Invitation {
+        kind: mett_core::InvitationKind::Request,
+        title: None,
+        start: Some(Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap()),
+        end: Some(Utc.with_ymd_and_hms(2026, 11, 3, 15, 0, 0).unwrap()),
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: repeats.then(|| mett_core::Recurrence::new(mett_core::RecurrenceUnit::Week, 1)),
+        reply: mett_core::Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        in_series: false,
+        series_master: false,
+        event: Some(event.into()),
+    }
+}
+
+fn answer(rsvp: mett_core::Rsvp, scope: mett_core::Scope, notify: bool) -> mett_core::Answer {
+    mett_core::Answer {
+        rsvp,
+        scope,
+        comment: Some("See you".into()),
+        notify,
+    }
+}
+
+#[tokio::test]
+async fn answers_a_meeting_that_does_not_repeat() {
+    let server = MockServer::start().await;
+    route("POST", "/me/events/ev1/tentativelyAccept")
+        .and(body_json(
+            json!({"comment": "See you", "sendResponse": true}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("m1"),
+            &meeting(false, "ev1"),
+            &answer(mett_core::Rsvp::Tentative, mett_core::Scope::Series, true),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn answers_a_series_through_its_master() {
+    let server = MockServer::start().await;
+    // The invitation is about one occurrence, whose series is answered.
+    route("GET", "/me/events/occ1")
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"id": "occ1", "type": "occurrence", "seriesMasterId": "master"}),
+            ),
+        )
+        .mount(&server)
+        .await;
+    route("POST", "/me/events/master/decline")
+        .and(body_json(
+            json!({"comment": "See you", "sendResponse": false}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("m1"),
+            &meeting(true, "occ1"),
+            &answer(mett_core::Rsvp::Decline, mett_core::Scope::Series, false),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn answers_one_occurrence_of_a_series() {
+    let server = MockServer::start().await;
+    route("GET", "/me/events/master")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "master", "type": "seriesMaster"})),
+        )
+        .mount(&server)
+        .await;
+    route("GET", "/me/events/master/instances")
+        .and(query_param("startDateTime", "2026-11-03T14:00:00Z"))
+        .and(query_param("endDateTime", "2026-11-03T15:00:00Z"))
+        .and(header("prefer", "outlook.timezone=\"UTC\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"value": [
+            {"id": "week1", "start": {"dateTime": "2026-11-03T14:00:00.0000000", "timeZone": "UTC"}}
+        ]})))
+        .mount(&server)
+        .await;
+    route("POST", "/me/events/week1/accept")
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("m1"),
+            &meeting(true, "master"),
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Occurrence, true),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn looks_for_the_occurrence_through_the_pages_of_instances() {
+    let server = MockServer::start().await;
+    route("GET", "/me/events/master")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "master", "type": "seriesMaster"})),
+        )
+        .mount(&server)
+        .await;
+    let next = format!("{}/v1.0/me/events/master/instances?page=2", server.uri());
+    route("GET", "/me/events/master/instances")
+        .and(query_param("startDateTime", "2026-11-03T14:00:00Z"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [
+                {"id": "earlier", "start": {"dateTime": "2026-11-02T14:00:00.0000000", "timeZone": "UTC"}}
+            ],
+            "@odata.nextLink": next,
+        })))
+        .mount(&server)
+        .await;
+    route("GET", "/me/events/master/instances")
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"value": [
+            {"id": "week1", "start": {"dateTime": "2026-11-03T14:00:00.0000000", "timeZone": "UTC"}}
+        ]})))
+        .mount(&server)
+        .await;
+    route("POST", "/me/events/week1/accept")
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    store(&server)
+        .answer_invitation(
+            &MessageId::new("m1"),
+            &meeting(true, "master"),
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Occurrence, true),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_occurrence_that_is_not_there_is_not_answered() {
+    let server = MockServer::start().await;
+    route("GET", "/me/events/master")
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": "master", "type": "seriesMaster"})),
+        )
+        .mount(&server)
+        .await;
+    route("GET", "/me/events/master/instances")
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"value": [
+            {"id": "other", "start": {"dateTime": "2026-11-10T14:00:00.0000000", "timeZone": "UTC"}}
+        ]})))
+        .mount(&server)
+        .await;
+    let e = store(&server)
+        .answer_invitation(
+            &MessageId::new("m1"),
+            &meeting(true, "master"),
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Occurrence, true),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Backend(ref m) if m.contains("isn't in your calendar")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_calendar_permission_says_so() {
+    let server = MockServer::start().await;
+    route("POST", "/me/events/ev1/accept")
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code": "ErrorAccessDenied", "message": "Access is denied."}
+        })))
+        .mount(&server)
+        .await;
+    let e = store(&server)
+        .answer_invitation(
+            &MessageId::new("m1"),
+            &meeting(false, "ev1"),
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Series, true),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Backend(ref m) if m.contains("Calendars.ReadWrite")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_invitation_without_its_event_cannot_be_answered() {
+    let server = MockServer::start().await;
+    let mut invitation = meeting(false, "ev1");
+    invitation.event = None;
+    let e = store(&server)
+        .answer_invitation(
+            &MessageId::new("m1"),
+            &invitation,
+            &answer(mett_core::Rsvp::Accept, mett_core::Scope::Series, true),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Backend(ref m) if m.contains("calendar")),
+        "{e:?}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

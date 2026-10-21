@@ -192,6 +192,8 @@ async fn a_meeting_is_asked_again_and_kept_when_the_server_cannot_say() {
         reply,
         out_of_date: false,
         response_requested: true,
+        in_series: false,
+        series_master: false,
         event: None,
     };
     let store = cached(mailbox(1)).unwrap();
@@ -216,6 +218,138 @@ async fn a_meeting_is_asked_again_and_kept_when_the_server_cannot_say() {
         reply(store.fetch_message(&id).await.unwrap()),
         Reply::Accepted
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_is_kept_for_when_the_server_cannot_say() {
+    use mett_core::{Answer, Invitation, InvitationKind, Reply, Rsvp, Scope};
+    let invitation = Invitation {
+        kind: InvitationKind::Request,
+        title: None,
+        start: Some(at(0)),
+        end: None,
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: None,
+        reply: Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        in_series: false,
+        series_master: false,
+        event: None,
+    };
+    let store = cached(mailbox(1)).unwrap();
+    listing(&store, 10).await;
+    let id = MessageId::new("m0");
+    store.inner().set_invitation(&id, Some(invitation.clone()));
+    store.fetch_message(&id).await.unwrap();
+    let answer = Answer {
+        rsvp: Rsvp::Decline,
+        scope: Scope::Series,
+        comment: None,
+        notify: true,
+    };
+    store
+        .answer_invitation(&id, &invitation, &answer)
+        .await
+        .unwrap();
+    store.inner().delete_message(&id).await.unwrap();
+    let kept = store.fetch_message(&id).await.unwrap();
+    assert_eq!(kept.invitation.unwrap().reply, Reply::Declined);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_for_one_occurrence_leaves_the_series_reply_in_the_store() {
+    use mett_core::{Answer, Invitation, InvitationKind, Recurrence, RecurrenceUnit};
+    use mett_core::{Reply, Rsvp, Scope};
+    let invitation = Invitation {
+        kind: InvitationKind::Request,
+        title: None,
+        start: Some(at(0)),
+        end: None,
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: Some(Recurrence::new(RecurrenceUnit::Week, 1)),
+        reply: Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        in_series: false,
+        series_master: false,
+        event: None,
+    };
+    let store = cached(mailbox(1)).unwrap();
+    listing(&store, 10).await;
+    let id = MessageId::new("m0");
+    store.inner().set_invitation(&id, Some(invitation.clone()));
+    store.fetch_message(&id).await.unwrap();
+    let answer = Answer {
+        rsvp: Rsvp::Accept,
+        scope: Scope::Occurrence,
+        comment: None,
+        notify: true,
+    };
+    store
+        .answer_invitation(&id, &invitation, &answer)
+        .await
+        .unwrap();
+    // Nowhere is the series said to be accepted: not by the server, not in
+    // what is kept.
+    assert_eq!(store.inner().answers().len(), 1);
+    let fetched = store.fetch_message(&id).await.unwrap();
+    assert_eq!(fetched.invitation.unwrap().reply, Reply::None);
+    store.inner().delete_message(&id).await.unwrap();
+    let kept = store.fetch_message(&id).await.unwrap();
+    assert_eq!(kept.invitation.unwrap().reply, Reply::None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_declined_meeting_stays_declined_once_its_event_is_gone() {
+    use mett_core::{Answer, Invitation, InvitationKind, Reply, Rsvp, Scope};
+    let invitation = |event: Option<&str>| Invitation {
+        kind: InvitationKind::Request,
+        title: None,
+        start: Some(at(0)),
+        end: None,
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: None,
+        reply: Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        in_series: false,
+        series_master: false,
+        event: event.map(str::to_owned),
+    };
+    let store = cached(mailbox(1)).unwrap();
+    listing(&store, 10).await;
+    let id = MessageId::new("m0");
+    store
+        .inner()
+        .set_invitation(&id, Some(invitation(Some("ev"))));
+    store.fetch_message(&id).await.unwrap();
+    let answer = Answer {
+        rsvp: Rsvp::Decline,
+        scope: Scope::Series,
+        comment: None,
+        notify: true,
+    };
+    store
+        .answer_invitation(&id, &invitation(Some("ev")), &answer)
+        .await
+        .unwrap();
+    // The server, as Graph does, no longer has the event, nor the answer.
+    store.inner().set_invitation(&id, Some(invitation(None)));
+    let shown = store.fetch_message(&id).await.unwrap().invitation.unwrap();
+    assert_eq!(shown.reply, Reply::Declined);
+    // It stays so.
+    let shown = store.fetch_message(&id).await.unwrap().invitation.unwrap();
+    assert_eq!(shown.reply, Reply::Declined);
 }
 
 #[tokio::test(start_paused = true)]

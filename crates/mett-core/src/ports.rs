@@ -14,6 +14,7 @@ use crate::draft::Draft;
 use crate::error::Result;
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor, SyncState};
+use crate::invitation::{Answer, Invitation};
 use crate::message::{Address, FlagsUpdate, Message, MessageSummary};
 
 /// How many unread messages [`MailStore::recent_unread`] returns at most.
@@ -211,6 +212,21 @@ pub trait MailStore: Send + Sync {
     /// Saves `draft` in the drafts folder (mutt's `postponed`) and returns
     /// the saved message's identifier.
     fn save_draft(&self, draft: &Draft) -> impl Future<Output = Result<MessageId>> + Send;
+
+    /// Answers the meeting message `id` is about, which says
+    /// `invitation`. The backend puts the answer in the owner's calendar,
+    /// and tells the organizer if `answer` says so.
+    fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> impl Future<Output = Result<()>> + Send {
+        let _ = (id, invitation, answer);
+        std::future::ready(Err(crate::Error::Backend(
+            "this mailbox can't answer invitations".into(),
+        )))
+    }
 
     /// Whether the backend can tell what changed in a folder since a sync
     /// state ([`MailStore::sync_folder`]).

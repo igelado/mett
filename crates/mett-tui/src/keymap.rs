@@ -338,6 +338,9 @@ impl Keymap {
             (Key::char('Q'), Query),
             (Key::char('a'), CreateAlias),
             (Key::char('R'), RecallMessage),
+            (Key::ctrl('a'), AcceptInvite),
+            (Key::ctrl('t'), TentativeInvite),
+            (Key::ctrl('d'), DeclineInvite),
             (Key::ctrl('n'), NextThread),
             (Key::ctrl('p'), PreviousThread),
             (Key::new(KeyCode::Tab), SidebarFocus),
@@ -628,6 +631,24 @@ mod tests {
         match keymap.lookup(menu, key)? {
             Binding::Action(action) => Some(*action),
             Binding::Macro { .. } => None,
+        }
+    }
+
+    #[test]
+    fn the_index_and_the_pager_answer_invitations_with_control_keys() {
+        let keymap = Keymap::mutt_defaults();
+        for (key, answer) in [
+            ('a', Action::AcceptInvite),
+            ('t', Action::TentativeInvite),
+            ('d', Action::DeclineInvite),
+        ] {
+            for menu in [Menu::Index, Menu::Pager] {
+                assert_eq!(
+                    action(&keymap, menu, Key::ctrl(key)),
+                    Some(answer),
+                    "^{key}"
+                );
+            }
         }
     }
 

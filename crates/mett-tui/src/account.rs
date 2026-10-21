@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Address, Attachment, AttachmentId, Draft, FlagsUpdate, Folder, FolderChanges, FolderId,
-    MailSender, MailStore, Message, MessageId, MessagePage, Page, Result as PortResult, SyncState,
-    WellKnownFolder,
+    Address, Answer, Attachment, AttachmentId, Draft, FlagsUpdate, Folder, FolderChanges, FolderId,
+    Invitation, MailSender, MailStore, Message, MessageId, MessagePage, Page, Result as PortResult,
+    SyncState, WellKnownFolder,
 };
 use mett_ews::EwsMailStore;
 use mett_msgraph::{
@@ -168,6 +168,15 @@ impl MailStore for Mailbox {
 
     async fn delete_message(&self, id: &MessageId) -> PortResult<()> {
         either!(self, s => s.delete_message(id).await)
+    }
+
+    async fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> PortResult<()> {
+        either!(self, s => s.answer_invitation(id, invitation, answer).await)
     }
 
     async fn save_draft(&self, draft: &Draft) -> PortResult<MessageId> {

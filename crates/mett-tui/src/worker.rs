@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
-    Message, MessageId, MessagePage, Page, Result, WellKnownFolder, join_bounded,
-    join_bounded_until,
+    Answer, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, Invitation,
+    MailSender, MailStore, Message, MessageId, MessagePage, Page, Result, WellKnownFolder,
+    join_bounded, join_bounded_until,
 };
 use tokio::sync::mpsc;
 
@@ -51,6 +51,15 @@ pub enum Request {
     FetchMessage(MessageId),
     /// Change a message's flags.
     UpdateFlags(MessageId, FlagsUpdate),
+    /// Answer the meeting a message invites to.
+    AnswerInvitation {
+        /// The message.
+        id: MessageId,
+        /// What it says about the meeting.
+        invitation: Invitation,
+        /// The answer.
+        answer: Answer,
+    },
     /// List a message's attachments.
     ListAttachments(MessageId),
     /// Fetch an attachment's content.
@@ -125,6 +134,8 @@ pub enum Event {
     MessageFetched(Result<Message>),
     /// Outcome of [`Request::UpdateFlags`].
     FlagsUpdated(Result<()>),
+    /// Outcome of [`Request::AnswerInvitation`].
+    InvitationAnswered(Result<()>),
     /// Outcome of [`Request::ListAttachments`].
     AttachmentsListed(Result<Vec<Attachment>>),
     /// Outcome of [`Request::FetchAttachment`].
@@ -392,6 +403,16 @@ impl<S: MailStore> MailStore for Patient<'_, S> {
         self.patiently(|| self.store.delete_message(id)).await
     }
 
+    async fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> Result<()> {
+        self.patiently(|| self.store.answer_invitation(id, invitation, answer))
+            .await
+    }
+
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         self.patiently(|| self.store.save_draft(draft)).await
     }
@@ -442,6 +463,11 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             }))
         }
         Request::FetchMessage(id) => Event::MessageFetched(store.fetch_message(&id).await),
+        Request::AnswerInvitation {
+            id,
+            invitation,
+            answer,
+        } => Event::InvitationAnswered(store.answer_invitation(&id, &invitation, &answer).await),
         Request::ListAttachments(id) => Event::AttachmentsListed(store.list_attachments(&id).await),
         Request::FetchAttachment(id, attachment) => {
             Event::AttachmentFetched(store.fetch_attachment(&id, &attachment).await)

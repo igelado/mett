@@ -14,6 +14,7 @@ use url::Url;
 pub const DEFAULT_SCOPES: &[&str] = &[
     "Mail.ReadWrite",
     "Mail.Send",
+    "Calendars.ReadWrite",
     "User.Read",
     "User.ReadBasic.All",
     "People.Read",
