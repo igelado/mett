@@ -1766,7 +1766,8 @@ async fn answers_one_occurrence_through_its_calendar_item() {
         .and(body_string_contains("series-item"))
         .respond_with(success(
             "GetItem",
-            "<m:Items><t:CalendarItem><t:UID>uid-1</t:UID></t:CalendarItem></m:Items>",
+            "<m:Items><t:CalendarItem><t:ParentFolderId Id=\"shared-calendar\"/>\
+             <t:UID>uid-1</t:UID></t:CalendarItem></m:Items>",
         ))
         .expect(1)
         .mount(&server)
@@ -1775,9 +1776,8 @@ async fn answers_one_occurrence_through_its_calendar_item() {
         .and(body_string_contains(
             "<m:CalendarView StartDate=\"2026-11-03T14:00:00Z\" EndDate=\"2026-11-03T15:00:00Z\"/>",
         ))
-        .and(body_string_contains(
-            "<t:DistinguishedFolderId Id=\"calendar\"/>",
-        ))
+        // The calendar the meeting is in, not the default one.
+        .and(body_string_contains("<t:FolderId Id=\"shared-calendar\"/>"))
         .respond_with(success(
             "FindItem",
             "<m:RootFolder><t:Items>\

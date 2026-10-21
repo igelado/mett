@@ -95,10 +95,17 @@ impl App {
         let Some(answering) = &self.answering else {
             return;
         };
+        // A meeting of whole days is by its date, whatever the time zone.
         let when = answering
             .invitation
             .start
-            .map(|start| format!(" {}", start.with_timezone(&chrono::Local).format("%d %b")))
+            .map(|start| {
+                if answering.invitation.all_day {
+                    format!(" {}", start.format("%d %b"))
+                } else {
+                    format!(" {}", start.with_timezone(&chrono::Local).format("%d %b"))
+                }
+            })
             .unwrap_or_default();
         let series = answering
             .invitation
@@ -370,6 +377,21 @@ mod tests {
         respond(&mut app, id, Event::InvitationAnswered(Ok(())));
         assert_eq!(app.status, "Declined.");
         assert!(lines(&app).contains("Your reply: declined"));
+    }
+
+    #[test]
+    fn the_occurrence_of_a_whole_day_meeting_is_named_by_its_date() {
+        let mut all_day = invitation(true);
+        all_day.all_day = true;
+        all_day.start = Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap());
+        all_day.end = Some(Utc.with_ymd_and_hms(2026, 11, 4, 0, 0, 0).unwrap());
+        let mut app = showing(Some(all_day));
+        act(&mut app, Action::AcceptInvite);
+        assert!(
+            prompt(&app).contains("[o]ccurrence 03 Nov,"),
+            "{}",
+            prompt(&app)
+        );
     }
 
     #[test]

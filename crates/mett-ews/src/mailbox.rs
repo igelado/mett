@@ -716,7 +716,6 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             .ok_or_else(|| unexpected(operation, "no new item ID"))
     }
 
-    /// Deletes item `id` for good.
     /// The calendar item of the occurrence an invitation to a series is
     /// about: the one of the series that starts when the invitation says.
     async fn occurrence_item(&self, invitation: &Invitation, about: About<'_>) -> Result<String> {
@@ -725,18 +724,25 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                 "the meeting isn't in your calendar yet".into(),
             ));
         };
-        // The series' occurrences share its UID.
+        // The series' occurrences share its UID, and are in the calendar it
+        // is in (which may not be the default one).
+        let fields = ["calendar:UID", "item:ParentFolderId"];
         let xml = self
-            .get_items(std::slice::from_ref(event), &["calendar:UID"], false, about)
+            .get_items(std::slice::from_ref(event), &fields, false, about)
             .await?;
         let doc = parse(&xml)?;
-        let uid = first_item(only_message(&doc, about)?)
-            .and_then(|item| child_text(item, "UID"))
-            .ok_or_else(|| unexpected("GetItem", "no UID"))?;
+        let item = first_item(only_message(&doc, about)?)
+            .ok_or_else(|| unexpected("GetItem", "no item"))?;
+        let uid = child_text(item, "UID").ok_or_else(|| unexpected("GetItem", "no UID"))?;
+        let calendar = child(item, "ParentFolderId")
+            .and_then(|f| f.attribute("Id"))
+            .map_or_else(
+                || "<t:DistinguishedFolderId Id=\"calendar\"/>".to_owned(),
+                |id| folder_id(&FolderId::new(id)),
+            );
         let body = format!(
             "<m:FindItem Traversal=\"Shallow\">{}<m:CalendarView {}/>\
-             <m:ParentFolderIds><t:DistinguishedFolderId Id=\"calendar\"/></m:ParentFolderIds>\
-             </m:FindItem>",
+             <m:ParentFolderIds>{calendar}</m:ParentFolderIds></m:FindItem>",
             item_shape(
                 &["calendar:UID", "calendar:Start", "calendar:StartWallClock"],
                 None
@@ -753,6 +759,7 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             .ok_or_else(|| Error::Backend("that occurrence isn't in your calendar".into()))
     }
 
+    /// Deletes item `id` for good.
     async fn delete_item(&self, id: &MessageId) -> Result<()> {
         let about = About::message(id.as_str());
         let body = format!(
