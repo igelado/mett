@@ -257,6 +257,50 @@ async fn an_answer_is_kept_for_when_the_server_cannot_say() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn an_answer_for_one_occurrence_leaves_the_series_reply_in_the_store() {
+    use mett_core::{Answer, Invitation, InvitationKind, Recurrence, RecurrenceUnit};
+    use mett_core::{Reply, Rsvp, Scope};
+    let invitation = Invitation {
+        kind: InvitationKind::Request,
+        title: None,
+        start: Some(at(0)),
+        end: None,
+        all_day: false,
+        location: None,
+        organizer: None,
+        attendees: Vec::new(),
+        recurrence: Some(Recurrence::new(RecurrenceUnit::Week, 1)),
+        reply: Reply::None,
+        out_of_date: false,
+        response_requested: true,
+        event: None,
+    };
+    let store = cached(mailbox(1)).unwrap();
+    listing(&store, 10).await;
+    let id = MessageId::new("m0");
+    store.inner().set_invitation(&id, Some(invitation.clone()));
+    store.fetch_message(&id).await.unwrap();
+    let answer = Answer {
+        rsvp: Rsvp::Accept,
+        scope: Scope::Occurrence,
+        comment: None,
+        notify: true,
+    };
+    store
+        .answer_invitation(&id, &invitation, &answer)
+        .await
+        .unwrap();
+    // Nowhere is the series said to be accepted: not by the server, not in
+    // what is kept.
+    assert_eq!(store.inner().answers().len(), 1);
+    let fetched = store.fetch_message(&id).await.unwrap();
+    assert_eq!(fetched.invitation.unwrap().reply, Reply::None);
+    store.inner().delete_message(&id).await.unwrap();
+    let kept = store.fetch_message(&id).await.unwrap();
+    assert_eq!(kept.invitation.unwrap().reply, Reply::None);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_stale_sync_starts_over() {
     let store = cached(mailbox(3)).unwrap();
     listing(&store, 10).await;

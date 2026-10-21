@@ -527,8 +527,11 @@ impl MailStore for MemoryStore {
         }
         let mut state = self.state();
         let message = state.message_mut(id)?;
-        if let Some(invitation) = &mut message.invitation {
-            invitation.reply = answer.rsvp.reply();
+        // An answer for one occurrence leaves the series' reply as it was.
+        if let Some(kept) = &mut message.invitation
+            && (answer.scope == crate::Scope::Series || !invitation.repeats())
+        {
+            kept.reply = answer.rsvp.reply();
         }
         state.answers.push((id.clone(), answer.clone()));
         Ok(())
