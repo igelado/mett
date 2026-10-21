@@ -961,6 +961,11 @@ impl Builtin {
     /// Inserts pasted `text` at the cursor (in place of Notepad's
     /// selection), or in the command being typed.
     pub fn paste(&mut self, text: &str) {
+        self.paste_text(text);
+        self.recheck();
+    }
+
+    fn paste_text(&mut self, text: &str) {
         if self.question.is_some() {
             return;
         }
@@ -1770,6 +1775,14 @@ mod tests {
         );
         press(&mut vim, &chars(":set spelllang=x\"y\n"));
         assert!(matches!(vim.bottom(80), Bottom::Note(n) if n.contains("not dictionary names")));
+    }
+
+    #[test]
+    fn pasted_text_is_checked() {
+        let mut notepad = spelling("Fine\n", Keys::Notepad);
+        // At the cursor, at the start: " wrnogFine".
+        notepad.paste(" wrnog");
+        assert_eq!(underlined(&notepad), [(0, 1, 9)]);
     }
 
     #[test]

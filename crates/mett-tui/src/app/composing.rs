@@ -831,6 +831,14 @@ impl App {
         if self.speller_loading.as_ref() == Some(&settings) {
             self.speller_loading = None;
         }
+        // For settings changed since: of no use.
+        let wanted = crate::editor::spell::Settings {
+            check: true,
+            ..self.settings.spell.clone()
+        };
+        if settings != wanted {
+            return Vec::new();
+        }
         match result {
             Ok(speller) => {
                 self.speller = Some((settings, speller));
@@ -1401,6 +1409,16 @@ mod tests {
                 path: words,
                 word: "Wrnog".into()
             }]
+        );
+        // Dictionaries for settings since changed are of no use.
+        let stale = crate::editor::spell::Settings {
+            langs: vec!["xx_XX".into()],
+            ..wanted.clone()
+        };
+        app.update(Msg::SpellerLoaded(stale, Err("no dictionary".into())));
+        assert_ne!(
+            bottom(&app),
+            Some(crate::editor::builtin::Bottom::Note("no dictionary".into()))
         );
         // `:set nospell` sets mett's own `spell_check`.
         let effects = typed_effects(&mut app, ":set nospell\n");

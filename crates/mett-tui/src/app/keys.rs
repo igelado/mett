@@ -66,6 +66,11 @@ impl App {
                     vec![Effect::Command(command)]
                 }
                 crate::editor::builtin::Outcome::AddWord(word) => {
+                    // Also in the dictionaries kept for later, which the
+                    // editor may not have (with spelling off).
+                    if let Some((_, speller)) = &self.speller {
+                        speller.add(&word);
+                    }
                     match self.settings.spell.words.clone() {
                         Some(path) => vec![Effect::AddWord { path, word }],
                         None => Vec::new(),
