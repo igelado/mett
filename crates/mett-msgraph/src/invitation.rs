@@ -11,7 +11,9 @@ use crate::mailbox::EmailAddress;
 /// `eventMessage` and `eventMessageRequest` are properties of derived
 /// types, so they are selected with the type's name.
 pub(crate) const MEETING_FIELDS: &str = "microsoft.graph.eventMessage/meetingMessageType,\
+    microsoft.graph.eventMessageRequest/meetingRequestType,\
     microsoft.graph.eventMessageRequest/isOutOfDate,\
+    microsoft.graph.eventMessageRequest/isAllDay,\
     microsoft.graph.eventMessageRequest/responseRequested,\
     microsoft.graph.eventMessageRequest/startDateTime,\
     microsoft.graph.eventMessageRequest/endDateTime,\
@@ -33,8 +35,13 @@ pub(crate) const PREFER_UTC: &str = "outlook.timezone=\"UTC\"";
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MeetingMessage {
     meeting_message_type: Option<String>,
+    /// For a request: whether it is new, an update, or outdated.
+    meeting_request_type: Option<String>,
     #[serde(default)]
     is_out_of_date: bool,
+    /// Whether the meeting lasts whole days, as the message says (the
+    /// event, when it is there, says it too).
+    is_all_day: Option<bool>,
     response_requested: Option<bool>,
     start_date_time: Option<DateTimeZone>,
     end_date_time: Option<DateTimeZone>,
@@ -120,15 +127,27 @@ impl MeetingMessage {
             return None;
         }
         let kind = match self.meeting_message_type.as_deref() {
-            Some("meetingRequest") => InvitationKind::Request,
+            Some("meetingRequest") => match self.meeting_request_type.as_deref() {
+                Some("fullUpdate" | "informationalUpdate" | "silentUpdate") => {
+                    InvitationKind::Update
+                }
+                _ => InvitationKind::Request,
+            },
             Some("meetingCancelled") => InvitationKind::Cancellation,
             Some("meetingAccepted") => InvitationKind::Accepted,
-            Some("meetingTentativelyAccepted") => InvitationKind::Tentative,
+            // Graph spells it without the first "t".
+            Some("meetingTentativelyAccepted" | "meetingTenativelyAccepted") => {
+                InvitationKind::Tentative
+            }
             Some("meetingDeclined") => InvitationKind::Declined,
             _ => return None,
         };
         let event = self.event;
-        let all_day = event.as_ref().is_some_and(|e| e.is_all_day);
+        let all_day = event
+            .as_ref()
+            .map(|e| e.is_all_day)
+            .or(self.is_all_day)
+            .unwrap_or(false);
         let time = |from_event: Option<&DateTimeZone>, from_message: &Option<DateTimeZone>| {
             from_event
                 .or(from_message.as_ref())
@@ -177,7 +196,8 @@ impl MeetingMessage {
                 Some("declined") => Reply::Declined,
                 _ => Reply::None,
             },
-            out_of_date: self.is_out_of_date,
+            out_of_date: self.is_out_of_date
+                || self.meeting_request_type.as_deref() == Some("outdated"),
             response_requested: self
                 .response_requested
                 .or(event.as_ref().and_then(|e| e.response_requested))
@@ -339,6 +359,35 @@ mod tests {
     }
 
     #[test]
+    fn tells_updates_and_outdated_requests() {
+        for (kind, expected, outdated) in [
+            ("newMeetingRequest", InvitationKind::Request, false),
+            ("fullUpdate", InvitationKind::Update, false),
+            ("informationalUpdate", InvitationKind::Update, false),
+            ("silentUpdate", InvitationKind::Update, false),
+            ("outdated", InvitationKind::Request, true),
+        ] {
+            let mut message = request();
+            message["meetingRequestType"] = json!(kind);
+            let invitation = read(message).unwrap();
+            assert_eq!(invitation.kind, expected, "{kind}");
+            assert_eq!(invitation.out_of_date, outdated, "{kind}");
+        }
+    }
+
+    #[test]
+    fn reads_graph_s_spelling_of_a_tentative_answer() {
+        for kind in ["meetingTenativelyAccepted", "meetingTentativelyAccepted"] {
+            let invitation = read(json!({
+                "@odata.type": "#microsoft.graph.eventMessageResponse",
+                "meetingMessageType": kind,
+            }))
+            .unwrap();
+            assert_eq!(invitation.kind, InvitationKind::Tentative, "{kind}");
+        }
+    }
+
+    #[test]
     fn reads_the_answer_already_given() {
         let mut message = request();
         message["event"]["responseStatus"]["response"] = json!("tentativelyAccepted");
@@ -357,6 +406,19 @@ mod tests {
         );
         assert!(invitation.organizer.is_none());
         assert!(invitation.event.is_none());
+
+        // A meeting of whole days is still one, without its event.
+        let mut message = request();
+        message["event"] = json!(null);
+        message["isAllDay"] = json!(true);
+        message["startDateTime"]["dateTime"] = json!("2026-11-03T00:00:00.0000000");
+        message["endDateTime"]["dateTime"] = json!("2026-11-04T00:00:00.0000000");
+        let invitation = read(message).unwrap();
+        assert!(invitation.all_day);
+        assert_eq!(
+            invitation.start,
+            Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap())
+        );
     }
 
     #[test]

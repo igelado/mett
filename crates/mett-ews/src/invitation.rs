@@ -124,6 +124,15 @@ fn weekdays(value: &str) -> Vec<Weekday> {
                 Weekday::Fri,
             ],
             "WeekendDay" => &[Weekday::Sat, Weekday::Sun],
+            "Day" => &[
+                Weekday::Mon,
+                Weekday::Tue,
+                Weekday::Wed,
+                Weekday::Thu,
+                Weekday::Fri,
+                Weekday::Sat,
+                Weekday::Sun,
+            ],
             _ => &[],
         };
         days.extend_from_slice(more);
@@ -294,6 +303,12 @@ mod tests {
             invitation.recurrence.unwrap().to_string(),
             "Every 2 weeks on Tue, Thu, until Fri 29 Jan 2027"
         );
+    }
+
+    #[test]
+    fn every_day_is_all_the_weekdays() {
+        assert_eq!(weekdays("Day").len(), 7);
+        assert_eq!(weekdays("Weekday WeekendDay").len(), 7);
     }
 
     #[test]
