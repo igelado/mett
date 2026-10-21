@@ -859,6 +859,8 @@ impl App {
                 self.speller = Some((settings, speller));
                 self.respell()
             }
+            // Not said once checking is off: nothing needs them.
+            Err(_) if !self.settings.spell.check => Vec::new(),
             Err(error) => {
                 self.fail(error);
                 Vec::new()

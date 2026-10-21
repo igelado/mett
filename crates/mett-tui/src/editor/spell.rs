@@ -285,7 +285,8 @@ fn words_in(token: &[char]) -> impl Iterator<Item = (usize, usize)> + '_ {
                 i += 1;
             }
             let word = &token[start..i];
-            let digits = word.iter().any(char::is_ascii_digit);
+            // Any script's digits (`١٢٣` too).
+            let digits = word.iter().any(|c| c.is_numeric());
             // (Scripts without capitals, such as Hebrew's, have no
             // words in capitals.)
             let capitals = word.len() > 1
@@ -395,6 +396,7 @@ mod tests {
             [(0, 2), (18, 19), (25, 27), (29, 30), (33, 35)]
         );
         assert_eq!(words("שלום עולם"), [(0, 3), (5, 8)]);
+        assert_eq!(words("١٢٣ x٣"), []);
         // A word beside an address is still one.
         assert_eq!(
             words("Thsi,bob@x.org (see <https://x.org>)"),
