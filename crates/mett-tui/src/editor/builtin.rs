@@ -515,8 +515,9 @@ impl Builtin {
         let style = Style::new()
             .add_modifier(Modifier::UNDERLINED)
             .underline_color(Color::Red);
-        let top = self.state.viewport_offset().1.min(self.state.cursor.row);
-        let rows = top.saturating_sub(self.height)..top + 2 * self.height;
+        // The screen follows the cursor: it is within a screen of it.
+        let at = self.state.cursor.row;
+        let rows = at.saturating_sub(2 * self.height)..at + 2 * self.height;
         let highlights = self
             .spans
             .iter()
@@ -1127,18 +1128,22 @@ impl Builtin {
             };
         }
         if let Some(offer) = &self.suggesting {
-            let words: Vec<String> = offer
-                .words
-                .iter()
-                .enumerate()
-                .map(|(i, word)| format!("{} {word}", i + 1))
-                .collect();
-            let offered = if words.is_empty() {
-                "no suggestions".to_owned()
-            } else {
-                words.join("  ")
-            };
-            let text = format!("{offered}  (a: add it to your words)");
+            // As many as fit, the best first.
+            let prompt_width = offer.word.chars().count() + 2;
+            let add = "  (a: add it to your words)";
+            let room = width.saturating_sub(prompt_width + add.len());
+            let mut offered = String::new();
+            for (i, word) in offer.words.iter().enumerate() {
+                let item = format!("{}{} {word}", if i > 0 { "  " } else { "" }, i + 1);
+                if i > 0 && offered.chars().count() + item.chars().count() > room {
+                    break;
+                }
+                offered.push_str(&item);
+            }
+            if offered.is_empty() {
+                offered = "no suggestions".to_owned();
+            }
+            let text = format!("{offered}{add}");
             return Bottom::Prompt {
                 prompt: format!("{}: ", offer.word),
                 // The cursor after it all, waiting for the choice.

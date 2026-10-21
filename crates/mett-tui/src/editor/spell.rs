@@ -239,7 +239,21 @@ pub fn words(line: &str) -> Vec<(usize, usize)> {
         }
         let token = &chars[start..i];
         let text: String = token.iter().collect();
-        let address = text.contains("://") || text.contains('@') || text.starts_with("www.");
+        // A web or mail address: with a scheme, `@`, or a dot between
+        // letters (`mett.dev/path`), past what ends a sentence.
+        let bare = text.trim_end_matches(['.', ',', '!', '?', ':', ';', ')']);
+        let dotted = bare.char_indices().any(|(i, c)| {
+            c == '.'
+                && bare[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric)
+                && bare[i + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+        });
+        let address = text.contains("://") || text.contains('@') || dotted || text.contains('/');
         if !address {
             words.extend(words_in(token).map(|(s, e)| (start + s, start + e)));
         }
@@ -269,7 +283,11 @@ fn words_in(token: &[char]) -> impl Iterator<Item = (usize, usize)> + '_ {
             }
             let word = &token[start..i];
             let digits = word.iter().any(char::is_ascii_digit);
-            let capitals = word.len() > 1 && word.iter().all(|c| !c.is_lowercase());
+            // (Scripts without capitals, such as Hebrew's, have no
+            // words in capitals.)
+            let capitals = word.len() > 1
+                && word.iter().any(|c| c.is_uppercase())
+                && word.iter().all(|c| !c.is_lowercase());
             if !digits && !capitals {
                 return Some((start, i - 1));
             }
@@ -369,6 +387,12 @@ mod tests {
             [(0, 2), (23, 24), (46, 50)]
         );
         assert_eq!(words("l’été"), [(0, 4)]);
+        // Bare addresses, and words in scripts without capitals.
+        assert_eq!(
+            words("see mett.dev/path or a/b, end."),
+            [(0, 2), (18, 19), (26, 28)]
+        );
+        assert_eq!(words("שלום עולם"), [(0, 3), (5, 8)]);
         // A word beside an address is still one.
         assert_eq!(
             words("Thsi,bob@x.org (see <https://x.org>)"),
