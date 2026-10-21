@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    AccountId, Address, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderChanges,
-    FolderId, MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, Page,
-    PageCursor, RECENT_UNREAD, Result, SyncState, WellKnownFolder,
+    AccountId, Address, Answer, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder,
+    FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage,
+    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, SyncState, WellKnownFolder,
 };
 use tokio::time::Instant;
 
@@ -778,6 +778,16 @@ impl<S: MailStore> MailStore for CachedStore<S> {
             let _ = self.with_cache(|db| db.remove(id));
         }
         Ok(())
+    }
+
+    async fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> Result<()> {
+        // What is kept of the meeting is asked again when it is shown.
+        self.inner.answer_invitation(id, invitation, answer).await
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {

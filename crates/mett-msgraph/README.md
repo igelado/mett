@@ -52,8 +52,8 @@ In the [Microsoft Entra admin center](https://entra.microsoft.com), go to
 3. After creating it, under **Authentication**, set **Allow public client
    flows** to *Yes*. This is needed for the device code flow.
 4. Under **API permissions**, add these *delegated* Microsoft Graph
-   permissions: `Mail.ReadWrite`, `Mail.Send`, `User.Read`,
-   `User.ReadBasic.All`, `People.Read` and `offline_access`. Depending on
+   permissions: `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`,
+   `User.Read`, `User.ReadBasic.All`, `People.Read` and `offline_access`. Depending on
    your tenant's policy, an administrator may need to grant consent.
 5. Copy the **Application (client) ID** from the **Overview** page.
 

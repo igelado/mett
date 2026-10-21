@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use mett_core::{
-    Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, MailSender, MailStore,
-    Message, MessageId, MessagePage, Page, Result, WellKnownFolder, join_bounded,
-    join_bounded_until,
+    Answer, Attachment, AttachmentId, Draft, Error, FlagsUpdate, Folder, FolderId, Invitation,
+    MailSender, MailStore, Message, MessageId, MessagePage, Page, Result, WellKnownFolder,
+    join_bounded, join_bounded_until,
 };
 use tokio::sync::mpsc;
 
@@ -390,6 +390,16 @@ impl<S: MailStore> MailStore for Patient<'_, S> {
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         self.patiently(|| self.store.delete_message(id)).await
+    }
+
+    async fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> Result<()> {
+        self.patiently(|| self.store.answer_invitation(id, invitation, answer))
+            .await
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {

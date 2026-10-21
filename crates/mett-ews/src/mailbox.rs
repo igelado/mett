@@ -10,16 +10,19 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
-    AccessToken, AccountId, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body,
-    BodyKind, Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId,
-    MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment,
-    Page, PageCursor, RECENT_UNREAD, Result, SyncState, ThreadPosition, WellKnownFolder,
+    AccessToken, AccountId, Address, Answer, Attachment, AttachmentId, AttachmentKind,
+    Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder,
+    FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage,
+    MessageSummary, OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, Result, Scope, SyncState,
+    ThreadPosition, WellKnownFolder,
 };
 use reqwest::StatusCode;
 use roxmltree::Node;
 use url::Url;
 
-use crate::invitation::{INVITATION_FIELDS, invitation};
+use crate::invitation::{
+    INVITATION_FIELDS, answer_xml, find_occurrence, invitation, occurrence_view,
+};
 use crate::soap::{
     About, check, child, child_text, children, coded_fault, descendant, envelope, escape,
     only_message, parse, response_code, response_messages, text,
@@ -714,6 +717,39 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
     }
 
     /// Deletes item `id` for good.
+    /// The calendar item of the occurrence an invitation to a series is
+    /// about: the one of the series that starts when the invitation says.
+    async fn occurrence_item(&self, invitation: &Invitation, about: About<'_>) -> Result<String> {
+        let (Some(event), Some(start)) = (&invitation.event, invitation.start) else {
+            return Err(Error::Backend(
+                "the meeting isn't in your calendar yet".into(),
+            ));
+        };
+        // The series' occurrences share its UID.
+        let xml = self
+            .get_items(&[event.clone()], &["calendar:UID"], false, about)
+            .await?;
+        let doc = parse(&xml)?;
+        let uid = first_item(only_message(&doc, about)?)
+            .and_then(|item| child_text(item, "UID"))
+            .ok_or_else(|| unexpected("GetItem", "no UID"))?;
+        let body = format!(
+            "<m:FindItem Traversal=\"Shallow\">{}<m:CalendarView {}/>\
+             <m:ParentFolderIds><t:DistinguishedFolderId Id=\"calendar\"/></m:ParentFolderIds>\
+             </m:FindItem>",
+            item_shape(&["calendar:UID", "calendar:Start"], None),
+            occurrence_view(start, invitation.end),
+        );
+        let xml = self.call(&body, about).await?;
+        let doc = parse(&xml)?;
+        let message = only_message(&doc, about)?;
+        let items = descendant(message, "RootFolder")
+            .and_then(|root| child(root, "Items"))
+            .ok_or_else(|| unexpected("FindItem", "no Items"))?;
+        find_occurrence(items, &uid, Some(start))
+            .ok_or_else(|| Error::Backend("that occurrence isn't in your calendar".into()))
+    }
+
     async fn delete_item(&self, id: &MessageId) -> Result<()> {
         let about = About::message(id.as_str());
         let body = format!(
@@ -1140,6 +1176,42 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
 
     async fn delete_message(&self, id: &MessageId) -> Result<()> {
         self.delete_item(id).await
+    }
+
+    async fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> Result<()> {
+        let about = About::message(id.as_str());
+        // The message answers the meeting, or all its series. One
+        // occurrence of a series is answered through its calendar item.
+        let reference = if answer.scope == Scope::Occurrence && invitation.repeats() {
+            self.occurrence_item(invitation, about).await?
+        } else {
+            id.to_string()
+        };
+        let items = answer_xml(answer.rsvp, &reference, answer.comment.as_deref());
+        // Without telling the organizer, the response is only saved (as a
+        // draft, which is then not wanted).
+        let disposition = if answer.notify {
+            "SendAndSaveCopy"
+        } else {
+            "SaveOnly"
+        };
+        let xml = self
+            .call(&create_item(disposition, None, &items), about)
+            .await?;
+        let doc = parse(&xml)?;
+        let message = only_message(&doc, about)?;
+        if !answer.notify
+            && let Some(saved) = first_item(message).and_then(item_id)
+        {
+            // Failing to remove it leaves a draft, not a wrong answer.
+            let _ = self.delete_item(&MessageId::new(saved)).await;
+        }
+        Ok(())
     }
 
     fn can_sync(&self) -> bool {

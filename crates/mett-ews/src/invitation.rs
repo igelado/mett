@@ -2,10 +2,10 @@
 //! `MeetingCancellation` and `MeetingResponse` items say.
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc, Weekday};
-use mett_core::{Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply};
+use mett_core::{Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp};
 use roxmltree::Node;
 
-use crate::soap::{child, child_text, children};
+use crate::soap::{child, child_text, children, escape};
 
 /// The fields that tell what a meeting message says. Items that aren't
 /// about meetings have none of them, and EWS leaves them out.
@@ -105,6 +105,67 @@ pub(crate) fn invitation(item: Node<'_, '_>) -> Option<Invitation> {
             .and_then(|id| id.attribute("Id"))
             .map(str::to_owned),
     })
+}
+
+/// The response object that answers the item `reference` as `rsvp`, with
+/// what the owner tells the organizer.
+pub(crate) fn answer_xml(rsvp: Rsvp, reference: &str, comment: Option<&str>) -> String {
+    let element = match rsvp {
+        Rsvp::Accept => "AcceptItem",
+        Rsvp::Tentative => "TentativelyAcceptItem",
+        Rsvp::Decline => "DeclineItem",
+    };
+    let body = comment
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("<t:Body BodyType=\"Text\">{}</t:Body>", escape(c)))
+        .unwrap_or_default();
+    format!(
+        "<t:{element}>{body}<t:ReferenceItemId Id=\"{}\"/></t:{element}>",
+        escape(reference)
+    )
+}
+
+/// The time window of a calendar view of the occurrence that starts at
+/// `start` and ends at `end`, as `StartDate` and `EndDate` attributes.
+pub(crate) fn occurrence_view(start: DateTime<Utc>, end: Option<DateTime<Utc>>) -> String {
+    let format = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // The view lists what is there in its window: a window of an instant
+    // can have nothing at its end.
+    let end = end
+        .filter(|e| *e > start)
+        .unwrap_or(start + Duration::seconds(1));
+    format!(
+        "StartDate=\"{}\" EndDate=\"{}\"",
+        format(start),
+        format(end)
+    )
+}
+
+/// The ID of the occurrence among the items a calendar view found that
+/// belongs to the series with `uid` and starts at `start` (or, if none
+/// starts then, the first that belongs to it).
+pub(crate) fn find_occurrence(
+    items: Node<'_, '_>,
+    uid: &str,
+    start: Option<DateTime<Utc>>,
+) -> Option<String> {
+    let ours: Vec<_> = items
+        .children()
+        .filter(Node::is_element)
+        .filter(|item| child_text(item.to_owned(), "UID").as_deref() == Some(uid))
+        .collect();
+    let at = |item: &Node<'_, '_>| {
+        child_text(*item, "Start")
+            .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    let chosen = ours
+        .iter()
+        .find(|item| start.is_some() && at(item) == start)
+        .or(ours.first())?;
+    child(*chosen, "ItemId")
+        .and_then(|id| id.attribute("Id"))
+        .map(str::to_owned)
 }
 
 /// The midnight (UTC) of the day an all-day meeting's time falls in, for
@@ -429,6 +490,59 @@ mod tests {
             .unwrap();
             assert_eq!(response.kind, kind);
         }
+    }
+
+    #[test]
+    fn answers_with_the_comment_in_the_response_object() {
+        assert_eq!(
+            answer_xml(Rsvp::Tentative, "AAA=", Some("Maybe <late>")),
+            "<t:TentativelyAcceptItem><t:Body BodyType=\"Text\">Maybe &lt;late&gt;</t:Body>\
+             <t:ReferenceItemId Id=\"AAA=\"/></t:TentativelyAcceptItem>"
+        );
+        assert_eq!(
+            answer_xml(Rsvp::Decline, "AAA=", None),
+            "<t:DeclineItem><t:ReferenceItemId Id=\"AAA=\"/></t:DeclineItem>"
+        );
+        assert!(answer_xml(Rsvp::Accept, "A", Some("")).starts_with("<t:AcceptItem><t:Reference"));
+    }
+
+    #[test]
+    fn finds_the_occurrence_of_a_series() {
+        let xml = "<Items xmlns:t=\"urn:t\">\
+            <t:CalendarItem><t:ItemId Id=\"other\"/><t:UID>x</t:UID><t:Start>2026-11-03T14:00:00Z</t:Start></t:CalendarItem>\
+            <t:CalendarItem><t:ItemId Id=\"week2\"/><t:UID>series</t:UID><t:Start>2026-11-10T14:00:00Z</t:Start></t:CalendarItem>\
+            <t:CalendarItem><t:ItemId Id=\"week1\"/><t:UID>series</t:UID><t:Start>2026-11-03T14:00:00Z</t:Start></t:CalendarItem>\
+            </Items>";
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-11-03T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let items = doc.root_element();
+        assert_eq!(
+            find_occurrence(items, "series", Some(start)).as_deref(),
+            Some("week1")
+        );
+        // Not at that time, the first of the series is the nearest there is.
+        assert_eq!(
+            find_occurrence(items, "series", None).as_deref(),
+            Some("week2")
+        );
+        assert_eq!(find_occurrence(items, "nothing", Some(start)), None);
+    }
+
+    #[test]
+    fn views_the_window_of_an_occurrence() {
+        let start = DateTime::parse_from_rfc3339("2026-11-03T14:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            occurrence_view(start, Some(start + Duration::hours(1))),
+            "StartDate=\"2026-11-03T14:00:00Z\" EndDate=\"2026-11-03T15:00:00Z\""
+        );
+        assert_eq!(
+            occurrence_view(start, None),
+            "StartDate=\"2026-11-03T14:00:00Z\" EndDate=\"2026-11-03T14:00:01Z\""
+        );
     }
 
     #[test]

@@ -23,7 +23,9 @@ pub use draft::{Draft, DraftOrigin};
 pub use error::{Error, Result};
 pub use folder::{Folder, UnknownWellKnownFolder, WellKnownFolder};
 pub use ids::{AccountId, AttachmentId, FolderId, MessageId, PageCursor, SyncState};
-pub use invitation::{Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp, Scope};
+pub use invitation::{
+    Answer, Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp, Scope,
+};
 pub use join::{join_bounded, join_bounded_until};
 pub use message::{
     Address, AddressError, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary,

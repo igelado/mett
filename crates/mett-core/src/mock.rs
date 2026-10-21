@@ -40,6 +40,8 @@ struct State {
     sync_epoch: u64,
     /// How many times folders were synced.
     syncs: u64,
+    /// The answers to invitations, as given.
+    answers: Vec<(MessageId, crate::Answer)>,
 }
 
 impl MemoryStore {
@@ -96,6 +98,11 @@ impl MemoryStore {
     pub fn with_sync(self) -> Self {
         self.state().sync = true;
         self
+    }
+
+    /// The answers given to invitations, in order.
+    pub fn answers(&self) -> Vec<(MessageId, crate::Answer)> {
+        self.state().answers.clone()
     }
 
     /// Changes what a message says about a meeting, as its organizer or an
@@ -506,6 +513,24 @@ impl MailStore for MemoryStore {
         if !self.state().remove(id) {
             return Err(Error::not_found("message", id));
         }
+        Ok(())
+    }
+
+    async fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &crate::Invitation,
+        answer: &crate::Answer,
+    ) -> Result<()> {
+        if !invitation.can_answer() {
+            return Err(Error::Backend("the meeting can't be answered".into()));
+        }
+        let mut state = self.state();
+        let message = state.message_mut(id)?;
+        if let Some(invitation) = &mut message.invitation {
+            invitation.reply = answer.rsvp.reply();
+        }
+        state.answers.push((id.clone(), answer.clone()));
         Ok(())
     }
 

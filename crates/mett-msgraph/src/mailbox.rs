@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
-    AccessToken, Address, Attachment, AttachmentId, AttachmentKind, Authenticator, Body, BodyKind,
-    Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId, Invitation,
-    MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary, OutgoingAttachment,
-    Page, PageCursor, RECENT_UNREAD, Result, SyncState, ThreadPosition, WellKnownFolder,
-    join_bounded_until,
+    AccessToken, Address, Answer, Attachment, AttachmentId, AttachmentKind, Authenticator, Body,
+    BodyKind, Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId,
+    Invitation, MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary,
+    OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, Result, Scope, SyncState, ThreadPosition,
+    WellKnownFolder, join_bounded_until,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 
-use crate::invitation::{EVENT_EXPAND, MEETING_FIELDS, MeetingMessage, PREFER_UTC};
+use crate::invitation::{
+    EVENT_EXPAND, EventKind, Instances, MEETING_FIELDS, MeetingMessage, PREFER_UTC, answer_action,
+    answer_json,
+};
 use crate::settings::{AuthSettings, Cloud, with_segments};
 
 /// Upper bound on each Graph request.
@@ -878,6 +881,31 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             .map(drop)
     }
 
+    async fn answer_invitation(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> Result<()> {
+        self.answer_event(id, invitation, answer)
+            .await
+            .map_err(|e| match e {
+                // Without the calendar permission, Graph refuses; signing
+                // in again wouldn't help.
+                Error::Auth(detail)
+                    if ["denied", "forbidden"]
+                        .iter()
+                        .any(|word| detail.to_lowercase().contains(word)) =>
+                {
+                    Error::Backend(format!(
+                        "{detail}: answering invitations needs the Calendars.ReadWrite \
+                         permission; add it to msgraph_scopes and sign in again"
+                    ))
+                }
+                e => e,
+            })
+    }
+
     fn can_sync(&self) -> bool {
         true
     }
@@ -1024,6 +1052,78 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
 }
 
 impl<A: Authenticator> GraphMailStore<A> {
+    /// Answers the calendar event an invitation is about: the series, one
+    /// occurrence of it, or the meeting that doesn't repeat.
+    async fn answer_event(
+        &self,
+        id: &MessageId,
+        invitation: &Invitation,
+        answer: &Answer,
+    ) -> Result<()> {
+        let about = About::message(id.as_str());
+        let Some(event) = invitation.event.as_deref() else {
+            return Err(Error::Backend(
+                "the meeting isn't in your calendar yet".into(),
+            ));
+        };
+        let target = if invitation.repeats() {
+            let mut url = self.url(&["me", "events", event]);
+            url.query_pairs_mut()
+                .append_pair("$select", "id,type,seriesMasterId");
+            let kind: EventKind = self.get(url, about).await?;
+            match answer.scope {
+                Scope::Series => kind.series().to_owned(),
+                Scope::Occurrence if kind.is_series() => {
+                    self.instance_at(&kind.id, invitation, about).await?
+                }
+                Scope::Occurrence => kind.id,
+            }
+        } else {
+            event.to_owned()
+        };
+        let url = self.url(&["me", "events", &target, answer_action(answer.rsvp)]);
+        let body = answer_json(answer.comment.as_deref(), answer.notify);
+        self.send(self.request(Method::POST, url).json(&body), about)
+            .await
+            .map(drop)
+    }
+
+    /// The instance of the series `master` that starts when `invitation`
+    /// says.
+    async fn instance_at(
+        &self,
+        master: &str,
+        invitation: &Invitation,
+        about: About<'_>,
+    ) -> Result<String> {
+        let Some(start) = invitation.start else {
+            return Err(Error::Backend("the meeting has no start".into()));
+        };
+        // The window lists what is there: an instant can have nothing at
+        // its end.
+        let end = invitation
+            .end
+            .filter(|e| *e > start)
+            .unwrap_or(start + chrono::TimeDelta::seconds(1));
+        let mut url = self.url(&["me", "events", master, "instances"]);
+        url.query_pairs_mut()
+            .append_pair(
+                "startDateTime",
+                &start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            )
+            .append_pair(
+                "endDateTime",
+                &end.to_rfc3339_opts(SecondsFormat::Secs, true),
+            )
+            .append_pair("$select", "id,start");
+        let request = self.request(Method::GET, url).header("Prefer", PREFER_UTC);
+        let instances: Instances = self.json(request, about).await?;
+        instances
+            .at(start)
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Backend("that occurrence isn't in your calendar".into()))
+    }
+
     /// Moves or copies (`action`) message `id` to folder `to`, returning
     /// the ID it has there.
     async fn relocate(&self, id: &MessageId, to: &FolderId, action: &str) -> Result<MessageId> {

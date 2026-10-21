@@ -91,6 +91,21 @@ pub enum Scope {
     Occurrence,
 }
 
+/// How the owner answers a meeting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answer {
+    /// Accept, accept tentatively or decline.
+    pub rsvp: Rsvp,
+    /// For a meeting that repeats, whether the answer covers the series
+    /// or one occurrence.
+    pub scope: Scope,
+    /// What the owner tells the organizer, if anything.
+    pub comment: Option<String>,
+    /// Whether the organizer is told: the answer is always recorded in
+    /// the owner's calendar.
+    pub notify: bool,
+}
+
 /// The unit a meeting repeats in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecurrenceUnit {
@@ -293,9 +308,22 @@ impl Invitation {
         self.recurrence.is_some()
     }
 
+    /// Why the message can't be answered, if it can't.
+    pub fn cannot_answer(&self) -> Option<&'static str> {
+        if self.reply == Reply::Organizer {
+            Some("you organize this meeting")
+        } else if self.out_of_date {
+            Some("it is out of date")
+        } else if !self.kind.is_open() {
+            Some("it doesn't ask for an answer")
+        } else {
+            None
+        }
+    }
+
     /// Whether the message can be answered.
     pub fn can_answer(&self) -> bool {
-        self.kind.is_open() && !self.out_of_date && self.reply != Reply::Organizer
+        self.cannot_answer().is_none()
     }
 }
 

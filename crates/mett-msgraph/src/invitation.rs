@@ -2,8 +2,9 @@
 //! with the calendar event it is about.
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc, Weekday};
-use mett_core::{Address, Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply};
+use mett_core::{Address, Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::mailbox::EmailAddress;
 
@@ -28,6 +29,80 @@ pub(crate) const EVENT_EXPAND: &str = "microsoft.graph.eventMessage/event(\
 /// The time zone Graph is asked to give times in (`Prefer:
 /// outlook.timezone`), so they are read as UTC.
 pub(crate) const PREFER_UTC: &str = "outlook.timezone=\"UTC\"";
+
+/// The Graph action that answers an event as `rsvp`.
+pub(crate) fn answer_action(rsvp: Rsvp) -> &'static str {
+    match rsvp {
+        Rsvp::Accept => "accept",
+        Rsvp::Tentative => "tentativelyAccept",
+        Rsvp::Decline => "decline",
+    }
+}
+
+/// The body of an answer: what is told to the organizer, and whether the
+/// organizer is told at all.
+pub(crate) fn answer_json(comment: Option<&str>, notify: bool) -> serde_json::Value {
+    json!({
+        "comment": comment.unwrap_or_default(),
+        "sendResponse": notify,
+    })
+}
+
+/// What kind of event a calendar event is, and which series it is of.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EventKind {
+    pub(crate) id: String,
+    /// `singleInstance`, `occurrence`, `exception` or `seriesMaster`.
+    #[serde(rename = "type")]
+    kind: String,
+    series_master_id: Option<String>,
+}
+
+impl EventKind {
+    /// The event that answers the whole series the event is of (itself,
+    /// if it is a series or doesn't repeat).
+    pub(crate) fn series(&self) -> &str {
+        match self.kind.as_str() {
+            "occurrence" | "exception" => self.series_master_id.as_deref().unwrap_or(&self.id),
+            _ => &self.id,
+        }
+    }
+
+    /// Whether the event is a series, whose occurrences are its
+    /// instances.
+    pub(crate) fn is_series(&self) -> bool {
+        self.kind == "seriesMaster"
+    }
+}
+
+/// The instances of a series found in a window.
+#[derive(Deserialize)]
+pub(crate) struct Instances {
+    value: Vec<Instance>,
+}
+
+#[derive(Deserialize)]
+struct Instance {
+    id: String,
+    start: Option<DateTimeZone>,
+}
+
+impl Instances {
+    /// The instance that starts at `start`, or else the first found.
+    pub(crate) fn at(&self, start: DateTime<Utc>) -> Option<&str> {
+        self.value
+            .iter()
+            .find(|i| {
+                i.start
+                    .as_ref()
+                    .and_then(|s| s.parse(false))
+                    .is_some_and(|s| s == start)
+            })
+            .or(self.value.first())
+            .map(|i| i.id.as_str())
+    }
+}
 
 /// A meeting message's own properties, which are there only for
 /// `eventMessage` and its derived types.
@@ -498,6 +573,45 @@ mod tests {
             invitation.start,
             Some(Utc.with_ymd_and_hms(2026, 11, 3, 0, 0, 0).unwrap())
         );
+    }
+
+    #[test]
+    fn answers_by_action() {
+        assert_eq!(answer_action(Rsvp::Accept), "accept");
+        assert_eq!(answer_action(Rsvp::Tentative), "tentativelyAccept");
+        assert_eq!(answer_action(Rsvp::Decline), "decline");
+        assert_eq!(
+            answer_json(Some("Late"), false),
+            json!({"comment": "Late", "sendResponse": false})
+        );
+        assert_eq!(
+            answer_json(None, true),
+            json!({"comment": "", "sendResponse": true})
+        );
+    }
+
+    #[test]
+    fn tells_the_series_of_an_event() {
+        let kind = |value: serde_json::Value| serde_json::from_value::<EventKind>(value).unwrap();
+        let single = kind(json!({"id": "e", "type": "singleInstance"}));
+        assert_eq!((single.series(), single.is_series()), ("e", false));
+        let master = kind(json!({"id": "m", "type": "seriesMaster"}));
+        assert_eq!((master.series(), master.is_series()), ("m", true));
+        let occurrence = kind(json!({"id": "o", "type": "occurrence", "seriesMasterId": "m"}));
+        assert_eq!((occurrence.series(), occurrence.is_series()), ("m", false));
+    }
+
+    #[test]
+    fn picks_the_instance_that_starts_then() {
+        let instances: Instances = serde_json::from_value(json!({"value": [
+            {"id": "w2", "start": {"dateTime": "2026-11-10T14:00:00.0000000", "timeZone": "UTC"}},
+            {"id": "w1", "start": {"dateTime": "2026-11-03T14:00:00.0000000", "timeZone": "UTC"}},
+        ]}))
+        .unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 11, 3, 14, 0, 0).unwrap();
+        assert_eq!(instances.at(start), Some("w1"));
+        let other = Utc.with_ymd_and_hms(2026, 11, 4, 14, 0, 0).unwrap();
+        assert_eq!(instances.at(other), Some("w2"));
     }
 
     #[test]
