@@ -56,9 +56,23 @@ impl UidSet {
             .flat_map(|(from, to)| (*from..=*to).rev())
     }
 
-    /// The `count` highest.
-    pub fn newest(&self, count: usize) -> Vec<u32> {
-        self.newest_first().take(count).collect()
+    /// The `count` highest, and the set without them, by taking them off the
+    /// ranges (a big set that is one range isn't expanded).
+    pub fn split_newest(&self, count: usize) -> (Vec<u32>, Self) {
+        let mut taken = Vec::with_capacity(count);
+        let mut ranges = self.0.clone();
+        while taken.len() < count {
+            let Some((from, to)) = ranges.last_mut() else {
+                break;
+            };
+            taken.push(*to);
+            if from == to {
+                ranges.pop();
+            } else {
+                *to -= 1;
+            }
+        }
+        (taken, Self(ranges))
     }
 
     /// This set and `more`.
@@ -146,7 +160,10 @@ mod tests {
         assert_eq!(set.with([4, 8]).to_string(), "1:4,7:8");
         assert_eq!(set.without([2, 7]).to_string(), "1,3");
         assert_eq!(set.minus(&UidSet::of([2, 3])), [7, 1]);
-        assert_eq!(set.newest(3), [7, 3, 2]);
+        let (taken, rest) = set.split_newest(3);
+        assert_eq!(taken, [7, 3, 2]);
+        assert_eq!(rest.to_string(), "1");
+        assert_eq!(set.split_newest(9).1, UidSet::default());
         assert!(UidSet::default().is_empty());
     }
 }

@@ -84,8 +84,9 @@ fn subjects(changes: &FolderChanges) -> Vec<String> {
 async fn syncs_only_where_the_server_tells_what_changed() {
     let server = server(Mode::Plain, Accept::Password("me", "secret"), folders()).await;
     let store = store_for(&server);
-    // Before it has connected, it doesn't know.
-    assert!(!store.can_sync());
+    // Before it has connected, it doesn't know, and an earlier run's cache
+    // can be read.
+    assert!(store.can_sync());
     store.list_folders().await.unwrap();
     assert!(store.can_sync());
 
@@ -179,7 +180,10 @@ async fn a_folder_made_anew_or_a_state_not_understood_says_to_start_over() {
     let (server, store) = plain().await;
     deliver(&server, "INBOX", "one", &[]);
     let (done, _) = synced(&store, None).await;
-    for state in [SyncState::new("rubbish"), SyncState::new("imap1/9/9/9/1/")] {
+    for state in [
+        SyncState::new("rubbish"),
+        SyncState::new("imap1/9/9/9/1//0"),
+    ] {
         let error = store.sync_folder(&inbox(), Some(&state)).await.unwrap_err();
         assert!(matches!(error, Error::StaleSync), "{error}");
     }
@@ -304,4 +308,31 @@ async fn what_mett_does_is_in_the_cache_at_once_and_agrees_with_the_server() {
     // The server says the same.
     let state = server.state.lock().unwrap();
     assert_eq!(state.folders[0].messages.len(), 1);
+}
+
+#[tokio::test]
+async fn every_batch_of_the_first_sync_keeps_the_dates_the_messages_came_in() {
+    let (server, store) = plain().await;
+    for n in 0..150 {
+        deliver(&server, "INBOX", &format!("m{n}"), &[]);
+    }
+    let (changes, batches) = synced(&store, None).await;
+    assert_eq!(batches, 2);
+    let now = chrono::Utc::now();
+    for message in &changes.changed {
+        // Delivered long before: not changed just now.
+        assert!(now - message.modified.unwrap() > chrono::TimeDelta::hours(1));
+    }
+}
+
+#[tokio::test]
+async fn a_folder_without_modification_sequences_is_not_synced() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().nomodseq = true;
+    deliver(&server, "INBOX", "one", &[]);
+    let error = store.sync_folder(&inbox(), None).await.unwrap_err();
+    assert!(
+        error.to_string().contains("modification sequences"),
+        "{error}"
+    );
 }

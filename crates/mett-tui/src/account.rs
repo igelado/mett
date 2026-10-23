@@ -237,7 +237,8 @@ pub fn cache_path(
     // another server: the server is in the name too.
     let file = match &url.server {
         Server::Imap(server) => {
-            let name = format!("imap-{}-{}", url.account, server.host);
+            let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
+            let name = format!("imap-{}-{}-{}", url.account, server.host, port);
             let name: String = name
                 .chars()
                 .map(|c| {
@@ -270,6 +271,18 @@ pub fn cache_path(
     }
 }
 
+/// The cache file of the account in `url`, as the environment and the home
+/// mett found say (see [`cache_path`]).
+pub fn default_cache_path(config: &Config, url: &MailboxUrl) -> Option<PathBuf> {
+    cache_path(
+        config,
+        url,
+        std::env::var_os("XDG_CACHE_HOME"),
+        // The home mett found, which on Windows may not be `$HOME`.
+        config.home().map(Into::into),
+    )
+}
+
 /// `mailbox` with its cache (see [`cache_path`]), which tells `progress`
 /// how far its syncs have got, and a warning if the cache can't be used:
 /// mett then works without it.
@@ -279,13 +292,7 @@ pub fn cached(
     mailbox: Mailbox,
     progress: Progress,
 ) -> (CachedStore<Mailbox>, Option<String>) {
-    let path = cache_path(
-        config,
-        url,
-        std::env::var_os("XDG_CACHE_HOME"),
-        // The home mett found, which on Windows may not be `$HOME`.
-        config.home().map(Into::into),
-    );
+    let path = default_cache_path(config, url);
     let Some(path) = path else {
         return (CachedStore::new(mailbox, None), None);
     };
@@ -676,16 +683,21 @@ mod tests {
         // The same address at two servers is two accounts, with two caches.
         assert_eq!(
             name("imaps://me%40example.org@mail.one.net/INBOX").as_deref(),
-            Some("imap-me@example.org-mail.one.net.sqlite")
+            Some("imap-me@example.org-mail.one.net-993.sqlite")
         );
         assert_eq!(
             name("imaps://me%40example.org@mail.two.net/INBOX").as_deref(),
-            Some("imap-me@example.org-mail.two.net.sqlite")
+            Some("imap-me@example.org-mail.two.net-993.sqlite")
+        );
+        // Another port is another server.
+        assert_eq!(
+            name("imaps://me@mail.one.net:1993/").as_deref(),
+            Some("imap-me@mail.one.net-mail.one.net-1993.sqlite")
         );
         // Whatever a file name can't hold is made harmless.
         assert_eq!(
             name("imap://a%2Fb@h/").as_deref(),
-            Some("imap-a_b@h-h.sqlite")
+            Some("imap-a_b@h-h-143.sqlite")
         );
     }
 

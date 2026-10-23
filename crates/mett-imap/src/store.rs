@@ -40,6 +40,11 @@ const STALE: Duration = Duration::from_secs(60);
 /// attachments.
 const SUMMARY: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER] BODYSTRUCTURE)";
 
+/// Whether the server can be synced is not known yet, is so, is not.
+const SYNCS_UNKNOWN: u8 = 0;
+const SYNCS_YES: u8 = 1;
+const SYNCS_NO: u8 = 2;
+
 /// How many messages a sync takes in at a time.
 const BATCH_SIZE: usize = 100;
 
@@ -106,8 +111,9 @@ pub struct ImapMailStore<A = NoTokens> {
     live: Mutex<Option<Live>>,
     /// How each folder stood when it was last asked about new mail.
     marks: Marks,
-    /// Whether the server can be synced (see [`MailStore::can_sync`]).
-    syncs: std::sync::atomic::AtomicBool,
+    /// Whether the server can be synced (see [`MailStore::can_sync`]): not
+    /// known until connected, when `SYNCS_UNKNOWN`.
+    syncs: std::sync::atomic::AtomicU8,
 }
 
 impl<A: Authenticator> ImapMailStore<A> {
@@ -121,7 +127,7 @@ impl<A: Authenticator> ImapMailStore<A> {
             smtp: None,
             live: Mutex::new(None),
             marks: Marks::default(),
-            syncs: std::sync::atomic::AtomicBool::new(false),
+            syncs: std::sync::atomic::AtomicU8::new(SYNCS_UNKNOWN),
         }
     }
 
@@ -168,8 +174,10 @@ impl<A: Authenticator> ImapMailStore<A> {
             .await?
             .map_err(|e| conn::lost(host, &e.to_string()))?;
         let condstore = caps.has_str("CONDSTORE") || caps.has_str("QRESYNC");
-        self.syncs
-            .store(condstore, std::sync::atomic::Ordering::SeqCst);
+        self.syncs.store(
+            if condstore { SYNCS_YES } else { SYNCS_NO },
+            std::sync::atomic::Ordering::SeqCst,
+        );
         Ok(Live {
             session,
             caps: Caps {
@@ -799,10 +807,11 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     }
 
     /// Whether the server tells what changed since a modification sequence
-    /// (`CONDSTORE`), which a sync needs to find flags that changed: known
-    /// once connected (the first request connects).
+    /// (`CONDSTORE`), which a sync needs to find flags that changed. That is
+    /// known once connected (the first request connects); until then it is
+    /// taken to, so that what an earlier run cached can be read offline.
     fn can_sync(&self) -> bool {
-        self.syncs.load(std::sync::atomic::Ordering::SeqCst)
+        self.syncs.load(std::sync::atomic::Ordering::SeqCst) != SYNCS_NO
     }
 
     async fn sync_folder(

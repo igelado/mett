@@ -209,10 +209,10 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
         // The caches the accounts use, named by the account (and for IMAP the
         // server): two tabs for one would share it, though their backends
         // may not agree on what is in it.
-        let mut cached: Vec<String> = Vec::new();
+        let mut cached: Vec<std::path::PathBuf> = Vec::new();
         for (label, config) in named {
             match open_account(&mut launch, label.clone(), config, &keymap) {
-                Ok((opened, cache)) if cached.contains(&cache) => {
+                Ok((opened, Some(cache))) if cached.contains(&cache) => {
                     return fail(
                         &mut launch,
                         format!(
@@ -222,7 +222,7 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
                     );
                 }
                 Ok((opened, cache)) => {
-                    cached.push(cache);
+                    cached.extend(cache);
                     list.push(opened);
                 }
                 Err(e) if several || !label.is_empty() => {
@@ -271,13 +271,19 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
 
 /// The account of `config`, opened: its mailbox (which signs in when first
 /// used, in the TUI's sign-in window), its cache and the app's settings; and
-/// what its cache is called (for telling two tabs for one account).
+/// its cache file, if it has one (two tabs can't share it).
 fn open_account(
     launch: &mut impl Launch,
     label: String,
     mut config: config::Config,
     keymap: &Keymap,
-) -> Result<(Opened<mett_sqlite::CachedStore<account::Mailbox>>, String), String> {
+) -> Result<
+    (
+        Opened<mett_sqlite::CachedStore<account::Mailbox>>,
+        Option<std::path::PathBuf>,
+    ),
+    String,
+> {
     let spoolfile = config.spoolfile().map_err(|e| e.to_string())?;
     let settings = settings_from_config(&config, &spoolfile.account)?;
     let editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
@@ -310,12 +316,7 @@ fn open_account(
     } else {
         label
     };
-    let cache = match &spoolfile.server {
-        config::mailbox::Server::Imap(server) => {
-            format!("imap/{}/{}", spoolfile.account, server.host.to_lowercase())
-        }
-        config::mailbox::Server::Office365 => format!("office365/{}", spoolfile.account),
-    };
+    let cache = account::default_cache_path(&config, &spoolfile);
     Ok((
         Opened {
             label,

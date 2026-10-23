@@ -27,6 +27,9 @@ struct State {
     set: UidSet,
     /// Those of them whose summaries haven't been taken in yet.
     pending: UidSet,
+    /// Whether this is the first sync, whose messages are as old as they
+    /// are (not changed now).
+    initial: bool,
 }
 
 /// A state's first word: what the rest is.
@@ -35,8 +38,13 @@ const VERSION: &str = "imap1";
 impl State {
     fn encode(&self) -> SyncState {
         SyncState::new(format!(
-            "{VERSION}/{}/{}/{}/{}/{}",
-            self.validity, self.next, self.modseq, self.set, self.pending
+            "{VERSION}/{}/{}/{}/{}/{}/{}",
+            self.validity,
+            self.next,
+            self.modseq,
+            self.set,
+            self.pending,
+            u8::from(self.initial)
         ))
     }
 
@@ -51,6 +59,7 @@ impl State {
             modseq: parts.next()?.parse().ok()?,
             set: UidSet::parse(parts.next()?)?,
             pending: UidSet::parse(parts.next()?)?,
+            initial: parts.next()? == "1",
         };
         parts.next().is_none().then_some(state)
     }
@@ -64,7 +73,14 @@ pub(super) async fn sync_folder(
 ) -> Res<FolderChanges> {
     let selected = select(live, folder).await?;
     let stale = || Fail::Core(Error::StaleSync);
-    let (state, removed, first) = match state {
+    // Without modification sequences, a change of flags would go unseen.
+    let Some(modseq) = selected.modseq else {
+        return Err(Error::Backend(format!(
+            "{folder}: the server keeps no modification sequences for it, so it can't be synced"
+        ))
+        .into());
+    };
+    let (state, removed) = match state {
         // Everything is a change; what the cache has that isn't is gone
         // once the sync is complete.
         None => {
@@ -72,31 +88,35 @@ pub(super) async fn sync_folder(
             let state = State {
                 validity: selected.validity,
                 next: selected.next,
-                modseq: selected.modseq.unwrap_or(0),
+                modseq,
                 set: all.clone(),
                 pending: all,
+                initial: true,
             };
-            (state, Vec::new(), true)
+            (state, Vec::new())
         }
         Some(state) => {
             let state = State::decode(state)
                 .filter(|state| state.validity == selected.validity)
                 .ok_or_else(stale)?;
             if state.pending.is_empty() {
-                let (state, removed) = advance(live, &selected, state).await?;
-                (state, removed, false)
+                advance(live, &selected, modseq, state).await?
             } else {
-                (state, Vec::new(), false)
+                (state, Vec::new())
             }
         }
     };
-    batch(live, folder, state, removed, first).await
+    batch(live, folder, state, removed).await
 }
 
 /// `state` moved on to how `selected` stands: what came in, changed and went
 /// since.
-async fn advance(live: &mut Live, selected: &Selected, old: State) -> Res<(State, Vec<u32>)> {
-    let modseq = selected.modseq.unwrap_or(0);
+async fn advance(
+    live: &mut Live,
+    selected: &Selected,
+    modseq: u64,
+    old: State,
+) -> Res<(State, Vec<u32>)> {
     // Nothing happened, by what the folder says of itself: no new message,
     // no change of flags, none gone.
     if selected.next == old.next
@@ -121,7 +141,7 @@ async fn advance(live: &mut Live, selected: &Selected, old: State) -> Res<(State
         (all, gone, came)
     };
     let mut changed = came;
-    if modseq > old.modseq && old.modseq > 0 && selected.exists > 0 {
+    if modseq > old.modseq && selected.exists > 0 {
         let flagged: Vec<_> = live
             .session
             .uid_fetch("1:*", format!("(UID) (CHANGEDSINCE {})", old.modseq))
@@ -137,6 +157,7 @@ async fn advance(live: &mut Live, selected: &Selected, old: State) -> Res<(State
         modseq,
         set,
         pending,
+        initial: false,
     };
     Ok((state, gone))
 }
@@ -148,10 +169,10 @@ async fn batch(
     folder: &str,
     mut state: State,
     gone: Vec<u32>,
-    first: bool,
 ) -> Res<FolderChanges> {
-    let uids = state.pending.newest(BATCH_SIZE);
-    state.pending = state.pending.without(uids.iter().copied());
+    let first = state.initial;
+    let (uids, rest) = state.pending.split_newest(BATCH_SIZE);
+    state.pending = rest;
     let by_arrival = !live.caps.sort;
     let found: Vec<Fetched> = fetch(live, &uids, SUMMARY, false).await?;
     let now = chrono::Utc::now();
@@ -196,12 +217,13 @@ mod tests {
             modseq: 1234,
             set: UidSet::of([1, 2, 3, 9]),
             pending: UidSet::of([9]),
+            initial: true,
         };
         assert_eq!(State::decode(&state.encode()), Some(state));
         for bad in [
             "",
             "imap2/1/2/3//",
-            "imap1/1/2/3/1:3",
+            "imap1/1/2/3/1:3/0",
             "imap1/x/2/3//",
             "imap1/1/2/3/5,1/",
         ] {
