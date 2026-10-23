@@ -870,7 +870,12 @@ async fn a_busy_cache_is_not_a_broken_one() {
     let dir = std::env::temp_dir().join(format!("mett-sqlite-busy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("cache.sqlite");
-    let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
+    // The first call that finds the cache busy waits this long.
+    let cache = Cache::open(&path, &alice())
+        .unwrap()
+        .with_busy_timeout(Duration::from_millis(50))
+        .unwrap();
+    let store = CachedStore::new(mailbox(2), Some(cache));
     listing(&store, 10).await;
     // Another mett is writing to the cache.
     let other = rusqlite::Connection::open(&path).unwrap();
@@ -942,4 +947,60 @@ async fn a_busy_cache_does_not_block_the_executor() {
     drop(other);
     store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A store that says what it can do: `MemoryStore` with other
+/// capabilities.
+struct Capable(MemoryStore, mett_core::Capabilities);
+
+macro_rules! forward {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        $(async fn $name(&self, $($arg: $ty),*) -> mett_core::Result<$ret> {
+            self.0.$name($($arg),*).await
+        })*
+    };
+}
+
+impl MailStore for Capable {
+    forward! {
+        list_folders() -> Vec<mett_core::Folder>;
+        folder(id: &FolderId) -> mett_core::Folder;
+        recent_unread(folder: &FolderId, since: Option<DateTime<Utc>>)
+            -> Vec<(MessageId, DateTime<Utc>)>;
+        well_known_folder(which: WellKnownFolder) -> mett_core::Folder;
+        list_messages(folder: &FolderId, page: Page) -> mett_core::MessagePage;
+        changed_messages(folder: &FolderId, since: DateTime<Utc>, page: Page)
+            -> mett_core::MessagePage;
+        fetch_message(id: &MessageId) -> mett_core::Message;
+        list_attachments(message: &MessageId) -> Vec<mett_core::Attachment>;
+        fetch_attachment(message: &MessageId, attachment: &mett_core::AttachmentId) -> Vec<u8>;
+        update_flags(id: &MessageId, update: FlagsUpdate) -> ();
+        move_message(id: &MessageId, to: &FolderId) -> MessageId;
+        copy_message(id: &MessageId, to: &FolderId) -> MessageId;
+        delete_message(id: &MessageId) -> ();
+        save_draft(draft: &mett_core::Draft) -> MessageId;
+    }
+
+    fn capabilities(&self) -> mett_core::Capabilities {
+        self.1
+    }
+}
+
+/// The cache is as the store behind it is: what it can do (and whether
+/// its bodies change) is the store's to say.
+#[tokio::test]
+async fn capabilities_are_the_inner_stores() {
+    let capabilities = mett_core::Capabilities {
+        bodies_change: false,
+        folder_names_ignore_case: false,
+        can_sync: true,
+        can_watch: true,
+    };
+    let inner = Capable(mailbox(1), capabilities);
+    let cached = CachedStore::new(inner, Some(Cache::in_memory(&alice()).unwrap()));
+    assert_eq!(cached.capabilities(), capabilities);
+    let uncached = CachedStore::new(Capable(mailbox(1), capabilities), None);
+    assert_eq!(uncached.capabilities(), capabilities);
+    let default = CachedStore::new(mailbox(1), None);
+    assert!(default.capabilities().bodies_change);
 }
