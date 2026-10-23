@@ -9,6 +9,11 @@ the ports that adapters implement:
   Microsoft Graph.
 - **`MailSender`:** sends a `Draft`: new mail, or a reply or forward of
   another message (`DraftOrigin`). `GraphMailStore` implements it too.
+- **`DraftSession` and `DraftBackend`:** the state machine of sending or
+  postponing through a server draft (the Exchange APIs): what to keep after
+  a lost answer, how a retry reuses the draft, and how the attachments of a
+  recalled draft are told apart from mett's own uploads. `DraftBackend` is
+  the handful of requests an adapter supplies (`mett-msgraph`, `mett-ews`).
 - **`Authenticator`:** provides access tokens. Implemented by
   `mett-msgraph`'s `GraphAuthenticator`.
 

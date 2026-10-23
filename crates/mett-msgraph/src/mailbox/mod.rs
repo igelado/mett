@@ -12,16 +12,16 @@ mod tests;
 mod wire;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Answer, Attachment, AttachmentId, AttachmentKind, Authenticator, Body,
-    BodyKind, Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder, FolderChanges, FolderId,
-    Invitation, MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary,
+    BodyKind, Draft, DraftOrigin, DraftSession, Error, Flags, FlagsUpdate, Folder, FolderChanges,
+    FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary,
     OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, Result, Scope, SyncState, ThreadPosition,
-    WellKnownFolder, join_bounded_until,
+    WellKnownFolder, join_bounded_until, unsent,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -34,7 +34,6 @@ use crate::invitation::{
     answer_json,
 };
 use crate::settings::{AuthSettings, Cloud, with_segments};
-use drafts::{DraftKey, Kept, Upload, is_recalled, key, unsent};
 use folders::{LISTINGS_AT_ONCE, Listings, Roles, Walk, first_then, walk, with_children};
 use wire::{
     BatchResponse, Collection, Delta, ErrorResponse, GraphAttachment, GraphFolder, GraphMessage,
@@ -85,16 +84,9 @@ pub struct GraphMailStore<A> {
     roles: Mutex<Option<(Arc<Roles>, Instant)>>,
     /// The hidden root folder's ID, once looked up on its own.
     root: Mutex<Option<Option<FolderId>>>,
-    /// Server drafts kept after a send or update
-    /// whose outcome is unknown, by what they answer and the composed
-    /// message they hold ([`Draft::attempt`]): sending or postponing that
-    /// message again updates the draft rather than making another.
-    kept: Mutex<HashMap<DraftKey, Kept>>,
-    /// The files mett uploaded to recalled drafts, by the same key, until
-    /// they are known to be gone or the message is done with: a retry
-    /// takes them off (to put on again what is still to go), and leaves
-    /// alone what was added elsewhere.
-    uploads: Mutex<HashMap<DraftKey, Vec<Upload>>>,
+    /// What is known of the server drafts made for messages being sent or
+    /// postponed.
+    drafts: DraftSession,
 }
 
 impl<A: Authenticator> GraphMailStore<A> {
@@ -109,8 +101,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             auth,
             roles: Mutex::new(None),
             root: Mutex::new(None),
-            kept: Mutex::new(HashMap::new()),
-            uploads: Mutex::new(HashMap::new()),
+            drafts: DraftSession::new(),
         }
     }
 
@@ -725,11 +716,15 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
-        if needs_server_draft(draft) || self.has_kept(draft) {
+        if needs_server_draft(draft) || self.drafts.has_kept(draft) {
             // Postponed: what mett attached is the draft's own now.
-            let saved = self.server_draft(draft).await.map(|(id, _)| id);
+            let saved = self
+                .drafts
+                .server_draft(self, draft)
+                .await
+                .map(|(id, _)| id);
             if saved.is_ok() {
-                self.forget_uploads(draft);
+                self.drafts.forget_uploads(draft);
             }
             return saved;
         }
@@ -871,30 +866,17 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
     /// Deletes the server draft kept for `draft`, if any. It is kept still
     /// if that fails.
     async fn discard_kept(&self, draft: &Draft) -> Result<()> {
-        let Some(Kept { id, base }) = self.kept().remove(&key(draft)) else {
-            return Ok(());
-        };
-        // A recalled postponed message stays in Drafts (with what the
-        // attempts put on it).
-        if is_recalled(draft, &id) {
-            self.forget_uploads(draft);
-            return Ok(());
-        }
-        let deleted = self.delete_draft(&id).await;
-        if deleted.is_err() {
-            self.keep(draft, id, base);
-        }
-        deleted
+        self.drafts.discard_kept(self, draft).await
     }
 
     fn keeps_draft(&self, draft: &Draft) -> bool {
-        self.has_kept(draft)
+        self.drafts.has_kept(draft)
     }
 
     async fn send(&self, draft: &Draft) -> Result<()> {
         // A server draft kept from an earlier attempt is sent, not left
         // behind.
-        if !needs_server_draft(draft) && !self.has_kept(draft) {
+        if !needs_server_draft(draft) && !self.drafts.has_kept(draft) {
             let url = self.url(&["me", "sendMail"]);
             let body = send_mail_json(draft);
             return self
@@ -907,31 +889,19 @@ impl<A: Authenticator> MailSender for GraphMailStore<A> {
         // pieces. Sending a draft always keeps a copy in Sent Items.
         // Failing before the send request leaves nothing sent, whatever
         // became of the draft.
-        let (id, base) = self.server_draft(draft).await.map_err(unsent)?;
+        let (id, base) = self
+            .drafts
+            .server_draft(self, draft)
+            .await
+            .map_err(unsent)?;
         let url = self.url(&["me", "messages", id.as_str(), "send"]);
         let sent = self
             .hand_over(self.request(Method::POST, url), About::message(id.as_str()))
             .await;
-        match &sent {
-            // The response was lost or Graph failed: the message may have
-            // gone out anyway. Keep the draft, so nothing is lost if it
-            // didn't, and say so; sending again reuses it.
-            Err(Error::Network(e)) => {
-                self.keep(draft, id, base);
-                return Err(Error::Network(format!(
-                    "{e}; if it wasn't sent, it is in Drafts"
-                )));
-            }
-            // Graph refused it: it wasn't sent. A draft that can't be
-            // deleted either is kept, for the next attempt.
-            Err(_) => {
-                if !self.discard(draft, &id).await {
-                    self.keep(draft, id, base);
-                }
-            }
-            Ok(_) => self.forget_uploads(draft),
-        }
-        sent.map(drop)
+        self.drafts
+            .after_send(self, draft, id, base, sent)
+            .await
+            .map(drop)
     }
 }
 

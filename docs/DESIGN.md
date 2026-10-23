@@ -119,6 +119,13 @@ own Sent and Drafts folders (IMAP) stores. Replies are threaded by the
 and gives as `Threading`. It leaves the Sent copy to the mailbox, so it is
 not a `MailSender` itself.
 
+`mett-msgraph` and `mett-ews` send replies, forwards and messages with
+attachments (large ones, for Graph) through a server draft, whose bookkeeping (drafts
+kept after a lost answer, the uploads of a recalled draft, what a retry takes
+off) is shared: `mett-core`'s `DraftSession` holds it and runs the
+algorithms, and each adapter implements only `DraftBackend`, the requests
+that differ between Graph's REST and EWS's SOAP.
+
 `mett-imap` implements `MailStore` against an IMAP server (wrapping
 `async-imap` and `mail-parser`, with TLS by rustls), and `MailSender` on top
 of an `SmtpSender`: it threads replies, carries the attachments of forwards

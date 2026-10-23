@@ -15,17 +15,17 @@ pub use drafts::needs_server_draft;
 pub(crate) use wire::address;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, AccountId, Address, Answer, Attachment, AttachmentId, AttachmentKind,
-    Authenticator, Body, BodyKind, Draft, DraftOrigin, Error, Flags, FlagsUpdate, Folder,
-    FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, Result, Scope, SyncState,
-    ThreadPosition, WellKnownFolder,
+    Authenticator, Body, BodyKind, Draft, DraftOrigin, DraftSession, Error, Flags, FlagsUpdate,
+    Folder, FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId,
+    MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, Result,
+    Scope, SyncState, ThreadPosition, WellKnownFolder, unsent,
 };
 use reqwest::StatusCode;
 use roxmltree::Node;
@@ -38,7 +38,6 @@ use crate::soap::{
     About, check, child, child_text, children, coded_fault, descendant, envelope, escape,
     only_message, parse, response_code, response_messages, text,
 };
-use drafts::{DraftKey, Kept, Upload, is_recalled, key, unsent};
 use folders::{Roles, distinguished, first_then, mail_folders, sort_by_name, tree_order};
 use wire::{
     EwsFolder, FoundItem, MESSAGE_FIELDS, Resolved, SUMMARY_FIELDS, attachment, create_item,
@@ -96,16 +95,9 @@ pub struct EwsMailStore<A> {
     conn: Connection<A>,
     /// The mailbox's folder roles, once looked up, and when.
     roles: Mutex<Option<(Arc<Roles>, Instant)>>,
-    /// Server drafts kept after a send or update whose outcome is unknown,
-    /// by what they answer and the composed message they hold
-    /// ([`Draft::attempt`]): sending or postponing that message again
-    /// updates the draft rather than making another.
-    kept: Mutex<HashMap<DraftKey, Kept>>,
-    /// The files mett attached to recalled drafts, by the same key, until
-    /// they are known to be gone or the message is done with: a retry
-    /// takes them off (to put on again what is still to go), and leaves
-    /// alone what was added elsewhere.
-    uploads: Mutex<HashMap<DraftKey, Vec<Upload>>>,
+    /// What is known of the server drafts made for messages being sent or
+    /// postponed.
+    drafts: DraftSession,
     /// One watch at a time.
     watching: tokio::sync::Mutex<()>,
     /// The streaming subscriptions. Shared with the task that changes
@@ -168,8 +160,7 @@ impl<A: Authenticator> EwsMailStore<A> {
                 auth,
             },
             roles: Mutex::new(None),
-            kept: Mutex::new(HashMap::new()),
-            uploads: Mutex::new(HashMap::new()),
+            drafts: DraftSession::new(),
             watching: tokio::sync::Mutex::new(()),
             subscriptions: Arc::new(tokio::sync::Mutex::new(Subscriptions::default())),
             unreported: Mutex::new(Unreported::default()),
@@ -986,11 +977,15 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
     }
 
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
-        if needs_server_draft(draft) || self.has_kept(draft) {
+        if needs_server_draft(draft) || self.drafts.has_kept(draft) {
             // Postponed: what mett attached is the draft's own now.
-            let saved = self.server_draft(draft).await.map(|(id, _)| id);
+            let saved = self
+                .drafts
+                .server_draft(self, draft)
+                .await
+                .map(|(id, _)| id);
             if saved.is_ok() {
-                self.forget_uploads(draft);
+                self.drafts.forget_uploads(draft);
             }
             return saved;
         }
@@ -1223,30 +1218,17 @@ impl<A: Authenticator + 'static> MailSender for EwsMailStore<A> {
     /// Deletes the server draft kept for `draft`, if any. It is kept still
     /// if that fails.
     async fn discard_kept(&self, draft: &Draft) -> Result<()> {
-        let Some(Kept { id, base }) = self.kept().remove(&key(draft)) else {
-            return Ok(());
-        };
-        // A recalled postponed message stays in Drafts (with what the
-        // attempts put on it).
-        if is_recalled(draft, &id) {
-            self.forget_uploads(draft);
-            return Ok(());
-        }
-        let deleted = self.delete_draft(&id).await;
-        if deleted.is_err() {
-            self.keep(draft, id, base);
-        }
-        deleted
+        self.drafts.discard_kept(self, draft).await
     }
 
     fn keeps_draft(&self, draft: &Draft) -> bool {
-        self.has_kept(draft)
+        self.drafts.has_kept(draft)
     }
 
     async fn send(&self, draft: &Draft) -> Result<()> {
         // A server draft kept from an earlier attempt is sent, not left
         // behind.
-        if !needs_server_draft(draft) && !self.has_kept(draft) {
+        if !needs_server_draft(draft) && !self.drafts.has_kept(draft) {
             let body = if draft.save_copy {
                 create_item("SendAndSaveCopy", Some("sentitems"), &message_xml(draft))
             } else {
@@ -1260,33 +1242,20 @@ impl<A: Authenticator + 'static> MailSender for EwsMailStore<A> {
         // attachments, and so do messages with attachments, which Exchange
         // takes only on a saved message. Failing before the send request
         // leaves nothing sent, whatever became of the draft.
-        let (id, base) = self.server_draft(draft).await.map_err(unsent)?;
+        let (id, base) = self
+            .drafts
+            .server_draft(self, draft)
+            .await
+            .map_err(unsent)?;
         // Sending takes the draft as it is now, which its change key says.
         let change_key = match self.change_key(&id).await {
             Ok(change_key) => change_key,
-            Err(e) => return Err(unsent(self.give_up(draft, id, base, e).await)),
+            Err(e) => {
+                return Err(unsent(self.drafts.give_up(self, draft, id, base, e).await));
+            }
         };
         let sent = self.send_draft(&id, &change_key, draft.save_copy).await;
-        match &sent {
-            // The response was lost or EWS failed: the message may have
-            // gone out anyway. Keep the draft, so nothing is lost if it
-            // didn't, and say so; sending again reuses it.
-            Err(Error::Network(e)) => {
-                self.keep(draft, id, base);
-                return Err(Error::Network(format!(
-                    "{e}; if it wasn't sent, it is in Drafts"
-                )));
-            }
-            // EWS refused it: it wasn't sent. A draft that can't be
-            // deleted either is kept, for the next attempt.
-            Err(_) => {
-                if !self.discard(draft, &id).await {
-                    self.keep(draft, id, base);
-                }
-            }
-            Ok(()) => self.forget_uploads(draft),
-        }
-        sent
+        self.drafts.after_send(self, draft, id, base, sent).await
     }
 }
 
