@@ -220,6 +220,10 @@ impl MailStore for Mailbox {
     ) -> PortResult<FolderChanges> {
         either!(self, s => s.sync_folder(folder, state).await)
     }
+
+    fn bodies_change(&self) -> bool {
+        either!(self, s => s.bodies_change())
+    }
 }
 
 /// The cache file of the account in `url` (mutt's `header_cache`): by
@@ -294,27 +298,59 @@ pub fn default_cache_path(config: &Config, url: &MailboxUrl) -> Option<PathBuf> 
     )
 }
 
+/// Whose a cache file is: the account, and for IMAP the server too (the
+/// same address may be at another), which a cache file named by hand
+/// doesn't say.
+fn cache_owner(url: &MailboxUrl) -> mett_core::AccountId {
+    match &url.server {
+        Server::Imap(server) => {
+            let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
+            mett_core::AccountId::new(format!(
+                "imap://{}@{}:{port}",
+                url.account,
+                server.host.to_lowercase()
+            ))
+        }
+        Server::Office365 => url.account.clone(),
+    }
+}
+
+/// `path` as the file it names, so that two spellings of one are told as
+/// one: the folder it is in as the system has it, and its name.
+fn identity(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    match (
+        absolute.parent().map(Path::canonicalize),
+        absolute.file_name(),
+    ) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => absolute,
+    }
+}
+
 /// `mailbox` with its cache (see [`cache_path`]), which tells `progress`
 /// how far its syncs have got, and a warning if the cache can't be used:
-/// mett then works without it.
+/// mett then works without it. Also the file the cache is in, if it is.
 pub fn cached(
     config: &Config,
     url: &MailboxUrl,
     mailbox: Mailbox,
     progress: Progress,
-) -> (CachedStore<Mailbox>, Option<String>) {
+) -> (CachedStore<Mailbox>, Option<String>, Option<PathBuf>) {
     let path = default_cache_path(config, url);
     let Some(path) = path else {
-        return (CachedStore::new(mailbox, None), None);
+        return (CachedStore::new(mailbox, None), None, None);
     };
-    match Cache::open(&path, &url.account) {
+    match Cache::open(&path, &cache_owner(url)) {
         Ok(cache) => (
             CachedStore::new(mailbox, Some(cache)).with_progress(progress),
             None,
+            Some(identity(&path)),
         ),
         Err(e) => (
             CachedStore::new(mailbox, None),
             Some(format!("header_cache: {e}; not caching")),
+            None,
         ),
     }
 }
@@ -682,6 +718,27 @@ mod tests {
             ..delegated
         }));
         assert!(!Api::Ews.always_copies(&attached));
+    }
+
+    #[test]
+    fn a_cache_file_named_by_hand_belongs_to_the_user_at_the_server() {
+        let owner = |text: &str| cache_owner(&MailboxUrl::parse(text).unwrap());
+        assert_ne!(
+            owner("imaps://me%40example.org@mail.one.net/INBOX"),
+            owner("imaps://me%40example.org@mail.two.net/INBOX")
+        );
+        assert_ne!(
+            owner("imaps://me%40example.org@mail.one.net/INBOX"),
+            owner("imaps://me%40example.org@mail.one.net:1993/INBOX")
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_a_cache_file_are_one_file() {
+        let dir = std::env::temp_dir();
+        let plain = dir.join("mett-identity.sqlite");
+        let roundabout = dir.join(".").join("mett-identity.sqlite");
+        assert_eq!(identity(&plain), identity(&roundabout));
     }
 
     #[test]

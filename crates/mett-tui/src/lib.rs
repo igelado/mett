@@ -300,7 +300,7 @@ fn open_account(
             taken,
         });
     });
-    let (mailbox, warning) = account::cached(&config, &spoolfile, mailbox, progress);
+    let (mailbox, warning, cache) = account::cached(&config, &spoolfile, mailbox, progress);
     if let Some(warning) = warning {
         launch.say(&format!("warning: {warning}"));
     }
@@ -316,7 +316,6 @@ fn open_account(
     } else {
         label
     };
-    let cache = account::default_cache_path(&config, &spoolfile);
     Ok((
         Opened {
             label,
