@@ -884,7 +884,8 @@ async fn a_busy_cache_is_not_a_broken_one() {
     assert_eq!(listing(&store, 10).await, ["m1", "m0"]);
     assert!(store.inner().syncs() > syncs, "the cache is used again");
     // Windows can't remove files that are open.
-    drop((store, other));
+    drop(other);
+    store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -931,6 +932,7 @@ async fn a_busy_cache_does_not_block_the_executor() {
         "the executor ran other tasks while SQLite waited ({ticks} ticks in {waited:?})"
     );
     // Windows can't remove files that are open.
-    drop((store, other));
+    drop(other);
+    store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }

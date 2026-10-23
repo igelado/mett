@@ -72,7 +72,9 @@ type Job = Box<dyn FnOnce(&mut Db) + Send>;
 /// The database, on a thread of its own: its calls block (a busy wait, a
 /// large sync batch), and run there one at a time, in the order they were
 /// made, to their end even if the call that made one is dropped (a change
-/// can't be overtaken by a later one). Dropping this ends the thread.
+/// can't be overtaken by a later one). Dropping this lets the thread end
+/// once it has run what is queued (without waiting for it: that could
+/// block the executor); [`CachedStore::close`] waits.
 struct Shared {
     jobs: Option<std::sync::mpsc::Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -155,13 +157,12 @@ impl Shared {
     }
 }
 
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // The thread finishes what was queued, closes the database and ends.
+impl Shared {
+    /// Stops taking calls: the thread ends, and closes the database, after
+    /// the ones queued. It is returned, to be waited for.
+    fn stop(&mut self) -> Option<std::thread::JoinHandle<()>> {
         self.jobs = None;
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.thread.take()
     }
 }
 
@@ -257,6 +258,20 @@ impl<S: MailStore> CachedStore<S> {
     pub fn with_progress(mut self, progress: Progress) -> Self {
         self.progress = Some(progress);
         self
+    }
+
+    /// Closes the cache (the database file) after the calls on it end,
+    /// which dropping the store leaves to happen on their own. Waits off
+    /// the executor.
+    pub async fn close(mut self) {
+        let thread = self
+            .db
+            .take()
+            .and_then(Arc::into_inner)
+            .and_then(|mut db| db.stop());
+        if let Some(thread) = thread {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
     }
 
     /// The store behind the cache.
