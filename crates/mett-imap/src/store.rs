@@ -4,8 +4,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_imap::Session;
-use async_imap::imap_proto::{MailboxDatum, NameAttribute, Response, Status};
-use async_imap::types::{Fetch, Flag, Name};
+use async_imap::imap_proto::{MailboxDatum, NameAttribute, Response, Status, StatusAttribute};
+use async_imap::types::{Fetch, Flag};
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use mett_core::{
@@ -94,6 +94,9 @@ struct Caps {
     /// `SPECIAL-USE`, which says which folder is Sent, Drafts and so on, if
     /// it is asked to (`RETURN (SPECIAL-USE)`).
     special_use: bool,
+    /// `LIST-STATUS`, which says how many messages folders hold in the
+    /// listing of them (`RETURN (STATUS (...))`).
+    list_status: bool,
 }
 
 /// A connection that is logged in.
@@ -195,6 +198,7 @@ impl<A: Authenticator> ImapMailStore<A> {
                 sort: caps.has_str("SORT"),
                 condstore: caps.has_str("CONDSTORE") || caps.has_str("QRESYNC"),
                 special_use: caps.has_str("SPECIAL-USE"),
+                list_status: caps.has_str("LIST-STATUS"),
             },
             used: Instant::now(),
             listing: None,
@@ -393,18 +397,18 @@ struct Listed {
     declared: bool,
 }
 
-fn listed(name: &Name) -> Listed {
-    let decoded = decode_utf7_imap(name.name().to_owned());
-    let found = role(&decoded, name.delimiter(), name.attributes());
+fn listed(name: &str, delimiter: Option<&str>, attributes: &[NameAttribute<'_>]) -> Listed {
+    let decoded = decode_utf7_imap(name.to_owned());
+    let found = role(&decoded, delimiter, attributes);
     Listed {
         role: found.map(|(role, _)| role),
         declared: found.is_some_and(|(_, declared)| declared),
-        selectable: !name.attributes().iter().any(|a| match a {
+        selectable: !attributes.iter().any(|a| match a {
             NameAttribute::NoSelect => true,
             NameAttribute::Extension(x) => x.eq_ignore_ascii_case("\\NonExistent"),
             _ => false,
         }),
-        delimiter: name.delimiter().map(str::to_owned),
+        delimiter: delimiter.map(str::to_owned),
         name: decoded,
     }
 }
@@ -415,63 +419,213 @@ fn parent_name<'a>(name: &'a str, delimiter: Option<&str>) -> Option<&'a str> {
     name.rsplit_once(delimiter).map(|(parent, _)| parent)
 }
 
+/// How many messages folders hold, by name: how many are unread, and the
+/// total.
+type Counts = HashMap<String, (u32, u32)>;
+
+/// What a batch of commands got.
+struct Batch {
+    /// What `LIST` said.
+    listed: Vec<Listed>,
+    /// What `STATUS` said (also in the listing, with `LIST-STATUS`).
+    counts: Counts,
+    /// How each command ended, in the order they were sent.
+    ended: Vec<Res<()>>,
+}
+
+/// A name, as a command takes it.
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Runs `commands` one after the other without waiting for the server in
+/// between: they are written, and then the answers read. That is a round
+/// trip for all, not for each.
+async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
+    let mut ids = Vec::with_capacity(commands.len());
+    for command in commands {
+        ids.push(live.session.run_command(command).await?);
+    }
+    let mut got = Batch {
+        listed: Vec::new(),
+        counts: Counts::new(),
+        ended: Vec::new(),
+    };
+    let mut ended: Vec<Option<Res<()>>> = commands.iter().map(|_| None).collect();
+    let mut pending = commands.len();
+    while pending > 0 {
+        let response = live
+            .session
+            .read_response()
+            .await
+            .map_err(async_imap::error::Error::Io)?;
+        let Some(response) = response else {
+            return Err(async_imap::error::Error::ConnectionLost.into());
+        };
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::List(data)) => got.listed.push(listed(
+                &data.name,
+                data.delimiter.as_deref(),
+                &data.name_attributes,
+            )),
+            Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+                let (mut unseen, mut total) = (0, 0);
+                for attribute in status {
+                    match attribute {
+                        StatusAttribute::Unseen(n) => unseen = *n,
+                        StatusAttribute::Messages(n) => total = *n,
+                        _ => {}
+                    }
+                }
+                got.counts
+                    .insert(decode_utf7_imap(mailbox.to_string()), (unseen, total));
+            }
+            Response::Done {
+                tag,
+                status,
+                outcome,
+            } => {
+                if let Some(at) = ids.iter().position(|id| id.0 == tag.0)
+                    && ended[at].is_none()
+                {
+                    let why = outcome
+                        .information
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned();
+                    ended[at] = Some(match status {
+                        Status::Ok => Ok(()),
+                        Status::No => Err(async_imap::error::Error::No(why).into()),
+                        _ => Err(async_imap::error::Error::Bad(why).into()),
+                    });
+                    pending -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    got.ended = ended.into_iter().flatten().collect();
+    Ok(got)
+}
+
+/// How many `STATUS` commands go out before the answers are read: no
+/// more than a server (or the connection, in both directions) takes
+/// unanswered, and the time allowed is for each round.
+const PIPELINE: usize = 50;
+
+/// How many messages `names` hold, from the server, asked of without
+/// waiting for the answer to each. A folder that can't be asked about fails
+/// the whole, as it would one at a time.
+async fn counted(live: &mut Live, names: &[&str], timeout: Duration) -> Res<Counts> {
+    let mut counts = Counts::new();
+    for round in names.chunks(PIPELINE) {
+        let commands: Vec<String> = round
+            .iter()
+            .map(|name| format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))))
+            .collect();
+        let got = bounded(timeout, batch(live, &commands)).await?;
+        for (name, ended) in round.iter().zip(got.ended) {
+            ended?;
+            // A server that says nothing of a folder says it is empty.
+            let found = got.counts.get(*name).copied().unwrap_or((0, 0));
+            counts.insert((*name).to_owned(), found);
+        }
+    }
+    Ok(counts)
+}
+
+/// What a listing is asked for, besides the folders.
+#[derive(Clone, Copy, Default)]
+struct Want<'a> {
+    /// How many messages every folder holds (where the server says so in
+    /// the listing).
+    all_counts: bool,
+    /// A folder to ask of at the same time, whatever the listing: it
+    /// costs no round trip of its own.
+    count_of: Option<&'a str>,
+}
+
 /// The folders, listed again if `fresh` or if the listing before is old.
 async fn all_folders(live: &mut Live, fresh: bool) -> Res<Vec<Listed>> {
+    Ok(listing(live, fresh, Want::default()).await?.0)
+}
+
+/// As `all_folders`, with what `want` says of how many messages: that is
+/// asked only when the folders are listed (those cached are of no use).
+async fn listing(live: &mut Live, fresh: bool, want: Want<'_>) -> Res<(Vec<Listed>, Counts)> {
     if !fresh
         && let Some((at, listing)) = &live.listing
         && at.elapsed() < LISTING_TTL
     {
-        return Ok(listing.clone());
+        return Ok((listing.clone(), Counts::new()));
     }
-    let listing = list(live, "*").await?;
+    let (listing, counts) = list(live, "*", want).await?;
     live.listing = Some((Instant::now(), listing.clone()));
-    Ok(listing)
+    Ok((listing, counts))
 }
 
-/// What `LIST` says of the folders that match `pattern`.
-async fn list_names(live: &mut Live, argument: &str) -> async_imap::error::Result<Vec<Name>> {
-    live.session
-        .list(Some(""), Some(argument))
-        .await?
-        .try_collect()
-        .await
-}
-
-async fn list(live: &mut Live, pattern: &str) -> Res<Vec<Listed>> {
+async fn list(live: &mut Live, pattern: &str, want: Want<'_>) -> Res<(Vec<Listed>, Counts)> {
     // Some servers say which folders are Sent, Drafts and so on only when
-    // asked: those that can are, and one that refuses is listed as every
-    // server can be.
-    let asked = if live.caps.special_use {
-        match list_names(live, &format!("\"{pattern}\" RETURN (SPECIAL-USE)")).await {
-            Err(async_imap::error::Error::Bad(_) | async_imap::error::Error::No(_)) => None,
-            other => Some(other?),
-        }
-    } else {
-        None
-    };
-    let names: Vec<Name> = match asked {
-        Some(names) => names,
-        None => list_names(live, &format!("\"{pattern}\"")).await?,
-    };
-    let mut all: Vec<Listed> = names.iter().map(listed).collect();
-    // A folder the server says has a role has it alone: another that only
-    // has the usual name for it is an ordinary folder.
-    let declared: HashSet<WellKnownFolder> = all
-        .iter()
-        .filter(|l| l.declared)
-        .filter_map(|l| l.role)
-        .collect();
-    for item in &mut all {
-        if !item.declared && item.role.is_some_and(|r| declared.contains(&r)) {
-            item.role = None;
-        }
+    // asked, and some how many messages the folders hold: those that can
+    // are, and one that refuses is listed as every server can be.
+    let mut options = Vec::new();
+    if live.caps.special_use {
+        options.push("SPECIAL-USE");
     }
-    Ok(all)
+    let counting = want.all_counts && live.caps.list_status;
+    if counting {
+        options.push("STATUS (MESSAGES UNSEEN)");
+    }
+    let mut attempts = vec![options.join(" ")];
+    if counting && live.caps.special_use {
+        attempts.push("SPECIAL-USE".to_owned());
+    }
+    attempts.push(String::new());
+    attempts.dedup();
+    let mut counts = Counts::new();
+    let mut extra: Vec<String> = want
+        .count_of
+        .iter()
+        .map(|name| format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))))
+        .collect();
+    let last = attempts.len() - 1;
+    for (n, options) in attempts.iter().enumerate() {
+        let mut commands = vec![if options.is_empty() {
+            format!("LIST \"\" {}", quoted(pattern))
+        } else {
+            format!("LIST \"\" {} RETURN ({options})", quoted(pattern))
+        }];
+        commands.append(&mut extra);
+        let got = batch(live, &commands).await?;
+        counts.extend(got.counts);
+        match got.ended.into_iter().next() {
+            Some(Err(Fail::Imap(
+                async_imap::error::Error::Bad(_) | async_imap::error::Error::No(_),
+            ))) if n < last => continue,
+            Some(Err(e)) => return Err(e),
+            _ => {}
+        }
+        let mut all = got.listed;
+        // A folder the server says has a role has it alone: another that
+        // only has the usual name for it is an ordinary folder.
+        let declared: HashSet<WellKnownFolder> = all
+            .iter()
+            .filter(|l| l.declared)
+            .filter_map(|l| l.role)
+            .collect();
+        for item in &mut all {
+            if !item.declared && item.role.is_some_and(|r| declared.contains(&r)) {
+                item.role = None;
+            }
+        }
+        return Ok((all, counts));
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// `listed` as a folder, with its counts from the server.
 async fn folder_of(live: &mut Live, listed: &Listed, parent: Option<FolderId>) -> Res<Folder> {
-    let (unread, total) = if listed.selectable {
+    let counts = if listed.selectable {
         let status = live
             .session
             .status(wire(&listed.name), "(MESSAGES UNSEEN)")
@@ -480,6 +634,11 @@ async fn folder_of(live: &mut Live, listed: &Listed, parent: Option<FolderId>) -
     } else {
         (0, 0)
     };
+    Ok(folder_with(listed, parent, counts))
+}
+
+/// `listed` as a folder, that holds `counts` (unread, total).
+fn folder_with(listed: &Listed, parent: Option<FolderId>, counts: (u32, u32)) -> Folder {
     let display = match (&parent, &listed.delimiter) {
         (Some(_), Some(d)) => listed
             .name
@@ -488,27 +647,33 @@ async fn folder_of(live: &mut Live, listed: &Listed, parent: Option<FolderId>) -
             .unwrap_or(&listed.name),
         _ => &listed.name,
     };
-    Ok(Folder {
+    Folder {
         id: FolderId::new(&listed.name),
         parent,
         name: display.to_owned(),
         well_known: listed.role,
-        unread_count: unread,
-        total_count: total,
-    })
+        unread_count: counts.0,
+        total_count: counts.1,
+    }
 }
 
 /// The folders of the mailbox, or, with `under`, those directly below the
-/// folder it holds (the top ones if it holds none): counting messages takes
-/// a request to the server for each.
+/// folder it holds (the top ones if it holds none): the counts of messages
+/// come with the listing where the server can, and else are asked for
+/// together, not one at a time.
 async fn folders(
     live: &mut Live,
     under: Option<Option<&FolderId>>,
     timeout: Duration,
 ) -> Res<Vec<Folder>> {
-    let all = bounded(timeout, all_folders(live, true)).await?;
+    // With `under`, those that are asked about are few: not all of them.
+    let want = Want {
+        all_counts: under.is_none(),
+        count_of: None,
+    };
+    let (all, mut counts) = bounded(timeout, listing(live, true, want)).await?;
     let names: HashSet<String> = all.iter().map(|l| l.name.clone()).collect();
-    let mut out = Vec::with_capacity(all.len());
+    let mut chosen = Vec::with_capacity(all.len());
     for item in &all {
         let parent = parent_name(&item.name, item.delimiter.as_deref())
             .filter(|p| names.contains(*p))
@@ -516,16 +681,31 @@ async fn folders(
         if under.is_some_and(|under| under != parent.as_ref()) {
             continue;
         }
-        // Each count takes a request: the time allowed is for each, not for
-        // a mailbox with many folders as a whole.
-        out.push(bounded(timeout, folder_of(live, item, parent)).await?);
+        chosen.push((item, parent));
     }
-    Ok(out)
+    let missing: Vec<&str> = chosen
+        .iter()
+        .filter(|(item, _)| item.selectable && !counts.contains_key(&item.name))
+        .map(|(item, _)| item.name.as_str())
+        .collect();
+    counts.extend(counted(live, &missing, timeout).await?);
+    Ok(chosen
+        .into_iter()
+        .map(|(item, parent)| {
+            let found = counts.get(&item.name).copied().unwrap_or((0, 0));
+            folder_with(item, parent, found)
+        })
+        .collect())
 }
 
 async fn folder(live: &mut Live, id: &FolderId) -> Res<Folder> {
-    // The whole listing, which says what roles the others have.
-    let all = all_folders(live, false).await?;
+    // The whole listing, which says what roles the others have: if it is
+    // listed again, the folder is asked of in the same round trip.
+    let want = Want {
+        all_counts: false,
+        count_of: Some(id.as_str()),
+    };
+    let (all, mut counts) = listing(live, false, want).await?;
     let item = all
         .iter()
         .find(|l| l.name == id.as_str())
@@ -533,7 +713,10 @@ async fn folder(live: &mut Live, id: &FolderId) -> Res<Folder> {
     let parent = parent_name(&item.name, item.delimiter.as_deref())
         .filter(|p| all.iter().any(|l| l.name == *p))
         .map(FolderId::new);
-    folder_of(live, item, parent).await
+    match counts.remove(&item.name) {
+        Some(found) if item.selectable => Ok(folder_with(item, parent, found)),
+        _ => folder_of(live, item, parent).await,
+    }
 }
 
 /// A folder that is selected.

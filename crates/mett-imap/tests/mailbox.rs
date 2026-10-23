@@ -1721,3 +1721,74 @@ async fn a_sent_message_whose_copy_cannot_be_kept_is_said_to_be_sent() {
     // It went out, once.
     assert_eq!(out.taken.lock().unwrap().len(), 1);
 }
+
+fn commands(server: &Server, verb: &str) -> usize {
+    server.state.lock().unwrap().count(verb)
+}
+
+#[tokio::test]
+async fn counts_come_with_the_listing_where_the_server_says_so() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    deliver(&server, "INBOX", &simple("two"), &["\\Seen"]);
+    let folders = store.list_folders().await.unwrap();
+    let inbox = folders.iter().find(|f| f.id.as_str() == "INBOX").unwrap();
+    assert_eq!((inbox.total_count, inbox.unread_count), (2, 1));
+    // One command for the listing and the counts of all folders.
+    assert_eq!(commands(&server, "LIST"), 1);
+    assert_eq!(commands(&server, "STATUS"), 0);
+}
+
+#[tokio::test]
+async fn counts_are_asked_together_where_the_listing_has_none() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_list_status = true;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    deliver(&server, "INBOX", &simple("two"), &["\\Seen"]);
+    let folders = store.list_folders().await.unwrap();
+    let inbox = folders.iter().find(|f| f.id.as_str() == "INBOX").unwrap();
+    assert_eq!((inbox.total_count, inbox.unread_count), (2, 1));
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.count("STATUS"), folders.len());
+    assert_eq!(state.count("LIST"), 1);
+    // All but the first of them went out before the answer to the one
+    // before: the connection waits for the server once, not for each.
+    assert!(state.pipelined >= folders.len() as u32 - 1);
+}
+
+#[tokio::test]
+async fn a_listing_that_is_refused_with_counts_is_asked_without() {
+    let (server, store) = plain().await;
+    // Says it can, and can't.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.no_list_status = true;
+        state.advertise_list_status = true;
+    }
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    let folders = store.list_folders().await.unwrap();
+    let inbox = folders.iter().find(|f| f.id.as_str() == "INBOX").unwrap();
+    assert_eq!((inbox.total_count, inbox.unread_count), (1, 1));
+}
+
+#[tokio::test]
+async fn a_folder_polled_after_the_listing_went_old_takes_one_round_trip() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    // The first asks the folders (and the folder) and keeps the listing.
+    let id = FolderId::new("INBOX");
+    assert_eq!(store.folder(&id).await.unwrap().unread_count, 1);
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.count("LIST"), 1);
+        assert_eq!(state.count("STATUS"), 1);
+        // Listing and counts were written together.
+        assert_eq!(state.pipelined, 1);
+    }
+    // While the listing is kept, only the folder is asked of.
+    deliver(&server, "INBOX", &simple("two"), &[]);
+    assert_eq!(store.folder(&id).await.unwrap().unread_count, 2);
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.count("LIST"), 1);
+    assert_eq!(state.count("STATUS"), 2);
+}
