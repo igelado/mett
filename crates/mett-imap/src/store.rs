@@ -19,6 +19,7 @@ use mett_core::{
     WellKnownFolder,
 };
 use mett_smtp::{SmtpSender, Threading};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, MutexGuard};
 use utf7_imap::{decode_utf7_imap, encode_utf7_imap};
 
@@ -1727,13 +1728,14 @@ async fn run(live: &mut Live, command: &str) -> Res<Option<Landed>> {
 /// does (`UIDPLUS`).
 async fn append(live: &mut Live, folder: &str, flags: &str, message: &[u8]) -> Res<Option<Landed>> {
     // The library doesn't tell what the server says at the end of an
-    // `APPEND`, so it is sent here (as text: that is what it sends).
-    let (true, Ok(text)) = (live.caps.uidplus, std::str::from_utf8(message)) else {
+    // `APPEND`, so it is sent here: the message goes to the connection as
+    // it is, not through the library's logging of commands.
+    if !live.caps.uidplus {
         live.session
             .append(wire(folder), Some(flags), None, message)
             .await?;
         return Ok(None);
-    };
+    }
     let command = format!(
         "APPEND {} {flags} {{{}}}",
         quoted(&wire(folder))?,
@@ -1766,9 +1768,15 @@ async fn append(live: &mut Live, folder: &str, flags: &str, message: &[u8]) -> R
             _ => {}
         }
     }
-    within(live.timeout, live.session.run_command_untagged(text))
-        .await
-        .map_err(Fail::Core)??;
+    let sent = within(live.timeout, async {
+        let conn = live.session.get_mut();
+        conn.write_all(message).await?;
+        conn.write_all(b"\r\n").await?;
+        conn.flush().await
+    })
+    .await;
+    sent.map_err(Fail::Core)?
+        .map_err(async_imap::error::Error::Io)?;
     finished(live, &id).await
 }
 
