@@ -445,9 +445,16 @@ struct Batch {
     ended: Vec<Res<()>>,
 }
 
-/// A name, as a command takes it.
-fn quoted(name: &str) -> String {
-    format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+/// A name, as a command takes it: a line break in it would end the
+/// command, and what follows would be another one.
+fn quoted(name: &str) -> Res<String> {
+    if name.contains(['\r', '\n']) {
+        return Err(Error::Backend(format!("{name:?} is not a name a folder can have")).into());
+    }
+    Ok(format!(
+        "\"{}\"",
+        name.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 /// Runs `commands` one after the other without waiting for the server in
@@ -531,10 +538,10 @@ const PIPELINE: usize = 50;
 async fn counted(live: &mut Live, names: &[&str], timeout: Duration) -> Res<Counts> {
     let mut counts = Counts::new();
     for round in names.chunks(PIPELINE) {
-        let commands: Vec<String> = round
+        let commands = round
             .iter()
-            .map(|name| format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))))
-            .collect();
+            .map(|name| Ok(format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))?)))
+            .collect::<Res<Vec<String>>>()?;
         // The time allowed is for each of them: a server may take each
         // that long.
         let got = bounded(timeout * round.len() as u32, batch(live, &commands)).await?;
@@ -597,17 +604,17 @@ async fn list(live: &mut Live, pattern: &str, want: Want<'_>) -> Res<(Vec<Listed
     attempts.push(String::new());
     attempts.dedup();
     let mut counts = Counts::new();
-    let mut extra: Vec<String> = want
+    let mut extra = want
         .count_of
         .iter()
-        .map(|name| format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))))
-        .collect();
+        .map(|name| Ok(format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))?)))
+        .collect::<Res<Vec<String>>>()?;
     let last = attempts.len() - 1;
     for (n, options) in attempts.iter().enumerate() {
         let mut commands = vec![if options.is_empty() {
-            format!("LIST \"\" {}", quoted(pattern))
+            format!("LIST \"\" {}", quoted(pattern)?)
         } else {
-            format!("LIST \"\" {} RETURN ({options})", quoted(pattern))
+            format!("LIST \"\" {} RETURN ({options})", quoted(pattern)?)
         }];
         commands.append(&mut extra);
         let got = batch(live, &commands).await?;

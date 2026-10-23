@@ -1895,3 +1895,12 @@ async fn a_failed_command_makes_the_next_select_the_folder_again() {
     assert!(store.fetch_message(&id).await.is_err());
     assert_eq!(commands(&server, "SELECT"), 2);
 }
+
+#[tokio::test]
+async fn a_folder_name_with_a_line_break_sends_no_command() {
+    let (server, store) = plain().await;
+    let result = store.folder(&FolderId::new("INBOX\r\nx LOGOUT")).await;
+    assert!(result.is_err());
+    assert_eq!(commands(&server, "LOGOUT"), 0);
+    assert_eq!(commands(&server, "x"), 0);
+}
