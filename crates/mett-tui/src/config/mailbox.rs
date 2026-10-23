@@ -186,10 +186,12 @@ impl MailboxUrl {
         if same_account {
             return true;
         }
-        // An IMAP URL that names no user is of whoever logs in at its
-        // server: the base says it is the server (without one, any is).
+        // An IMAP URL that names no user is of whoever logs in at its server:
+        // the base says it is the server (checked above), and without a base
+        // that is a mailbox (`folder` is left at its default), nothing says
+        // it isn't.
         matches!(&self.server, Server::Imap(server) if server.user.is_none())
-            && base.is_some_and(|base| matches!(base.server, Server::Imap(_)))
+            && base.is_none_or(|base| matches!(base.server, Server::Imap(_)))
     }
 
     /// Whether both mailboxes are on the same server.
@@ -682,5 +684,18 @@ mod tests {
             let error = MailboxUrl::parse(bad).unwrap_err().to_string();
             assert!(!error.contains("hunter2"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_userless_imap_url_is_the_accounts_when_folder_names_no_server() {
+        // `imap_user=alice`, `spoolfile=imaps://mail.example.com/INBOX`, `folder` unset.
+        let account = AccountId::new("alice@mail.example.com");
+        let path = |text| folder_path(text, "~/Mail", &account);
+        assert_eq!(
+            path("imaps://mail.example.com/INBOX"),
+            Ok(FolderPath::Named(vec!["INBOX".into()]))
+        );
+        // Another user is another account, though.
+        assert!(path("imaps://bob@mail.example.com/INBOX").is_err());
     }
 }
