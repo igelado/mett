@@ -1069,3 +1069,19 @@ fn resetting_the_folder_restores_a_fresh_index() {
     app.reset_folder();
     assert_eq!(format!("{:?}", app.index), fresh);
 }
+
+#[test]
+fn resetting_the_folder_restores_a_fresh_poll_of_the_folder() {
+    let (mut app, _) = opened(Settings::default(), 24, plain(&["a"]), None);
+    app.poll.open.known_before_refresh = Some(HashSet::from([MessageId::new("a")]));
+    app.poll.open.tie_check = Some((RequestId(7), mett_core::FolderId::new("in")));
+    app.poll.armed = true;
+    app.poll.epoch = 3;
+    let fresh = format!("{:?}", poll::OpenPoll::default());
+    assert_ne!(format!("{:?}", app.poll.open), fresh);
+    app.reset_folder();
+    assert_eq!(format!("{:?}", app.poll.open), fresh);
+    // The timers and the sign-in's state go on across folders.
+    assert!(app.poll.armed);
+    assert_eq!(app.poll.epoch, 3);
+}

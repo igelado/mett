@@ -689,9 +689,7 @@ impl App {
     /// on their way or failed are kept: they don't depend on it.
     pub(super) fn reset_folder(&mut self) {
         self.screens.truncate(1);
-        self.polling = None;
-        self.known_before_refresh = None;
-        self.tie_check = None;
+        self.poll.reset();
         self.reselect = None;
         self.folder = None;
         self.index.reset();

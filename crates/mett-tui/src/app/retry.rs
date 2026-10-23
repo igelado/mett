@@ -210,9 +210,9 @@ impl App {
     /// changes.
     pub(super) fn retry(&mut self) -> Vec<Effect> {
         // Signed in again: checking for new mail can go on.
-        self.poll_paused = false;
-        self.watch_paused = false;
-        self.poll_epoch += 1;
+        self.poll.paused = false;
+        self.poll.watch_paused = false;
+        self.poll.epoch += 1;
         if self.quit {
             let mut effects = self.retry_saves();
             effects.extend(self.retry_discards());

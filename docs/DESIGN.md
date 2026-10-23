@@ -187,7 +187,9 @@ run `$EDITOR`. The main loop carries them out.
 **Grouped state.** State that belongs to the open folder lives in a
 sub-struct of `App` that owns its `Default` and a `reset()`, so that opening
 another folder resets it with one call and a new field can't be forgotten:
-`IndexState` (the messages and how they are threaded, limited and listed).
+`IndexState` (the messages and how they are threaded, limited and listed)
+and the folder's part of `Poll` (the check for new mail on its way, which
+sits with the timers and the watch that carry on across folders).
 
 **Frontends.** The main loop is the same for the terminal and for
 `mett-gui`'s window: it reads crossterm events from a channel, and draws on
