@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
+use lettre::transport::smtp::client::{Certificate, CertificateStore, Tls, TlsParameters};
 use lettre::transport::smtp::{self, AsyncSmtpTransport};
 use lettre::{Address as MailAddress, AsyncTransport, Tokio1Executor};
 use mett_core::{AccessToken, Address, Authenticator, Draft, Error, Result};
@@ -208,15 +208,12 @@ impl<A: Authenticator> SmtpSender<A> {
                 );
             }
             if !settings.verify_host {
-                // Lettre doesn't skip the name check of a server it trusts
-                // extra certificates for: that is refused, not done wrong.
-                if !settings.ca_certificates.is_empty() {
-                    return Err(Error::NotSent(
-                        "not checking the server's name can't be combined with extra certificate authorities for SMTP: give a certificate for the name used"
-                            .into(),
-                    ));
-                }
-                tls = tls.dangerous_accept_invalid_hostnames(true);
+                // Lettre skips the name check only with a store of its own
+                // (its platform verifier is all or nothing): the roots it
+                // bundles, and the extra ones given.
+                tls = tls
+                    .certificate_store(CertificateStore::WebpkiRoots)
+                    .dangerous_accept_invalid_hostnames(true);
             }
             tls.build_rustls()
                 .map_err(|e| Error::NotSent(format!("TLS: {e}")))

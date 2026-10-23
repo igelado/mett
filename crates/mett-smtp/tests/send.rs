@@ -287,7 +287,7 @@ async fn refuses_a_certificate_it_does_not_trust() {
 }
 
 #[tokio::test]
-async fn checks_the_name_of_the_certificate_and_the_certificate_itself() {
+async fn takes_a_certificate_for_another_name_only_when_not_checking_names() {
     // Its certificate is for 127.0.0.2, the connection is to 127.0.0.1.
     let server = server_for(true, Accept::Everything, "127.0.0.2").await;
     let mut settings = settings(&server, Security::Tls);
@@ -297,24 +297,19 @@ async fn checks_the_name_of_the_certificate_and_the_certificate_itself() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::NotSent(_)), "{error}");
-
-    // Not checking the name doesn't mean taking any certificate: this one
-    // is from no authority the sender knows.
-    settings.verify_host = false;
-    settings.ca_certificates.clear();
-    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
-    assert!(sender.send(&draft(), &Threading::default()).await.is_err());
-
-    // Nor can it be combined with the extra authorities, which lettre
-    // would check the name with anyway: that is said, not done wrong.
-    settings.ca_certificates = vec![server.ca.clone()];
-    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
-    let error = sender
-        .send(&draft(), &Threading::default())
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("can't be combined"), "{error}");
     assert!(server.seen.lock().unwrap().is_empty());
+
+    settings.verify_host = false;
+    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
+    sender.send(&draft(), &Threading::default()).await.unwrap();
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
+
+    // Not checking the name doesn't mean taking any certificate: one no
+    // authority vouches for is not taken.
+    settings.ca_certificates.clear();
+    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    assert!(sender.send(&draft(), &Threading::default()).await.is_err());
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
