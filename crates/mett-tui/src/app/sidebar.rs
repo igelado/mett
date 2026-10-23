@@ -447,13 +447,13 @@ impl App {
             && self.sidebar.listing.is_none()
             && self.sidebar_shown()
             && !self.quit
-            && !self.poll_paused
+            && !self.poll.paused
             && self.sign_in.is_none();
         if !wanted {
             return Vec::new();
         }
         let request = self.request(Request::ListFolders);
-        self.sidebar.listing = Some((effect_id(&request), self.poll_epoch));
+        self.sidebar.listing = Some((effect_id(&request), self.poll.epoch));
         // Up to date once listed, unless they change meanwhile.
         self.sidebar.listed = true;
         vec![request]

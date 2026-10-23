@@ -164,9 +164,9 @@ impl App {
     /// off.
     pub(super) fn arm_poll(&mut self) -> Vec<Effect> {
         let mut effects = match self.sync_interval {
-            Some(interval) if !self.poll_armed => {
-                self.poll_armed = true;
-                vec![Effect::Later(interval, Timer::Poll(self.poll_timer))]
+            Some(interval) if !self.poll.armed => {
+                self.poll.armed = true;
+                vec![Effect::Later(interval, Timer::Poll(self.poll.timer))]
             }
             _ => Vec::new(),
         };
@@ -186,33 +186,33 @@ impl App {
         // Quitting: nothing new starts.
         // Nor while watching is being ended: that could end the new watch.
         if self.quit
-            || !self.can_watch
-            || self.watch_retry
-            || self.watch_paused
-            || self.unwatching.is_some()
+            || !self.poll.can_watch
+            || self.poll.watch_retry
+            || self.poll.watch_paused
+            || self.poll.unwatching.is_some()
             || self.sync_interval.is_none()
-            || self.poll_paused
+            || self.poll.paused
             || self.sign_in.is_some()
         {
             return Vec::new();
         }
         let folders = self.to_watch();
         // Watched already, or nothing to watch.
-        if self.watching.is_some() && folders == self.watched || folders.is_empty() {
+        if self.poll.watching.is_some() && folders == self.poll.watched || folders.is_empty() {
             return Vec::new();
         }
         // Other folders now (the mailboxes found, another folder opened):
         // the watch starts again.
         let mut effects = Vec::new();
-        if let Some(old) = self.watching.take() {
+        if let Some(old) = self.poll.watching.take() {
             effects.push(self.request(Request::Cancel(old)));
         }
         let watch = self.request(Request::Watch(folders.clone()));
-        self.watching = Some(effect_id(&watch));
-        self.watch_epoch = self.poll_epoch;
+        self.poll.watching = Some(effect_id(&watch));
+        self.poll.watch_epoch = self.poll.epoch;
         // What was left to end, the mailbox ends first.
-        self.unwatch_failed = false;
-        self.watched = folders;
+        self.poll.unwatch_failed = false;
+        self.poll.watched = folders;
         effects.push(watch);
         effects
     }
@@ -222,23 +222,23 @@ impl App {
     /// subscription), rather than linger there until it expires.
     pub fn unwatch(&mut self) -> Vec<Effect> {
         let mut effects = Vec::new();
-        if let Some(old) = self.watching.take() {
+        if let Some(old) = self.poll.watching.take() {
             effects.push(self.request(Request::Cancel(old)));
         }
-        if self.can_watch
-            && (!self.watched.is_empty() || self.unwatch_failed)
-            && self.unwatching.is_none()
+        if self.poll.can_watch
+            && (!self.poll.watched.is_empty() || self.poll.unwatch_failed)
+            && self.poll.unwatching.is_none()
         {
-            self.watched.clear();
+            self.poll.watched.clear();
             // Watching's sign-in failed: ended once the user signs in, not
             // to ask them again unbidden.
-            if self.watch_paused {
-                self.unwatch_failed = true;
+            if self.poll.watch_paused {
+                self.poll.unwatch_failed = true;
                 return effects;
             }
-            self.unwatch_failed = false;
+            self.poll.unwatch_failed = false;
             let unwatch = self.request(Request::Watch(Vec::new()));
-            self.unwatching = Some(effect_id(&unwatch));
+            self.poll.unwatching = Some(effect_id(&unwatch));
             effects.push(unwatch);
         }
         effects
@@ -246,7 +246,7 @@ impl App {
 
     /// Whether watching is being stopped ([`Self::unwatch`]).
     pub fn unwatching(&self) -> bool {
-        self.unwatching.is_some()
+        self.poll.unwatching.is_some()
     }
 
     /// The folders to watch: the open folder, and the `mailboxes` found.
@@ -276,27 +276,27 @@ impl App {
         id: RequestId,
         result: Option<mett_core::Result<Vec<mett_core::FolderId>>>,
     ) -> Vec<Effect> {
-        if self.unwatching == Some(id) {
-            self.unwatching = None;
+        if self.poll.unwatching == Some(id) {
+            self.poll.unwatching = None;
             // Tried again later (a watch would end it too), unless
             // quitting; after a failed sign-in, once the user signs in, not
             // to ask them again unbidden.
             return match result {
                 Some(Err(_)) if self.quit => Vec::new(),
                 Some(Err(Error::Auth(_))) => {
-                    self.unwatch_failed = true;
-                    self.watch_paused = true;
+                    self.poll.unwatch_failed = true;
+                    self.poll.watch_paused = true;
                     Vec::new()
                 }
                 Some(Err(_)) => {
-                    self.unwatch_failed = true;
+                    self.poll.unwatch_failed = true;
                     vec![Effect::Later(WATCH_RETRY, Timer::Watch)]
                 }
                 // Checks may have been turned on again meanwhile.
                 _ => self.watch(),
             };
         }
-        if self.watching != Some(id) {
+        if self.poll.watching != Some(id) {
             // A watch replaced as it ended: what it said changed is not
             // told again.
             return match result {
@@ -307,10 +307,10 @@ impl App {
                 _ => Vec::new(),
             };
         }
-        self.watching = None;
+        self.poll.watching = None;
         let mut effects = Vec::new();
         match result {
-            None => self.can_watch = false,
+            None => self.poll.can_watch = false,
             Some(Ok(changed)) => {
                 self.note_changed(changed);
                 effects.extend(self.recheck());
@@ -320,12 +320,12 @@ impl App {
             // until the user signs in again, rather than ask again
             // unbidden. (Unless the user has since.) Checks go on: the
             // mailbox may only refuse to be watched.
-            Some(Err(Error::Auth(_))) if self.watch_epoch == self.poll_epoch => {
-                self.watch_paused = true;
+            Some(Err(Error::Auth(_))) if self.poll.watch_epoch == self.poll.epoch => {
+                self.poll.watch_paused = true;
             }
             // The timer's checks go on meanwhile.
             Some(Err(_)) => {
-                self.watch_retry = true;
+                self.poll.watch_retry = true;
                 effects.push(Effect::Later(WATCH_RETRY, Timer::Watch));
             }
         }
@@ -340,11 +340,11 @@ impl App {
             .as_ref()
             .is_some_and(|f| changed.contains(&f.id))
         {
-            self.recheck_folder = true;
+            self.poll.recheck_folder = true;
         }
         for folder in changed {
-            if !self.recheck_mailboxes.contains(&folder) {
-                self.recheck_mailboxes.push(folder);
+            if !self.poll.recheck_mailboxes.contains(&folder) {
+                self.poll.recheck_mailboxes.push(folder);
             }
         }
     }
@@ -353,20 +353,20 @@ impl App {
     /// way allow: those still busy (whose check may predate the change)
     /// are checked once it ends.
     pub(super) fn recheck(&mut self) -> Vec<Effect> {
-        if self.quit || self.sync_interval.is_none() || self.poll_paused || self.sign_in.is_some() {
+        if self.quit || self.sync_interval.is_none() || self.poll.paused || self.sign_in.is_some() {
             return Vec::new();
         }
         let mut effects = Vec::new();
-        if self.recheck_folder && self.polling.is_none() {
+        if self.poll.recheck_folder && self.poll.open.polling.is_none() {
             effects.extend(self.poll_folder());
             // Being checked now. (A listing under way may predate the
             // change: it is checked when that ends.)
-            if self.polling.is_some() {
-                self.recheck_folder = false;
+            if self.poll.open.polling.is_some() {
+                self.poll.recheck_folder = false;
             }
         }
-        if self.checking.is_none() && !self.recheck_mailboxes.is_empty() {
-            let changed = std::mem::take(&mut self.recheck_mailboxes);
+        if self.poll.checking.is_none() && !self.poll.recheck_mailboxes.is_empty() {
+            let changed = std::mem::take(&mut self.poll.recheck_mailboxes);
             effects.extend(self.check_mailboxes_in(Some(&changed)));
         }
         effects
@@ -375,15 +375,15 @@ impl App {
     /// The timer went off: check for new mail, and set it again. A timer
     /// set before the interval changed is ignored: another was set.
     pub(super) fn on_poll_timer(&mut self, timer: u64) -> Vec<Effect> {
-        if timer != self.poll_timer {
+        if timer != self.poll.timer {
             return Vec::new();
         }
-        self.poll_armed = false;
+        self.poll.armed = false;
         let mut effects = Vec::new();
         // After a failed sign-in, background checks would only ask the
         // user to sign in again and again: they wait for something the
         // user does to sign in.
-        if !self.poll_paused && self.sign_in.is_none() {
+        if !self.poll.paused && self.sign_in.is_none() {
             effects.extend(self.poll_folder());
             effects.extend(self.check_mailboxes());
             self.sidebar_outdated();
@@ -399,7 +399,7 @@ impl App {
             return Vec::new();
         };
         if self.index.listing.is_some()
-            || self.polling.is_some()
+            || self.poll.open.polling.is_some()
             || self.opening.is_some()
             || self.switching.is_some()
         {
@@ -413,17 +413,17 @@ impl App {
         }
         let folder = folder.id.clone();
         let started = Utc::now();
-        let since = self.poll_since.unwrap_or(started - OVERLAP);
+        let since = self.poll.since.unwrap_or(started - OVERLAP);
         let request = self.request(Request::PollFolder {
             folder: folder.clone(),
             page: Page::first(self.page_size),
             since,
         });
-        self.polling = Some(Polling {
+        self.poll.open.polling = Some(Polling {
             request: effect_id(&request),
             folder,
             started,
-            epoch: self.poll_epoch,
+            epoch: self.poll.epoch,
         });
         vec![request]
     }
@@ -432,10 +432,10 @@ impl App {
     /// changes from now on.
     pub(super) fn listing_started(&mut self) {
         // The listing shows what a check on its way would find.
-        self.polling = None;
+        self.poll.open.polling = None;
         let now = Utc::now();
-        self.poll_since = Some(now - OVERLAP);
-        self.listed_at = Some(now);
+        self.poll.since = Some(now - OVERLAP);
+        self.poll.listed_at = Some(now);
     }
 
     /// Reads the counts of the mailboxes to check, unless that is on its
@@ -447,7 +447,7 @@ impl App {
     /// Checks the `mailboxes` (with `only`, those of these folders) for new
     /// mail, unless a check is under way.
     fn check_mailboxes_in(&mut self, only: Option<&[mett_core::FolderId]>) -> Vec<Effect> {
-        if self.checking.is_some() {
+        if self.poll.checking.is_some() {
             return Vec::new();
         }
         let mailboxes: Vec<_> = self
@@ -480,7 +480,7 @@ impl App {
             return Vec::new();
         }
         let request = self.request(Request::CheckMailboxes(mailboxes));
-        self.checking = Some(effect_id(&request));
+        self.poll.checking = Some(effect_id(&request));
         vec![request]
     }
 
@@ -488,7 +488,7 @@ impl App {
     /// listed again for new mail. Changes made meanwhile may not show in
     /// what arrives.
     pub(super) fn fetching_index(&self) -> bool {
-        self.index.listing.is_some() || self.polling.is_some()
+        self.index.listing.is_some() || self.poll.open.polling.is_some()
     }
 
     /// Takes in what a check of the open folder found: adds the messages
@@ -503,7 +503,7 @@ impl App {
             started,
             epoch,
             ..
-        }) = self.polling.take_if(|p| p.request == id)
+        }) = self.poll.open.polling.take_if(|p| p.request == id)
         else {
             return Vec::new();
         };
@@ -523,7 +523,7 @@ impl App {
         };
         // The next check asks for what changed after this one began (from
         // a while before, for the clocks to differ).
-        self.poll_since = Some(started - OVERLAP);
+        self.poll.since = Some(started - OVERLAP);
         let effects = self.merge_polled(page);
         self.forget_index_changes();
         effects
@@ -543,8 +543,8 @@ impl App {
     /// A failure from before the user last retried doesn't hold off
     /// checking again.
     pub(super) fn background_error(&mut self, e: Error, epoch: u64) {
-        if matches!(e, Error::Auth(_)) && epoch == self.poll_epoch {
-            self.poll_paused = true;
+        if matches!(e, Error::Auth(_)) && epoch == self.poll.epoch {
+            self.poll.paused = true;
         }
         if self.status.is_empty() {
             self.report(e);
@@ -585,7 +585,7 @@ impl App {
             .iter()
             .filter_map(|m| m.modified)
             .min()
-            .zip(self.listed_at)
+            .zip(self.poll.listed_at)
             .is_some_and(|(oldest, listed)| oldest < listed - OVERLAP);
         if (!complete && all_new) || (changed.next.is_some() && !listed_before) {
             let known = known.into_iter().cloned().collect();
@@ -594,7 +594,7 @@ impl App {
             }
             let effects = self.refresh();
             // New mail may be on pages not seen yet: the listing tells.
-            self.known_before_refresh = Some(known);
+            self.poll.open.known_before_refresh = Some(known);
             return effects;
         }
         // What the page covers. Graph sorts by when messages were sent,
@@ -633,13 +633,13 @@ impl App {
         let mut effects = Vec::new();
         if let Some(open) = self.folder.as_ref().map(|f| f.id.clone())
             && !tied.is_empty()
-            && self.tie_check.is_none()
+            && self.poll.open.tie_check.is_none()
         {
             let request = self.request(Request::StillThere {
                 folder: open.clone(),
                 ids: tied,
             });
-            self.tie_check = Some((effect_id(&request), open));
+            self.poll.open.tie_check = Some((effect_id(&request), open));
             effects.push(request);
         }
         let gone: HashSet<MessageId> = self
@@ -725,7 +725,12 @@ impl App {
         id: RequestId,
         result: mett_core::Result<Vec<MessageId>>,
     ) -> Vec<Effect> {
-        let Some((_, folder)) = self.tie_check.take_if(|(request, _)| *request == id) else {
+        let Some((_, folder)) = self
+            .poll
+            .open
+            .tie_check
+            .take_if(|(request, _)| *request == id)
+        else {
             return Vec::new();
         };
         // (A failure is asked about again at the next check.)
@@ -827,7 +832,7 @@ impl App {
     /// The folder was listed again because a check found more than it
     /// could take in: says if mail arrived meanwhile.
     pub(super) fn relisted(&mut self) {
-        let Some(known) = self.known_before_refresh.take() else {
+        let Some(known) = self.poll.open.known_before_refresh.take() else {
             return;
         };
         let arrived: Vec<MessageSummary> = self
@@ -851,7 +856,12 @@ impl App {
         id: RequestId,
         checked: Vec<(FolderPath, mett_core::Result<Checked>)>,
     ) -> Vec<Effect> {
-        if self.checking.take_if(|request| *request == id).is_none() {
+        if self
+            .poll
+            .checking
+            .take_if(|request| *request == id)
+            .is_none()
+        {
             return Vec::new();
         }
         let mut arrived = Vec::new();
@@ -1084,7 +1094,7 @@ impl App {
                 .collect::<Vec<_>>()
         };
         if checked(&self.mailboxes) != checked(&mailboxes) || self.sync_interval != interval {
-            self.checking = None;
+            self.poll.checking = None;
         }
         // Without them, the sidebar lists every folder: they may have
         // changed since it last did.
@@ -1095,8 +1105,8 @@ impl App {
         // A timer set for another interval is replaced.
         if self.sync_interval != interval {
             self.sync_interval = interval;
-            self.poll_timer += 1;
-            self.poll_armed = false;
+            self.poll.timer += 1;
+            self.poll.armed = false;
         }
         self.refresh_mailbox_browser();
         self.rebuild_sidebar(false);

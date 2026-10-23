@@ -186,12 +186,12 @@ fn draft(id: &str, minutes: i64) -> MessageSummary {
 #[test]
 fn a_watch_whose_sign_in_failed_waits_for_the_user() {
     let (mut app, _) = app();
-    let watch = app.watching.expect("watched");
+    let watch = app.poll.watching.expect("watched");
     let denied = || Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
     // Not tried again unbidden. Checks go on: the mailbox may only
     // refuse to be watched.
     assert!(respond(&mut app, watch, denied()).is_empty());
-    assert!(app.watch_paused && !app.poll_paused);
+    assert!(app.poll.watch_paused && !app.poll.paused);
     assert!(app.watch().is_empty());
     // The user signs in again: watched again.
     let effects = app.retry();
@@ -202,11 +202,11 @@ fn a_watch_whose_sign_in_failed_waits_for_the_user() {
         "{effects:?}"
     );
     // A failure from before then doesn't hold it off again.
-    let watch = app.watching.expect("watched");
-    app.poll_epoch += 1;
+    let watch = app.poll.watching.expect("watched");
+    app.poll.epoch += 1;
     let effects = respond(&mut app, watch, denied());
     assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
-    assert!(!app.watch_paused);
+    assert!(!app.poll.watch_paused);
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn folders_are_checked_as_soon_as_they_change() {
     let (mut app, _) = app();
     let inbox = mett_core::FolderId::new("in");
     // Opened, the Inbox is watched.
-    let watch = app.watching.expect("the folder is watched");
+    let watch = app.poll.watching.expect("the folder is watched");
     // A change: it is checked at once, and watched again.
     let effects = respond(
         &mut app,
@@ -233,11 +233,11 @@ fn folders_are_checked_as_soon_as_they_change() {
         "{sent:?}"
     );
     // Its wait ran out: watched again, nothing checked.
-    let watch = app.watching.expect("watched again");
+    let watch = app.poll.watching.expect("watched again");
     let effects = respond(&mut app, watch, Event::Watched(Some(Ok(Vec::new()))));
     assert!(matches!(requests(&effects)[..], [(_, Request::Watch(_))]));
     // It failed: tried again later (the timer's checks go on).
-    let watch = app.watching.expect("watched again");
+    let watch = app.poll.watching.expect("watched again");
     let failed = Event::Watched(Some(Err(mett_core::Error::Network("down".into()))));
     let effects = respond(&mut app, watch, failed);
     assert_eq!(effects, [Effect::Later(WATCH_RETRY, Timer::Watch)]);
@@ -249,7 +249,7 @@ fn folders_are_checked_as_soon_as_they_change() {
     let effects = app.update(Msg::Timer(Timer::Watch));
     assert!(matches!(requests(&effects)[..], [(_, Request::Watch(_))]));
     // The mailbox can't watch: never again.
-    let watch = app.watching.expect("watched again");
+    let watch = app.poll.watching.expect("watched again");
     assert!(respond(&mut app, watch, Event::Watched(None)).is_empty());
     assert!(
         app.update(Msg::Timer(Timer::Poll(0)))
@@ -263,7 +263,7 @@ fn the_watch_follows_the_folders_and_checks_only_those_changed() {
     let (mut app, check) = app();
     let inbox = mett_core::FolderId::new("in");
     let work = mett_core::FolderId::new("wk");
-    let first = app.watching.expect("the folder is watched");
+    let first = app.poll.watching.expect("the folder is watched");
     // The mailboxes found, they are watched too: the watch starts
     // again.
     let effects = check_both(
@@ -287,7 +287,7 @@ fn the_watch_follows_the_folders_and_checks_only_those_changed() {
     assert!(app.watch().is_empty());
     // The Inbox changed: its index is checked, and its counts (it is
     // one of the mailboxes too).
-    let watch = app.watching.expect("watched");
+    let watch = app.poll.watching.expect("watched");
     let effects = respond(
         &mut app,
         watch,
@@ -310,7 +310,7 @@ fn the_watch_follows_the_folders_and_checks_only_those_changed() {
         .expect("the Inbox's counts are checked");
     respond(&mut app, check, Event::MailboxesChecked(Vec::new()));
     // Work changed: only it is checked.
-    let watch = app.watching.expect("watched");
+    let watch = app.poll.watching.expect("watched");
     let effects = respond(
         &mut app,
         watch,
@@ -338,7 +338,7 @@ fn a_change_during_a_check_is_checked_after_it() {
     let inbox = mett_core::FolderId::new("in");
     // A check is under way when the watch says the Inbox changed.
     let check = poll(&mut app);
-    let watch = app.watching.expect("watched");
+    let watch = app.poll.watching.expect("watched");
     let effects = respond(&mut app, watch, Event::Watched(Some(Ok(vec![inbox]))));
     assert!(
         !requests(&effects)
@@ -360,7 +360,7 @@ fn a_change_during_a_check_is_checked_after_it() {
 #[test]
 fn turning_checks_off_ends_the_watch() {
     let (mut app, _) = app();
-    let watch = app.watching.expect("watched");
+    let watch = app.poll.watching.expect("watched");
     app.sync_interval = None;
     // The watch ends, and so does what the mailbox keeps for it.
     let effects = app.watch();
@@ -370,7 +370,7 @@ fn turning_checks_off_ends_the_watch() {
             if *id == watch && f.is_empty()),
         "{sent:?}"
     );
-    assert!(app.watching.is_none());
+    assert!(app.poll.watching.is_none());
     assert!(app.unwatching());
     // Once.
     assert!(app.watch().is_empty());
@@ -396,7 +396,7 @@ fn turning_checks_off_ends_the_watch() {
 fn changes_told_by_a_replaced_watch_are_checked() {
     let (mut app, check) = app();
     let inbox = mett_core::FolderId::new("in");
-    let first = app.watching.expect("the folder is watched");
+    let first = app.poll.watching.expect("the folder is watched");
     // The mailboxes found, the watch starts again; the first had ended
     // already, telling of a change.
     check_both(
@@ -405,7 +405,7 @@ fn changes_told_by_a_replaced_watch_are_checked() {
         checked("in", "Inbox", 1, None),
         checked("wk", "Work", 0, None),
     );
-    let second = app.watching.expect("watched again");
+    let second = app.poll.watching.expect("watched again");
     assert_ne!(first, second);
     let effects = respond(&mut app, first, Event::Watched(Some(Ok(vec![inbox]))));
     let sent = requests(&effects);
@@ -415,7 +415,7 @@ fn changes_told_by_a_replaced_watch_are_checked() {
         "{sent:?}"
     );
     // Not watched a third time.
-    assert_eq!(app.watching, Some(second));
+    assert_eq!(app.poll.watching, Some(second));
     assert!(
         !sent.iter().any(|(_, r)| matches!(r, Request::Watch(_))),
         "{sent:?}"
@@ -454,7 +454,7 @@ fn ending_a_watch_whose_sign_in_failed_waits_for_the_user() {
 #[test]
 fn a_watch_paused_is_ended_once_signed_in() {
     let (mut app, _) = app();
-    let watch = app.watching.expect("watched");
+    let watch = app.poll.watching.expect("watched");
     let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
     respond(&mut app, watch, denied);
     // Checks turned off: not ended yet, not to ask for a sign-in.
@@ -474,7 +474,7 @@ fn a_watch_paused_is_ended_once_signed_in() {
 #[test]
 fn a_watch_paused_goes_on_once_signed_in() {
     let (mut app, _) = app();
-    let watch = app.watching.expect("watched");
+    let watch = app.poll.watching.expect("watched");
     let denied = Event::Watched(Some(Err(Error::Auth("cancelled".into()))));
     respond(&mut app, watch, denied);
     let signed_in = crate::SignInEvent::Finished {
@@ -513,7 +513,7 @@ fn nothing_is_watched_nor_checked_after_quitting() {
     let effects = app.unwatch();
     assert!(app.unwatching(), "{effects:?}");
     // Say, a sign-in a save needed ends: no watch starts again.
-    app.recheck_folder = true;
+    app.poll.recheck_folder = true;
     assert!(app.watch().is_empty());
     assert!(app.recheck().is_empty());
 }
@@ -577,7 +577,7 @@ fn new_mail_joins_the_index_where_its_date_puts_it() {
 fn mail_that_arrives_with_an_old_date_joins_the_index() {
     let (mut app, _) = app();
     let id = poll(&mut app);
-    let Some(Polling { started, .. }) = app.polling.clone() else {
+    let Some(Polling { started, .. }) = app.poll.open.polling.clone() else {
         panic!("expected a check");
     };
     polled_with(
@@ -689,7 +689,7 @@ fn changes_older_than_the_listing_need_no_listing_again() {
     assert!(requests(&effects).is_empty(), "{effects:?}");
     // And the next check still allows for the clocks.
     let effects = app.update(Msg::Timer(Timer::Poll(0)));
-    let Some(Polling { started, .. }) = app.polling.clone() else {
+    let Some(Polling { started, .. }) = app.poll.open.polling.clone() else {
         panic!("expected a check");
     };
     let since = requests(&effects).into_iter().find_map(|(_, r)| match r {

@@ -14,6 +14,7 @@ mod keys;
 mod mailbox;
 mod newmail;
 mod pager;
+mod poll;
 mod query;
 mod recall;
 mod retry;
@@ -42,6 +43,7 @@ pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
 pub use self::newmail::MailboxEntry;
 pub use self::pager::Pager;
+use self::poll::Poll;
 pub use self::query::{QueryMenu, QuerySettings};
 pub use self::recall::PostponedMenu;
 use self::retry::{Retries, Retry, RetryKind};
@@ -558,59 +560,14 @@ pub struct App {
     mailbox_state: HashMap<FolderPath, newmail::MailboxState>,
     /// See [`Settings::sync_interval`].
     sync_interval: Option<std::time::Duration>,
-    /// Whether the timer for the next check for new mail is set.
-    poll_armed: bool,
-    /// Checks for new mail wait for the user to sign in again.
-    poll_paused: bool,
-    /// The open folder's check for new mail, on its way.
-    polling: Option<newmail::Polling>,
-    /// Since when the next check asks for changes.
-    poll_since: Option<chrono::DateTime<chrono::Utc>>,
-    /// Which timer for checks counts.
-    poll_timer: u64,
-    /// The messages in the index before a check had it listed again, to
-    /// tell what arrived.
-    known_before_refresh: Option<HashSet<MessageId>>,
-    /// The request asking whether messages missing from a check's page,
-    /// as old as its last, are still in the folder (on the next page).
-    tie_check: Option<(RequestId, mett_core::FolderId)>,
-    /// The request reading the mailboxes' counts.
-    checking: Option<RequestId>,
+    /// The checks for new mail, and watching for changes.
+    poll: Poll,
     /// The unread mail the user has seen, by folder.
     seen: newmail::SeenByFolder,
-    /// How many times the user retried after a failed sign-in: background
-    /// checks made before the last retry don't hold off checking.
-    poll_epoch: u64,
-    /// When the folder was last listed from the start.
-    listed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The sidebar.
     sidebar: Sidebar,
     /// The API the account is reached through.
     api: crate::account::Api,
-    /// The request watching the folders for changes, while one is, and
-    /// which folders it watches.
-    watching: Option<RequestId>,
-    watched: Vec<mett_core::FolderId>,
-    /// The request ending what the mailbox keeps for watching, while it
-    /// is under way.
-    unwatching: Option<RequestId>,
-    /// Ending it failed: it is tried again.
-    unwatch_failed: bool,
-    /// The `poll_epoch` the watch started in.
-    watch_epoch: u64,
-    /// Watching is held off until the user signs in again: its sign-in
-    /// failed. (Only watching: the mailbox may just not let mett watch.)
-    watch_paused: bool,
-    /// What a watch said changed and is still to be checked (a check under
-    /// way when it said may predate the change): the open folder, and the
-    /// folders of `mailboxes` (the open one among them, for its counts).
-    recheck_folder: bool,
-    recheck_mailboxes: Vec<mett_core::FolderId>,
-    /// Whether the mailbox can tell when folders change (until it says it
-    /// can't).
-    can_watch: bool,
-    /// A retry of watching is set, after it failed.
-    watch_retry: bool,
     /// The requests the server throttled, by how long until each is tried
     /// again (counted down every second) and which retry that is. A
     /// request's answer, or giving it up, takes it out.
@@ -730,29 +687,10 @@ impl App {
             mailboxes: settings.mailboxes,
             mailbox_state: HashMap::new(),
             sync_interval: settings.sync_interval,
-            poll_armed: false,
-            poll_paused: false,
-            polling: None,
-            poll_since: None,
-            poll_timer: 0,
-            known_before_refresh: None,
-            tie_check: None,
-            checking: None,
+            poll: Poll::default(),
             seen: HashMap::new(),
-            poll_epoch: 0,
-            listed_at: None,
             sidebar: Sidebar::default(),
             api: settings.api,
-            watching: None,
-            unwatching: None,
-            unwatch_failed: false,
-            watch_epoch: 0,
-            watch_paused: false,
-            watched: Vec::new(),
-            recheck_folder: false,
-            recheck_mailboxes: Vec::new(),
-            can_watch: true,
-            watch_retry: false,
             throttled: HashMap::new(),
             throttle_timer: 0,
             given_up: VecDeque::new(),
@@ -880,7 +818,7 @@ impl App {
             }
             Msg::Timer(Timer::Poll(timer)) => self.on_poll_timer(timer),
             Msg::Timer(Timer::Watch) => {
-                self.watch_retry = false;
+                self.poll.watch_retry = false;
                 self.watch()
             }
             Msg::Syncing { folder, taken } => {
@@ -1028,7 +966,7 @@ impl App {
                 // cancellation that came too late didn't happen.
                 self.sign_in = None;
                 // Signed in: watching can go on.
-                self.watch_paused = false;
+                self.poll.watch_paused = false;
                 if std::mem::take(&mut self.cancelled) && self.status.is(StatusKind::Cancelled) {
                     self.status.clear();
                 }
@@ -1461,7 +1399,7 @@ impl App {
             Event::FolderOpened(_) if self.opening != Some(id) => {}
             Event::FolderOpened(Ok(folder)) => {
                 self.opening = None;
-                self.poll_paused = false;
+                self.poll.paused = false;
                 self.status
                     .say(format!("Loading {}...", folder.name), StatusKind::Loading);
                 self.folder = Some(folder);
@@ -1492,7 +1430,7 @@ impl App {
             Event::Watched(result) => return self.on_watched(id, result),
             Event::MessagesListed(result) if self.index.listing == Some(id) => match result {
                 Ok(page) => {
-                    self.poll_paused = false;
+                    self.poll.paused = false;
                     let mut messages = page.messages;
                     messages.retain(|m| !self.removed_while_listing.contains(&m.id));
                     self.overlay_wanted_flags(&mut messages);
@@ -1541,7 +1479,7 @@ impl App {
                     self.index.pending = None;
                     self.reselect = None;
                     self.index.listing = None;
-                    self.known_before_refresh = None;
+                    self.poll.open.known_before_refresh = None;
                     self.index.unlisted = self.index.listing_page.take();
                     // What was listed is threaded, while the rest waits.
                     self.thread_listed();
