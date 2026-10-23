@@ -497,7 +497,8 @@ account Home ~/.config/mett/home
   `set spoolfile` in the main file is not used when there are accounts.
   `mett -D` prints the settings of the main file, and then those of each account.
   Aliases made with `a` are saved, unless `alias_file` says otherwise, in a file
-  called `aliases` beside the mettrc, which every account reads.
+  called `aliases` beside the mettrc, which every account reads when mett
+  starts: one made in a tab is in the others after that.
 - **Tabs.** With more than one account, a line of the screen holds the tabs,
   `1 Work  2 Home*`, with the account shown highlighted (`color indicator`)
   and a `*` and bold on those with new mail (`color sidebar_new` adds to
