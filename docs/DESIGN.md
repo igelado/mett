@@ -191,7 +191,9 @@ another folder resets it with one call and a new field can't be forgotten:
 and the folder's part of `Poll` (the check for new mail on its way, which
 sits with the timers and the watch that carry on across folders). `FlagSync`
 (flag changes on their way, saved or failed) forgets only what a listing
-knew; the rest doesn't depend on the folder.
+knew; the rest doesn't depend on the folder. `Throttle` (the requests the
+server throttled and the countdown) belongs to no folder, so
+`reset_folder` leaves it alone.
 
 **Frontends.** The main loop is the same for the terminal and for
 `mett-gui`'s window: it reads crossterm events from a channel, and draws on

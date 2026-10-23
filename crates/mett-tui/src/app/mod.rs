@@ -26,6 +26,7 @@ mod tabs;
 #[cfg(test)]
 pub(crate) mod testing;
 mod threads;
+mod throttle;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -54,6 +55,9 @@ pub use self::signin::{Row, SignIn};
 pub use self::status::{Status, StatusKind};
 pub use self::tabs::{Switch, Tab, TabPosition, Tabs};
 pub use self::threads::{Ordering, Threaded};
+#[cfg(test)]
+use self::throttle::GIVEN_UP_KEPT;
+use self::throttle::Throttle;
 use crate::action::Action;
 use crate::compose::Kind;
 use crate::config::Quad;
@@ -68,9 +72,6 @@ pub const PAGE_SIZE: u32 = 100;
 
 /// A second, the step of the throttling countdown.
 const SECOND: Duration = Duration::from_secs(1);
-
-/// How many requests given up on are remembered (see `App::given_up`).
-const GIVEN_UP_KEPT: usize = 16;
 
 /// Where a pending move goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -551,22 +552,14 @@ pub struct App {
     flag_sync: FlagSync,
     /// The checks for new mail, and watching for changes.
     poll: Poll,
+    /// The requests the server throttled.
+    throttle: Throttle,
     /// The unread mail the user has seen, by folder.
     seen: newmail::SeenByFolder,
     /// The sidebar.
     sidebar: Sidebar,
     /// The API the account is reached through.
     api: crate::account::Api,
-    /// The requests the server throttled, by how long until each is tried
-    /// again (counted down every second) and which retry that is. A
-    /// request's answer, or giving it up, takes it out.
-    throttled: HashMap<RequestId, (Duration, u32)>,
-    /// The countdown's timer, which goes while a request waits.
-    throttle_timer: u64,
-    /// The last requests given up on, whose waits that the worker told of
-    /// before it stopped them are ignored. Those come right after giving
-    /// up, so only the last few are kept.
-    given_up: VecDeque<RequestId>,
 }
 
 impl App {
@@ -674,12 +667,10 @@ impl App {
             sync_interval: settings.sync_interval,
             flag_sync: FlagSync::default(),
             poll: Poll::default(),
+            throttle: Throttle::default(),
             seen: HashMap::new(),
             sidebar: Sidebar::default(),
             api: settings.api,
-            throttled: HashMap::new(),
-            throttle_timer: 0,
-            given_up: VecDeque::new(),
         };
         app.apply_sidebar(settings.sidebar);
         let effects = app.open_folder();
@@ -824,11 +815,7 @@ impl App {
     fn request(&mut self, request: Request) -> Effect {
         // A request given up on isn't tried again.
         if let Request::Cancel(query) = &request {
-            self.throttled.remove(query);
-            if self.given_up.len() == GIVEN_UP_KEPT {
-                self.given_up.pop_front();
-            }
-            self.given_up.push_back(*query);
+            self.throttle.give_up(*query);
         }
         self.next_request += 1;
         Effect::Request(RequestId(self.next_request), request)
@@ -1352,7 +1339,7 @@ impl App {
             return self.on_throttled(response.id, wait, attempt);
         }
         let id = response.id;
-        self.throttled.remove(&id);
+        self.throttle.answered(id);
         let mut effects = self.handle_response(response);
         effects.extend(self.retry_if_requested(id));
         effects
@@ -1987,7 +1974,8 @@ impl App {
     /// for them before exiting, so they aren't lost.
     /// The longest wait of a save the server throttled, if one is waiting.
     pub fn save_wait(&self) -> Option<Duration> {
-        self.throttled
+        self.throttle
+            .waiting
             .iter()
             .filter(|(id, _)| self.saves(**id))
             .map(|(_, (left, _))| *left)
