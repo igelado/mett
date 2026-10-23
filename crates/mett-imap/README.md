@@ -42,7 +42,9 @@ are those missing from the `UID`s the folder has now (asked for only when
 its message count doesn't add up). A sync of many messages is made 100 at a
 time. A folder made anew, or a state that isn't understood, is `StaleSync`: the cache
 starts that folder over. Servers without `CONDSTORE` can't be synced (flags
-changed by other clients couldn't be found), so mett doesn't cache them.
+changed by other clients couldn't be found), so mett doesn't cache them. On a
+server that can't `SORT`, messages are dated by arrival; the cache orders
+those that arrived in the same second by their ids, not by `UID`.
 
 Limits: IMAP can't say what changed in a folder as Exchange's APIs do (no
 `QRESYNC`, no `IDLE` yet), so the adapter doesn't watch. To find what is new

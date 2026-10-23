@@ -728,6 +728,12 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         let mut cached = None;
         if self.caching()
             && let Ok(Some(message)) = self.with_cache(|db| db.message(id))
+            // What the backend can't keep up to date isn't served.
+            && !self
+                .unsyncable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&message.summary.folder)
         {
             // A meeting changes without its message changing (an answer
             // from another client, the organizer moving it), so the server
