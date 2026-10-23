@@ -8,6 +8,11 @@ follows the Elm Architecture (`docs/DESIGN.md` §5.2):
 
 - **`app/`:** the model and `update`. All UI logic lives here;
   `app/composing.rs` has the steps of writing a message.
+  `app/mod.rs` has `App` and its `update`; `pager.rs`, `signin.rs`,
+  `flags.rs` (flag bookkeeping) and `retry.rs` (throttling and retries)
+  hold the rest of its parts; each module's unit tests are in its
+  sibling `<module>/tests.rs` (`app/tests.rs` for `mod.rs`),
+  with shared helpers in `app/testing.rs`.
 - **`compose.rs`:** how replies and forwards are built (quoting,
   attribution, recipients, signature); **`lineedit.rs`:** the line editor
   for questions such as `To:`; **`editor/`:** runs the external editor, or
