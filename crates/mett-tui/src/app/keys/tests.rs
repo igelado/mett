@@ -9,9 +9,7 @@ use crate::worker::Event;
 
 /// Messages m0, m1 and m2.
 fn three() -> Vec<MessageSummary> {
-    (0..3)
-        .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
-        .collect()
+    plain(&["m0", "m1", "m2"])
 }
 
 /// An app with three messages in its index.

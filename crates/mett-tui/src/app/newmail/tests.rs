@@ -1,5 +1,5 @@
 use chrono::{DateTime, TimeDelta};
-use mett_core::{AccountId, FlagsUpdate, FolderId, WellKnownFolder, mock};
+use mett_core::{AccountId, FlagsUpdate, FolderId, mock};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::*;
@@ -13,14 +13,9 @@ const MINUTE: Duration = Duration::from_secs(60);
 
 /// A message dated (and last changed) at `minutes`.
 fn summary(id: &str, minutes: i64) -> MessageSummary {
-    let date = DateTime::UNIX_EPOCH + TimeDelta::minutes(minutes);
-    let mut summary = mock::message(id, "in", id, date).summary;
-    summary.modified = Some(date);
+    let mut summary = summary_at(id, id, minutes);
+    summary.modified = Some(DateTime::UNIX_EPOCH + TimeDelta::minutes(minutes));
     summary
-}
-
-fn inbox() -> FolderPath {
-    FolderPath::WellKnown(WellKnownFolder::Inbox, vec![])
 }
 
 fn work() -> FolderPath {

@@ -1,9 +1,9 @@
 use super::*;
 use crate::app::Settings;
-use crate::app::testing::{act, opened};
+use crate::app::testing::{act, empty_app, opened};
 
 fn app() -> App {
-    opened(Settings::default(), 24, Vec::new(), None).0
+    empty_app()
 }
 
 fn tabs(active: usize, count: usize) -> Tabs {

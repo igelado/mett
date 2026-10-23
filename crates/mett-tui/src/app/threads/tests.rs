@@ -307,7 +307,6 @@ fn a_collapsed_thread_stays_selected_when_its_first_message_goes() {
 #[test]
 fn a_pending_page_down_counts_from_where_it_started() {
     let (mut app, list) = opening(sorted("subject"), 5);
-    let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
     let next = page(&mut app, list, vec![named("a"), named("z")], "in next");
     // Two rows a page, from a.
     act(&mut app, Action::NextPage);
@@ -535,7 +534,6 @@ fn the_next_thread_may_be_on_a_page_to_come() {
 #[test]
 fn a_pending_next_entry_goes_after_its_message_whatever_comes_before() {
     let (mut app, list) = opening(sorted("subject"), 24);
-    let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
     let next = page(&mut app, list, vec![named("b")], "in next");
     act(&mut app, Action::NextEntry);
     // d comes first, but the last page may hold what goes between.
@@ -548,7 +546,6 @@ fn a_pending_next_entry_goes_after_its_message_whatever_comes_before() {
 #[test]
 fn a_pending_next_entry_survives_its_message_going() {
     let (mut app, list) = opening(sorted("subject"), 24);
-    let named = |id: &str| mock::message(id, "in", id, DateTime::UNIX_EPOCH).summary;
     let next = page(&mut app, list, vec![named("a"), named("b")], "in next");
     act(&mut app, Action::LastEntry);
     act(&mut app, Action::NextEntry);

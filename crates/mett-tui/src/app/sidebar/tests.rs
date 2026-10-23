@@ -339,10 +339,7 @@ fn ordered_by_counts_follows_the_open_folder_s() {
     let mut settings = with_mailboxes(sorted_by("unread"));
     settings.sidebar.visible = true;
     let unread = (0..5)
-        .map(|i| {
-            let date = chrono::DateTime::UNIX_EPOCH + chrono::TimeDelta::minutes(i);
-            mett_core::mock::message(&format!("m{i}"), "in", "s", date).summary
-        })
+        .map(|i| summary_at(&format!("m{i}"), "s", i))
         .collect();
     let (mut app, check) = mailboxes_listed(settings, 120, 24, unread);
     mailboxes_checked(&mut app, check, &[("Work", 3, 3, false)]);

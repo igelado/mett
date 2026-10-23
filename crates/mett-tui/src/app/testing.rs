@@ -299,3 +299,26 @@ pub(crate) fn mailboxes_checked(
         .collect();
     respond(app, id, Event::MailboxesChecked(checked))
 }
+
+/// A summary of Inbox message `id`, dated `minutes` after the epoch.
+pub(crate) fn summary_at(id: &str, subject: &str, minutes: i64) -> MessageSummary {
+    let date = chrono::DateTime::UNIX_EPOCH + chrono::TimeDelta::minutes(minutes);
+    mock::message(id, "in", subject, date).summary
+}
+
+/// A summary of Inbox message `id`, whose subject is `id` too.
+pub(crate) fn named(id: &str) -> MessageSummary {
+    mock::message(id, "in", id, chrono::DateTime::UNIX_EPOCH).summary
+}
+
+/// Summaries of Inbox messages with these `ids`, all with subject `s`.
+pub(crate) fn plain(ids: &[&str]) -> Vec<MessageSummary> {
+    ids.iter()
+        .map(|id| mock::message(id, "in", "s", chrono::DateTime::UNIX_EPOCH).summary)
+        .collect()
+}
+
+/// An app that has opened and listed an empty Inbox.
+pub(crate) fn empty_app() -> App {
+    opened(Settings::default(), 24, Vec::new(), None).0
+}

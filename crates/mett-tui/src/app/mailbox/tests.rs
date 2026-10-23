@@ -16,10 +16,7 @@ fn app(settings: Settings) -> App {
     let folder = mett_core::mock::folder("in", "Inbox", Some(WellKnownFolder::Inbox));
     let list = first_request(&respond(&mut app, open, Event::FolderOpened(Ok(folder))));
     let messages = (0..3)
-        .map(|i| {
-            let date = DateTime::UNIX_EPOCH + TimeDelta::minutes(10 - i);
-            mock::message(&format!("m{i}"), "in", "s", date).summary
-        })
+        .map(|i| summary_at(&format!("m{i}"), "s", 10 - i))
         .collect();
     listed(&mut app, list, messages, None);
     app
@@ -1232,9 +1229,7 @@ fn a_listing_older_than_a_purge_does_not_bring_it_back() {
     let purge =
         request_for(&effects, |r| matches!(r, Request::Purge { .. })).expect("the purge goes next");
     purged(&mut app, purge, "m0");
-    let messages = ["m0", "c0", "m1"]
-        .map(|id| mock::message(id, "in", "s", DateTime::UNIX_EPOCH).summary)
-        .to_vec();
+    let messages = plain(&["m0", "c0", "m1"]);
     listed(&mut app, list, messages, None);
     assert!(!app.messages.iter().any(|m| m.id.as_str() == "m0"));
 }
@@ -1398,9 +1393,7 @@ fn a_save_before_a_failure_survives_an_older_listing() {
     let mut app = app(settings());
     let list = request_for(&app.relist(), |r| matches!(r, Request::ListMessages { .. }))
         .expect("listed again");
-    app.messages = (0..3)
-        .map(|i| mock::message(&format!("m{i}"), "in", "s", DateTime::UNIX_EPOCH).summary)
-        .collect();
+    app.messages = plain(&["m0", "m1", "m2"]);
     let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
     act(&mut app, Action::ToggleNew);
     let effects = respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
@@ -1534,9 +1527,7 @@ fn a_copy_into_the_open_folder_keeps_the_selection() {
     let (copy, _) = sent(&answer(&mut app, "=@inbox"));
     let effects = transferred(&mut app, copy, "in", "m1", Ok("c1"));
     let (list, _) = sent(&effects);
-    let messages = ["c1", "m0", "m1", "m2"]
-        .map(|id| mock::message(id, "in", "s", DateTime::UNIX_EPOCH).summary)
-        .to_vec();
+    let messages = plain(&["c1", "m0", "m1", "m2"]);
     listed(&mut app, list, messages, None);
     assert_eq!(app.messages[app.selected].id.as_str(), "m1");
 }
