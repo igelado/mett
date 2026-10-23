@@ -193,7 +193,7 @@ fn denied() -> Error {
 #[test]
 fn loads_the_inbox_on_start() {
     let app = loaded(3);
-    assert_eq!(app.messages.len(), 3);
+    assert_eq!(app.index.messages.len(), 3);
     assert_eq!(app.folder.as_ref().unwrap().name, "Inbox");
     assert!(app.status.is_empty());
 }
@@ -209,31 +209,31 @@ fn keeps_listing_until_the_last_page() {
         panic!("expected another page request, got {effects:?}");
     };
     assert_eq!(page.cursor(), Some(&PageCursor::new("c")));
-    assert_eq!(app.messages.len(), 2);
+    assert_eq!(app.index.messages.len(), 2);
 }
 
 #[test]
 fn ignores_a_stale_listing() {
     let mut app = loaded(1);
     listed(&mut app, RequestId(999), summaries(5), None);
-    assert_eq!(app.messages.len(), 1);
+    assert_eq!(app.index.messages.len(), 1);
 }
 
 #[test]
 fn moves_through_the_index_within_bounds() {
     let mut app = loaded(3);
     act(&mut app, Action::PreviousEntry);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     assert_eq!(app.status, "You are on the first message.");
     act(&mut app, Action::NextEntry);
     act(&mut app, Action::NextEntry);
     act(&mut app, Action::NextEntry);
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
     assert_eq!(app.status, "You are on the last message.");
     act(&mut app, Action::FirstEntry);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     act(&mut app, Action::LastEntry);
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
 }
 
 #[test]
@@ -241,12 +241,12 @@ fn pages_through_the_index() {
     let mut app = loaded(50);
     assert_eq!(app.body_height, 20);
     act(&mut app, Action::NextPage);
-    assert_eq!(app.selected, 20);
+    assert_eq!(app.index.selected, 20);
     act(&mut app, Action::NextPage);
     act(&mut app, Action::NextPage);
-    assert_eq!(app.selected, 49);
+    assert_eq!(app.index.selected, 49);
     act(&mut app, Action::PreviousPage);
-    assert_eq!(app.selected, 29);
+    assert_eq!(app.index.selected, 29);
 }
 
 #[test]
@@ -258,7 +258,10 @@ fn marks_a_message_read_once_it_is_shown() {
         effects.as_slice(),
         [Effect::Request(_, Request::FetchMessage(id))] if id.as_str() == "m0"
     ));
-    assert!(!app.messages[0].flags.read, "not read before it is shown");
+    assert!(
+        !app.index.messages[0].flags.read,
+        "not read before it is shown"
+    );
 
     act(&mut app, Action::Exit);
     let effects = open(&mut app, 1);
@@ -267,7 +270,7 @@ fn marks_a_message_read_once_it_is_shown() {
         [Effect::Request(_, Request::UpdateFlags(id, FlagsUpdate { read: Some(true), .. }))]
             if id.as_str() == "m0"
     ));
-    assert!(app.messages[0].flags.read);
+    assert!(app.index.messages[0].flags.read);
 
     // Reopening a read message doesn't update its flags again.
     act(&mut app, Action::Exit);
@@ -303,7 +306,7 @@ fn a_failed_page_leaves_the_index_incomplete_until_retried() {
     assert_eq!(page.cursor(), Some(&PageCursor::new("c")));
     assert!(!app.incomplete());
     listed(&mut app, *retry, summaries(1), None);
-    assert_eq!(app.messages.len(), 3);
+    assert_eq!(app.index.messages.len(), 3);
     assert!(!app.incomplete());
 }
 
@@ -364,12 +367,12 @@ fn loading_more(n: usize) -> (App, RequestId) {
 fn next_entry_waits_for_the_next_page_in_the_index() {
     let (mut app, second) = loading_more(1);
     act(&mut app, Action::NextEntry);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     assert_eq!(app.status, "Loading more messages...");
     let mut more = summaries(2);
     more.remove(0);
     listed(&mut app, second, more, None);
-    assert_eq!(app.selected, 1, "moved on once the page arrived");
+    assert_eq!(app.index.selected, 1, "moved on once the page arrived");
 }
 
 #[test]
@@ -380,7 +383,7 @@ fn next_entry_waits_for_the_next_page_in_the_pager() {
     let mut more = summaries(2);
     more.remove(0);
     let effects = listed(&mut app, second, more, None);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
     assert!(
         matches!(
             effects.as_slice(),
@@ -394,9 +397,9 @@ fn next_entry_waits_for_the_next_page_in_the_pager() {
 fn last_entry_follows_the_folder_while_it_loads() {
     let (mut app, second) = loading_more(2);
     act(&mut app, Action::LastEntry);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
     listed(&mut app, second, summaries(5), None);
-    assert_eq!(app.selected, 6, "the real last message");
+    assert_eq!(app.index.selected, 6, "the real last message");
 }
 
 #[test]
@@ -404,9 +407,9 @@ fn next_page_completes_once_the_page_arrives() {
     let (mut app, second) = loading_more(5);
     // 20 rows per page: the target, entry 20, isn't loaded yet.
     act(&mut app, Action::NextPage);
-    assert_eq!(app.selected, 4);
+    assert_eq!(app.index.selected, 4);
     listed(&mut app, second, summaries(30), None);
-    assert_eq!(app.selected, 20);
+    assert_eq!(app.index.selected, 20);
 }
 
 #[test]
@@ -416,7 +419,7 @@ fn another_action_cancels_a_pending_next_entry() {
     act(&mut app, Action::NextEntry);
     act(&mut app, Action::PreviousEntry);
     listed(&mut app, second, Vec::new(), None);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
 }
 
 #[test]
@@ -435,7 +438,7 @@ fn a_failed_flag_update_marks_the_message_unread_again() {
     let mut app = loaded(1);
     let update = first_request(&open(&mut app, 1));
     respond(&mut app, update, Event::FlagsUpdated(Err(offline())));
-    assert!(!app.messages[0].flags.read);
+    assert!(!app.index.messages[0].flags.read);
     assert_eq!(app.status, "network error: offline");
 }
 
@@ -448,7 +451,7 @@ fn shows_the_fetched_message_and_ignores_stale_ones() {
 
     respond(&mut app, first, Event::MessageFetched(Ok(message("m0", 1))));
     assert_eq!(pager(&app).message, None, "stale response ignored");
-    assert!(!app.messages[0].flags.read);
+    assert!(!app.index.messages[0].flags.read);
 
     respond(
         &mut app,
@@ -457,7 +460,7 @@ fn shows_the_fetched_message_and_ignores_stale_ones() {
     );
     let shown = pager(&app).message.as_ref().unwrap();
     assert_eq!(shown.summary.id.as_str(), "m1");
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
 }
 
 #[test]
@@ -468,7 +471,7 @@ fn a_failed_fetch_returns_to_the_index_and_leaves_it_unread() {
     assert!(effects.is_empty());
     assert_eq!(app.menu(), Menu::Index);
     assert_eq!(app.status, "network error: offline");
-    assert!(!app.messages[0].flags.read);
+    assert!(!app.index.messages[0].flags.read);
 }
 
 #[test]
@@ -819,7 +822,7 @@ fn the_sign_in_window_keeps_a_pending_move() {
     let mut more = summaries(2);
     more.remove(0);
     listed(&mut app, second, more, None);
-    assert_eq!(app.selected, 1, "moved on once the page arrived");
+    assert_eq!(app.index.selected, 1, "moved on once the page arrived");
 }
 
 #[test]
@@ -1046,4 +1049,23 @@ fn addresses_are_the_user_s_whatever_their_case() {
     // Not ASCII: lowercased as before.
     app.settings.me.push("ünï@contoso.com".to_owned());
     assert!(app.is_me(&address("ÜNÏ@Contoso.com")));
+}
+
+#[test]
+fn resetting_the_folder_restores_a_fresh_index() {
+    let (mut app, _) = opened(Settings::default(), 24, plain(&["a", "b", "c"]), None);
+    app.index.selected = 2;
+    app.index.threaded_count = 3;
+    app.index.settled = true;
+    app.index.collapse_all = true;
+    app.index.listed_twice = true;
+    app.index.chosen.insert("thread".into(), true);
+    app.index.limited.insert(MessageId::new("a"), true);
+    app.index.deleted.insert(MessageId::new("b"));
+    app.index.pending = Some(Target::Last);
+    app.index.unlisted = Some(Page::first(10));
+    let fresh = format!("{:?}", IndexState::default());
+    assert_ne!(format!("{:?}", app.index), fresh);
+    app.reset_folder();
+    assert_eq!(format!("{:?}", app.index), fresh);
 }

@@ -522,7 +522,7 @@ fn nothing_is_watched_nor_checked_after_quitting() {
 fn a_message_missing_at_the_page_s_end_is_asked_about() {
     let (mut app, _) = app();
     // m0 is as old as m1, the page's last: on the next page, or gone.
-    app.messages.iter_mut().for_each(|m| {
+    app.index.messages.iter_mut().for_each(|m| {
         if m.id.as_str() == "m0" {
             m.received = DateTime::UNIX_EPOCH + TimeDelta::minutes(1);
         }
@@ -568,8 +568,8 @@ fn new_mail_joins_the_index_where_its_date_puts_it() {
     );
     assert_eq!(ids(&app), ["m3", "m2", "m1", "m0"]);
     // Still on m1, which was read elsewhere.
-    assert_eq!(app.selected, 2);
-    assert!(app.messages[2].flags.read);
+    assert_eq!(app.index.selected, 2);
+    assert!(app.index.messages[2].flags.read);
     assert_eq!(app.status, NEW_MAIL);
 }
 
@@ -636,7 +636,7 @@ fn a_draft_beyond_the_newest_page_stays() {
     // A draft created after m1 was sent, but listed after the sent
     // mail, as Graph sorts unsent drafts.
     let draft = draft("d", 5);
-    app.messages.push(draft);
+    app.index.messages.push(draft);
     polled_with(
         &mut app,
         id,
@@ -652,10 +652,10 @@ fn drafts_are_placed_and_removed_among_drafts() {
     // In the order the folder is listed in.
     app.apply_ordering(unsorted());
     // The drafts were listed after the sent mail.
-    app.messages.push(draft("d2", 9));
-    app.messages.push(draft("d1", 8));
-    app.positions.insert(MessageId::new("d2"), 3);
-    app.positions.insert(MessageId::new("d1"), 4);
+    app.index.messages.push(draft("d2", 9));
+    app.index.messages.push(draft("d1", 8));
+    app.index.positions.insert(MessageId::new("d2"), 3);
+    app.index.positions.insert(MessageId::new("d1"), 4);
     let id = poll(&mut app);
     // d3 is new, and d2 went; d1 may be on the next page.
     polled_with(
@@ -796,8 +796,8 @@ fn lifting_a_limit_keeps_new_mail_in_place() {
     app.apply_ordering(unsorted());
     // Listed out of date order, as drafts can be.
     let draft = draft("d", 9);
-    app.messages.push(draft.clone());
-    app.positions.insert(draft.id.clone(), 3);
+    app.index.messages.push(draft.clone());
+    app.index.positions.insert(draft.id.clone(), 3);
     act(&mut app, Action::Limit);
     typed(&mut app, "~s m2");
     key(&mut app, KeyCode::Enter);
@@ -866,7 +866,7 @@ fn flags_saved_meanwhile_are_kept() {
         id,
         vec![summary("m2", 2), summary("m1", 1), summary("m0", 0)],
     );
-    assert!(app.messages[0].flags.flagged);
+    assert!(app.index.messages[0].flags.flagged);
 }
 
 #[test]
@@ -875,7 +875,10 @@ fn a_listing_started_meanwhile_wins() {
     let id = poll(&mut app);
     app.refresh();
     polled(&mut app, id, vec![summary("m9", 9)]);
-    assert!(app.messages.is_empty(), "the relist hasn't answered yet");
+    assert!(
+        app.index.messages.is_empty(),
+        "the relist hasn't answered yet"
+    );
 }
 
 #[test]
@@ -1165,7 +1168,7 @@ fn a_refused_mailbox_is_said_and_checks_go_on() {
 #[test]
 fn a_check_lists_again_what_failed_to_list() {
     let (mut app, _) = app();
-    app.unlisted = Some(Page::first(10));
+    app.index.unlisted = Some(Page::first(10));
     let effects = app.update(Msg::Timer(Timer::Poll(0)));
     let requests = requests(&effects);
     assert!(
@@ -1178,7 +1181,7 @@ fn a_check_lists_again_what_failed_to_list() {
             .iter()
             .any(|(_, r)| matches!(r, Request::ListMessages { .. }))
     );
-    assert!(app.unlisted.is_none());
+    assert!(app.index.unlisted.is_none());
 }
 
 /// Leaves the Inbox for Work, then has a check find the Inbox's
@@ -1274,7 +1277,7 @@ fn a_message_in_both_lists_comes_as_last_changed() {
         ]),
         page(vec![read]),
     );
-    assert!(app.messages[0].flags.read);
+    assert!(app.index.messages[0].flags.read);
     assert_ne!(app.status, NEW_MAIL);
 }
 
@@ -1292,7 +1295,7 @@ fn a_known_message_in_both_lists_comes_as_last_changed() {
         page(vec![summary("m2", 2), read, summary("m0", 0)]),
         page(vec![summary("m1", 1)]),
     );
-    assert!(app.messages[1].flags.read);
+    assert!(app.index.messages[1].flags.read);
 }
 
 #[test]
@@ -1401,11 +1404,11 @@ fn sent_mail_goes_before_the_drafts() {
     let (mut app, _) = app();
     // In the order the folder is listed in.
     app.apply_ordering(unsorted());
-    app.messages.clear();
-    app.positions.clear();
+    app.index.messages.clear();
+    app.index.positions.clear();
     let draft = draft("d", 9);
-    app.messages.push(draft.clone());
-    app.positions.insert(draft.id.clone(), 0);
+    app.index.messages.push(draft.clone());
+    app.index.positions.insert(draft.id.clone(), 0);
     let id = poll(&mut app);
     polled(&mut app, id, vec![summary("moved", -50), draft]);
     assert_eq!(ids(&app), ["moved", "d"]);

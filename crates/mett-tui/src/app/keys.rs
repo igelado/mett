@@ -263,7 +263,7 @@ impl App {
             || self.awaiting_addresses.is_some()
             || self.opening.is_some()
             || self.switching.is_some()
-            || self.listing.is_some()
+            || self.index.listing.is_some()
             || loading_pager
             || self.browser_request().is_some()
             // Attachments being listed, or one fetched to show or save.

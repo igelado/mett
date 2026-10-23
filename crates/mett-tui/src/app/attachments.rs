@@ -104,7 +104,11 @@ impl App {
     pub(super) fn view_attachments(&mut self) -> Vec<Effect> {
         let message = match self.screens.last() {
             Some(Screen::Pager(pager)) => Some(pager.id.clone()),
-            _ => self.messages.get(self.selected).map(|m| m.id.clone()),
+            _ => self
+                .index
+                .messages
+                .get(self.index.selected)
+                .map(|m| m.id.clone()),
         };
         let Some(message) = message else {
             self.fail("No messages.");

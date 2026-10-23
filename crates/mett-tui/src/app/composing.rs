@@ -227,7 +227,7 @@ impl App {
             let message = message.clone();
             return self.reply_when_ready(kind, message);
         }
-        let Some(summary) = self.messages.get(self.selected) else {
+        let Some(summary) = self.index.messages.get(self.index.selected) else {
             self.fail("No messages.");
             return Vec::new();
         };
@@ -287,7 +287,7 @@ impl App {
         else {
             return Vec::new();
         };
-        let selected = self.messages.get(self.selected).map(|m| &m.id);
+        let selected = self.index.messages.get(self.index.selected).map(|m| &m.id);
         if selected != Some(&id) {
             return Vec::new();
         }

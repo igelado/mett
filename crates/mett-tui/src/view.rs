@@ -176,8 +176,8 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
     );
     let status_line = match app.screen() {
         Screen::Index => {
-            let first = page_start(app.selected, usize::from(body.height));
-            render_index(app, first, Some(app.selected), frame, body);
+            let first = page_start(app.index.selected, usize::from(body.height));
+            render_index(app, first, Some(app.index.selected), frame, body);
             index_status(
                 app,
                 first,
@@ -808,7 +808,7 @@ fn render_index(app: &App, first: usize, current: Option<usize>, frame: &mut Fra
     // page, and only if a collapsed thread on it needs them.
     let unread_roots = std::cell::OnceCell::new();
     render_rows(
-        &app.messages,
+        &app.index.messages,
         first,
         current,
         colors.indicator,
@@ -863,7 +863,7 @@ fn render_index(app: &App, first: usize, current: Option<usize>, frame: &mut Fra
 /// shown from entry `first` in `height` rows.
 fn index_status(app: &App, first: usize, height: usize, width: usize) -> String {
     let height = height.max(1);
-    let position = expando::position(first, height, app.messages.len());
+    let position = expando::position(first, height, app.index.messages.len());
     let (sort, aux) = (app.ordering.sort.name(), app.ordering.aux.name());
     // The whole folder, as in mutt, whatever the limit shows: counted in
     // one pass.
@@ -871,12 +871,12 @@ fn index_status(app: &App, first: usize, height: usize, width: usize) -> String 
     let status = Status {
         folder: app.folder.as_ref().map_or("", |f| f.name.as_str()),
         total: app.total_messages(),
-        shown: app.limit.as_ref().map(|_| app.shown_count()),
+        shown: app.index.limit.as_ref().map(|_| app.shown_count()),
         new,
         deleted: app.deleted_count(),
         flagged,
         incoming: app.mailboxes_with_new_mail(),
-        limit: app.limit.as_ref().map(|limit| limit.text.as_str()),
+        limit: app.index.limit.as_ref().map(|limit| limit.text.as_str()),
         incomplete: app.incomplete(),
         changed: app.deleted_count() > 0 || app.saving(),
         position: &position,
@@ -897,13 +897,14 @@ fn render_pager(
     // The message as the index shows it: usually the selected one. IDs
     // are unique, so it is the only one.
     let index = if app
+        .index
         .messages
-        .get(app.selected)
+        .get(app.index.selected)
         .is_some_and(|m| m.id == pager.id)
     {
-        Some(app.selected)
+        Some(app.index.selected)
     } else {
-        app.messages.iter().position(|m| m.id == pager.id)
+        app.index.messages.iter().position(|m| m.id == pager.id)
     };
     let area = render_mini_index(app, index, frame, area);
     let Some(message) = &pager.message else {
@@ -1032,9 +1033,9 @@ fn render_pager(
     let position = expando::position(top, height, total);
     // The message as the index currently shows it, as in mutt's `%Z`: its
     // flags may have changed since it was fetched.
-    let summary = index.map_or(&message.summary, |i| &app.messages[i]);
+    let summary = index.map_or(&message.summary, |i| &app.index.messages[i]);
     let entry = Entry {
-        number: index.unwrap_or(app.selected) + 1,
+        number: index.unwrap_or(app.index.selected) + 1,
         summary,
         deleted: app.is_deleted(&pager.id),
         from_me: summary.from.as_ref().is_some_and(|a| app.is_me(a)),
@@ -1055,7 +1056,7 @@ fn render_pager(
 fn render_mini_index(app: &App, current: Option<usize>, frame: &mut Frame, area: Rect) -> Rect {
     let rows = app
         .display
-        .mini_index_rows(app.messages.len(), usize::from(area.height));
+        .mini_index_rows(app.index.messages.len(), usize::from(area.height));
     if rows == 0 {
         return area;
     }
@@ -1069,8 +1070,13 @@ fn render_mini_index(app: &App, current: Option<usize>, frame: &mut Frame, area:
     let height = usize::from(index.height);
     // Until the index lists the open message again (as a refresh does),
     // around the selected entry, with none highlighted.
-    let around = current.unwrap_or(app.selected);
-    let first = mini_index_top(around, app.messages.len(), height, usize::from(rows) / 3);
+    let around = current.unwrap_or(app.index.selected);
+    let first = mini_index_top(
+        around,
+        app.index.messages.len(),
+        height,
+        usize::from(rows) / 3,
+    );
     render_index(app, first, current, frame, index);
     let line = index_status(app, first, height, usize::from(status.width));
     frame.render_widget(
@@ -1473,7 +1479,8 @@ mod tests {
         act(&mut app, Action::CollapseAll);
         // Collapsing every thread leaves "a" open, with unread mail: it is
         // collapsed on its own.
-        app.selected = app
+        app.index.selected = app
+            .index
             .messages
             .iter()
             .position(|m| m.id.as_str() == "a0")
@@ -1482,6 +1489,7 @@ mod tests {
         let lines = sized_screen(&app, WIDTH, HEIGHT);
         let row = |id: &str| {
             let i = app
+                .index
                 .messages
                 .iter()
                 .position(|m| m.id.as_str() == id)
@@ -1495,7 +1503,7 @@ mod tests {
     #[test]
     fn index_columns_line_up_with_wide_characters() {
         let mut app = app(1);
-        app.messages[0].from = Some(Address::new("x@example.com").with_name("山田太郎さん"));
+        app.index.messages[0].from = Some(Address::new("x@example.com").with_name("山田太郎さん"));
         let lines = screen(&app);
         // The 15-cell sender column: 6 two-cell characters and 3 spaces of
         // padding, then the 2-space gap before the subject.
@@ -1627,7 +1635,7 @@ mod tests {
         colored(&mut app, &["color indicator black yellow"]);
         read(&mut app, Action::DisplayMessage, "Body");
         // As while a refresh lists the folder again.
-        app.messages.retain(|m| m.id.as_str() != "m0");
+        app.index.messages.retain(|m| m.id.as_str() != "m0");
         let buffer = drawn(&app, WIDTH, 16);
         for y in 1..4 {
             assert_ne!(buffer[(5, y)].bg, Color::Yellow, "row {y}");

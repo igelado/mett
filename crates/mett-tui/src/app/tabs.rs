@@ -81,7 +81,7 @@ impl App {
     /// Whether messages are marked deleted that nothing has purged yet: on
     /// quitting, the user is asked what to do with them.
     pub fn has_deleted(&self) -> bool {
-        !self.deleted.is_empty()
+        !self.index.deleted.is_empty()
     }
 
     /// Whether a message is being written (or is about to be: its recipients

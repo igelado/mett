@@ -39,7 +39,8 @@ fn app() -> App {
 }
 
 fn shown(app: &App) -> Vec<String> {
-    app.messages
+    app.index
+        .messages
         .iter()
         .map(|m| {
             let thread = app.thread_of(&m.id).unwrap();
@@ -57,7 +58,7 @@ fn shown(app: &App) -> Vec<String> {
 fn shows_threads_with_their_trees() {
     let app = app();
     assert_eq!(shown(&app), ["a0", "├─>a1", "└─>a2", "b0", "└─>b1"]);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     assert!(app.thread_of(&MessageId::new("a1")).unwrap().same_subject);
 }
 
@@ -66,12 +67,12 @@ fn moves_between_threads() {
     let mut app = app();
     act(&mut app, Action::NextEntry);
     act(&mut app, Action::NextThread);
-    assert_eq!(app.messages[app.selected].id.as_str(), "b0");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b0");
     act(&mut app, Action::NextThread);
     assert_eq!(app.status, "You are on the last thread.");
     act(&mut app, Action::NextEntry);
     act(&mut app, Action::PreviousThread);
-    assert_eq!(app.messages[app.selected].id.as_str(), "a0");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "a0");
     act(&mut app, Action::PreviousThread);
     assert_eq!(app.status, "You are on the first thread.");
 }
@@ -82,7 +83,7 @@ fn collapses_threads() {
     act(&mut app, Action::NextEntry);
     act(&mut app, Action::CollapseThread);
     assert_eq!(shown(&app), ["a0 (2)", "b0", "└─>b1"]);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     assert_eq!(app.total_messages(), 5);
     // The key: Escape then v.
     app.update(Msg::Key(KeyEvent::new(
@@ -99,7 +100,7 @@ fn collapses_threads() {
 /// [`app`], with `unread` unread.
 fn app_with_unread(unread: &[&str]) -> App {
     let mut app = app();
-    for m in app.messages.iter_mut() {
+    for m in app.index.messages.iter_mut() {
         m.flags.read = !unread.contains(&m.id.as_str());
     }
     app.arrange();
@@ -108,7 +109,8 @@ fn app_with_unread(unread: &[&str]) -> App {
 
 /// Selects the entry of `id`.
 fn select(app: &mut App, id: &str) {
-    app.selected = app
+    app.index.selected = app
+        .index
         .messages
         .iter()
         .position(|m| m.id.as_str() == id)
@@ -198,7 +200,7 @@ fn new_mail_opens_its_collapsed_thread() {
     app.arrange();
     assert_eq!(shown(&app)[..3], ["a0", "├─>a1", "└─>a2"]);
     // It stays open once the mail is read.
-    for m in app.messages.iter_mut() {
+    for m in app.index.messages.iter_mut() {
         m.flags.read = true;
     }
     app.arrange();
@@ -218,15 +220,16 @@ fn collapsing_a_thread_with_nothing_to_fold_can_be_undone() {
     let mut app = opened(sorted("threads"), 24, messages, None).0;
     let key = "conversation c";
     act(&mut app, Action::CollapseThread);
-    assert_eq!(app.chosen.get(key), Some(&true));
+    assert_eq!(app.index.chosen.get(key), Some(&true));
     act(&mut app, Action::CollapseThread);
-    assert_eq!(app.chosen.get(key), Some(&false), "undone");
+    assert_eq!(app.index.chosen.get(key), Some(&false), "undone");
 }
 
 #[test]
 fn a_search_opens_the_collapsed_thread_it_finds() {
     let mut app = app();
     let a2 = app
+        .index
         .messages
         .iter_mut()
         .find(|m| m.id.as_str() == "a2")
@@ -234,16 +237,17 @@ fn a_search_opens_the_collapsed_thread_it_finds() {
     a2.subject = "Re: a, special".into();
     act(&mut app, Action::CollapseAll);
     // a2 is folded into a0's thread.
-    app.messages
+    app.index
+        .messages
         .iter()
         .for_each(|m| assert_ne!(m.id.as_str(), "a2"));
-    app.selected = 1;
+    app.index.selected = 1;
     app.new_search("~s special");
-    assert_eq!(app.messages[app.selected].id.as_str(), "a2");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "a2");
     // When the start of the thread matches too, the thread opens, and
     // `n` goes on to its other matches.
     act(&mut app, Action::CollapseAll);
-    app.selected = 1;
+    app.index.selected = 1;
     app.new_search("~s a");
     assert_eq!(shown(&app)[0], "a0");
     assert!(shown(&app).len() > 2);
@@ -281,7 +285,7 @@ fn escape_then_control_n_is_control_n() {
         KeyModifiers::CONTROL,
     )));
     // The next thread, not Alt-n.
-    assert_eq!(app.messages[app.selected].id.as_str(), "b0");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b0");
 }
 
 #[test]
@@ -301,7 +305,7 @@ fn a_collapsed_thread_stays_selected_when_its_first_message_goes() {
     act(&mut app, Action::CollapseThread);
     assert_eq!(shown(&app)[0], "a0 (2)");
     app.remove_messages(&std::collections::HashSet::from([MessageId::new("a0")]));
-    assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "a1");
 }
 
 #[test]
@@ -311,7 +315,7 @@ fn a_pending_page_down_counts_from_where_it_started() {
     // Two rows a page, from a.
     act(&mut app, Action::NextPage);
     listed(&mut app, next, vec![named("b"), named("zz")], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "z");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "z");
 }
 
 #[test]
@@ -340,9 +344,9 @@ fn a_pending_move_waits_for_mail_from_the_same_time() {
     act(&mut app, Action::NextEntry);
     // e may not come right after c: d, from the same time, may follow.
     let next = page(&mut app, next, vec![from("e", 3)], "in next");
-    assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "c");
     listed(&mut app, next, vec![from("d", 3)], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "d");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "d");
 }
 
 #[test]
@@ -363,15 +367,15 @@ fn a_pending_move_waits_among_drafts() {
     let next = page(&mut app, list, vec![at("d9", 9, true)], "in next");
     act(&mut app, Action::NextEntry);
     let next = page(&mut app, next, vec![at("d2", 2, true)], "in next");
-    assert_eq!(app.messages[app.selected].id.as_str(), "d9");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "d9");
     listed(&mut app, next, vec![at("s5", 5, false)], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "s5");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "s5");
 }
 
 #[test]
 fn a_collapsed_thread_tells_of_its_unread_mail() {
     let mut app = app();
-    for m in &mut app.messages {
+    for m in &mut app.index.messages {
         m.flags.read = m.id.as_str() != "a2";
     }
     act(&mut app, Action::CollapseThread);
@@ -379,6 +383,7 @@ fn a_collapsed_thread_tells_of_its_unread_mail() {
     assert_eq!(app.roots_with_folded_unread(), HashSet::from([&a0]));
     // As the flags are now.
     let a2 = app
+        .index
         .folded
         .iter_mut()
         .find(|m| m.id.as_str() == "a2")
@@ -391,21 +396,23 @@ fn a_collapsed_thread_tells_of_its_unread_mail() {
 fn a_search_looks_under_the_selected_collapsed_thread_first() {
     let mut app = app();
     let a1 = app
+        .index
         .messages
         .iter_mut()
         .find(|m| m.id.as_str() == "a1")
         .unwrap();
     a1.subject = "Re: a, found".into();
     let b1 = app
+        .index
         .messages
         .iter_mut()
         .find(|m| m.id.as_str() == "b1")
         .unwrap();
     b1.subject = "Re: b, found".into();
     act(&mut app, Action::CollapseAll);
-    app.selected = 0;
+    app.index.selected = 0;
     app.new_search("~s found");
-    assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "a1");
 }
 
 #[test]
@@ -437,7 +444,7 @@ fn pages_are_merged_into_a_sorted_index() {
         sort: Sort::parse("date", true).unwrap(),
         ..Ordering::default()
     });
-    app.selected = 1;
+    app.index.selected = 1;
     listed(
         &mut app,
         next,
@@ -448,10 +455,10 @@ fn pages_are_merged_into_a_sorted_index() {
         ],
         None,
     );
-    let ids: Vec<&str> = app.messages.iter().map(|m| m.id.as_str()).collect();
+    let ids: Vec<&str> = app.index.messages.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["x1", "x2", "x3", "x4", "x5"]);
     // Still on x4.
-    assert_eq!(app.selected, 3);
+    assert_eq!(app.index.selected, 3);
 }
 
 #[test]
@@ -487,7 +494,7 @@ fn replies_listed_later_fold_into_their_collapsed_thread() {
         Some("in more"),
     );
     assert!(!effects.is_empty());
-    assert!(!app.messages.iter().any(|m| m.id.as_str() == "b1"));
+    assert!(!app.index.messages.iter().any(|m| m.id.as_str() == "b1"));
 }
 
 #[test]
@@ -528,7 +535,7 @@ fn the_next_thread_may_be_on_a_page_to_come() {
     assert_ne!(app.status, "You are on the last thread.");
     // (A later page normally has older mail; this thread sorts after.)
     listed(&mut app, next, vec![message("b0", 9, "b", &[0])], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "b0");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b0");
 }
 
 #[test]
@@ -538,9 +545,9 @@ fn a_pending_next_entry_goes_after_its_message_whatever_comes_before() {
     act(&mut app, Action::NextEntry);
     // d comes first, but the last page may hold what goes between.
     let more = page(&mut app, next, vec![named("d")], "in more");
-    assert_eq!(app.messages[app.selected].id.as_str(), "b");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b");
     listed(&mut app, more, vec![named("a"), named("c")], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "c");
 }
 
 #[test]
@@ -552,25 +559,25 @@ fn a_pending_next_entry_survives_its_message_going() {
     // b goes (moved elsewhere, say) before the next page comes.
     app.remove_messages(&std::collections::HashSet::from([MessageId::new("b")]));
     listed(&mut app, next, vec![named("c"), named("d")], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "c");
 }
 
 #[test]
 fn a_pending_move_from_a_folded_message_goes_after_its_thread() {
     let mut app = app();
     act(&mut app, Action::CollapseAll);
-    app.pending = Some(super::super::Target::After(MessageId::new("a1"), 1));
+    app.index.pending = Some(super::super::Target::After(MessageId::new("a1"), 1));
     app.apply_pending();
-    assert_eq!(app.messages[app.selected].id.as_str(), "b0");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b0");
 }
 
 #[test]
 fn a_limit_keeps_a_visible_reply_selected() {
     let mut app = app();
     act(&mut app, Action::NextEntry);
-    assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "a1");
     app.set_limit("~s a");
-    assert_eq!(app.messages[app.selected].id.as_str(), "a1");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "a1");
 }
 
 /// What the index shows and the folded messages, how each is
@@ -584,9 +591,14 @@ type State = (
 
 fn state(app: &App) -> State {
     let ids = |list: &[MessageSummary]| list.iter().map(|m| m.id.clone()).collect();
-    let mut threads: Vec<_> = app.threads.clone().into_iter().collect();
+    let mut threads: Vec<_> = app.index.threads.clone().into_iter().collect();
     threads.sort_by(|a, b| a.0.cmp(&b.0));
-    (ids(&app.messages), ids(&app.folded), threads, app.selected)
+    (
+        ids(&app.index.messages),
+        ids(&app.index.folded),
+        threads,
+        app.index.selected,
+    )
 }
 
 #[test]
@@ -635,12 +647,12 @@ fn collapsing_and_opening_one_thread_is_arranging_the_index_again() {
         );
         for step in 0..30 {
             match below(5) {
-                0 | 1 if !app.messages.is_empty() => {
-                    app.selected = below(app.messages.len());
+                0 | 1 if !app.index.messages.is_empty() => {
+                    app.index.selected = below(app.index.messages.len());
                     act(&mut app, Action::CollapseThread);
                 }
-                2 if !app.folded.is_empty() => {
-                    let id = app.folded[below(app.folded.len())].id.clone();
+                2 if !app.index.folded.is_empty() => {
+                    let id = app.index.folded[below(app.index.folded.len())].id.clone();
                     app.uncollapse_to(&id);
                 }
                 3 if below(4) == 0 => {
@@ -658,8 +670,8 @@ fn collapsing_and_opening_one_thread_is_arranging_the_index_again() {
                 }
             }
             // Threaded, it is as arranging it all again makes it.
-            if app.shown_count() == app.threaded_count {
-                assert!(app.settled);
+            if app.shown_count() == app.index.threaded_count {
+                assert!(app.index.settled);
                 let before = state(&app);
                 app.arrange();
                 assert_eq!(state(&app), before, "round {round}, step {step}");
@@ -673,7 +685,8 @@ fn without_threads_thread_keys_say_so() {
     let mut app = app();
     app.apply_ordering(Ordering::default());
     assert_eq!(
-        app.messages
+        app.index
+            .messages
             .iter()
             .map(|m| m.id.as_str())
             .collect::<Vec<_>>(),

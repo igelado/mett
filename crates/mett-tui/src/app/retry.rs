@@ -248,7 +248,7 @@ impl App {
             Some(Retry::Open { id, search }) => (Some(id), search),
             _ => (None, None),
         };
-        let selected = self.messages.get(self.selected).map(|s| &s.id);
+        let selected = self.index.messages.get(self.index.selected).map(|s| &s.id);
         if failed.is_some() && failed.as_ref() == selected && self.screen() == &Screen::Index {
             effects.extend(self.open_selected());
             if let Some(Screen::Pager(pager)) = self.screens.last_mut() {
