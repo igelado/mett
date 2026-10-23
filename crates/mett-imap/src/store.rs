@@ -73,6 +73,9 @@ struct Caps {
     sort: bool,
     /// `CONDSTORE`, which tells what changed since a modification sequence.
     condstore: bool,
+    /// `SPECIAL-USE`, which says which folder is Sent, Drafts and so on, if
+    /// it is asked to (`RETURN (SPECIAL-USE)`).
+    special_use: bool,
 }
 
 /// A connection that is logged in.
@@ -164,6 +167,7 @@ impl<A: Authenticator> ImapMailStore<A> {
                 uidplus: caps.has_str("UIDPLUS"),
                 sort: caps.has_str("SORT"),
                 condstore: caps.has_str("CONDSTORE") || caps.has_str("QRESYNC"),
+                special_use: caps.has_str("SPECIAL-USE"),
             },
             used: Instant::now(),
             listing: None,
@@ -419,13 +423,31 @@ async fn all_folders(live: &mut Live, fresh: bool) -> Res<Vec<Listed>> {
     Ok(listing)
 }
 
-async fn list(live: &mut Live, pattern: &str) -> Res<Vec<Listed>> {
-    let names: Vec<Name> = live
-        .session
-        .list(Some(""), Some(&format!("\"{pattern}\"")))
+/// What `LIST` says of the folders that match `pattern`.
+async fn list_names(live: &mut Live, argument: &str) -> async_imap::error::Result<Vec<Name>> {
+    live.session
+        .list(Some(""), Some(argument))
         .await?
         .try_collect()
-        .await?;
+        .await
+}
+
+async fn list(live: &mut Live, pattern: &str) -> Res<Vec<Listed>> {
+    // Some servers say which folders are Sent, Drafts and so on only when
+    // asked: those that can are, and one that refuses is listed as every
+    // server can be.
+    let asked = if live.caps.special_use {
+        match list_names(live, &format!("\"{pattern}\" RETURN (SPECIAL-USE)")).await {
+            Err(async_imap::error::Error::Bad(_) | async_imap::error::Error::No(_)) => None,
+            other => Some(other?),
+        }
+    } else {
+        None
+    };
+    let names: Vec<Name> = match asked {
+        Some(names) => names,
+        None => list_names(live, &format!("\"{pattern}\"")).await?,
+    };
     let mut all: Vec<Listed> = names.iter().map(listed).collect();
     // A folder the server says has a role has it alone: another that only
     // has the usual name for it is an ordinary folder.

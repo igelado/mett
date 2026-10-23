@@ -74,6 +74,9 @@ pub struct State {
     pub refuse_starttls: bool,
     /// How many times every folder was listed.
     pub full_lists: u32,
+    /// Says which folders are Sent, Drafts and so on only when asked to
+    /// (`RETURN (SPECIAL-USE)`), as the servers allowed to do.
+    pub special_use_only_on_request: bool,
 }
 
 impl State {
@@ -306,7 +309,7 @@ impl Session {
                         )
                     };
                     out.push_str(&format!(
-                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2{uidplus}{moves}{sort}{condstore}\r\n"
+                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2 SPECIAL-USE LIST-EXTENDED{uidplus}{moves}{sort}{condstore}\r\n"
                     ));
                     ok(&mut out, "done");
                 } else if upper == "STARTTLS" {
@@ -403,14 +406,20 @@ impl Session {
         let shared = self.state.clone();
         let mut state = shared.lock().unwrap();
         if upper.starts_with("LIST ") {
-            // LIST "" "pattern"
-            let pattern = unquote(rest[5..].trim().split_once(' ').map_or("", |(_, p)| p));
+            // LIST "" "pattern" [RETURN (SPECIAL-USE)]
+            let args = rest[5..].trim().split_once(' ').map_or("", |(_, p)| p);
+            let asked = args.to_uppercase().contains("RETURN (SPECIAL-USE)");
+            let pattern = unquote(args.split(" RETURN").next().unwrap_or(""));
             if pattern == "*" {
                 state.full_lists += 1;
             }
             for folder in &state.folders {
                 if pattern == "*" || pattern == folder.name {
-                    let attributes = folder.attributes.join(" ");
+                    let attributes = if state.special_use_only_on_request && !asked {
+                        String::new()
+                    } else {
+                        folder.attributes.join(" ")
+                    };
                     out.push_str(&format!(
                         "* LIST ({attributes}) \"/\" \"{}\"\r\n",
                         folder.name

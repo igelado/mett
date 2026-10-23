@@ -1616,3 +1616,36 @@ async fn asking_about_one_folder_after_another_lists_the_folders_once() {
     store.list_folders().await.unwrap();
     assert_eq!(server.state.lock().unwrap().full_lists, 2);
 }
+
+#[tokio::test]
+async fn asks_for_the_roles_of_folders_from_servers_that_say_only_when_asked() {
+    let server = server(
+        Mode::Plain,
+        password(),
+        vec![
+            Folder::new("INBOX", &[]),
+            // Localized names: only the server's word tells what they are.
+            Folder::new("Gesendet", &["\\Sent"]),
+            Folder::new("Entw&APw-rfe", &["\\Drafts"]),
+        ],
+    )
+    .await;
+    server.state.lock().unwrap().special_use_only_on_request = true;
+    let store = ImapMailStore::new(settings(&server, Security::None), login(), Address::new(ME));
+    let sent = store
+        .well_known_folder(WellKnownFolder::SentItems)
+        .await
+        .unwrap();
+    assert_eq!(sent.id.as_str(), "Gesendet");
+    let drafts = store
+        .well_known_folder(WellKnownFolder::Drafts)
+        .await
+        .unwrap();
+    assert_eq!(drafts.id.as_str(), "Entwürfe");
+    // Saving a draft finds the folder.
+    let draft = Draft {
+        subject: "Notes".into(),
+        ..Draft::default()
+    };
+    store.save_draft(&draft).await.unwrap();
+}
