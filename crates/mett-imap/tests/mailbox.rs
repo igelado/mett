@@ -386,6 +386,13 @@ async fn a_message_of_a_folder_made_anew_is_gone() {
         .id
         .clone();
     server.state.lock().unwrap().folder("INBOX").validity += 1;
+    // A server doesn't make a folder anew while it is selected: it is
+    // selected again here, as it is when the connection has gone to
+    // another folder in the meantime.
+    store
+        .list_messages(&FolderId::new("Sent"), Page::first(1))
+        .await
+        .unwrap();
     assert!(matches!(
         store.fetch_message(&id).await,
         Err(Error::NotFound { .. })
@@ -1791,4 +1798,100 @@ async fn a_folder_polled_after_the_listing_went_old_takes_one_round_trip() {
     let state = server.state.lock().unwrap();
     assert_eq!(state.count("LIST"), 1);
     assert_eq!(state.count("STATUS"), 2);
+}
+
+#[tokio::test]
+async fn a_folder_that_is_selected_is_not_selected_again_for_a_message() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    deliver(&server, "INBOX", &simple("two"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let page = store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    let (first, second) = (page.messages[0].id.clone(), page.messages[1].id.clone());
+    assert_eq!(commands(&server, "SELECT"), 1);
+
+    store.fetch_message(&first).await.unwrap();
+    store.fetch_message(&second).await.unwrap();
+    store
+        .update_flags(&first, FlagsUpdate::read(true))
+        .await
+        .unwrap();
+    store.list_attachments(&first).await.unwrap();
+    store.message_folder(&first).await.unwrap();
+    store.delete_message(&second).await.unwrap();
+    assert_eq!(commands(&server, "SELECT"), 1);
+
+    // What lists the folder selects it, for the counts it says anew.
+    store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    assert_eq!(commands(&server, "SELECT"), 2);
+
+    // Another folder is selected for what is done in it, and then the
+    // first is selected again.
+    store
+        .well_known_folder(WellKnownFolder::Drafts)
+        .await
+        .unwrap();
+    store
+        .list_messages(&FolderId::new("Sent"), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(commands(&server, "SELECT"), 3);
+    store.fetch_message(&first).await.unwrap();
+    assert_eq!(commands(&server, "SELECT"), 4);
+}
+
+#[tokio::test]
+async fn a_message_that_is_gone_is_not_found_in_a_folder_that_is_selected() {
+    let (server, store) = plain().await;
+    let id = {
+        deliver(&server, "INBOX", &simple("one"), &[]);
+        let page = store
+            .list_messages(&FolderId::new("INBOX"), Page::first(10))
+            .await
+            .unwrap();
+        page.messages[0].id.clone()
+    };
+    // Another client deletes it.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .clear();
+    assert!(matches!(
+        store.fetch_message(&id).await,
+        Err(Error::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.update_flags(&id, FlagsUpdate::read(true)).await,
+        Err(Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_failed_command_makes_the_next_select_the_folder_again() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    let id = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(10))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    assert_eq!(commands(&server, "SELECT"), 1);
+    // Another client deletes it: the fetch finds nothing, and what the
+    // server says of the folder is not taken for granted after that.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .clear();
+    assert!(store.fetch_message(&id).await.is_err());
+    assert_eq!(commands(&server, "SELECT"), 1);
+    assert!(store.fetch_message(&id).await.is_err());
+    assert_eq!(commands(&server, "SELECT"), 2);
 }

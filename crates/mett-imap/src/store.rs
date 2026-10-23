@@ -106,6 +106,10 @@ struct Live {
     used: Instant,
     /// The folders as last listed, and when.
     listing: Option<(Instant, Vec<Listed>)>,
+    /// The folder that is selected, with its `UIDVALIDITY`, as the last
+    /// `SELECT` left it: what works on a message by its `UID` needs not
+    /// select it again. Not known (`None`) after a command failed.
+    open: Option<(String, u32)>,
 }
 
 /// A mailbox on an IMAP server.
@@ -202,6 +206,7 @@ impl<A: Authenticator> ImapMailStore<A> {
             },
             used: Instant::now(),
             listing: None,
+            open: None,
         })
     }
 
@@ -254,6 +259,13 @@ impl Guard<'_> {
     /// `result` for the caller: a connection that failed is let go, so
     /// that the next request makes a new one.
     fn done<T>(&mut self, result: Res<T>) -> Result<T> {
+        if result.is_err()
+            && let Some(live) = self.slot.as_mut()
+        {
+            // Where the server stands after a command that failed (or was
+            // given up on) is not to be taken for granted.
+            live.open = None;
+        }
         match result {
             Ok(value) => {
                 self.live().used = Instant::now();
@@ -745,6 +757,8 @@ impl Selected {
 
 /// Selects `name`.
 async fn select(live: &mut Live, name: &str) -> Res<Selected> {
+    // A `SELECT` that fails leaves nothing selected.
+    live.open = None;
     let selected = if live.caps.condstore {
         live.session.select_condstore(wire(name)).await
     } else {
@@ -754,6 +768,7 @@ async fn select(live: &mut Live, name: &str) -> Res<Selected> {
         async_imap::error::Error::No(_) => Fail::Core(Error::not_found("folder", name)),
         e => Fail::Imap(e),
     })?;
+    live.open = Some((name.to_owned(), mailbox.uid_validity.unwrap_or(0)));
     Ok(Selected {
         validity: mailbox.uid_validity.unwrap_or(0),
         next: mailbox.uid_next.unwrap_or(0),
@@ -763,7 +778,18 @@ async fn select(live: &mut Live, name: &str) -> Res<Selected> {
 }
 
 /// Selects the folder of `at`, as long as it is the one `at` was made in.
+/// A folder that is selected already is not selected again: that is a round
+/// trip, and what is done to a message by its `UID` doesn't need what a
+/// `SELECT` says anew (how many messages the folder holds, and so on); the
+/// listings and syncs, which do, select the folder themselves.
 async fn select_ref(live: &mut Live, at: &Ref) -> Res<()> {
+    if live
+        .open
+        .as_ref()
+        .is_some_and(|(folder, validity)| *folder == at.folder && *validity == at.validity)
+    {
+        return Ok(());
+    }
     if select(live, &at.folder).await?.validity != at.validity {
         return Err(Error::not_found("message", at.id()).into());
     }

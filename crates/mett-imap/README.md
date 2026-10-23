@@ -65,6 +65,12 @@ attachments, not answered. The folder listing counts messages with the
 listing itself where the server has `LIST-STATUS`, and else with a `STATUS` for
 each folder, sent together without waiting for each answer (in rounds of 50).
 
+The connection remembers which folder is selected (and its `UIDVALIDITY`):
+what is done to one message (fetching it, its flags, deleting it, its
+attachments) doesn't select its folder again if it is selected. Listings and
+syncs always select, for the counts and `UIDNEXT` they need new, and a command
+that failed makes the next select again.
+
 The configuration (`imaps://` URLs, `imap_user`, `imap_pass`, `smtp_url`,
 `ssl_*`) is described in [docs/MUTTRC.md](../../docs/MUTTRC.md) §4.13.
 
