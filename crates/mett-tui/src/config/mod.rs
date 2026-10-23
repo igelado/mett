@@ -732,7 +732,10 @@ impl Config {
             "<" => self.string("record"),
             _ => path.trim(),
         };
-        mailbox::expand_shortcut(path, self.string("folder"))
+        // A password in a mailbox's URL is no use to a mailbox of the
+        // account (only its server and user are looked at), and the path is
+        // shown: it is kept without.
+        server::redact(&mailbox::expand_shortcut(path, self.string("folder")))
     }
 
     fn bind(&mut self, menus: &Word, key: &Word, function: &Word) -> Result<(), String> {

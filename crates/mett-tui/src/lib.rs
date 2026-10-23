@@ -358,7 +358,10 @@ fn settings_keeping(
         }
         _ => return Err(format!("{interval} must be 0 (off) or a number of seconds")),
     };
-    let folder = config.string("folder");
+    // Without the password a URL may hold: the mailboxes, as `mailboxes`
+    // keeps them, don't have it either, and are shown relative to this.
+    let folder = config::server::redact(config.string("folder"));
+    let folder = folder.as_str();
     let mailboxes = config
         .mailboxes()
         .iter()
@@ -441,7 +444,8 @@ fn settings_keeping(
         sync_interval,
         compose,
         account: account.clone(),
-        folder: config.string("folder").to_owned(),
+        // The mailboxes are shown relative to it: without a password in it.
+        folder: config::server::redact(config.string("folder")),
         trash,
         delete: config.quad("delete"),
         resolve: config.flag("resolve"),
@@ -464,7 +468,8 @@ fn sidebar_settings(
         }
         _ => Err(format!("{name} must be 0 or more")),
     };
-    let folder = config.string("folder");
+    let folder = config::server::redact(config.string("folder"));
+    let folder = folder.as_str();
     // Those that name no folder of the account can't match a mailbox.
     let path = |text: &str| config::mailbox::folder_path(text, folder, account).ok();
     Ok(app::SidebarSettings {
@@ -1987,5 +1992,26 @@ mod tests {
         let done = demo.run("set resolve=no; set timeout=soon");
         assert!(done.outcome.is_err());
         assert!(demo.config.changed_since(&before).is_empty());
+    }
+
+    #[test]
+    fn passwords_in_mailbox_urls_are_not_shown() {
+        let mut config = config::Config::new(None);
+        for line in [
+            "set folder=imaps://alice:secret@mail.example.com/ signature=\"\"",
+            "mailboxes =INBOX imaps://alice:secret@mail.example.com/Work",
+        ] {
+            config.run_line(line).unwrap();
+        }
+        let account = mett_core::AccountId::new("alice@mail.example.com");
+        let settings = settings_from_config(&config, &account).unwrap();
+        assert!(!settings.folder.contains("secret"), "{}", settings.folder);
+        for mailbox in &settings.mailboxes {
+            assert!(!mailbox.text.contains("secret"), "{}", mailbox.text);
+            assert!(!mailbox.name.contains("secret"), "{}", mailbox.name);
+        }
+        // They still name their folders.
+        let names: Vec<_> = settings.mailboxes.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["=INBOX", "=Work"]);
     }
 }
