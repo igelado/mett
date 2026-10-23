@@ -1,0 +1,24 @@
+[package]
+name = "mett-smtp"
+description = "SMTP adapter for mett: sends mail, and writes it as MIME"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mett-core.workspace = true
+
+lettre.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+chrono.workspace = true
+rcgen = "0.14.10"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+
+[lints]
+workspace = true
