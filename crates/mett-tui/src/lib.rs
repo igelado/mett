@@ -206,15 +206,13 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
         };
         let several = named.len() > 1;
         let mut list: Vec<Opened<_>> = Vec::with_capacity(named.len());
+        // The accounts whose cache is a file named by the account (not IMAP's,
+        // which has none): two tabs for one would share it, though their
+        // backends may not agree on what is in it.
+        let mut cached: Vec<mett_core::AccountId> = Vec::new();
         for (label, config) in named {
             match open_account(&mut launch, label.clone(), config, &keymap) {
-                // Two tabs for one account would share a cache (named by the
-                // account) their backends may not agree on.
-                Ok(opened)
-                    if list
-                        .iter()
-                        .any(|a| a.session.account == opened.session.account) =>
-                {
+                Ok((opened, true)) if cached.contains(&opened.session.account) => {
                     return fail(
                         &mut launch,
                         format!(
@@ -223,7 +221,12 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
                         ),
                     );
                 }
-                Ok(opened) => list.push(opened),
+                Ok((opened, uses_cache)) => {
+                    if uses_cache {
+                        cached.push(opened.session.account.clone());
+                    }
+                    list.push(opened);
+                }
                 Err(e) if several || !label.is_empty() => {
                     return fail(&mut launch, format!("account {label}: {e}"));
                 }
@@ -269,13 +272,14 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
 }
 
 /// The account of `config`, opened: its mailbox (which signs in when first
-/// used, in the TUI's sign-in window), its cache and the app's settings.
+/// used, in the TUI's sign-in window), its cache and the app's settings; and
+/// whether it has a cache file.
 fn open_account(
     launch: &mut impl Launch,
     label: String,
     mut config: config::Config,
     keymap: &Keymap,
-) -> Result<Opened<mett_sqlite::CachedStore<account::Mailbox>>, String> {
+) -> Result<(Opened<mett_sqlite::CachedStore<account::Mailbox>>, bool), String> {
     let spoolfile = config.spoolfile().map_err(|e| e.to_string())?;
     let settings = settings_from_config(&config, &spoolfile.account)?;
     let editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
@@ -308,23 +312,27 @@ fn open_account(
     } else {
         label
     };
-    Ok(Opened {
-        label,
-        store: Arc::new(mailbox),
-        session: Session {
-            folder: spoolfile.folder,
-            settings,
-            keymap: keymap.clone(),
-            pushed,
-            account: spoolfile.account,
-            config,
-            editor,
-            sign_in,
-            syncing,
-            cancel: Some(cancel),
-            notice: None,
+    let uses_cache = !matches!(spoolfile.server, config::mailbox::Server::Imap(_));
+    Ok((
+        Opened {
+            label,
+            store: Arc::new(mailbox),
+            session: Session {
+                folder: spoolfile.folder,
+                settings,
+                keymap: keymap.clone(),
+                pushed,
+                account: spoolfile.account,
+                config,
+                editor,
+                sign_in,
+                syncing,
+                cancel: Some(cancel),
+                notice: None,
+            },
         },
-    })
+        uses_cache,
+    ))
 }
 
 /// The demo's configuration, and the settings it gives. Its folders are
