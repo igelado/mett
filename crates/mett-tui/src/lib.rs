@@ -205,9 +205,24 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
                 .collect()
         };
         let several = named.len() > 1;
-        let mut list = Vec::with_capacity(named.len());
+        let mut list: Vec<Opened<_>> = Vec::with_capacity(named.len());
         for (label, config) in named {
             match open_account(&mut launch, label.clone(), config, &keymap) {
+                // Two tabs for one account would share a cache (named by the
+                // account) their backends may not agree on.
+                Ok(opened)
+                    if list
+                        .iter()
+                        .any(|a| a.session.account == opened.session.account) =>
+                {
+                    return fail(
+                        &mut launch,
+                        format!(
+                            "account {}: {} is the account of another tab already",
+                            opened.label, opened.session.account
+                        ),
+                    );
+                }
                 Ok(opened) => list.push(opened),
                 Err(e) if several || !label.is_empty() => {
                     return fail(&mut launch, format!("account {label}: {e}"));
@@ -1015,6 +1030,12 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 // A `push <quit>` there quits mett, as it would in any
                 // account (see above).
                 if slots[at].app.quit && !done[at] {
+                    continue 'run;
+                }
+                // A question there (a purge, asked by a `push <quit>`) needs
+                // the user: that account is shown.
+                if slots[at].app.input.is_some() {
+                    active = at;
                     continue 'run;
                 }
             }
@@ -2723,6 +2744,41 @@ mod tests {
                 ] {
                     input.send(stroke).unwrap();
                 }
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_question_asked_in_the_background_shows_the_account() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                // Home's file deletes a message and quits: asking whether to
+                // purge it.
+                let push = vec![
+                    keymap::Stroke::Key(keymap::Key::char('d')),
+                    keymap::Stroke::Key(keymap::Key::char('q')),
+                ];
+                let accounts = Accounts {
+                    list: vec![demo_account("Work"), demo_account_pushing("Home", push)],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                // Home is shown, with the question, though Work was first.
+                drawn_until(&drawn, |(tab, _, _, question)| {
+                    tab.as_deref() == Some("Home") && *question
+                })
+                .await;
+                input.send(key('n', false)).unwrap();
                 let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
                     .await
                     .expect("quits")
