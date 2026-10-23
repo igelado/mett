@@ -394,6 +394,7 @@ async fn a_new_cache_opens_anywhere() {
     {
         let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
         listing(&store, 10).await;
+        store.close().await;
     }
     assert!(path.is_file());
     Cache::open(&path, &alice()).unwrap();
@@ -411,6 +412,7 @@ async fn the_cache_is_private_and_lasts() {
     {
         let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
         listing(&store, 10).await;
+        store.close().await;
     }
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&path), 0o600);
@@ -469,6 +471,7 @@ async fn the_cache_is_private_and_lasts() {
         .await
         .unwrap();
     assert_eq!(ids(&page.messages), ["m1", "m0"]);
+    store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -513,6 +516,7 @@ async fn a_cache_that_fails_is_left_for_the_server() {
     later().await;
     listing(&store, 10).await;
     assert_eq!(store.inner().syncs(), syncs, "the cache is left alone");
+    store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -751,6 +755,7 @@ async fn a_cache_that_fails_mid_listing_goes_on_from_the_server() {
         next = page.next;
     }
     assert_eq!(rest, ["m3", "m2", "m1", "m0"]);
+    store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -763,6 +768,7 @@ async fn a_cache_is_one_accounts() {
     {
         let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
         listing(&store, 10).await;
+        store.close().await;
     }
     // Bob's mett doesn't use (nor empty) Alice's cache: hers may have it
     // open.
@@ -782,6 +788,7 @@ async fn a_cache_is_one_accounts() {
         .await
         .unwrap();
     assert_eq!(ids(&page.messages), ["m1", "m0"], "still Alice's");
+    store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -884,6 +891,55 @@ async fn a_busy_cache_is_not_a_broken_one() {
     assert_eq!(listing(&store, 10).await, ["m1", "m0"]);
     assert!(store.inner().syncs() > syncs, "the cache is used again");
     // Windows can't remove files that are open.
-    drop((store, other));
+    drop(other);
+    store.close().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// SQLite waits (up to its busy timeout) off the executor: a task that
+/// shares its thread keeps running meanwhile.
+#[tokio::test(flavor = "current_thread")]
+async fn a_busy_cache_does_not_block_the_executor() {
+    let dir = std::env::temp_dir().join(format!("mett-sqlite-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("cache.sqlite");
+    let cache = Cache::open(&path, &alice())
+        .unwrap()
+        .with_busy_timeout(Duration::from_millis(600))
+        .unwrap();
+    let store = CachedStore::new(mailbox(2), Some(cache));
+    // Another mett is writing to the cache: the first sync waits for it.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let ticker = {
+        let ticks = std::sync::Arc::clone(&ticks);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    };
+    let started = std::time::Instant::now();
+    assert_eq!(
+        listing(&store, 10).await,
+        ["m1", "m0"],
+        "from the server meanwhile"
+    );
+    let waited = started.elapsed();
+    ticker.abort();
+    assert!(
+        waited >= Duration::from_millis(500),
+        "the cache was waited for ({waited:?})"
+    );
+    let ticks = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        ticks >= 20,
+        "the executor ran other tasks while SQLite waited ({ticks} ticks in {waited:?})"
+    );
+    // Windows can't remove files that are open.
+    drop(other);
+    store.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }

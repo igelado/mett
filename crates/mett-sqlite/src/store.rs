@@ -48,14 +48,7 @@ pub struct CacheError {
 /// can't sync, everything goes to `S`.
 pub struct CachedStore<S> {
     inner: S,
-    db: Option<Mutex<Db>>,
-    /// Set when the cache fails (a full disk, say): from then on,
-    /// everything goes to `S`.
-    broken: AtomicBool,
-    /// Until when the cache is left alone, after it was busy for as long as
-    /// SQLite waited (another mett holds it): each call would wait that
-    /// long again.
-    busy_until: Mutex<Option<Instant>>,
+    db: Option<Arc<Shared>>,
     /// How many changes mett made, which a sync brings in (with the dates
     /// the server gives them) or elsewhere (a copy, a draft), where the
     /// folder isn't known: any folder synced before one is synced again.
@@ -71,6 +64,123 @@ pub struct CachedStore<S> {
     progress: Option<Progress>,
     /// The folders the backend said it can't sync: listed by the backend.
     unsyncable: Mutex<std::collections::HashSet<FolderId>>,
+}
+
+/// A call on the database, to run on its thread.
+type Job = Box<dyn FnOnce(&mut Db) + Send>;
+
+/// The database, on a thread of its own: its calls block (a busy wait, a
+/// large sync batch), and run there one at a time, in the order they were
+/// made, to their end even if the call that made one is dropped (a change
+/// can't be overtaken by a later one). Dropping this lets the thread end
+/// once it has run what is queued (without waiting for it: that could
+/// block the executor); [`CachedStore::close`] waits.
+struct Shared {
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    state: Arc<State>,
+}
+
+/// What the calls on the database found out about it.
+struct State {
+    /// Set when the cache fails (a full disk, say): from then on,
+    /// everything goes to `S`.
+    broken: AtomicBool,
+    /// Until when the cache is left alone, after it was busy for as long as
+    /// SQLite waited (another mett holds it): each call would wait that
+    /// long again.
+    busy_until: Mutex<Option<Instant>>,
+}
+
+impl State {
+    /// Whether the cache failed, and is no longer used.
+    fn broken(&self) -> bool {
+        self.broken.load(Ordering::SeqCst)
+    }
+
+    /// Whether the cache was busy lately, and is left alone for a while.
+    fn busy(&self) -> bool {
+        self.busy_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Runs `f` on `db`. If it fails, the cache is no longer used, unless
+    /// it was only busy.
+    fn run<T>(&self, db: &mut Db, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
+        // Calls that waited their turn while another one found the cache
+        // busy don't wait on it again.
+        if self.broken() || self.busy() {
+            return Err(Error::Backend("cache: not caching".into()));
+        }
+        let done = f(db);
+        match &done {
+            Err(e) if is_busy(e) => {
+                *self.busy_until.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Instant::now() + BUSY_COOLDOWN);
+            }
+            Err(_) => self.broken.store(true, Ordering::SeqCst),
+            Ok(_) => {}
+        }
+        done
+    }
+}
+
+impl Shared {
+    fn new(mut db: Db) -> Self {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        let state = Arc::new(State {
+            broken: AtomicBool::new(false),
+            busy_until: Mutex::new(None),
+        });
+        let thread = std::thread::Builder::new()
+            .name("mett-cache".into())
+            .spawn(move || {
+                for job in queue {
+                    job(&mut db);
+                }
+            })
+            .ok();
+        Self {
+            jobs: Some(jobs),
+            thread,
+            state,
+        }
+    }
+
+    /// Queues `job`; `false` if the thread is gone.
+    fn send(&self, job: Job) -> bool {
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(job).is_ok())
+    }
+}
+
+impl Shared {
+    /// Stops taking calls: the thread ends, and closes the database, after
+    /// the ones queued. It is returned, to be waited for.
+    fn stop(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.jobs = None;
+        self.thread.take()
+    }
+}
+
+/// Which folders a listing gave, owned ([`Listing`] borrows).
+enum Noted {
+    All,
+    Below(Option<FolderId>),
+    Some,
+}
+
+impl Noted {
+    fn listing(&self) -> Listing<'_> {
+        match self {
+            Self::All => Listing::All,
+            Self::Below(parent) => Listing::Below(parent.as_ref()),
+            Self::Some => Listing::Some,
+        }
+    }
 }
 
 /// Told, as a folder syncs, how many of its messages the cache has, batch
@@ -106,6 +216,16 @@ impl Cache {
         Ok(Self(db))
     }
 
+    /// How long a call waits for another mett's lock on the cache (five
+    /// seconds to begin with) before the cache is left alone for a while.
+    pub fn with_busy_timeout(mut self, timeout: Duration) -> std::result::Result<Self, CacheError> {
+        self.0.set_busy_timeout(timeout).map_err(|e| CacheError {
+            path: "busy timeout".into(),
+            source: Box::new(e),
+        })?;
+        Ok(self)
+    }
+
     /// A cache of `account`'s mailbox in memory, gone when it is dropped.
     pub fn in_memory(account: &AccountId) -> std::result::Result<Self, CacheError> {
         Db::in_memory(account).map(Self).map_err(|e| CacheError {
@@ -123,10 +243,8 @@ impl<S: MailStore> CachedStore<S> {
             inner,
             db: cache.map(|Cache(mut db)| {
                 db.set_bodies_stay(stay);
-                Mutex::new(db)
+                Arc::new(Shared::new(db))
             }),
-            broken: AtomicBool::new(false),
-            busy_until: Mutex::new(None),
             writes: AtomicU64::new(0),
             folder_writes: Mutex::default(),
             synced: Mutex::new(HashMap::new()),
@@ -140,6 +258,20 @@ impl<S: MailStore> CachedStore<S> {
     pub fn with_progress(mut self, progress: Progress) -> Self {
         self.progress = Some(progress);
         self
+    }
+
+    /// Closes the cache (the database file) after the calls on it end,
+    /// which dropping the store leaves to happen on their own. Waits off
+    /// the executor.
+    pub async fn close(mut self) {
+        let thread = self
+            .db
+            .take()
+            .and_then(Arc::into_inner)
+            .and_then(|mut db| db.stop());
+        if let Some(thread) = thread {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
     }
 
     /// The store behind the cache.
@@ -242,47 +374,54 @@ impl<S: MailStore> CachedStore<S> {
     /// Whether folders are cached: there is a cache, it works, and the
     /// backend can keep it up to date.
     fn caching(&self) -> bool {
-        self.db.is_some() && !self.broken() && !self.busy() && self.inner.capabilities().can_sync
-    }
-
-    /// Whether the cache was busy lately, and is left alone for a while.
-    fn busy(&self) -> bool {
-        self.busy_until
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some_and(|until| Instant::now() < until)
+        self.db
+            .as_ref()
+            .is_some_and(|db| !db.state.broken() && !db.state.busy())
+            && self.inner.capabilities().can_sync
     }
 
     /// Whether the cache failed, and is no longer used.
     fn broken(&self) -> bool {
-        self.broken.load(Ordering::SeqCst)
+        self.db.as_ref().is_some_and(|db| db.state.broken())
     }
 
-    /// Runs `f` on the cache. If it fails, the cache is no longer used,
-    /// unless it was only busy (another mett holds it, say): that is the
-    /// call's failure alone (see [`is_busy`]), and the cache is used again.
-    fn with_cache<T>(&self, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
+    /// Runs `f` on the cache, off the executor (SQLite may wait for as long
+    /// as its busy timeout, and a transaction takes a while): on a thread
+    /// that may block, where it runs to its end even if this call is
+    /// dropped meanwhile (its transaction is finished or rolled back
+    /// there, and the cache's state noted). If it fails, the cache is no
+    /// longer used, unless it was only busy (another mett holds it, say):
+    /// that is the call's failure alone (see [`is_busy`]), and the cache
+    /// is used again.
+    async fn with_cache<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Db) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let db = self
             .db
             .as_ref()
             .filter(|_| self.caching())
             .ok_or_else(|| Error::Backend("cache: not caching".into()))?;
-        let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
-        // Calls that waited for the lock while another one found the cache
-        // busy don't wait on it again.
-        if !self.caching() {
-            return Err(Error::Backend("cache: not caching".into()));
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let state = Arc::clone(&db.state);
+        // Queued at once: calls reach the database in the order they are made.
+        let runtime = tokio::runtime::Handle::current();
+        let queued = db.send(Box::new(move |db| {
+            // The cache's clock is the runtime's (a test pauses it).
+            let _entered = runtime.enter();
+            // Dropped, the call is still made, and its end noted.
+            let _ = answer.send(state.run(db, f));
+        }));
+        let stopped = || Error::Backend("cache: stopped".into());
+        if !queued {
+            db.state.broken.store(true, Ordering::SeqCst);
+            return Err(stopped());
         }
-        let done = f(&mut db);
-        match &done {
-            Err(e) if is_busy(e) => {
-                *self.busy_until.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(Instant::now() + BUSY_COOLDOWN);
-            }
-            Err(_) => self.broken.store(true, Ordering::SeqCst),
-            Ok(_) => {}
-        }
-        done
+        answered.await.map_err(|_| {
+            // The thread ended without answering: a panic.
+            db.state.broken.store(true, Ordering::SeqCst);
+            stopped()
+        })?
     }
 
     /// Notes a change mett made that a sync may bring in elsewhere.
@@ -345,10 +484,10 @@ impl<S: MailStore> CachedStore<S> {
         if last.is_some_and(|(at, then)| at.elapsed() < FRESH && then == writes) {
             return Ok(true);
         }
-        let mut state = match self.with_cache(|db| db.synced(folder))? {
+        let mut state = match self.cache_synced(folder).await? {
             Some(synced) if synced.state.is_some() => synced.state,
             _ => {
-                self.with_cache(|db| db.start_over(folder))?;
+                self.start_over(folder).await?;
                 None
             }
         };
@@ -361,7 +500,7 @@ impl<S: MailStore> CachedStore<S> {
                 // The server forgot where the sync stood: start over,
                 // keeping what is here until the sync says it's gone.
                 Err(Error::StaleSync) if state.is_some() => {
-                    self.with_cache(|db| db.start_over(folder))?;
+                    self.start_over(folder).await?;
                     state = None;
                     here = None;
                     continue;
@@ -377,10 +516,16 @@ impl<S: MailStore> CachedStore<S> {
                 }
                 changes => changes?,
             };
-            let Some(more_here) = self.with_cache(|db| {
-                db.apply(folder, state.as_ref(), &changes, self.progress.is_some())
-            })?
-            else {
+            // The changes go to the thread that applies them, and come back.
+            let (applied, changes) = {
+                let (folder, from, count) =
+                    (folder.clone(), state.clone(), self.progress.is_some());
+                self.with_cache(move |db| {
+                    Ok((db.apply(&folder, from.as_ref(), &changes, count)?, changes))
+                })
+                .await?
+            };
+            let Some(more_here) = applied else {
                 // Another mett sharing the cache synced the folder
                 // meanwhile: go on from where it left it (what came since
                 // may be in neither's changes). Should it keep winning, its
@@ -388,7 +533,8 @@ impl<S: MailStore> CachedStore<S> {
                 lost += 1;
                 if lost > LOST_RACES {
                     let complete = self
-                        .with_cache(|db| db.synced(folder))?
+                        .cache_synced(folder)
+                        .await?
                         .is_some_and(|synced| synced.complete);
                     if !complete {
                         return Ok(false);
@@ -397,10 +543,10 @@ impl<S: MailStore> CachedStore<S> {
                 }
                 // What is here changed meanwhile: it is counted again.
                 here = None;
-                match self.with_cache(|db| db.synced(folder))? {
+                match self.cache_synced(folder).await? {
                     Some(synced) if synced.state.is_some() => state = synced.state,
                     _ => {
-                        self.with_cache(|db| db.start_over(folder))?;
+                        self.start_over(folder).await?;
                         state = None;
                         here = None;
                     }
@@ -422,7 +568,10 @@ impl<S: MailStore> CachedStore<S> {
                     Some((here, then)) if then == writes => {
                         Some(here.saturating_add_signed(more_here))
                     }
-                    _ => self.with_cache(|db| db.count(folder)).ok(),
+                    _ => {
+                        let folder = folder.clone();
+                        self.with_cache(move |db| db.count(&folder)).await.ok()
+                    }
                 };
                 if let Some(now) = now {
                     progress(folder, now);
@@ -441,10 +590,23 @@ impl<S: MailStore> CachedStore<S> {
         Ok(true)
     }
 
+    /// What the cache knows of `folder`'s sync.
+    async fn cache_synced(&self, folder: &FolderId) -> Result<Option<crate::db::Synced>> {
+        let folder = folder.clone();
+        self.with_cache(move |db| db.synced(&folder)).await
+    }
+
+    /// Forgets how far `folder`'s sync got.
+    async fn start_over(&self, folder: &FolderId) -> Result<()> {
+        let folder = folder.clone();
+        self.with_cache(move |db| db.start_over(&folder)).await
+    }
+
     /// Whether `folder` was ever all in the cache: offline, it can be
     /// listed as it was then (or since).
-    fn has_snapshot(&self, folder: &FolderId) -> bool {
-        self.with_cache(|db| db.synced(folder))
+    async fn has_snapshot(&self, folder: &FolderId) -> bool {
+        self.cache_synced(folder)
+            .await
             .ok()
             .flatten()
             .is_some_and(|synced| synced.snapshot)
@@ -452,13 +614,13 @@ impl<S: MailStore> CachedStore<S> {
 
     /// A page of `folder`'s summaries from the cache, from `query` (`what`
     /// the listing is, which its cursors record), which `key` orders.
-    fn cached_page(
+    async fn cached_page(
         &self,
         folder: &FolderId,
         page: &Page,
         what: &str,
         key: fn(&MessageSummary) -> Key,
-        query: impl FnOnce(&Db, Option<&Key>, u64) -> Result<Vec<MessageSummary>>,
+        query: impl FnOnce(&Db, Option<&Key>, u64) -> Result<Vec<MessageSummary>> + Send + 'static,
     ) -> Result<MessagePage> {
         let after = match page.cursor() {
             None => None,
@@ -466,7 +628,9 @@ impl<S: MailStore> CachedStore<S> {
         };
         let size = u64::from(page.size());
         // One more than asked for tells whether there are more.
-        let mut messages = self.with_cache(|db| query(db, after.as_ref(), size + 1))?;
+        let mut messages = self
+            .with_cache(move |db| query(db, after.as_ref(), size + 1))
+            .await?;
         let more = messages.len() as u64 > size;
         messages.truncate(page.size() as usize);
         // The next page starts after the last message of this one, however
@@ -548,16 +712,22 @@ impl<S: MailStore> CachedStore<S> {
         if page.cursor().is_none() {
             match self.sync(folder).await {
                 // Offline, a folder that was all here is listed as it was.
-                Err(Error::Network(_)) if self.has_snapshot(folder) => {}
+                Err(Error::Network(_)) if self.has_snapshot(folder).await => {}
                 Ok(false) => return self.inner.list_messages(folder, page.clone()).await,
                 synced => {
                     synced?;
                 }
             }
         }
-        self.cached_page(folder, page, "all", received_key, |db, after, limit| {
-            db.page(folder, after, limit)
-        })
+        let folder_ = folder.clone();
+        self.cached_page(
+            folder,
+            page,
+            "all",
+            received_key,
+            move |db, after, limit| db.page(&folder_, after, limit),
+        )
+        .await
     }
 
     async fn changed_cached(
@@ -575,9 +745,15 @@ impl<S: MailStore> CachedStore<S> {
                 .await;
         }
         let what = since.timestamp_micros().to_string();
-        self.cached_page(folder, page, &what, modified_key, |db, after, limit| {
-            db.changed(folder, since, after, limit)
-        })
+        let folder_ = folder.clone();
+        self.cached_page(
+            folder,
+            page,
+            &what,
+            modified_key,
+            move |db, after, limit| db.changed(&folder_, since, after, limit),
+        )
+        .await
     }
 
     async fn recent_unread_cached(
@@ -591,32 +767,39 @@ impl<S: MailStore> CachedStore<S> {
         // Without `since`, the last few tell.
         let limit = if since.is_some() { RECENT_UNREAD } else { 50 };
         let since = since.unwrap_or(DateTime::UNIX_EPOCH);
-        self.with_cache(|db| db.recent_unread(folder, since, limit as u64))
+        let folder = folder.clone();
+        self.with_cache(move |db| db.recent_unread(&folder, since, limit as u64))
+            .await
     }
 
     /// Keeps what the server said of folders (as `listing`), to find them
     /// offline.
-    fn note_folders(&self, folders: &Result<Vec<Folder>>, listing: Listing<'_>) {
+    async fn note_folders(&self, folders: &Result<Vec<Folder>>, listing: Noted) {
         if let Ok(folders) = folders
             && self.caching()
         {
-            let _ = self.with_cache(|db| db.keep_folders(folders, listing));
+            let folders = folders.clone();
+            let _ = self
+                .with_cache(move |db| db.keep_folders(&folders, listing.listing()))
+                .await;
         }
     }
 
     /// `online`, or offline (a network failure), what `recall` finds in the
     /// cache, as last seen.
-    fn or_as_seen<T>(
+    async fn or_as_seen<T: Send + 'static>(
         &self,
         online: Result<T>,
-        recall: impl FnOnce(&Db) -> Result<Option<T>>,
+        recall: impl FnOnce(&Db) -> Result<Option<T>> + Send + 'static,
     ) -> Result<T> {
         match online {
             Err(Error::Network(e)) => {
-                match self.caching().then(|| self.with_cache(|db| recall(db))) {
-                    Some(Ok(Some(seen))) => Ok(seen),
-                    _ => Err(Error::Network(e)),
+                if self.caching()
+                    && let Ok(Some(seen)) = self.with_cache(move |db| recall(db)).await
+                {
+                    return Ok(seen);
                 }
+                Err(Error::Network(e))
             }
             online => online,
         }
@@ -699,14 +882,20 @@ impl<S: MailStore> MailStore for CachedStore<S> {
 
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let listed = self.inner.list_folders().await;
-        self.note_folders(&listed, Listing::All);
+        self.note_folders(&listed, Noted::All).await;
         self.or_as_seen(listed, |db| db.folders_listed(Listing::All))
+            .await
     }
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
         let listed = self.inner.child_folders(parent).await;
-        self.note_folders(&listed, Listing::Below(parent));
-        self.or_as_seen(listed, |db| db.folders_listed(Listing::Below(parent)))
+        self.note_folders(&listed, Noted::Below(parent.cloned()))
+            .await;
+        let parent = parent.cloned();
+        self.or_as_seen(listed, move |db| {
+            db.folders_listed(Listing::Below(parent.as_ref()))
+        })
+        .await
     }
 
     async fn folder(&self, id: &FolderId) -> Result<Folder> {
@@ -716,9 +905,11 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 .as_ref()
                 .map(|f| vec![f.clone()])
                 .map_err(Clone::clone),
-            Listing::Some,
-        );
-        self.or_as_seen(found, |db| db.folder_info(id))
+            Noted::Some,
+        )
+        .await;
+        let id = id.clone();
+        self.or_as_seen(found, move |db| db.folder_info(&id)).await
     }
 
     async fn recent_unread(
@@ -742,9 +933,10 @@ impl<S: MailStore> MailStore for CachedStore<S> {
                 .as_ref()
                 .map(|f| vec![f.clone()])
                 .map_err(Clone::clone),
-            Listing::Some,
-        );
-        self.or_as_seen(found, |db| db.well_known(which))
+            Noted::Some,
+        )
+        .await;
+        self.or_as_seen(found, move |db| db.well_known(which)).await
     }
 
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
@@ -794,7 +986,10 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
         let mut cached = None;
         if self.caching()
-            && let Ok(Some(message)) = self.with_cache(|db| db.message(id))
+            && let Ok(Some(message)) = {
+                let id = id.clone();
+                self.with_cache(move |db| db.message(&id)).await
+            }
             // What the backend can't keep up to date isn't served.
             && !self
                 .unsyncable
@@ -827,7 +1022,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         }
         if self.caching() {
             // Failing to keep it costs only fetching it again.
-            let _ = self.with_cache(|db| db.keep_body(&message));
+            let kept = message.clone();
+            let _ = self.with_cache(move |db| db.keep_body(&kept)).await;
         }
         Ok(message)
     }
@@ -857,7 +1053,10 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         // The server dates the change: the next sync brings its date in.
         self.wrote();
         if self.caching() {
-            let _ = self.with_cache(|db| db.update_flags(id, update));
+            let id = id.clone();
+            let _ = self
+                .with_cache(move |db| db.update_flags(&id, update))
+                .await;
         }
         Ok(())
     }
@@ -868,7 +1067,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         let moved = moved?;
         // Its new folder's sync brings it in there.
         if self.caching() {
-            let _ = self.with_cache(|db| db.remove(id));
+            let id = id.clone();
+            let _ = self.with_cache(move |db| db.remove(&id)).await;
         }
         Ok(moved)
     }
@@ -884,7 +1084,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         self.inner.delete_message(id).await?;
         self.wrote();
         if self.caching() {
-            let _ = self.with_cache(|db| db.remove(id));
+            let id = id.clone();
+            let _ = self.with_cache(move |db| db.remove(&id)).await;
         }
         Ok(())
     }
@@ -903,15 +1104,18 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         // is what is shown without the server: it says the answer too, when
         // it is the answer of the meeting itself (not of one occurrence).
         if self.caching() && invitation.answer_changes_reply(answer.scope) {
-            let _ = self.with_cache(|db| {
-                if let Some(mut message) = db.message(id)? {
-                    if let Some(kept) = &mut message.invitation {
-                        kept.reply = answer.rsvp.reply();
+            let (id, reply) = (id.clone(), answer.rsvp.reply());
+            let _ = self
+                .with_cache(move |db| {
+                    if let Some(mut message) = db.message(&id)? {
+                        if let Some(kept) = &mut message.invitation {
+                            kept.reply = reply;
+                        }
+                        db.keep_body(&message)?;
                     }
-                    db.keep_body(&message)?;
-                }
-                Ok(())
-            });
+                    Ok(())
+                })
+                .await;
         }
         Ok(())
     }
