@@ -163,6 +163,11 @@ pub(crate) struct Synced {
 /// The cache database.
 pub(crate) struct Db {
     conn: Connection,
+    /// Whether a message's body is good whatever happens to the message
+    /// (the backend says its bodies don't change): it is kept when the
+    /// message changes, and kept whatever version of the message it was
+    /// fetched with.
+    bodies_stay: bool,
 }
 
 /// A cache failure, as a port error.
@@ -225,7 +230,15 @@ impl Db {
             tx.execute("INSERT INTO account (id) VALUES (?1)", [account.as_str()])?;
         }
         tx.commit()?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            bodies_stay: false,
+        })
+    }
+
+    /// Says whether bodies stay good (see the field).
+    pub fn set_bodies_stay(&mut self, stay: bool) {
+        self.bodies_stay = stay;
     }
 
     /// Where `folder`'s sync stands, if it has started.
@@ -328,7 +341,7 @@ impl Db {
                     folder = excluded.folder, received = excluded.received,
                     modified = excluded.modified, unread = excluded.unread,
                     summary = excluded.summary, seen = 1,
-                    extras = CASE WHEN ?7 OR modified IS NOT excluded.modified
+                    extras = CASE WHEN ?7 OR (NOT ?8 AND modified IS NOT excluded.modified)
                         THEN NULL ELSE extras END",
                 params![
                     summary.id.as_str(),
@@ -338,6 +351,7 @@ impl Db {
                     !summary.flags.read,
                     stored,
                     summary.draft,
+                    self.bodies_stay,
                 ],
             )
             .map_err(failed)?;
@@ -502,17 +516,25 @@ impl Db {
     pub fn keep_body(&self, message: &Message) -> Result<(), Error> {
         // Only as the summary here is: a sync may have brought a newer one
         // (whose body this isn't) while it was fetched.
-        let Some(modified) = message.summary.modified.filter(|_| !message.summary.draft) else {
+        if message.summary.draft {
+            return Ok(());
+        }
+        let Some(modified) = message
+            .summary
+            .modified
+            .or(self.bodies_stay.then_some(chrono::DateTime::UNIX_EPOCH))
+        else {
             return Ok(());
         };
         let extras = serde_json::to_string(&StoredExtras::from(message)).map_err(failed)?;
         self.conn
             .execute(
-                "UPDATE messages SET extras = ?2 WHERE id = ?1 AND modified = ?3",
+                "UPDATE messages SET extras = ?2 WHERE id = ?1 AND (?4 OR modified = ?3)",
                 params![
                     message.summary.id.as_str(),
                     extras,
-                    modified.timestamp_micros()
+                    modified.timestamp_micros(),
+                    self.bodies_stay
                 ],
             )
             .map_err(failed)?;

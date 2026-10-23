@@ -220,6 +220,10 @@ impl MailStore for Mailbox {
     ) -> PortResult<FolderChanges> {
         either!(self, s => s.sync_folder(folder, state).await)
     }
+
+    fn bodies_change(&self) -> bool {
+        either!(self, s => s.bodies_change())
+    }
 }
 
 /// The cache file of the account in `url` (mutt's `header_cache`): by
@@ -233,7 +237,37 @@ pub fn cache_path(
     xdg_cache_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    let file = format!("{}.sqlite", url.account);
+    // An IMAP account is named by its user, who may be the same address at
+    // another server: the server is in the name too.
+    let file = match &url.server {
+        Server::Imap(server) => {
+            let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
+            // What a file name may not hold, or could be confused with, is
+            // written as `%` and its code; the parts are told apart by a `~`
+            // (which is one of those), so that two accounts never share a
+            // name.
+            let part = |text: &str| -> String {
+                text.chars()
+                    .flat_map(|c| {
+                        if c.is_ascii_alphanumeric() || "@.-".contains(c) {
+                            c.to_string()
+                        } else {
+                            c.to_string().bytes().map(|b| format!("%{b:02X}")).collect()
+                        }
+                        .chars()
+                        .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            let name = format!(
+                "imap~{}~{}~{port}",
+                part(&imap_user(url, server)),
+                part(&server.host.to_lowercase())
+            );
+            format!("{name}.sqlite")
+        }
+        Server::Office365 => format!("{}.sqlite", url.account),
+    };
     if !config.was_set("header_cache") {
         // The XDG Base Directory spec says to ignore relative values.
         let cache = xdg_cache_home
@@ -252,39 +286,85 @@ pub fn cache_path(
     }
 }
 
+/// The cache file of the account in `url`, as the environment and the home
+/// mett found say (see [`cache_path`]).
+pub fn default_cache_path(config: &Config, url: &MailboxUrl) -> Option<PathBuf> {
+    cache_path(
+        config,
+        url,
+        std::env::var_os("XDG_CACHE_HOME"),
+        // The home mett found, which on Windows may not be `$HOME`.
+        config.home().map(Into::into),
+    )
+}
+
+/// Who logs in at the IMAP `server` of `url`: its user, else the account
+/// (which, for a user who is no address, is the user at the server as it is
+/// spelt, and so not the same for two spellings of the server).
+fn imap_user(url: &MailboxUrl, server: &crate::config::server::ServerUrl) -> String {
+    server
+        .user
+        .clone()
+        .unwrap_or_else(|| url.account.to_string())
+}
+
+/// Whose a cache file is: the account, and for IMAP the server too (the
+/// same address may be at another), which a cache file named by hand
+/// doesn't say.
+fn cache_owner(url: &MailboxUrl) -> mett_core::AccountId {
+    match &url.server {
+        Server::Imap(server) => {
+            let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
+            mett_core::AccountId::new(format!(
+                "imap://{}@{}:{port}",
+                imap_user(url, server),
+                server.host.to_lowercase()
+            ))
+        }
+        Server::Office365 => url.account.clone(),
+    }
+}
+
+/// `path` as the file it names, so that two spellings of one are told as
+/// one: as the system has it (or, if there is no such file, the folder it
+/// is in as the system has it, and its name).
+fn identity(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    match (
+        absolute.parent().map(Path::canonicalize),
+        absolute.file_name(),
+    ) {
+        (Some(Ok(parent)), Some(name)) => parent.join(name),
+        _ => absolute,
+    }
+}
+
 /// `mailbox` with its cache (see [`cache_path`]), which tells `progress`
 /// how far its syncs have got, and a warning if the cache can't be used:
-/// mett then works without it.
+/// mett then works without it. Also the file the cache is in, if it is.
 pub fn cached(
     config: &Config,
     url: &MailboxUrl,
     mailbox: Mailbox,
     progress: Progress,
-) -> (CachedStore<Mailbox>, Option<String>) {
-    // IMAP can't tell what changed in a folder: there is nothing to sync
-    // into a cache.
-    let path = (!matches!(mailbox, Mailbox::Imap(_)))
-        .then(|| {
-            cache_path(
-                config,
-                url,
-                std::env::var_os("XDG_CACHE_HOME"),
-                // The home mett found, which on Windows may not be `$HOME`.
-                config.home().map(Into::into),
-            )
-        })
-        .flatten();
+) -> (CachedStore<Mailbox>, Option<String>, Option<PathBuf>) {
+    let path = default_cache_path(config, url);
     let Some(path) = path else {
-        return (CachedStore::new(mailbox, None), None);
+        return (CachedStore::new(mailbox, None), None, None);
     };
-    match Cache::open(&path, &url.account) {
+    match Cache::open(&path, &cache_owner(url)) {
         Ok(cache) => (
             CachedStore::new(mailbox, Some(cache)).with_progress(progress),
             None,
+            Some(identity(&path)),
         ),
         Err(e) => (
             CachedStore::new(mailbox, None),
             Some(format!("header_cache: {e}; not caching")),
+            None,
         ),
     }
 }
@@ -652,6 +732,72 @@ mod tests {
             ..delegated
         }));
         assert!(!Api::Ews.always_copies(&attached));
+    }
+
+    #[test]
+    fn a_cache_file_named_by_hand_belongs_to_the_user_at_the_server() {
+        let owner = |text: &str| cache_owner(&MailboxUrl::parse(text).unwrap());
+        assert_ne!(
+            owner("imaps://me%40example.org@mail.one.net/INBOX"),
+            owner("imaps://me%40example.org@mail.two.net/INBOX")
+        );
+        assert_ne!(
+            owner("imaps://me%40example.org@mail.one.net/INBOX"),
+            owner("imaps://me%40example.org@mail.one.net:1993/INBOX")
+        );
+    }
+
+    #[test]
+    fn two_spellings_of_a_cache_file_are_one_file() {
+        let dir = std::env::temp_dir();
+        let plain = dir.join("mett-identity.sqlite");
+        let roundabout = dir.join(".").join("mett-identity.sqlite");
+        assert_eq!(identity(&plain), identity(&roundabout));
+    }
+
+    #[test]
+    fn an_imap_cache_is_named_by_the_user_and_the_server() {
+        let name = |text: &str| {
+            let url = MailboxUrl::parse(text).unwrap();
+            cache_path(
+                &config(""),
+                &url,
+                Some(std::env::temp_dir().into_os_string()),
+                None,
+            )
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        };
+        // The same address at two servers is two accounts, with two caches.
+        assert_eq!(
+            name("imaps://me%40example.org@mail.one.net/INBOX").as_deref(),
+            Some("imap~me@example.org~mail.one.net~993.sqlite")
+        );
+        assert_eq!(
+            name("imaps://me%40example.org@mail.two.net/INBOX").as_deref(),
+            Some("imap~me@example.org~mail.two.net~993.sqlite")
+        );
+        // Names that were alike once are told apart.
+        assert_ne!(name("imap://a%2Fb@h/"), name("imap://a_b@h/"));
+        // A `-` in the user or the host doesn't blur where one ends.
+        assert_ne!(
+            name("imap://alice%40company-mail@example.net/"),
+            name("imap://alice%40company@mail-example.net/")
+        );
+        // The spelling of the server's name doesn't make another account.
+        assert_eq!(
+            name("imaps://me@MAIL.One.net/"),
+            name("imaps://me@mail.one.net/")
+        );
+        // Another port is another server.
+        assert_eq!(
+            name("imaps://me@mail.one.net:1993/").as_deref(),
+            Some("imap~me~mail.one.net~1993.sqlite")
+        );
+        // Whatever a file name can't hold is made harmless.
+        assert_eq!(
+            name("imap://a%2Fb@h/").as_deref(),
+            Some("imap~a%2Fb~h~143.sqlite")
+        );
     }
 
     #[test]

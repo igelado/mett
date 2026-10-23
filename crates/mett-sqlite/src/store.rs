@@ -59,6 +59,8 @@ pub struct CachedStore<S> {
     synced: Mutex<HashMap<FolderId, Arc<tokio::sync::Mutex<LastSync>>>>,
     /// Told how far each sync has got.
     progress: Option<Progress>,
+    /// The folders the backend said it can't sync: listed by the backend.
+    unsyncable: Mutex<std::collections::HashSet<FolderId>>,
 }
 
 /// Told, as a folder syncs, how many of its messages the cache has, batch
@@ -100,16 +102,21 @@ impl Cache {
     }
 }
 
-impl<S> CachedStore<S> {
+impl<S: MailStore> CachedStore<S> {
     /// `inner` with `cache`, or without one.
     pub fn new(inner: S, cache: Option<Cache>) -> Self {
+        let stay = !inner.bodies_change();
         Self {
             inner,
-            db: cache.map(|Cache(db)| Mutex::new(db)),
+            db: cache.map(|Cache(mut db)| {
+                db.set_bodies_stay(stay);
+                Mutex::new(db)
+            }),
             broken: AtomicBool::new(false),
             writes: AtomicU64::new(0),
             synced: Mutex::new(HashMap::new()),
             progress: None,
+            unsyncable: Mutex::default(),
         }
     }
 
@@ -253,6 +260,14 @@ impl<S: MailStore> CachedStore<S> {
     /// where it stopped. `false` if the cache can't tell the folder yet
     /// (another mett sharing it is still filling it): the server has to.
     async fn sync(&self, folder: &FolderId) -> Result<bool> {
+        if self
+            .unsyncable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(folder)
+        {
+            return Ok(false);
+        }
         let lock = Arc::clone(
             self.synced
                 .lock()
@@ -285,6 +300,15 @@ impl<S: MailStore> CachedStore<S> {
                     state = None;
                     here = None;
                     continue;
+                }
+                // Not this folder: the backend lists it, as it would
+                // without a cache.
+                Err(Error::CannotSync) => {
+                    self.unsyncable
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(folder.clone());
+                    return Ok(false);
                 }
                 changes => changes?,
             };
@@ -704,6 +728,12 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         let mut cached = None;
         if self.caching()
             && let Ok(Some(message)) = self.with_cache(|db| db.message(id))
+            // What the backend can't keep up to date isn't served.
+            && !self
+                .unsyncable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&message.summary.folder)
         {
             // A meeting changes without its message changing (an answer
             // from another client, the organizer moving it), so the server

@@ -54,6 +54,11 @@ pub enum Error {
     #[error("the folder has to be synced again from the start")]
     StaleSync,
 
+    /// The backend can't sync this folder (though it syncs others): the
+    /// cache leaves it to the backend, as if it couldn't sync at all.
+    #[error("this folder can't be synced")]
+    CannotSync,
+
     /// The backend returned an error not covered by another variant.
     #[error("backend error: {0}")]
     Backend(String),
