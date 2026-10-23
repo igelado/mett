@@ -41,7 +41,7 @@ pub use message::{
     ThreadPosition,
 };
 pub use ports::{
-    AccessToken, Authenticator, FolderChanges, MailSender, MailStore, MessagePage, Page,
-    RECENT_UNREAD,
+    AccessToken, Authenticator, Capabilities, FolderChanges, MailSender, MailStore, MessagePage,
+    Page, RECENT_UNREAD,
 };
 pub use server::{Login, NoTokens, Security, ServerSettings};

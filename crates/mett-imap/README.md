@@ -37,7 +37,7 @@ one of a folder the server made anew is gone.
 
 **Syncing.** With `CONDSTORE` (nearly every server), `ImapMailStore` also
 implements `sync_folder`, so `mett-sqlite`'s cache works in front of it as it
-does in front of Graph and EWS (`can_sync` is true once connected). A folder's
+does in front of Graph and EWS (`capabilities().can_sync` is true once connected). A folder's
 sync state holds its `UIDVALIDITY`, the next `UID`, the highest modification
 sequence and the `UID`s it had: changed messages are those `CHANGEDSINCE` the
 sequence, and the new ones are among them (those from the next `UID`: a new

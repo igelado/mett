@@ -228,36 +228,17 @@ pub trait MailStore: Send + Sync {
         )))
     }
 
-    /// Whether a message's body can change after it is fetched (Exchange
-    /// lets one be edited): the cache fetches it again when the message
-    /// changes. Where it can't (IMAP), a body kept stays good.
-    fn bodies_change(&self) -> bool {
-        true
-    }
-
-    /// Whether the backend takes folder names that differ only in case as
-    /// the same folder, as Office365 does. Where it doesn't (most IMAP
-    /// servers), a name that isn't a folder's exactly names no folder.
-    fn folder_names_ignore_case(&self) -> bool {
-        true
-    }
-
-    /// Whether the backend can tell what changed in a folder since a sync
-    /// state ([`MailStore::sync_folder`]).
-    fn can_sync(&self) -> bool {
-        false
-    }
-
-    /// Whether the backend can tell when folders change, as it happens
-    /// ([`MailStore::watch`]).
-    fn can_watch(&self) -> bool {
-        false
+    /// What the backend can do beyond the required calls. Read each time
+    /// it matters, not once: a backend may learn more once connected.
+    /// A wrapper forwards this one method to the store it wraps.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
     }
 
     /// Waits until something changes in some of `folders` (mail arrives,
     /// changes or goes), and returns those; or, after a while the backend
     /// sets (minutes), returns none, to be called again. Only for backends
-    /// that [`MailStore::can_watch`]. What changed is then found as ever
+    /// that [`Capabilities::can_watch`]. What changed is then found as ever
     /// (say, by [`MailStore::sync_folder`]). Watching no folders stops
     /// watching: what the backend keeps on the server for a watch goes.
     fn watch(&self, folders: &[FolderId]) -> impl Future<Output = Result<Vec<FolderId>>> + Send {
@@ -274,7 +255,7 @@ pub trait MailStore: Send + Sync {
     /// [`FolderChanges::more`]). Without a state, every message in the
     /// folder is a change. A state the backend no longer takes is
     /// [`Error::StaleSync`](crate::Error::StaleSync): sync again without
-    /// one. Only for backends that [`MailStore::can_sync`].
+    /// one. Only for backends that [`Capabilities::can_sync`].
     fn sync_folder(
         &self,
         folder: &FolderId,
@@ -284,6 +265,40 @@ pub trait MailStore: Send + Sync {
         std::future::ready(Err(crate::Error::Backend(
             "this mailbox can't sync folders".into(),
         )))
+    }
+}
+
+/// What a [`MailStore`] can do beyond its required calls. The defaults are
+/// those of a backend that does none of the optional things and behaves as
+/// Office365 does where that differs (see each flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Whether a message's body can change after it is fetched (Exchange
+    /// lets one be edited): the cache fetches it again when the message
+    /// changes. Where it can't (IMAP), a body kept stays good. By default
+    /// it can.
+    pub bodies_change: bool,
+    /// Whether the backend takes folder names that differ only in case as
+    /// the same folder, as Office365 does. Where it doesn't (most IMAP
+    /// servers), a name that isn't a folder's exactly names no folder. By
+    /// default it does.
+    pub folder_names_ignore_case: bool,
+    /// Whether the backend can tell what changed in a folder since a sync
+    /// state ([`MailStore::sync_folder`]). By default it can't.
+    pub can_sync: bool,
+    /// Whether the backend can tell when folders change, as it happens
+    /// ([`MailStore::watch`]). By default it can't.
+    pub can_watch: bool,
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            bodies_change: true,
+            folder_names_ignore_case: true,
+            can_sync: false,
+            can_watch: false,
+        }
     }
 }
 

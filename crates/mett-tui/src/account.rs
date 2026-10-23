@@ -197,16 +197,8 @@ impl MailStore for Mailbox {
         either!(self, s => s.save_draft(draft).await)
     }
 
-    fn can_sync(&self) -> bool {
-        either!(self, s => s.can_sync())
-    }
-
-    fn folder_names_ignore_case(&self) -> bool {
-        either!(self, s => s.folder_names_ignore_case())
-    }
-
-    fn can_watch(&self) -> bool {
-        either!(self, s => s.can_watch())
+    fn capabilities(&self) -> mett_core::Capabilities {
+        either!(self, s => s.capabilities())
     }
 
     async fn watch(&self, folders: &[FolderId]) -> PortResult<Vec<FolderId>> {
@@ -219,10 +211,6 @@ impl MailStore for Mailbox {
         state: Option<&SyncState>,
     ) -> PortResult<FolderChanges> {
         either!(self, s => s.sync_folder(folder, state).await)
-    }
-
-    fn bodies_change(&self) -> bool {
-        either!(self, s => s.bodies_change())
     }
 }
 

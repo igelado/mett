@@ -622,8 +622,11 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             })
     }
 
-    fn can_sync(&self) -> bool {
-        true
+    fn capabilities(&self) -> mett_core::Capabilities {
+        mett_core::Capabilities {
+            can_sync: true,
+            ..mett_core::Capabilities::default()
+        }
     }
 
     /// With Graph's delta query: the state is the link to go on from (a

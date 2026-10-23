@@ -177,7 +177,7 @@ pub struct ImapMailStore<A = NoTokens> {
     live: Mutex<Option<Live>>,
     /// How each folder stood when it was last asked about new mail.
     marks: Marks,
-    /// Whether the server can be synced (see [`MailStore::can_sync`]): not
+    /// Whether the server can be synced (see [`Capabilities::can_sync`](mett_core::Capabilities)): not
     /// known until connected, when `SYNCS_UNKNOWN`.
     syncs: std::sync::atomic::AtomicU8,
 }
@@ -1139,21 +1139,18 @@ fn day(at: DateTime<Utc>) -> String {
 }
 
 impl<A: Authenticator> MailStore for ImapMailStore<A> {
-    fn folder_names_ignore_case(&self) -> bool {
-        false
-    }
-
-    /// A message's body is the one it came with: only its flags change.
-    fn bodies_change(&self) -> bool {
-        false
-    }
-
+    /// A message's body is the one it came with (only its flags change).
     /// Whether the server tells what changed since a modification sequence
-    /// (`CONDSTORE`), which a sync needs to find flags that changed. That is
+    /// (`CONDSTORE`), which a sync needs to find flags that changed, is
     /// known once connected (the first request connects); until then it is
     /// taken to, so that what an earlier run cached can be read offline.
-    fn can_sync(&self) -> bool {
-        self.syncs.load(std::sync::atomic::Ordering::SeqCst) != SYNCS_NO
+    fn capabilities(&self) -> mett_core::Capabilities {
+        mett_core::Capabilities {
+            bodies_change: false,
+            folder_names_ignore_case: false,
+            can_sync: self.syncs.load(std::sync::atomic::Ordering::SeqCst) != SYNCS_NO,
+            ..mett_core::Capabilities::default()
+        }
     }
 
     async fn sync_folder(

@@ -118,7 +118,7 @@ impl Cache {
 impl<S: MailStore> CachedStore<S> {
     /// `inner` with `cache`, or without one.
     pub fn new(inner: S, cache: Option<Cache>) -> Self {
-        let stay = !inner.bodies_change();
+        let stay = !inner.capabilities().bodies_change;
         Self {
             inner,
             db: cache.map(|Cache(mut db)| {
@@ -242,7 +242,7 @@ impl<S: MailStore> CachedStore<S> {
     /// Whether folders are cached: there is a cache, it works, and the
     /// backend can keep it up to date.
     fn caching(&self) -> bool {
-        self.db.is_some() && !self.broken() && !self.busy() && self.inner.can_sync()
+        self.db.is_some() && !self.broken() && !self.busy() && self.inner.capabilities().can_sync
     }
 
     /// Whether the cache was busy lately, and is left alone for a while.
@@ -922,20 +922,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         saved
     }
 
-    fn can_sync(&self) -> bool {
-        self.inner.can_sync()
-    }
-
-    fn bodies_change(&self) -> bool {
-        self.inner.bodies_change()
-    }
-
-    fn folder_names_ignore_case(&self) -> bool {
-        self.inner.folder_names_ignore_case()
-    }
-
-    fn can_watch(&self) -> bool {
-        self.inner.can_watch()
+    fn capabilities(&self) -> mett_core::Capabilities {
+        self.inner.capabilities()
     }
 
     async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {

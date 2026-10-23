@@ -1279,7 +1279,7 @@ async fn the_folder_of_a_message_is_known_only_while_it_is_there() {
 #[tokio::test]
 async fn folder_names_are_exact() {
     let (_server, store) = plain().await;
-    assert!(!store.folder_names_ignore_case());
+    assert!(!store.capabilities().folder_names_ignore_case);
 }
 
 #[tokio::test]
