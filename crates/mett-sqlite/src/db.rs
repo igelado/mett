@@ -15,7 +15,7 @@ use crate::invitation::StoredInvitation;
 
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Marks mett's caches (SQLite's `application_id`): "mett".
 const APPLICATION_ID: i64 = 0x6D65_7474;
@@ -43,6 +43,8 @@ const SCHEMA: &str = "
         received INTEGER NOT NULL,
         modified INTEGER,
         unread INTEGER NOT NULL,
+        flagged INTEGER NOT NULL,
+        -- The rest of the summary, as JSON.
         summary TEXT NOT NULL,
         -- The rest of the message, once it was fetched.
         extras TEXT,
@@ -65,7 +67,10 @@ const SCHEMA: &str = "
     -- those below a folder (`below:` for the top-level ones).
     CREATE TABLE listed (what TEXT PRIMARY KEY);
     CREATE INDEX messages_by_date ON messages (folder, received DESC, id);
-    CREATE INDEX messages_by_change ON messages (folder, modified DESC);
+    CREATE INDEX messages_by_change ON messages (folder, modified DESC, id);
+    -- To find what is unread among the recent changes.
+    CREATE INDEX messages_unread ON messages (folder, modified DESC, id)
+        WHERE unread;
 ";
 
 /// Where a message is in a listing: its date there, in microseconds, and
@@ -170,9 +175,28 @@ pub(crate) struct Db {
     bodies_stay: bool,
 }
 
-/// A cache failure, as a port error.
-fn failed(e: impl std::fmt::Display) -> Error {
-    Error::Backend(format!("cache: {e}"))
+/// How a failure because the database was busy begins.
+const BUSY: &str = "cache busy: ";
+
+/// A cache failure, as a port error. A database that is busy or locked
+/// (another mett holds it) is told from the rest by [`is_busy`].
+fn failed<E: std::fmt::Display + 'static>(e: E) -> Error {
+    let busy = (&e as &dyn std::any::Any)
+        .downcast_ref::<rusqlite::Error>()
+        .and_then(rusqlite::Error::sqlite_error_code)
+        .is_some_and(|code| {
+            matches!(
+                code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+        });
+    Error::Backend(format!("{}{e}", if busy { BUSY } else { "cache: " }))
+}
+
+/// Whether `e` is a cache failure because the database was busy or locked,
+/// which passes, unlike a full disk or a corrupt file.
+pub(crate) fn is_busy(e: &Error) -> bool {
+    matches!(e, Error::Backend(m) if m.starts_with(BUSY))
 }
 
 impl Db {
@@ -204,6 +228,9 @@ impl Db {
         // (or new); and again, as another mett may have changed it since.
         identify(&conn, account)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // The cache can be made again from the server: a crash may lose
+        // the last changes, but not corrupt it.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if identify(&tx, account)? {
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
@@ -213,6 +240,7 @@ impl Db {
             tx.execute_batch(
                 "DROP INDEX IF EXISTS messages_by_date;
                  DROP INDEX IF EXISTS messages_by_change;
+                 DROP INDEX IF EXISTS messages_unread;
                  DROP TABLE IF EXISTS messages;
                  DROP TABLE IF EXISTS folders;
                  DROP TABLE IF EXISTS folder_info;
@@ -314,12 +342,11 @@ impl Db {
                 return Ok(false);
             }
             Ok(tx
-                .query_row(
-                    "SELECT folder = ?2 AND seen FROM messages WHERE id = ?1",
-                    [id, folder.as_str()],
-                    |r| r.get::<_, bool>(0),
-                )
-                .optional()
+                .prepare_cached("SELECT folder = ?2 AND seen FROM messages WHERE id = ?1")
+                .and_then(|mut q| {
+                    q.query_row([id, folder.as_str()], |r| r.get::<_, bool>(0))
+                        .optional()
+                })
                 .map_err(failed)?
                 .unwrap_or(false))
         };
@@ -334,37 +361,39 @@ impl Db {
             // A message whose change date moved may have a new body (EWS
             // lets bodies be edited), and a draft's may change without
             // one: either is fetched again.
-            tx.execute(
-                "INSERT INTO messages (id, folder, received, modified, unread, summary, seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+            tx.prepare_cached(
+                "INSERT INTO messages
+                    (id, folder, received, modified, unread, flagged, summary, seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
                  ON CONFLICT (id) DO UPDATE SET
                     folder = excluded.folder, received = excluded.received,
                     modified = excluded.modified, unread = excluded.unread,
-                    summary = excluded.summary, seen = 1,
-                    extras = CASE WHEN ?7 OR (NOT ?8 AND modified IS NOT excluded.modified)
+                    flagged = excluded.flagged, summary = excluded.summary, seen = 1,
+                    extras = CASE WHEN ?8 OR (NOT ?9 AND modified IS NOT excluded.modified)
                         THEN NULL ELSE extras END",
-                params![
+            )
+            .and_then(|mut upsert| {
+                upsert.execute(params![
                     summary.id.as_str(),
                     folder.as_str(),
                     summary.received.timestamp_micros(),
                     summary.modified.map(|m| m.timestamp_micros()),
                     !summary.flags.read,
+                    summary.flags.flagged,
                     stored,
                     summary.draft,
                     self.bodies_stay,
-                ],
-            )
+                ])
+            })
             .map_err(failed)?;
         }
         for id in &changes.removed {
             if counted(id.as_str())? {
                 more -= 1;
             }
-            tx.execute(
-                "DELETE FROM messages WHERE id = ?1 AND folder = ?2",
-                [id.as_str(), folder.as_str()],
-            )
-            .map_err(failed)?;
+            tx.prepare_cached("DELETE FROM messages WHERE id = ?1 AND folder = ?2")
+                .and_then(|mut delete| delete.execute([id.as_str(), folder.as_str()]))
+                .map_err(failed)?;
         }
         let complete = !changes.more;
         tx.execute(
@@ -405,19 +434,36 @@ impl Db {
 
     /// Up to `limit` of `folder`'s summaries, newest first (by
     /// [`received_key`], then ID), after the one `after` is the key of.
+    ///
+    /// The next page is a range on the index (`received <= at`), which
+    /// SQLite seeks to, not an `OR` it scans through from the start.
     pub fn page(
         &self,
         folder: &FolderId,
         after: Option<&Key>,
         limit: u64,
     ) -> Result<Vec<MessageSummary>, Error> {
-        let (at, id) = after.map_or((None, ""), |(at, id)| (Some(*at), id.as_str()));
-        self.summaries(
-            "SELECT summary FROM messages WHERE folder = ?1
-             AND (?2 IS NULL OR received < ?2 OR (received = ?2 AND id > ?3))
-             ORDER BY received DESC, id LIMIT ?4",
-            params![folder.as_str(), at, id, sql(limit)],
-        )
+        match after {
+            None => self.summaries(
+                concat!(
+                    "SELECT ",
+                    summary_columns!(),
+                    " FROM messages WHERE folder = ?1
+                     ORDER BY received DESC, id LIMIT ?2"
+                ),
+                params![folder.as_str(), sql(limit)],
+            ),
+            Some((at, id)) => self.summaries(
+                concat!(
+                    "SELECT ",
+                    summary_columns!(),
+                    " FROM messages WHERE folder = ?1
+                     AND received <= ?2 AND (received < ?2 OR id > ?3)
+                     ORDER BY received DESC, id LIMIT ?4"
+                ),
+                params![folder.as_str(), at, id, sql(limit)],
+            ),
+        }
     }
 
     /// Up to `limit` of `folder`'s summaries changed at or after `since`,
@@ -430,19 +476,29 @@ impl Db {
         after: Option<&Key>,
         limit: u64,
     ) -> Result<Vec<MessageSummary>, Error> {
-        let (at, id) = after.map_or((None, ""), |(at, id)| (Some(*at), id.as_str()));
-        self.summaries(
-            "SELECT summary FROM messages WHERE folder = ?1 AND modified >= ?2
-             AND (?3 IS NULL OR modified < ?3 OR (modified = ?3 AND id > ?4))
-             ORDER BY modified DESC, id LIMIT ?5",
-            params![
-                folder.as_str(),
-                since.timestamp_micros(),
-                at,
-                id,
-                sql(limit)
-            ],
-        )
+        let since = since.timestamp_micros();
+        match after {
+            None => self.summaries(
+                concat!(
+                    "SELECT ",
+                    summary_columns!(),
+                    " FROM messages
+                     WHERE folder = ?1 AND modified >= ?2
+                     ORDER BY modified DESC, id LIMIT ?3"
+                ),
+                params![folder.as_str(), since, sql(limit)],
+            ),
+            Some((at, id)) => self.summaries(
+                concat!(
+                    "SELECT ",
+                    summary_columns!(),
+                    " FROM messages WHERE folder = ?1
+                     AND modified >= ?2 AND modified <= ?3 AND (modified < ?3 OR id > ?4)
+                     ORDER BY modified DESC, id LIMIT ?5"
+                ),
+                params![folder.as_str(), since, at, id, sql(limit)],
+            ),
+        }
     }
 
     /// Up to `limit` of `folder`'s unread messages changed at or after
@@ -455,7 +511,7 @@ impl Db {
     ) -> Result<Vec<(MessageId, DateTime<Utc>)>, Error> {
         let mut statement = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, modified FROM messages
                  WHERE folder = ?1 AND unread AND modified >= ?2
                  ORDER BY modified DESC, id LIMIT ?3",
@@ -479,35 +535,35 @@ impl Db {
         query: &str,
         params: impl rusqlite::Params,
     ) -> Result<Vec<MessageSummary>, Error> {
-        let mut statement = self.conn.prepare(query).map_err(failed)?;
+        let mut statement = self.conn.prepare_cached(query).map_err(failed)?;
         let rows = statement
-            .query_map(params, |r| r.get::<_, String>(0))
+            .query_map(params, StoredRow::read)
             .map_err(failed)?;
-        rows.map(|row| {
-            let stored: StoredSummary =
-                serde_json::from_str(&row.map_err(failed)?).map_err(failed)?;
-            stored.into_summary()
-        })
-        .collect()
+        rows.map(|row| row.map_err(failed)?.into_summary())
+            .collect()
     }
 
     /// The full message `id`, if it is here with its body.
     pub fn message(&self, id: &MessageId) -> Result<Option<Message>, Error> {
-        let row: Option<(String, Option<String>)> = self
+        let row = self
             .conn
-            .query_row(
-                "SELECT summary, extras FROM messages WHERE id = ?1",
-                [id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
+            .prepare_cached(concat!(
+                "SELECT ",
+                summary_columns!(),
+                ", extras FROM messages WHERE id = ?1"
+            ))
+            .and_then(|mut q| {
+                q.query_row([id.as_str()], |r| {
+                    Ok((StoredRow::read(r)?, r.get::<_, Option<String>>(7)?))
+                })
+                .optional()
+            })
             .map_err(failed)?;
-        let Some((summary, Some(extras))) = row else {
+        let Some((row, Some(extras))) = row else {
             return Ok(None);
         };
-        let summary: StoredSummary = serde_json::from_str(&summary).map_err(failed)?;
         let extras: StoredExtras = serde_json::from_str(&extras).map_err(failed)?;
-        Ok(Some(extras.into_message(summary.into_summary()?)))
+        Ok(Some(extras.into_message(row.into_summary()?)))
     }
 
     /// Keeps the body of `message`, fetched just now, if its summary is
@@ -528,47 +584,43 @@ impl Db {
         };
         let extras = serde_json::to_string(&StoredExtras::from(message)).map_err(failed)?;
         self.conn
-            .execute(
+            .prepare_cached(
                 "UPDATE messages SET extras = ?2 WHERE id = ?1 AND (?4 OR modified = ?3)",
-                params![
+            )
+            .and_then(|mut update| {
+                update.execute(params![
                     message.summary.id.as_str(),
                     extras,
                     modified.timestamp_micros(),
                     self.bodies_stay
-                ],
-            )
+                ])
+            })
             .map_err(failed)?;
         Ok(())
     }
 
     /// Changes the flags of message `id`, if it is here.
     pub fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<(), Error> {
-        let summary: Option<String> = self
+        let flags = self
             .conn
-            .query_row(
-                "SELECT summary FROM messages WHERE id = ?1",
-                [id.as_str()],
-                |r| r.get(0),
-            )
-            .optional()
+            .prepare_cached("SELECT unread, flagged FROM messages WHERE id = ?1")
+            .and_then(|mut q| {
+                q.query_row([id.as_str()], |r| {
+                    Ok(Flags {
+                        read: !r.get::<_, bool>(0)?,
+                        flagged: r.get(1)?,
+                    })
+                })
+                .optional()
+            })
             .map_err(failed)?;
-        let Some(summary) = summary else {
+        let Some(mut flags) = flags else {
             return Ok(());
         };
-        let mut stored: StoredSummary = serde_json::from_str(&summary).map_err(failed)?;
-        let mut flags = Flags {
-            read: stored.read,
-            flagged: stored.flagged,
-        };
         update.apply(&mut flags);
-        stored.read = flags.read;
-        stored.flagged = flags.flagged;
-        let summary = serde_json::to_string(&stored).map_err(failed)?;
         self.conn
-            .execute(
-                "UPDATE messages SET summary = ?2, unread = ?3 WHERE id = ?1",
-                params![id.as_str(), summary, !flags.read],
-            )
+            .prepare_cached("UPDATE messages SET unread = ?2, flagged = ?3 WHERE id = ?1")
+            .and_then(|mut u| u.execute(params![id.as_str(), !flags.read, flags.flagged]))
             .map_err(failed)?;
         Ok(())
     }
@@ -604,7 +656,7 @@ impl Db {
             gone.retain(|id| !folders.iter().any(|f| f.id.as_str() == id));
             while let Some(id) = gone.pop() {
                 let mut statement = tx
-                    .prepare("SELECT id FROM folder_info WHERE parent = ?1")
+                    .prepare_cached("SELECT id FROM folder_info WHERE parent = ?1")
                     .map_err(failed)?;
                 let below = statement
                     .query_map([&id], |r| r.get::<_, String>(0))
@@ -612,9 +664,11 @@ impl Db {
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(failed)?;
                 gone.extend(below);
-                tx.execute("DELETE FROM folder_info WHERE id = ?1", [&id])
+                tx.prepare_cached("DELETE FROM folder_info WHERE id = ?1")
+                    .and_then(|mut q| q.execute([&id]))
                     .map_err(failed)?;
-                tx.execute("DELETE FROM well_known WHERE id = ?1", [&id])
+                tx.prepare_cached("DELETE FROM well_known WHERE id = ?1")
+                    .and_then(|mut q| q.execute([&id]))
                     .map_err(failed)?;
                 purged.push(id);
             }
@@ -625,12 +679,11 @@ impl Db {
             let mut folder = folder.clone();
             if folder.well_known.is_none() && !matches!(listing, Listing::All) {
                 folder.well_known = tx
-                    .query_row(
-                        "SELECT name FROM well_known WHERE id = ?1",
-                        [folder.id.as_str()],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()
+                    .prepare_cached("SELECT name FROM well_known WHERE id = ?1")
+                    .and_then(|mut q| {
+                        q.query_row([folder.id.as_str()], |r| r.get::<_, String>(0))
+                            .optional()
+                    })
                     .map_err(failed)?
                     .and_then(|name| name.parse().ok());
             }
@@ -642,26 +695,28 @@ impl Db {
                 Listing::Some => None,
                 _ => Some(sql(ord as u64)),
             };
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO folder_info (id, parent, ord, folder) VALUES (?1, ?2,
                     COALESCE(?3, (SELECT COALESCE(MAX(ord) + 1, 0) FROM folder_info)), ?4)
                  ON CONFLICT (id) DO UPDATE SET
                     parent = excluded.parent, folder = excluded.folder,
                     ord = COALESCE(?3, ord)",
-                params![
+            )
+            .and_then(|mut q| {
+                q.execute(params![
                     folder.id.as_str(),
                     folder.parent.as_ref().map(FolderId::as_str),
                     ord,
                     stored
-                ],
-            )
+                ])
+            })
             .map_err(failed)?;
             if let Some(which) = folder.well_known {
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT INTO well_known (name, id) VALUES (?1, ?2)
                      ON CONFLICT (name) DO UPDATE SET id = excluded.id",
-                    [which.as_str(), folder.id.as_str()],
                 )
+                .and_then(|mut q| q.execute([which.as_str(), folder.id.as_str()]))
                 .map_err(failed)?;
             }
         }
@@ -674,9 +729,11 @@ impl Db {
             .map_err(failed)?;
         }
         for id in &purged {
-            tx.execute("DELETE FROM messages WHERE folder = ?1", [id])
+            tx.prepare_cached("DELETE FROM messages WHERE folder = ?1")
+                .and_then(|mut q| q.execute([id]))
                 .map_err(failed)?;
-            tx.execute("DELETE FROM folders WHERE id = ?1", [id])
+            tx.prepare_cached("DELETE FROM folders WHERE id = ?1")
+                .and_then(|mut q| q.execute([id]))
                 .map_err(failed)?;
         }
         tx.commit().map_err(failed)
@@ -736,7 +793,7 @@ impl Db {
     }
 
     fn folders(&self, query: &str, params: impl rusqlite::Params) -> Result<Vec<Folder>, Error> {
-        let mut statement = self.conn.prepare(query).map_err(failed)?;
+        let mut statement = self.conn.prepare_cached(query).map_err(failed)?;
         let rows = statement
             .query_map(params, |r| r.get::<_, String>(0))
             .map_err(failed)?;
@@ -751,7 +808,8 @@ impl Db {
     /// Forgets message `id`.
     pub fn remove(&self, id: &MessageId) -> Result<(), Error> {
         self.conn
-            .execute("DELETE FROM messages WHERE id = ?1", [id.as_str()])
+            .prepare_cached("DELETE FROM messages WHERE id = ?1")
+            .and_then(|mut q| q.execute([id.as_str()]))
             .map_err(failed)?;
         Ok(())
     }
@@ -833,73 +891,134 @@ impl From<StoredAddress> for Address {
     }
 }
 
-/// A [`MessageSummary`], as stored.
-#[derive(Serialize, Deserialize)]
-struct StoredSummary {
+/// The columns of a message's row that make its summary (as a macro, to
+/// make the queries' text at compile time).
+macro_rules! summary_columns {
+    () => {
+        "id, folder, received, modified, unread, flagged, summary"
+    };
+}
+use summary_columns;
+
+/// A [`MessageSummary`], as its row stores it: the columns that are
+/// sorted or filtered by (or changed alone, as the flags are), and the rest
+/// as JSON.
+struct StoredRow {
     id: String,
     folder: String,
+    received: i64,
+    modified: Option<i64>,
+    unread: bool,
+    flagged: bool,
+    rest: String,
+}
+
+impl StoredRow {
+    /// The row of the columns of `summary_columns!`.
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            folder: r.get(1)?,
+            received: r.get(2)?,
+            modified: r.get(3)?,
+            unread: r.get(4)?,
+            flagged: r.get(5)?,
+            rest: r.get(6)?,
+        })
+    }
+
+    fn into_summary(self) -> Result<MessageSummary, Error> {
+        let rest: StoredSummary = serde_json::from_str(&self.rest).map_err(failed)?;
+        Ok(MessageSummary {
+            id: MessageId::new(self.id),
+            folder: FolderId::new(self.folder),
+            subject: rest.subject,
+            from: rest.from.map(Address::from),
+            to: rest.to.into_iter().map(Address::from).collect(),
+            received: time(self.received)?,
+            flags: Flags {
+                read: !self.unread,
+                flagged: self.flagged,
+            },
+            has_attachments: rest.has_attachments,
+            draft: rest.draft,
+            delivered: maybe_time(rest.delivered)?,
+            modified: maybe_time(self.modified)?,
+            thread: rest
+                .conversation
+                .map(|conversation| {
+                    Ok::<_, Error>(ThreadPosition {
+                        conversation,
+                        path: rest
+                            .thread_path
+                            .iter()
+                            .map(|p| unhex(p))
+                            .collect::<Result<_, _>>()?,
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// What of a [`MessageSummary`] isn't in columns, as stored.
+#[derive(Serialize, Deserialize)]
+struct StoredSummary {
     subject: String,
     from: Option<StoredAddress>,
     to: Vec<StoredAddress>,
-    received: i64,
-    read: bool,
-    flagged: bool,
     has_attachments: bool,
     draft: bool,
     delivered: Option<i64>,
-    modified: Option<i64>,
     conversation: Option<String>,
-    thread_path: Vec<Vec<u8>>,
+    /// The thread path's elements, in hex (as numbers, JSON is about four
+    /// times the size).
+    thread_path: Vec<String>,
 }
 
 impl From<&MessageSummary> for StoredSummary {
     fn from(s: &MessageSummary) -> Self {
         Self {
-            id: s.id.to_string(),
-            folder: s.folder.to_string(),
             subject: s.subject.clone(),
             from: s.from.as_ref().map(StoredAddress::from),
             to: s.to.iter().map(StoredAddress::from).collect(),
-            received: s.received.timestamp_micros(),
-            read: s.flags.read,
-            flagged: s.flags.flagged,
             has_attachments: s.has_attachments,
             draft: s.draft,
             delivered: s.delivered.map(|d| d.timestamp_micros()),
-            modified: s.modified.map(|m| m.timestamp_micros()),
             conversation: s.thread.as_ref().map(|t| t.conversation.clone()),
             thread_path: s
                 .thread
                 .as_ref()
-                .map(|t| t.path.clone())
+                .map(|t| t.path.iter().map(|p| hex(p)).collect())
                 .unwrap_or_default(),
         }
     }
 }
 
-impl StoredSummary {
-    fn into_summary(self) -> Result<MessageSummary, Error> {
-        Ok(MessageSummary {
-            id: MessageId::new(self.id),
-            folder: FolderId::new(self.folder),
-            subject: self.subject,
-            from: self.from.map(Address::from),
-            to: self.to.into_iter().map(Address::from).collect(),
-            received: time(self.received)?,
-            flags: Flags {
-                read: self.read,
-                flagged: self.flagged,
-            },
-            has_attachments: self.has_attachments,
-            draft: self.draft,
-            delivered: maybe_time(self.delivered)?,
-            modified: maybe_time(self.modified)?,
-            thread: self.conversation.map(|conversation| ThreadPosition {
-                conversation,
-                path: self.thread_path,
-            }),
-        })
+/// `bytes` in lower-case hex.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+/// The bytes `hex` is of.
+fn unhex(hex: &str) -> Result<Vec<u8>, Error> {
+    let bad = || failed("a thread path that isn't hex");
+    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
+        return Err(bad());
     }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+                .ok_or_else(bad)
+        })
+        .collect()
 }
 
 /// The parts of a [`Message`] besides its summary, as stored.
@@ -964,6 +1083,143 @@ mod tests {
             unread_count: 0,
             total_count: 0,
         }
+    }
+
+    fn summary(id: &str, received: i64, modified: i64) -> MessageSummary {
+        let mut summary = mett_core::mock::message(
+            id,
+            "in",
+            "hi",
+            DateTime::from_timestamp_micros(received).unwrap(),
+        )
+        .summary;
+        summary.modified = DateTime::from_timestamp_micros(modified);
+        summary
+    }
+
+    fn changes(summaries: Vec<MessageSummary>) -> FolderChanges {
+        FolderChanges {
+            changed: summaries,
+            removed: Vec::new(),
+            state: SyncState::new("s"),
+            more: false,
+        }
+    }
+
+    /// A cache whose Inbox holds `summaries`.
+    fn filled(summaries: Vec<MessageSummary>) -> Db {
+        let mut db = Db::in_memory(&AccountId::new("a@b.c")).unwrap();
+        let inbox = FolderId::new("in");
+        db.start_over(&inbox).unwrap();
+        db.apply(&inbox, None, &changes(summaries), false).unwrap();
+        db
+    }
+
+    #[test]
+    fn pages_go_across_messages_of_one_date() {
+        // Five messages of one date, and one older and one newer.
+        let mut all = vec![summary("old", 1_000, 1_000), summary("new", 3_000, 3_000)];
+        all.extend(["c", "a", "e", "b", "d"].map(|id| summary(id, 2_000, 2_000)));
+        let db = filled(all);
+        let inbox = FolderId::new("in");
+        let since = DateTime::from_timestamp_micros(0).unwrap();
+        type Lister = Box<dyn Fn(&Db, Option<&Key>, u64) -> Vec<MessageSummary>>;
+        let by_date: Lister = {
+            let inbox = inbox.clone();
+            Box::new(move |db, after, n| db.page(&inbox, after, n).unwrap())
+        };
+        let by_change: Lister =
+            Box::new(move |db, after, n| db.changed(&inbox, since, after, n).unwrap());
+        for (list, key) in [
+            (by_date, received_key as fn(&MessageSummary) -> Key),
+            (by_change, modified_key),
+        ] {
+            for size in 1..=4 {
+                let mut got: Vec<String> = Vec::new();
+                let mut after: Option<Key> = None;
+                loop {
+                    let page = list(&db, after.as_ref(), size);
+                    if page.is_empty() {
+                        break;
+                    }
+                    got.extend(page.iter().map(|s| s.id.to_string()));
+                    after = page.last().map(key);
+                }
+                assert_eq!(got, ["new", "a", "b", "c", "d", "e", "old"], "by {size}");
+            }
+        }
+    }
+
+    #[test]
+    fn flags_change_in_place() {
+        let mut thread = summary("m", 1_000, 1_000);
+        thread.thread = Some(ThreadPosition {
+            conversation: "conv".into(),
+            path: vec![vec![0, 255, 16], vec![], vec![7]],
+        });
+        let other = summary("n", 2_000, 2_000);
+        let db = filled(vec![thread.clone(), other]);
+        let inbox = FolderId::new("in");
+        let since = DateTime::from_timestamp_micros(0).unwrap();
+        let unread = |db: &Db| {
+            db.recent_unread(&inbox, since, 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unread(&db), ["n", "m"]);
+        db.update_flags(&thread.id, FlagsUpdate::read(true))
+            .unwrap();
+        db.update_flags(&thread.id, FlagsUpdate::flagged(true))
+            .unwrap();
+        assert_eq!(unread(&db), ["n"]);
+        let page = db.page(&inbox, None, 10).unwrap();
+        let m = page.iter().find(|s| s.id.as_str() == "m").unwrap();
+        assert_eq!(
+            m.flags,
+            Flags {
+                read: true,
+                flagged: true
+            }
+        );
+        // All else as it was, the thread's path too.
+        let mut expected = thread;
+        expected.flags = m.flags;
+        assert_eq!(*m, expected);
+        db.update_flags(&expected.id, FlagsUpdate::read(false))
+            .unwrap();
+        assert_eq!(unread(&db), ["n", "m"]);
+        // A message that isn't here is left alone.
+        db.update_flags(&MessageId::new("gone"), FlagsUpdate::read(true))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_busy_database_is_told_from_a_broken_one() {
+        let dir = std::env::temp_dir().join(format!("mett-sqlite-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.sqlite");
+        let account = AccountId::new("a@b.c");
+        let mut db = Db::open(&path, &account).unwrap();
+        db.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let inbox = FolderId::new("in");
+        db.start_over(&inbox).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let busy = db
+            .apply(&inbox, None, &changes(Vec::new()), false)
+            .err()
+            .unwrap();
+        assert!(is_busy(&busy), "{busy}");
+        other.execute_batch("ROLLBACK").unwrap();
+        db.apply(&inbox, None, &changes(Vec::new()), false).unwrap();
+        // A missing table isn't a busy database.
+        other.execute_batch("DROP TABLE messages").unwrap();
+        let broken = db.count(&inbox).unwrap_err();
+        assert!(!is_busy(&broken), "{broken}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

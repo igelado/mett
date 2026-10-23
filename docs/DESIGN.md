@@ -252,6 +252,9 @@ Graph delta queries, or EWS `SyncFolderItems`).
   cache after syncing; message bodies are kept once fetched; changes go to
   the server, then to the cache. A backend that can't sync, or
   `unset header_cache`, leaves everything to the server.
+  A cache that fails for good (a full disk, corruption) is dropped for the
+  session; one that is only busy (another mett writing) is skipped for
+  that call alone.
 
 - **Pros:**
   - Browsing is fast, and the index opens instantly.

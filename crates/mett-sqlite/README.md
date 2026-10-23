@@ -24,9 +24,18 @@ of each folder listed, and each message read, in a database file: mutt's
 - **Changes:** flags, moves and deletions go to the server first; the
   cache follows at once, and the next sync confirms them. What mett puts
   elsewhere (a move, a copy, a draft, a sent message) makes folders sync
-  again at once. The server is always the source of truth.
-- **Failures:** if the cache fails (a full disk, say), mett leaves it
-  alone for the rest of the session and asks the server for everything.
+  again at once (only the folder a copy or a watch names, where the change
+  is known to be in one). The server is always the source of truth.
+- **Failures:** if the cache fails (a full disk, a corrupt file, say), mett
+  leaves it alone for the rest of the session and asks the server for
+  everything. A cache that is only busy (another mett is writing to it)
+  isn't given up on: the server answers that call, and the cache serves
+  the next.
+- **Storage:** a message's row keeps what is sorted, filtered or changed
+  alone (dates, read, flagged) in columns, with indexes that page by date
+  and by change (and one for unread mail), and the rest of its summary as
+  JSON. The database is in WAL mode with `synchronous=NORMAL`: a crash may
+  lose the last changes, which the next sync brings back.
 - **Privacy:** the cache holds mail, so on Unix its directory is created
   with mode `0700` and its file with mode `0600` (an existing one is made
   so), and a directory others can write to is refused. On Windows, mett
