@@ -18,6 +18,10 @@ pub enum Security {
     /// None: everything, passwords included, goes in plain text.
     None,
     /// The connection starts in plain text and is upgraded with STARTTLS
+    /// if the server offers it (mutt's `ssl_starttls` without
+    /// `ssl_force_tls`); one that doesn't is used in plain text.
+    StartTlsIfOffered,
+    /// The connection starts in plain text and is upgraded with STARTTLS
     /// (and fails if the server won't).
     #[default]
     StartTls,
@@ -55,7 +59,7 @@ impl SmtpSettings {
             host: host.into(),
             port: match security {
                 Security::None => 25,
-                Security::StartTls => 587,
+                Security::StartTls | Security::StartTlsIfOffered => 587,
                 Security::Tls => 465,
             },
             security,
@@ -199,6 +203,7 @@ impl<A: Authenticator> SmtpSender<A> {
         };
         let tls = match settings.security {
             Security::None => Tls::None,
+            Security::StartTlsIfOffered => Tls::Opportunistic(tls()?),
             Security::StartTls => Tls::Required(tls()?),
             Security::Tls => Tls::Wrapper(tls()?),
         };

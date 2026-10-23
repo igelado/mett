@@ -13,6 +13,7 @@ repository = "https://github.com/igelado/mett"
 [workspace.dependencies]
 mett-core = { path = "crates/mett-core" }
 mett-ews = { path = "crates/mett-ews" }
+mett-imap = { path = "crates/mett-imap" }
 mett-msgraph = { path = "crates/mett-msgraph" }
 mett-smtp = { path = "crates/mett-smtp" }
 mett-sqlite = { path = "crates/mett-sqlite" }
@@ -25,6 +26,11 @@ edtui = { version = "0.11.7", default-features = false }
 encoding_rs = "0.8.35"
 getrandom = "0.4.3"
 keyring = "4.2.0"
+# IMAP, with its parsing of mail and of mailbox names.
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+futures-util = { version = "0.3.34", default-features = false }
+mail-parser = { version = "0.11.9", features = ["full_encoding"] }
+utf7-imap = "0.3.2"
 # SMTP, and the MIME of what is sent.
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "aws-lc-rs", "rustls-platform-verifier", "hostname"] }
 open = "5.4.4"
@@ -38,6 +44,8 @@ ttf-parser = "0.25.1"
 winit = "0.30.13"
 ratatui = "0.30.2"
 regex = "1.13.1"
+rustls = { version = "0.23.46", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7.1"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy", "json", "form"] }
@@ -48,6 +56,7 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = "1.53.3"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws-lc-rs", "tls12"] }
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 url = "2.5.8"

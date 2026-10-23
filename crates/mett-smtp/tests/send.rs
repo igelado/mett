@@ -443,3 +443,12 @@ async fn asks_for_another_token_when_refused_with_a_challenge() {
     sender.send(&draft(), &Threading::default()).await.unwrap();
     assert_eq!(server.seen.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn upgrades_when_the_server_offers_starttls_if_asked_to_only_then() {
+    let server = server(false, Accept::Everything).await;
+    let sender =
+        SmtpSender::<NoTokens>::new(settings(&server, Security::StartTlsIfOffered), Login::None);
+    sender.send(&draft(), &Threading::default()).await.unwrap();
+    assert!(server.seen.lock().unwrap()[0].encrypted);
+}
