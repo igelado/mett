@@ -26,7 +26,7 @@ use mett_core::{
     Folder, FolderChanges, FolderId, Invitation, MAX_PAGE_SIZE, MailSender, MailStore, Message,
     MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor, RECENT_UNREAD,
     ROOT, Result, Roles, Scope, SyncState, ThreadPosition, WellKnownFolder, error_for_status,
-    first_then, parse_time, retry_after, unsent, with_fresh_token,
+    first_then, join_bounded_until, parse_time, retry_after, unsent, with_fresh_token,
 };
 use reqwest::StatusCode;
 use roxmltree::Node;
@@ -62,6 +62,10 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// The most items looked up in one `GetItem`: Exchange's limit (its
 /// `EWSMaxBatchSize`, by default) is often 100.
 const ITEMS_PER_REQUEST: usize = 100;
+
+/// The most `GetItem` requests in flight at once for one listing: a few
+/// shorten a big batch without feeding the server's throttling.
+const CHUNKS_AT_ONCE: usize = 3;
 
 /// The most changes one `SyncFolderItems` returns (EWS takes up to 512).
 const SYNC_BATCH: u32 = 512;
@@ -382,19 +386,44 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
     /// The summaries of the messages `ids`, in that order. Those gone
     /// meanwhile are left out.
     async fn summaries(&self, ids: &[String], about: About<'_>) -> Result<Vec<MessageSummary>> {
+        // Exchange takes only so many items per request (often 100): the
+        // requests go a few at a time, not one after the other. The error
+        // a walk one request at a time would stop at comes back once it is
+        // known that none comes before it, without waiting for the other
+        // requests (a throttled one included: the caller backs off).
+        let chunks = join_bounded_until(
+            ids.chunks(ITEMS_PER_REQUEST)
+                .map(|ids| self.chunk_summaries(ids, about))
+                .collect(),
+            CHUNKS_AT_ONCE,
+            |chunks| chunks.iter().map_while(Option::as_ref).any(Result::is_err),
+        )
+        .await;
         let mut summaries = Vec::new();
-        // Exchange takes only so many items per request (often 100).
-        for ids in ids.chunks(ITEMS_PER_REQUEST) {
-            let xml = self.get_items(ids, SUMMARY_FIELDS, false, about).await?;
-            let doc = parse(&xml)?;
-            for message in response_messages(&doc, about)? {
-                if response_code(message) == "ErrorItemNotFound" {
-                    continue;
-                }
-                check(message, about)?;
-                if let Some(item) = first_item(message) {
-                    summaries.push(summary(item)?);
-                }
+        for chunk in chunks {
+            // Only a chunk after the first error is left unfinished.
+            summaries.extend(chunk.expect("every chunk before the first error finished")?);
+        }
+        Ok(summaries)
+    }
+
+    /// The summaries of the messages `ids` (up to [`ITEMS_PER_REQUEST`]),
+    /// in that order, from one `GetItem`.
+    async fn chunk_summaries(
+        &self,
+        ids: &[String],
+        about: About<'_>,
+    ) -> Result<Vec<MessageSummary>> {
+        let xml = self.get_items(ids, SUMMARY_FIELDS, false, about).await?;
+        let doc = parse(&xml)?;
+        let mut summaries = Vec::new();
+        for message in response_messages(&doc, about)? {
+            if response_code(message) == "ErrorItemNotFound" {
+                continue;
+            }
+            check(message, about)?;
+            if let Some(item) = first_item(message) {
+                summaries.push(summary(item)?);
             }
         }
         Ok(summaries)

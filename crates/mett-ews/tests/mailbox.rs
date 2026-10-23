@@ -1087,6 +1087,129 @@ async fn a_first_sync_tells_of_every_message() {
     assert!(changes.more);
 }
 
+/// `count` change notices for the messages "m0", "m1", and so on.
+fn created(count: usize) -> String {
+    (0..count)
+        .map(|i| format!("<t:Create><t:Message><t:ItemId Id=\"m{i}\"/></t:Message></t:Create>"))
+        .collect()
+}
+
+/// The IDs a `GetItem` asks for.
+fn asked(request: &Request) -> Vec<String> {
+    String::from_utf8_lossy(&request.body)
+        .split("<t:ItemId Id=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A `GetItem` answer with the message of each of `ids`.
+fn got(ids: &[String]) -> ResponseTemplate {
+    let messages: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            format!(
+                "<m:Items>{}</m:Items>",
+                message(id, id, "2026-10-19T10:00:00Z")
+            )
+        })
+        .collect();
+    responses("GetItem", &messages)
+}
+
+/// A sync of `count` new messages, whose `GetItem` requests are answered
+/// by `answer` (given the IDs asked for, it gives the answer and how long
+/// it takes), and the instant each arrived at.
+async fn sync_of(
+    count: usize,
+    answer: impl Fn(&[String]) -> (ResponseTemplate, Duration) + Send + Sync + 'static,
+) -> (
+    Result<mett_core::FolderChanges, Error>,
+    Vec<std::time::Instant>,
+) {
+    let server = MockServer::start().await;
+    ews("<m:SyncFolderItems>")
+        .respond_with(sync_answer(&created(count), "s1", true))
+        .mount(&server)
+        .await;
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&arrivals);
+    ews("<m:GetItem>")
+        .respond_with(move |request: &Request| {
+            seen.lock().unwrap().push(std::time::Instant::now());
+            let (template, delay) = answer(&asked(request));
+            template.set_delay(delay)
+        })
+        .mount(&server)
+        .await;
+    let result = store(&server)
+        .sync_folder(&FolderId::new("inbox-id"), None)
+        .await;
+    let arrivals = arrivals.lock().unwrap().clone();
+    (result, arrivals)
+}
+
+#[tokio::test]
+async fn the_lookups_of_a_big_batch_overlap_by_three_and_keep_their_order() {
+    // 5 requests of 100, 100, 100, 100 and 50 messages.
+    let (changes, arrivals) = sync_of(450, |ids| (got(ids), Duration::from_millis(500))).await;
+    let changes = changes.unwrap();
+    let subjects: Vec<String> = changes.changed.iter().map(|m| m.subject.clone()).collect();
+    let wanted: Vec<String> = (0..450).map(|i| format!("m{i}")).collect();
+    assert_eq!(subjects, wanted, "in the order they were told of");
+    assert!(changes.removed.is_empty());
+    assert_eq!(arrivals.len(), 5);
+    // Three go out at once, the others as those finish: not all at once,
+    // nor one after the other.
+    let first = arrivals.iter().min().unwrap();
+    let early = arrivals
+        .iter()
+        .filter(|at| at.duration_since(*first) < Duration::from_millis(250))
+        .count();
+    assert_eq!(early, 3, "{arrivals:?}");
+}
+
+#[tokio::test]
+async fn the_first_error_in_order_wins_even_when_a_later_lookup_fails_first() {
+    // The first lookup fails slowly with a refusal, the second at once
+    // with a throttle: a walk one request at a time would stop at the
+    // first.
+    let (changes, _) = sync_of(250, |ids| {
+        if ids[0] == "m0" {
+            (
+                failure("GetItem", "ErrorQuotaExceeded"),
+                Duration::from_millis(300),
+            )
+        } else if ids[0] == "m100" {
+            (failure("GetItem", "ErrorServerBusy"), Duration::ZERO)
+        } else {
+            (got(ids), Duration::ZERO)
+        }
+    })
+    .await;
+    let e = changes.unwrap_err();
+    assert!(
+        matches!(&e, Error::Backend(m) if m.contains("ErrorQuotaExceeded")),
+        "{e:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_throttle_of_a_lookup_is_reported_once_the_ones_before_it_are_done() {
+    let (changes, arrivals) = sync_of(250, |ids| {
+        if ids[0] == "m100" {
+            (failure("GetItem", "ErrorServerBusy"), Duration::ZERO)
+        } else {
+            (got(ids), Duration::from_millis(100))
+        }
+    })
+    .await;
+    let e = changes.unwrap_err();
+    assert!(matches!(e, Error::Throttled { .. }), "{e:?}");
+    assert_eq!(arrivals.len(), 3);
+}
+
 #[tokio::test]
 async fn a_sync_goes_on_from_its_state() {
     let server = MockServer::start().await;
