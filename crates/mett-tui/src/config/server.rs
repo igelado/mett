@@ -28,7 +28,17 @@ pub fn redact(url: &str) -> String {
         None => (None, url),
     };
     let Some((userinfo, after)) = rest.rsplit_once('@') else {
-        return url.to_owned();
+        // No user: what follows a `:` in the host is a port, if it is
+        // digits; else it may be a password, which a missing `@` hid.
+        let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+        let ambiguous = authority.rsplit_once(':').filter(|(_, tail)| {
+            !authority.starts_with('[') && !tail.chars().all(|c| c.is_ascii_digit())
+        });
+        return match (ambiguous, scheme) {
+            (Some((host, _)), Some(scheme)) => format!("{scheme}://{host}:***/{path}"),
+            (Some((host, _)), None) => format!("{host}:***/{path}"),
+            (None, _) => url.to_owned(),
+        };
     };
     let Some((user, _)) = userinfo.split_once(':') else {
         return url.to_owned();
@@ -266,6 +276,13 @@ mod tests {
         );
         assert_eq!(redact("imaps://me@host/INBOX"), "imaps://me@host/INBOX");
         assert_eq!(redact("INBOX"), "INBOX");
+        assert_eq!(redact("imap://alice:secret"), "imap://alice:***/");
+        assert_eq!(redact("imaps://host:993/INBOX"), "imaps://host:993/INBOX");
+        assert!(
+            !imap("imap://alice:hunter2")
+                .unwrap_err()
+                .contains("hunter2")
+        );
         assert_eq!(redact("imap:/me:hunter2@host/INBOX"), "imap:***@host/INBOX");
         assert_eq!(
             redact("imaps://alice:p/ss@host/INBOX"),

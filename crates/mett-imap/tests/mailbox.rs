@@ -1649,3 +1649,27 @@ async fn asks_for_the_roles_of_folders_from_servers_that_say_only_when_asked() {
     };
     store.save_draft(&draft).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_message_without_an_id_is_found_where_it_went_whatever_the_status_says() {
+    // `locate` without a `UIDNEXT` to count from looks at the newest.
+    let (server, store) = plain().await;
+    let raw = "From: a@example.org\nTo: me@example.com\nSubject: anonymous\nDate: Tue, 20 Oct 2026 09:00:00 +0000\n\nbody\n";
+    deliver(&server, "INBOX", raw, &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    let copy = store
+        .copy_message(&id, &FolderId::new("Archive"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch_message(&copy).await.unwrap().summary.subject,
+        "anonymous"
+    );
+}

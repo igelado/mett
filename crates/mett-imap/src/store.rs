@@ -1292,13 +1292,10 @@ async fn locate(
             id.replace('\\', "\\\\").replace('"', "\\\"")
         ),
         None if before.is_some() => from.trim_end().to_owned(),
-        None => String::new(),
+        // Nothing says where to look: the newest in the folder.
+        None => "ALL".to_owned(),
     };
-    let mut candidates: Vec<u32> = if query.is_empty() {
-        Vec::new()
-    } else {
-        search(live, &query).await?
-    };
+    let mut candidates: Vec<u32> = search(live, &query).await?;
     candidates.retain(|uid| before.is_none_or(|before| *uid >= before));
     candidates.truncate(LOOKED_AT);
     let headers = fetch(live, &candidates, SUMMARY, false).await?;
