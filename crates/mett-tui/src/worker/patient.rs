@@ -161,6 +161,15 @@ impl<S: MailStore> MailStore for Patient<'_, S> {
     async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
         self.patiently(|| self.store.watch(folders)).await
     }
+
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&mett_core::SyncState>,
+    ) -> Result<mett_core::FolderChanges> {
+        self.patiently(|| self.store.sync_folder(folder, state))
+            .await
+    }
 }
 
 impl<S: MailSender> MailSender for Patient<'_, S> {
