@@ -345,12 +345,18 @@ fn settings_keeping(
         }
         _ => return Err("office365_page_size must be a positive number".into()),
     };
-    let sync_interval = match config.get("office365_sync_interval") {
+    // How often mail is looked for: mutt's `mail_check` for an IMAP mailbox,
+    // Office365's own setting for those.
+    let interval = match account::Api::from_config(config) {
+        account::Api::Imap => "mail_check",
+        account::Api::Graph | account::Api::Ews => "office365_sync_interval",
+    };
+    let sync_interval = match config.get(interval) {
         Some(config::Value::Number(0)) => None,
         Some(config::Value::Number(n)) if *n > 0 => {
             Some(std::time::Duration::from_secs(n.unsigned_abs()))
         }
-        _ => return Err("office365_sync_interval must be 0 (off) or a number of seconds".into()),
+        _ => return Err(format!("{interval} must be 0 (off) or a number of seconds")),
     };
     let folder = config.string("folder");
     let mailboxes = config
@@ -1898,6 +1904,47 @@ mod tests {
         assert_eq!(settings.sync_interval, None);
         config.run_line("mailboxes msgraph://z@y.x/@inbox").unwrap();
         assert!(settings_from_config(&config, &account).is_err());
+    }
+
+    #[test]
+    fn an_imap_mailbox_is_checked_every_mail_check_seconds() {
+        let mut config = config::Config::new(None);
+        for line in [
+            "set spoolfile=imaps://me@mail.example.com/INBOX signature=\"\"",
+            "set office365_sync_interval=0",
+        ] {
+            config.run_line(line).unwrap();
+        }
+        let account = mett_core::AccountId::new("me@mail.example.com");
+        let settings = settings_from_config(&config, &account).unwrap();
+        // Office365's setting is not IMAP's.
+        assert_eq!(
+            settings.sync_interval,
+            Some(std::time::Duration::from_secs(5))
+        );
+        config.run_line("set mail_check=30").unwrap();
+        let settings = settings_from_config(&config, &account).unwrap();
+        assert_eq!(
+            settings.sync_interval,
+            Some(std::time::Duration::from_secs(30))
+        );
+        config.run_line("set mail_check=0").unwrap();
+        assert_eq!(
+            settings_from_config(&config, &account)
+                .unwrap()
+                .sync_interval,
+            None
+        );
+        // And an Office365 mailbox is not checked by `mail_check`.
+        config
+            .run_line("set spoolfile=msgraph://me@contoso.com/@inbox office365_sync_interval=60")
+            .unwrap();
+        let account = mett_core::AccountId::new("me@contoso.com");
+        let settings = settings_from_config(&config, &account).unwrap();
+        assert_eq!(
+            settings.sync_interval,
+            Some(std::time::Duration::from_secs(60))
+        );
     }
 
     #[test]

@@ -19,30 +19,23 @@ pub struct ServerUrl {
 }
 
 /// `url` with the password in it, if any, hidden: for messages, which are
-/// shown and may be logged.
+/// shown and may be logged. What comes before the last `@` and has a `:` in
+/// it may be a password (which may hold a `/` or an `@` a mistake left
+/// unescaped), so it is hidden from the `:` on.
 pub fn redact(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        // Not the form of a URL, so where a password would be is not known:
-        // all that comes before an `@` goes.
-        return match url.rsplit_once('@') {
-            Some((_, host)) => format!("***@{host}"),
-            None => url.to_owned(),
-        };
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
     };
-    let (authority, path) = match rest.split_once('/') {
-        Some((authority, path)) => (authority, Some(path)),
-        None => (rest, None),
+    let Some((userinfo, after)) = rest.rsplit_once('@') else {
+        return url.to_owned();
     };
-    let authority = match authority.rsplit_once('@') {
-        Some((userinfo, host)) => match userinfo.split_once(':') {
-            Some((user, _)) => format!("{user}:***@{host}"),
-            None => authority.to_owned(),
-        },
-        None => authority.to_owned(),
+    let Some((user, _)) = userinfo.split_once(':') else {
+        return url.to_owned();
     };
-    match path {
-        Some(path) => format!("{scheme}://{authority}/{path}"),
-        None => format!("{scheme}://{authority}"),
+    match scheme {
+        Some(scheme) => format!("{scheme}://{user}:***@{after}"),
+        None => format!("{user}:***@{after}"),
     }
 }
 
@@ -71,7 +64,10 @@ impl ServerUrl {
             // `[::1]:993`
             Some(v6) => match v6.split_once(']') {
                 Some((host, "")) => (host, None),
-                Some((host, port)) => (host, port.strip_prefix(':')),
+                Some((host, port)) => match port.strip_prefix(':') {
+                    Some(port) => (host, Some(port)),
+                    None => return Err(format!("{shown}: text after the host in [ ]")),
+                },
                 None => return Err(format!("{shown}: unclosed [ in the host")),
             },
             None => match hostport.rsplit_once(':') {
@@ -85,7 +81,7 @@ impl ServerUrl {
         let port = port
             .map(|p| {
                 p.parse::<u16>()
-                    .map_err(|_| format!("{shown}: {p:?} is not a port"))
+                    .map_err(|_| format!("{shown}: the port is not a number up to 65535"))
             })
             .transpose()?;
         let (user, password) = match userinfo {
@@ -176,6 +172,9 @@ mod tests {
         let url = imap("imap://[::1]:143/").unwrap();
         assert_eq!((url.host.as_str(), url.port), ("::1", Some(143)));
         assert!(imap("imap://[::1/").is_err());
+        // Nothing but a port may follow the brackets.
+        assert!(imap("imap://[::1]junk/INBOX").is_err());
+        assert!(imap("imap://[::1]:x/INBOX").is_err());
     }
 
     #[test]
@@ -207,6 +206,8 @@ mod tests {
             "imap://me:hunter2@:993/",
             "imapx://me:hunter2@host/",
             "imap://me:hunter2@[::1/",
+            "imaps://alice:hunter2/x@host/INBOX",
+            "imap://me:hunter2@[::1]junk/",
             "imap://me:h%zzter2@host/",
         ] {
             let error = imap(bad).unwrap_err();
@@ -218,7 +219,14 @@ mod tests {
         );
         assert_eq!(redact("imaps://me@host/INBOX"), "imaps://me@host/INBOX");
         assert_eq!(redact("INBOX"), "INBOX");
-        assert_eq!(redact("imap:/me:hunter2@host/INBOX"), "***@host/INBOX");
+        assert_eq!(
+            redact("imap:/me:hunter2@host/INBOX"),
+            "imap:/me:***@host/INBOX"
+        );
+        assert_eq!(
+            redact("imaps://alice:p/ss@host/INBOX"),
+            "imaps://alice:***@host/INBOX"
+        );
         assert!(
             !imap("imap:/me:hunter2@host/INBOX")
                 .unwrap_err()

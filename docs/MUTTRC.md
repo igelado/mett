@@ -123,7 +123,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `sig_dashes` | boolean | Put `-- ` before the signature. |
 | | `abort_unmodified`, `abort_nosubject`, `postpone` | quadoption | Abort an unedited message or one without subject (asked again when sending without one, as in mutt); postpone when leaving the compose menu. |
 | | `tmpdir` | path | Where the editor's temporary files go. |
-| Behaviour | `mail_check` | number | Seconds between new-mail checks. |
+| Behaviour | `mail_check` | number | Seconds between new-mail checks of an IMAP mailbox (`0` turns them off; Office365 has `office365_sync_interval`). |
 | | `timeout` | number | Seconds to wait for input before checking mail. |
 | | `sort`, `sort_aux` | sort order | Index sorting. |
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |
