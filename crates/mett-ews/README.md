@@ -8,7 +8,9 @@ Exchange Server, as an alternative to Microsoft Graph (`mett-msgraph`):
   user's mailbox. It lists folders (the mail folders of the whole tree in
   one deep `FindFolder`, or those below one), lists messages (newest first,
   a page at a time by offset, with `FindItem` for the order and `GetItem`
-  for the fields), fetches messages (with Exchange converting HTML bodies to
+  for the fields; the `GetItem` requests of a big batch, 100 items each, go
+  three at a time, and the error of the first one in order is the one
+  reported, as if they had gone one after the other), fetches messages (with Exchange converting HTML bodies to
   text), updates read and flagged state, moves, copies and deletes
   messages, and fetches attachments. It also implements `MailSender`: new
   mail without attachments goes out with one `CreateItem`, while replies,
