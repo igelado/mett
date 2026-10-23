@@ -1,34 +1,5 @@
 use super::*;
 
-/// Which folders play special roles. Folder IDs don't change, so this is
-/// looked up once.
-#[derive(Debug, Default)]
-pub(super) struct Roles {
-    /// The hidden root that top-level folders hang from.
-    pub(super) root: Option<FolderId>,
-    /// Well-known folders by ID.
-    pub(super) well_known: HashMap<FolderId, WellKnownFolder>,
-}
-
-impl Roles {
-    pub(super) fn folder(&self, folder: GraphFolder) -> Folder {
-        let id = FolderId::new(folder.id);
-        Folder {
-            well_known: self.well_known.get(&id).copied(),
-            // Top-level folders hang from the hidden root; the port says
-            // they have no parent.
-            parent: folder
-                .parent_folder_id
-                .map(FolderId::new)
-                .filter(|p| Some(p) != self.root.as_ref()),
-            id,
-            name: folder.display_name,
-            unread_count: folder.unread_item_count,
-            total_count: folder.total_item_count,
-        }
-    }
-}
-
 impl<A: Authenticator> GraphMailStore<A> {
     /// The hidden root folder's ID: from the roles if they are known,
     /// otherwise looked up on its own (and cached).
@@ -67,8 +38,9 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// of every folder does so, and a listing of the folders below one
     /// uses what that found ([`Self::known_roles`]). The result is cached.
     pub(super) async fn roles(&self) -> Result<Arc<Roles>> {
+        let nameable: Vec<_> = nameable(|which| Some(which.as_str())).collect();
         let names: Vec<&str> = std::iter::once(ROOT)
-            .chain(WellKnownFolder::ALL.iter().map(|w| w.as_str()))
+            .chain(nameable.iter().map(|(_, name)| *name))
             .collect();
         let requests: Vec<_> = names
             .iter()
@@ -135,7 +107,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             match index.checked_sub(1) {
                 None => roles.root = Some(id),
                 Some(i) => {
-                    if let Some(which) = WellKnownFolder::ALL.get(i) {
+                    if let Some((which, _)) = nameable.get(i) {
                         roles.well_known.insert(id, *which);
                     }
                 }
@@ -165,9 +137,6 @@ impl<A: Authenticator> GraphMailStore<A> {
 /// folders below one, which would otherwise look them up each time.
 const ROLES_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// Graph's well-known name for the hidden root of the folder tree.
-const ROOT: &str = "msgfolderroot";
-
 /// How many folder listings [`MailStore::list_folders`] makes at once: a
 /// large tree is listed sooner, without flooding Graph.
 pub(super) const LISTINGS_AT_ONCE: usize = 4;
@@ -195,20 +164,6 @@ impl<A: Authenticator> GraphMailStore<A> {
                 None => return Ok(folders),
             }
         }
-    }
-}
-
-/// `first` and `second` at once, as if `first` came first: its error is
-/// the answer as soon as it is known, without waiting for `second`.
-pub(super) async fn first_then<T, U>(
-    first: impl Future<Output = Result<T>>,
-    second: impl Future<Output = U>,
-) -> Result<(T, U)> {
-    tokio::pin!(first, second);
-    tokio::select! {
-        biased;
-        first = &mut first => Ok((first?, second.await)),
-        second = &mut second => Ok((first.await?, second)),
     }
 }
 

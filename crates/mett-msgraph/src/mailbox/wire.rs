@@ -220,11 +220,26 @@ pub(super) struct BatchItem {
 impl BatchItem {
     /// The item's `Retry-After`, in seconds, if it has one.
     pub(super) fn retry_after(&self) -> Option<Duration> {
-        self.headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-            .and_then(|(_, value)| value.trim().parse().ok())
-            .map(Duration::from_secs)
+        mett_core::retry_after(
+            self.headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, value)| value.as_str()),
+        )
+    }
+}
+
+impl From<GraphFolder> for Folder {
+    /// The folder, not yet labelled by [`Roles::folder`] with its role.
+    fn from(folder: GraphFolder) -> Self {
+        Self {
+            id: FolderId::new(folder.id),
+            parent: folder.parent_folder_id.map(FolderId::new),
+            name: folder.display_name,
+            well_known: None,
+            unread_count: folder.unread_item_count,
+            total_count: folder.total_item_count,
+        }
     }
 }
 
@@ -394,7 +409,7 @@ impl GraphMessage {
                 path: self
                     .conversation_index
                     .as_deref()
-                    .map(thread_path)
+                    .map(mett_core::thread_path)
                     .unwrap_or_default(),
             }),
         };
@@ -420,27 +435,7 @@ fn addresses(recipients: Vec<Recipient>) -> Vec<Address> {
 
 /// A Graph timestamp, if there is one and it parses.
 fn parse_time(time: Option<&str>) -> Option<DateTime<Utc>> {
-    time.and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&Utc))
-}
-
-/// A message's path in its conversation, from Outlook's conversation
-/// index: the 22-byte header (the conversation's first message), then a
-/// 5-byte block for each reply. An index that doesn't decode, or doesn't
-/// have that shape, gives none.
-fn thread_path(index: &str) -> Vec<Vec<u8>> {
-    use base64::Engine;
-
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(index) else {
-        return Vec::new();
-    };
-    if bytes.len() < 22 || (bytes.len() - 22) % 5 != 0 {
-        return Vec::new();
-    }
-    let (header, replies) = bytes.split_at(22);
-    std::iter::once(header.to_vec())
-        .chain(replies.chunks(5).map(<[u8]>::to_vec))
-        .collect()
+    time.and_then(mett_core::parse_time)
 }
 
 /// The parts of a [`GraphMessage`] that only a full [`Message`] needs.

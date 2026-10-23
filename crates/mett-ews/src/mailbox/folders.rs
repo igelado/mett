@@ -4,38 +4,6 @@ use super::*;
 /// would otherwise look them up each time.
 const ROLES_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// The distinguished folder at the root of the mail folders.
-const ROOT: &str = "msgfolderroot";
-
-/// Which folders play special roles. Folder IDs don't change, so this is
-/// looked up once.
-#[derive(Debug, Default)]
-pub(super) struct Roles {
-    /// The root that top-level folders hang from.
-    pub(super) root: Option<FolderId>,
-    /// Well-known folders by ID.
-    well_known: HashMap<FolderId, WellKnownFolder>,
-}
-
-impl Roles {
-    pub(super) fn folder(&self, folder: EwsFolder) -> Folder {
-        let id = FolderId::new(folder.id);
-        Folder {
-            well_known: self.well_known.get(&id).copied(),
-            // Top-level folders hang from the root; the port says they
-            // have no parent.
-            parent: folder
-                .parent
-                .map(FolderId::new)
-                .filter(|p| Some(p) != self.root.as_ref()),
-            id,
-            name: folder.name,
-            unread_count: folder.unread,
-            total_count: folder.total,
-        }
-    }
-}
-
 /// EWS's distinguished folder name for a well-known folder. EWS has none
 /// for Outlook's Archive folder.
 pub(super) fn distinguished(which: WellKnownFolder) -> Option<&'static str> {
@@ -45,11 +13,9 @@ pub(super) fn distinguished(which: WellKnownFolder) -> Option<&'static str> {
     }
 }
 
-/// The well-known folders EWS can name.
+/// The well-known folders EWS can name, by their distinguished names.
 fn nameable() -> impl Iterator<Item = (WellKnownFolder, &'static str)> {
-    WellKnownFolder::ALL
-        .into_iter()
-        .filter_map(|which| distinguished(which).map(|name| (which, name)))
+    mett_core::nameable(distinguished)
 }
 
 impl<A: Authenticator + 'static> EwsMailStore<A> {
@@ -178,20 +144,6 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             .and_then(|list| list.children().find(Node::is_element))
             .and_then(EwsFolder::parse)
             .ok_or_else(|| unexpected("GetFolder", "no folder"))
-    }
-}
-
-/// `first` and `second` at once, as if `first` came first: its error is
-/// the answer as soon as it is known, without waiting for `second`.
-pub(super) async fn first_then<T, U>(
-    first: impl Future<Output = Result<T>>,
-    second: impl Future<Output = U>,
-) -> Result<(T, U)> {
-    tokio::pin!(first, second);
-    tokio::select! {
-        biased;
-        first = &mut first => Ok((first?, second.await)),
-        second = &mut second => Ok((first.await?, second)),
     }
 }
 

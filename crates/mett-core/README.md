@@ -16,6 +16,12 @@ the ports that adapters implement:
   the handful of requests an adapter supplies (`mett-msgraph`, `mett-ews`).
 - **`Authenticator`:** provides access tokens. Implemented by
   `mett-msgraph`'s `GraphAuthenticator`.
+- **Shared adapter policy:** what the Graph and EWS adapters do alike, on
+  plain values (no HTTP library): the meaning of an HTTP status and of
+  `Retry-After`, and the retry with a fresh token when one is rejected
+  (`error_for_status`, `retry_after`, `with_fresh_token`); meeting times and
+  recurrence words (`whole_day`, `occurrence_window`, `nth_of`); and reading
+  a mailbox (`parse_time`, `thread_path`, `Roles`, `first_then`).
 
 It performs no I/O and depends on no adapter.
 

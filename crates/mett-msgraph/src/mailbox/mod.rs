@@ -19,9 +19,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, Address, Answer, Attachment, AttachmentId, AttachmentKind, Authenticator, Body,
     BodyKind, Draft, DraftOrigin, DraftSession, Error, Flags, FlagsUpdate, Folder, FolderChanges,
-    FolderId, Invitation, MailSender, MailStore, Message, MessageId, MessagePage, MessageSummary,
-    OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, Result, Scope, SyncState, ThreadPosition,
-    WellKnownFolder, join_bounded_until, unsent,
+    FolderId, Invitation, MAX_PAGE_SIZE, MailSender, MailStore, Message, MessageId, MessagePage,
+    MessageSummary, OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, ROOT, Result, Roles,
+    Scope, SyncState, ThreadPosition, WellKnownFolder, error_for_status, first_then,
+    join_bounded_until, nameable, retry_after, unsent, with_fresh_token,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -34,7 +35,7 @@ use crate::invitation::{
     answer_json,
 };
 use crate::settings::{AuthSettings, Cloud, with_segments};
-use folders::{LISTINGS_AT_ONCE, Listings, Roles, Walk, first_then, walk, with_children};
+use folders::{LISTINGS_AT_ONCE, Listings, Walk, walk, with_children};
 use wire::{
     BatchResponse, Collection, Delta, ErrorResponse, GraphAttachment, GraphFolder, GraphMessage,
     IdOnly, Me, MoveRequest, file_attachment_json, message_json, send_mail_json, send_mail_size,
@@ -140,28 +141,26 @@ impl<A: Authenticator> GraphMailStore<A> {
         before: fn(Error) -> Error,
         timeout: Duration,
     ) -> Result<(reqwest::Response, AccessToken)> {
-        let token = self.auth.access_token().await.map_err(before)?;
         // Kept for a retry; JSON bodies can always be cloned.
-        let retry = request.try_clone();
-        let response = Self::attempt(request, &token, timeout).await?;
-        if response.status() != StatusCode::UNAUTHORIZED {
-            return Ok((Self::checked(response, about).await?, token));
-        }
-        // Graph rejected a token that hadn't expired (it may have been
-        // revoked): get a new one and try once more.
-        self.auth.token_rejected(&token).await;
-        let fresh = self.auth.access_token().await.map_err(before)?;
-        match retry {
-            Some(retry) if fresh != token => {
-                let response = Self::attempt(retry, &fresh, timeout).await?;
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    // Rejected too: don't let the next request reuse it.
-                    self.auth.token_rejected(&fresh).await;
+        let mut retry = request.try_clone();
+        let mut request = Some(request);
+        // Graph may reject a token that hadn't expired (it may have been
+        // revoked): `with_fresh_token` gets a new one and tries once more.
+        let (response, token) = with_fresh_token(
+            &*self.auth,
+            before,
+            retry.is_some(),
+            |response: &reqwest::Response| response.status() == StatusCode::UNAUTHORIZED,
+            |token| {
+                let request = request.take().or_else(|| retry.take());
+                async move {
+                    let request = request.expect("a request to make");
+                    Self::attempt(request, &token, timeout).await
                 }
-                Ok((Self::checked(response, about).await?, fresh))
-            }
-            _ => Ok((Self::checked(response, about).await?, token)),
-        }
+            },
+        )
+        .await?;
+        Ok((Self::checked(response, about).await?, token))
     }
 
     async fn attempt(
@@ -940,9 +939,6 @@ impl<A> GraphMailStore<A> {
     }
 }
 
-/// The most messages Graph returns per request.
-const MAX_PAGE_SIZE: u32 = 1000;
-
 /// `$top` for `page`: its size, within Graph's limit. A larger request
 /// still gets a cursor for the rest.
 fn top_for(page: &Page) -> String {
@@ -987,28 +983,25 @@ async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
 /// Maps an unsuccessful Graph response to a port error.
 async fn error_from(response: reqwest::Response, about: About<'_>) -> Error {
     let status = response.status();
-    let retry_after = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
+    let retry_after = retry_after(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+    );
     let body = response.bytes().await.unwrap_or_default();
     let detail = serde_json::from_slice::<ErrorResponse>(&body)
         .map(|e| format!("{}: {}", e.error.code, e.error.message))
         .unwrap_or_else(|_| format!("HTTP {status}"));
     match status {
-        StatusCode::TOO_MANY_REQUESTS => Error::Throttled { retry_after },
         // A delta link Graph no longer takes.
         StatusCode::GONE => Error::StaleSync,
-        StatusCode::NOT_FOUND => Error::NotFound {
-            kind: about.kind,
-            id: about.id.to_owned(),
-        },
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Error::Auth(detail),
-        StatusCode::REQUEST_TIMEOUT => Error::Network(detail),
-        s if s.is_server_error() => Error::Network(detail),
-        _ => Error::Backend(detail),
+        status => error_for_status(
+            status.as_u16(),
+            retry_after,
+            detail,
+            Some(Error::not_found(about.kind, about.id)),
+        ),
     }
 }
 

@@ -1,8 +1,10 @@
 //! Running a few futures at a time.
 
 use std::future::Future;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::task::Poll;
+
+use crate::Result;
 
 /// Runs `futures`, at most `limit` at a time, and gives their outputs in
 /// order: a slow one doesn't hold up the others, nor do many at once flood
@@ -58,6 +60,37 @@ pub async fn join_bounded_until<F: Future>(
     outputs
 }
 
+/// `first` and `second` at once, as if `first` came first: its error is
+/// the answer as soon as it is known, without waiting for `second`.
+pub async fn first_then<T, U>(
+    first: impl Future<Output = Result<T>>,
+    second: impl Future<Output = U>,
+) -> Result<(T, U)> {
+    let mut first = pin!(first);
+    let mut second = pin!(second);
+    // `first` is polled before `second` each time, so when both are ready
+    // at once, `first` is the one taken.
+    let mut first_done: Option<Result<T>> = None;
+    let mut second_done: Option<U> = None;
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = first.as_mut().poll(cx) {
+            first_done = Some(output);
+            return Poll::Ready(());
+        }
+        if let Poll::Ready(output) = second.as_mut().poll(cx) {
+            second_done = Some(output);
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    })
+    .await;
+    match (first_done, second_done) {
+        (Some(first), _) => Ok((first?, second.await)),
+        (None, Some(second)) => Ok((first.await?, second)),
+        (None, None) => unreachable!("one of them finished"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +135,38 @@ mod tests {
             .collect();
         let done = join_bounded_until(futures, 3, |outputs| outputs[1].is_some()).await;
         assert_eq!(done, [None, Some(1), None, None, None, None]);
+    }
+
+    #[tokio::test]
+    async fn the_first_error_is_the_answer_without_the_second() {
+        let first = async { Err::<(), _>(crate::Error::Backend("first".into())) };
+        let second = std::future::pending::<()>();
+        assert!(matches!(
+            first_then(first, second).await,
+            Err(crate::Error::Backend(e)) if e == "first"
+        ));
+    }
+
+    #[tokio::test]
+    async fn both_are_waited_for_when_the_first_succeeds() {
+        let first = async {
+            tokio::task::yield_now().await;
+            Ok(1)
+        };
+        let second = async { 2 };
+        assert_eq!(first_then(first, second).await.unwrap(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn the_second_finishing_first_still_waits_for_the_first() {
+        let first = async {
+            tokio::task::yield_now().await;
+            Err::<(), _>(crate::Error::Backend("first".into()))
+        };
+        let second = async { 2 };
+        assert!(matches!(
+            first_then(first, second).await,
+            Err(crate::Error::Backend(e)) if e == "first"
+        ));
     }
 }
