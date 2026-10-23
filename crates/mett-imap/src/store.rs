@@ -1081,7 +1081,7 @@ async fn unread_and_recent(
         ));
     };
     let query = format!("UNSEEN SINCE {}", day(since - chrono::TimeDelta::days(1)));
-    let mut got = batch(
+    let got = batch(
         live,
         &[
             "UID SEARCH UNSEEN".to_owned(),
@@ -1092,16 +1092,20 @@ async fn unread_and_recent(
     for ended in got.ended {
         ended?;
     }
-    // The answers come in the order of the commands: a server that leaves
-    // one out (it is to say, even if it found nothing) is asked one at a time.
-    if got.searches.len() != 2 {
-        let unseen = search(live, "UNSEEN").await?.into_iter().collect();
-        return Ok((unseen, search(live, &query).await?));
+    // An answer doesn't say which command it is of: they are taken to come in
+    // the order of the commands, which is what servers do. The recent ones
+    // are among the unread ones: if they are not, or one answer is
+    // missing, the order was not that, and they are asked one at a time.
+    if let [unseen, recent] = got.searches.as_slice() {
+        let unseen: BTreeSet<u32> = unseen.iter().copied().collect();
+        if recent.iter().all(|uid| unseen.contains(uid)) {
+            let mut recent = recent.clone();
+            recent.sort_unstable_by(|a, b| b.cmp(a));
+            return Ok((unseen, recent));
+        }
     }
-    let mut recent = got.searches.pop().unwrap_or_default();
-    recent.sort_unstable_by(|a, b| b.cmp(a));
-    let unseen = got.searches.pop().unwrap_or_default().into_iter().collect();
-    Ok((unseen, recent))
+    let unseen = search(live, "UNSEEN").await?.into_iter().collect();
+    Ok((unseen, search(live, &query).await?))
 }
 
 /// What is new in the selected folder since `floor`: the messages from its
