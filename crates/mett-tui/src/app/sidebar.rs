@@ -657,7 +657,9 @@ impl App {
                         below.is_empty() && open.well_known == Some(*role)
                     }
                     FolderPath::Named(names) => {
+                        // A top-level name is only the open folder if that is.
                         open.well_known.is_some()
+                            && open.parent.is_none()
                             && matches!(names.as_slice(), [name] if same_name(name, &open.name, self.api, true))
                     }
                     FolderPath::Root => false,

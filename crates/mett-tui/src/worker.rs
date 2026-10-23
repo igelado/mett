@@ -940,6 +940,19 @@ async fn transfer<S: MailStore>(
     Ok((folder.id, results))
 }
 
+/// Whether the folder names `a` and `b` are the same one, by the rules of
+/// the backend: exactly, or, where it takes names that differ in case as the
+/// same (Office365), ignoring case (in any script). IMAP servers tell the
+/// names apart, but for the `INBOX` at the top of the mailbox (`root`).
+fn names_match<S: MailStore>(store: &S, a: &str, b: &str, root: bool) -> bool {
+    a == b
+        || if store.folder_names_ignore_case() {
+            crate::config::mailbox::same_name(a, b)
+        } else {
+            root && a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX")
+        }
+}
+
 /// Whether `folder` is still at `path`: its name and its parents' match
 /// the path's, up to the top of the mailbox or the well-known folder the
 /// path starts from.
@@ -956,7 +969,9 @@ async fn at_path<S: MailStore>(
     };
     let mut current = folder.clone();
     for (i, name) in names.iter().enumerate().rev() {
-        if !crate::config::mailbox::same_name(name, &current.name) {
+        // `root`: the name is of a folder at the top of the mailbox.
+        let root = i == 0 && start.is_none();
+        if !names_match(store, name, &current.name, root) {
             return Ok(false);
         }
         if i > 0 {
@@ -1022,15 +1037,7 @@ async fn descend<S: MailStore>(
         let children = || folders.iter().filter(|f| f.parent.as_ref() == parent);
         let found = children()
             .find(|f| &f.name == name)
-            .or_else(|| {
-                // The inbox is the one folder IMAP names ignore case for.
-                let ignore = store.folder_names_ignore_case()
-                    || (parent.is_none() && name.eq_ignore_ascii_case("INBOX"));
-                let name = name.to_lowercase();
-                ignore
-                    .then(|| children().find(|f| f.name.to_lowercase() == name))
-                    .flatten()
-            })
+            .or_else(|| children().find(|f| names_match(store, name, &f.name, parent.is_none())))
             .ok_or_else(|| Error::NotFound {
                 kind: "folder",
                 id: names.join("/"),
@@ -1195,6 +1202,20 @@ mod tests {
         // Below a folder too.
         let nested = FolderPath::WellKnown(WellKnownFolder::Inbox, vec!["ÉQUIPE".into()]);
         assert!(resolve(&store, &nested).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_known_folder_is_at_a_path_by_the_names_rules_of_the_backend() {
+        let named = |name: &str| FolderPath::Named(vec![name.into()]);
+        let check = |store: MemoryStore, name: &'static str| async move {
+            let folder = resolve(&store, &named("Archive")).await.unwrap();
+            at_path(&store, &Lookups::default(), &named(name), &folder)
+                .await
+                .unwrap()
+        };
+        assert!(check(tree(), "archive").await);
+        assert!(!check(tree().with_exact_names(), "archive").await);
+        assert!(check(tree().with_exact_names(), "Archive").await);
     }
 
     #[tokio::test]
