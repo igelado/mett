@@ -102,6 +102,9 @@ struct Caps {
 /// A connection that is logged in.
 struct Live {
     session: Session<Conn>,
+    /// How long the server is given to answer: for each answer of a batch
+    /// of commands, not for all of them.
+    timeout: Duration,
     caps: Caps,
     used: Instant,
     /// The folders as last listed, and when.
@@ -196,6 +199,7 @@ impl<A: Authenticator> ImapMailStore<A> {
         );
         Ok(Live {
             session,
+            timeout: self.settings.server.timeout,
             caps: Caps {
                 moves: caps.has_str("MOVE"),
                 uidplus: caps.has_str("UIDPLUS"),
@@ -459,11 +463,14 @@ fn quoted(name: &str) -> Res<String> {
 
 /// Runs `commands` one after the other without waiting for the server in
 /// between: they are written, and then the answers read. That is a round
-/// trip for all, not for each.
+/// trip for all, not for each. The server is given its time to answer
+/// each (as `live.timeout`), not all together: one that stalls fails it, and
+/// one that goes on answering is not cut off for how much it says.
 async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
     let mut ids = Vec::with_capacity(commands.len());
     for command in commands {
-        ids.push(live.session.run_command(command).await?);
+        let sent = within(live.timeout, live.session.run_command(command)).await;
+        ids.push(sent.map_err(Fail::Core)??);
     }
     let mut got = Batch {
         listed: Vec::new(),
@@ -473,10 +480,9 @@ async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
     let mut ended: Vec<Option<Res<()>>> = commands.iter().map(|_| None).collect();
     let mut pending = commands.len();
     while pending > 0 {
-        let response = live
-            .session
-            .read_response()
+        let response = within(live.timeout, live.session.read_response())
             .await
+            .map_err(Fail::Core)?
             .map_err(async_imap::error::Error::Io)?;
         let Some(response) = response else {
             return Err(async_imap::error::Error::ConnectionLost.into());
@@ -535,16 +541,14 @@ const PIPELINE: usize = 50;
 /// How many messages `names` hold, from the server, asked of without
 /// waiting for the answer to each. A folder that can't be asked about fails
 /// the whole, as it would one at a time.
-async fn counted(live: &mut Live, names: &[&str], timeout: Duration) -> Res<Counts> {
+async fn counted(live: &mut Live, names: &[&str]) -> Res<Counts> {
     let mut counts = Counts::new();
     for round in names.chunks(PIPELINE) {
         let commands = round
             .iter()
             .map(|name| Ok(format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))?)))
             .collect::<Res<Vec<String>>>()?;
-        // The time allowed is for each of them: a server may take each
-        // that long.
-        let got = bounded(timeout * round.len() as u32, batch(live, &commands)).await?;
+        let got = batch(live, &commands).await?;
         for (name, ended) in round.iter().zip(got.ended) {
             ended?;
             // A server that says nothing of a folder says it is empty.
@@ -682,17 +686,13 @@ fn folder_with(listed: &Listed, parent: Option<FolderId>, counts: (u32, u32)) ->
 /// folder it holds (the top ones if it holds none): the counts of messages
 /// come with the listing where the server can, and else are asked for
 /// together, not one at a time.
-async fn folders(
-    live: &mut Live,
-    under: Option<Option<&FolderId>>,
-    timeout: Duration,
-) -> Res<Vec<Folder>> {
+async fn folders(live: &mut Live, under: Option<Option<&FolderId>>) -> Res<Vec<Folder>> {
     // With `under`, those that are asked about are few: not all of them.
     let want = Want {
         all_counts: under.is_none(),
         count_of: None,
     };
-    let (all, mut counts) = bounded(timeout, listing(live, true, want)).await?;
+    let (all, mut counts) = listing(live, true, want).await?;
     let names: HashSet<String> = all.iter().map(|l| l.name.clone()).collect();
     let mut chosen = Vec::with_capacity(all.len());
     for item in &all {
@@ -709,7 +709,7 @@ async fn folders(
         .filter(|(item, _)| item.selectable && !counts.contains_key(&item.name))
         .map(|(item, _)| item.name.as_str())
         .collect();
-    counts.extend(counted(live, &missing, timeout).await?);
+    counts.extend(counted(live, &missing).await?);
     Ok(chosen
         .into_iter()
         .map(|(item, parent)| {
@@ -1045,15 +1045,13 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
 
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let mut g = self.lock().await?;
-        let t = g.timeout;
-        let r = folders(g.live(), None, t).await;
+        let r = folders(g.live(), None).await;
         g.done(r)
     }
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
         let mut g = self.lock().await?;
-        let t = g.timeout;
-        let r = folders(g.live(), Some(parent), t).await;
+        let r = folders(g.live(), Some(parent)).await;
         g.done(r)
     }
 
