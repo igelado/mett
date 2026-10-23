@@ -206,8 +206,8 @@ fn decode(text: &str) -> String {
 
 fn settings(server: &Server, security: Security) -> SmtpSettings {
     let mut settings = SmtpSettings::new("127.0.0.1", security, Address::new("me@example.com"));
-    settings.port = server.port;
-    settings.ca_certificates = vec![server.ca.clone()];
+    settings.server.port = server.port;
+    settings.server.ca_certificates = vec![server.ca.clone()];
     settings
 }
 
@@ -225,7 +225,7 @@ fn draft() -> Draft {
 #[tokio::test]
 async fn sends_in_plain_text() {
     let server = server(false, Accept::Everything).await;
-    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), Login::None);
+    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), None);
     sender.send(&draft(), &Threading::default()).await.unwrap();
 
     let seen = server.seen.lock().unwrap();
@@ -251,10 +251,10 @@ async fn sends_in_plain_text() {
 #[tokio::test]
 async fn upgrades_with_starttls() {
     let server = server(false, Accept::Everything).await;
-    let login = Login::Password {
+    let login = Some(Login::Password {
         user: "me".into(),
         password: "hunter2".into(),
-    };
+    });
     let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::StartTls), login);
     sender.send(&draft(), &Threading::default()).await.unwrap();
 
@@ -267,7 +267,7 @@ async fn upgrades_with_starttls() {
 #[tokio::test]
 async fn is_encrypted_from_the_start_with_tls() {
     let server = server(true, Accept::Everything).await;
-    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::Tls), Login::None);
+    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::Tls), None);
     sender.send(&draft(), &Threading::default()).await.unwrap();
     assert!(server.seen.lock().unwrap()[0].encrypted);
 }
@@ -276,8 +276,8 @@ async fn is_encrypted_from_the_start_with_tls() {
 async fn refuses_a_certificate_it_does_not_trust() {
     let server = server(true, Accept::Everything).await;
     let mut settings = settings(&server, Security::Tls);
-    settings.ca_certificates.clear();
-    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    settings.server.ca_certificates.clear();
+    let sender = SmtpSender::<NoTokens>::new(settings, None);
     let error = sender
         .send(&draft(), &Threading::default())
         .await
@@ -291,7 +291,7 @@ async fn takes_a_certificate_for_another_name_only_when_not_checking_names() {
     // Its certificate is for 127.0.0.2, the connection is to 127.0.0.1.
     let server = server_for(true, Accept::Everything, "127.0.0.2").await;
     let mut settings = settings(&server, Security::Tls);
-    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
+    let sender = SmtpSender::<NoTokens>::new(settings.clone(), None);
     let error = sender
         .send(&draft(), &Threading::default())
         .await
@@ -299,15 +299,15 @@ async fn takes_a_certificate_for_another_name_only_when_not_checking_names() {
     assert!(matches!(error, Error::NotSent(_)), "{error}");
     assert!(server.seen.lock().unwrap().is_empty());
 
-    settings.verify_host = false;
-    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
+    settings.server.verify_host = false;
+    let sender = SmtpSender::<NoTokens>::new(settings.clone(), None);
     sender.send(&draft(), &Threading::default()).await.unwrap();
     assert_eq!(server.seen.lock().unwrap().len(), 1);
 
     // Not checking the name doesn't mean taking any certificate: one no
     // authority vouches for is not taken.
-    settings.ca_certificates.clear();
-    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    settings.server.ca_certificates.clear();
+    let sender = SmtpSender::<NoTokens>::new(settings, None);
     assert!(sender.send(&draft(), &Threading::default()).await.is_err());
     assert_eq!(server.seen.lock().unwrap().len(), 1);
 }
@@ -315,10 +315,10 @@ async fn takes_a_certificate_for_another_name_only_when_not_checking_names() {
 #[tokio::test]
 async fn a_wrong_password_is_an_authentication_error() {
     let server = server(false, Accept::Only("right")).await;
-    let login = Login::Password {
+    let login = Some(Login::Password {
         user: "me".into(),
         password: "wrong".into(),
-    };
+    });
     let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::StartTls), login);
     let error = sender
         .send(&draft(), &Threading::default())
@@ -357,10 +357,10 @@ async fn logs_in_with_an_oauth_token_and_asks_for_another_when_refused() {
         Mutex::new(vec!["stale-token", "good-token"]),
         Mutex::default(),
     );
-    let login = Login::OAuth {
+    let login = Some(Login::OAuth {
         user: "me@example.com".into(),
         tokens,
-    };
+    });
     let sender = SmtpSender::new(settings(&server, Security::StartTls), login);
     sender.send(&draft(), &Threading::default()).await.unwrap();
 
@@ -373,7 +373,7 @@ async fn logs_in_with_an_oauth_token_and_asks_for_another_when_refused() {
 #[tokio::test]
 async fn threads_a_reply_and_attaches_files() {
     let server = server(false, Accept::Everything).await;
-    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), Login::None);
+    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), None);
     let mut draft = draft();
     draft.attachments = vec![OutgoingAttachment {
         name: "notes.txt".into(),
@@ -402,7 +402,7 @@ async fn threads_a_reply_and_attaches_files() {
 #[tokio::test]
 async fn a_message_without_recipients_is_not_sent() {
     let server = server(false, Accept::Everything).await;
-    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), Login::None);
+    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), None);
     let error = sender
         .send(&Draft::default(), &Threading::default())
         .await
@@ -417,8 +417,8 @@ async fn an_unreachable_server_is_a_network_error() {
     drop(listener);
     let mut settings =
         SmtpSettings::new("127.0.0.1", Security::None, Address::new("me@example.com"));
-    settings.port = port;
-    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    settings.server.port = port;
+    let sender = SmtpSender::<NoTokens>::new(settings, None);
     let error = sender
         .send(&draft(), &Threading::default())
         .await
@@ -438,9 +438,9 @@ async fn a_server_that_never_answers_is_given_up_on() {
     });
     let mut settings =
         SmtpSettings::new("127.0.0.1", Security::None, Address::new("me@example.com"));
-    settings.port = port;
-    settings.timeout = std::time::Duration::from_millis(100);
-    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    settings.server.port = port;
+    settings.server.timeout = std::time::Duration::from_millis(100);
+    let sender = SmtpSender::<NoTokens>::new(settings, None);
     let error = sender
         .send(&draft(), &Threading::default())
         .await
@@ -455,10 +455,10 @@ async fn asks_for_another_token_when_refused_with_a_challenge() {
         Mutex::new(vec!["stale-token", "good-token"]),
         Mutex::default(),
     );
-    let login = Login::OAuth {
+    let login = Some(Login::OAuth {
         user: "me@example.com".into(),
         tokens,
-    };
+    });
     let sender = SmtpSender::new(settings(&server, Security::StartTls), login);
     sender.send(&draft(), &Threading::default()).await.unwrap();
     assert_eq!(server.seen.lock().unwrap().len(), 1);
@@ -467,8 +467,7 @@ async fn asks_for_another_token_when_refused_with_a_challenge() {
 #[tokio::test]
 async fn upgrades_when_the_server_offers_starttls_if_asked_to_only_then() {
     let server = server(false, Accept::Everything).await;
-    let sender =
-        SmtpSender::<NoTokens>::new(settings(&server, Security::StartTlsIfOffered), Login::None);
+    let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::StartTlsIfOffered), None);
     sender.send(&draft(), &Threading::default()).await.unwrap();
     assert!(server.seen.lock().unwrap()[0].encrypted);
 }

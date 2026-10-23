@@ -6,14 +6,14 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_imap::{Client, Session};
-use mett_core::{AccessToken, Error, Result};
+use mett_core::{AccessToken, Error, Result, Security};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-use crate::settings::{ImapSettings, Security};
+use crate::settings::ImapSettings;
 use crate::tls::client_config;
 
 /// A connection, encrypted or not.
@@ -98,6 +98,7 @@ pub(crate) async fn connect(
     settings: &ImapSettings,
     credentials: Credentials<'_>,
 ) -> std::result::Result<Session<Conn>, LoginFailure> {
+    let settings = &settings.server;
     let other = LoginFailure::Other;
     let timeout = settings.timeout;
     let tcp = within(

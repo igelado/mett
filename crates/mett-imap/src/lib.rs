@@ -30,5 +30,6 @@ mod store;
 mod tls;
 mod uidset;
 
-pub use settings::{ImapSettings, Login, NoTokens, Security};
+pub use mett_core::{Login, NoTokens, Security};
+pub use settings::ImapSettings;
 pub use store::{ImapMailStore, account};

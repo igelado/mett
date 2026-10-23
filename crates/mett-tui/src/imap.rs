@@ -5,7 +5,7 @@
 
 use mett_core::Address;
 use mett_imap::{ImapMailStore, ImapSettings, Login, NoTokens, Security};
-use mett_smtp::{Login as SmtpLogin, SmtpSender, SmtpSettings};
+use mett_smtp::{SmtpSender, SmtpSettings};
 
 use crate::config::Config;
 use crate::config::mailbox::{MailboxUrl, Server};
@@ -53,10 +53,10 @@ pub fn imap_settings(config: &Config, url: &MailboxUrl) -> Result<ImapSettings, 
     let server = imap_server(url)?;
     let mut settings = ImapSettings::new(&server.host, security(config, server)?);
     if let Some(port) = server.port {
-        settings.port = port;
+        settings.server.port = port;
     }
-    settings.verify_host = config.flag("ssl_verify_host");
-    settings.ca_certificates = certificates(config)?;
+    settings.server.verify_host = config.flag("ssl_verify_host");
+    settings.server.ca_certificates = certificates(config)?;
     Ok(settings)
 }
 
@@ -91,15 +91,15 @@ pub fn smtp_sender(
     let server = ServerUrl::parse(text, "smtp", "smtps").map_err(|e| format!("smtp_url: {e}"))?;
     let mut settings = SmtpSettings::new(&server.host, security(config, &server)?, from.clone());
     if let Some(port) = server.port {
-        settings.port = port;
+        settings.server.port = port;
     }
-    settings.verify_host = config.flag("ssl_verify_host");
-    settings.ca_certificates = certificates(config)?;
+    settings.server.verify_host = config.flag("ssl_verify_host");
+    settings.server.ca_certificates = certificates(config)?;
     // Like mutt, mett logs in only as the user the URL names; the password
     // is the URL's, or `smtp_pass`, or the mailbox's if the user is the same.
     // A URL with no user is a relay that takes mail without a login.
     let login = match &server.user {
-        None => SmtpLogin::None,
+        None => None,
         Some(user) => {
             let same_user = imap_login(config, url).ok().and_then(|login| match login {
                 Login::Password {
@@ -114,10 +114,10 @@ pub fn smtp_sender(
                 .or_else(|| Some(config.string("smtp_pass").to_owned()).filter(|p| !p.is_empty()))
                 .or(same_user)
                 .ok_or("smtp_pass is not set")?;
-            SmtpLogin::Password {
+            Some(Login::Password {
                 user: user.clone(),
                 password,
-            }
+            })
         }
     };
     Ok(Some(SmtpSender::new(settings, login)))
@@ -171,14 +171,14 @@ mod tests {
     fn imaps_is_tls_and_imap_upgrades_when_it_can() {
         let c = config("");
         let tls = imap_settings(&c, &url("imaps://me@mail.example.com/")).unwrap();
-        assert_eq!((tls.security, tls.port), (Security::Tls, 993));
+        assert_eq!((tls.server.security, tls.server.port), (Security::Tls, 993));
         let plain = imap_settings(&c, &url("imap://me@mail.example.com/")).unwrap();
         assert_eq!(
-            (plain.security, plain.port),
+            (plain.server.security, plain.server.port),
             (Security::StartTlsIfOffered, 143)
         );
         let ported = imap_settings(&c, &url("imap://me@mail.example.com:1143/")).unwrap();
-        assert_eq!(ported.port, 1143);
+        assert_eq!(ported.server.port, 1143);
     }
 
     #[test]
@@ -186,12 +186,12 @@ mod tests {
         let imap = url("imap://me@mail.example.com/");
         let required = config("set ssl_force_tls=yes\n");
         assert_eq!(
-            imap_settings(&required, &imap).unwrap().security,
+            imap_settings(&required, &imap).unwrap().server.security,
             Security::StartTls
         );
         let none = config("set ssl_starttls=no\n");
         assert_eq!(
-            imap_settings(&none, &imap).unwrap().security,
+            imap_settings(&none, &imap).unwrap().server.security,
             Security::None
         );
         let both = config("set ssl_starttls=no ssl_force_tls=yes\n");
@@ -202,16 +202,25 @@ mod tests {
         );
         // TLS from the start doesn't depend on them.
         let tls = url("imaps://me@mail.example.com/");
-        assert_eq!(imap_settings(&none, &tls).unwrap().security, Security::Tls);
+        assert_eq!(
+            imap_settings(&none, &tls).unwrap().server.security,
+            Security::Tls
+        );
     }
 
     #[test]
     fn verification_and_extra_authorities_follow_the_variables() {
         let imap = url("imaps://me@mail.example.com/");
-        assert!(imap_settings(&config(""), &imap).unwrap().verify_host);
+        assert!(
+            imap_settings(&config(""), &imap)
+                .unwrap()
+                .server
+                .verify_host
+        );
         assert!(
             !imap_settings(&config("set ssl_verify_host=no\n"), &imap)
                 .unwrap()
+                .server
                 .verify_host
         );
         let missing = config("set ssl_ca_certificate_file=/nonexistent/ca.pem\n");
@@ -226,7 +235,7 @@ mod tests {
         let written = dir.display().to_string().replace('\\', "/");
         let c = config(&format!("set ssl_ca_certificate_file={written}\n"));
         assert_eq!(
-            imap_settings(&c, &imap).unwrap().ca_certificates,
+            imap_settings(&c, &imap).unwrap().server.ca_certificates,
             [b"PEM".to_vec()]
         );
         let _ = std::fs::remove_file(&dir);

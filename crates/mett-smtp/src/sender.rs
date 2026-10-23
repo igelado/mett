@@ -1,55 +1,28 @@
 //! Sending over SMTP.
 
 use std::fmt;
-use std::time::Duration;
+use std::sync::OnceLock;
 
 use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Certificate, CertificateStore, Tls, TlsParameters};
 use lettre::transport::smtp::{self, AsyncSmtpTransport};
 use lettre::{Address as MailAddress, AsyncTransport, Tokio1Executor};
-use mett_core::{AccessToken, Address, Authenticator, Draft, Error, Result};
+use mett_core::{
+    AccessToken, Address, Authenticator, Draft, Error, Login, NoTokens, Result, Security,
+    ServerSettings,
+};
 
 use crate::compose::{Threading, compose};
-
-/// How the connection to the server is protected.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Security {
-    /// None: everything, passwords included, goes in plain text.
-    None,
-    /// The connection starts in plain text and is upgraded with STARTTLS
-    /// if the server offers it (mutt's `ssl_starttls` without
-    /// `ssl_force_tls`); one that doesn't is used in plain text.
-    StartTlsIfOffered,
-    /// The connection starts in plain text and is upgraded with STARTTLS
-    /// (and fails if the server won't).
-    #[default]
-    StartTls,
-    /// TLS from the first byte (the `smtps` port, 465).
-    Tls,
-}
 
 /// How to reach an SMTP server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SmtpSettings {
-    /// The server's name.
-    pub host: String,
-    /// Its port.
-    pub port: u16,
-    /// How the connection is protected.
-    pub security: Security,
-    /// Whether to check that the server's certificate is for the name the
-    /// connection is made to (mutt's `ssl_verify_host`). The certificate is
-    /// always checked against the authorities; turning this off leaves the
-    /// connection open to anyone with a certificate from one of them.
-    pub verify_host: bool,
-    /// Certificate authorities to trust besides the system's, as PEM.
-    pub ca_certificates: Vec<Vec<u8>>,
+    /// The server, and how to trust it. A whole send is given three times
+    /// the server's `timeout`.
+    pub server: ServerSettings,
     /// The sender's address, for messages that don't name another.
     pub from: Address,
-    /// How long to wait for the server at each step; a whole send is given
-    /// three times as long.
-    pub timeout: Duration,
 }
 
 impl SmtpSettings {
@@ -57,70 +30,22 @@ impl SmtpSettings {
     /// the checks on: 25 (and 587 for STARTTLS, which is what servers
     /// ask clients to use) or 465.
     pub fn new(host: impl Into<String>, security: Security, from: Address) -> Self {
+        let port = match security {
+            Security::None => 25,
+            Security::StartTls | Security::StartTlsIfOffered => 587,
+            Security::Tls => 465,
+        };
         Self {
-            host: host.into(),
-            port: match security {
-                Security::None => 25,
-                Security::StartTls | Security::StartTlsIfOffered => 587,
-                Security::Tls => 465,
-            },
-            security,
-            verify_host: true,
-            ca_certificates: Vec::new(),
+            server: ServerSettings::new(host, port, security),
             from,
-            timeout: Duration::from_secs(60),
         }
-    }
-}
-
-/// How to log in to the server.
-pub enum Login<A = NoTokens> {
-    /// Without logging in.
-    None,
-    /// With a password (SASL PLAIN or LOGIN).
-    Password {
-        /// The user name.
-        user: String,
-        /// The password.
-        password: String,
-    },
-    /// With an OAuth2 access token (SASL XOAUTH2).
-    OAuth {
-        /// The user name.
-        user: String,
-        /// The source of tokens.
-        tokens: A,
-    },
-}
-
-impl<A> fmt::Debug for Login<A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::None => f.write_str("None"),
-            Self::Password { user, .. } => f
-                .debug_struct("Password")
-                .field("user", user)
-                .field("password", &"<redacted>")
-                .finish(),
-            Self::OAuth { user, .. } => f.debug_struct("OAuth").field("user", user).finish(),
-        }
-    }
-}
-
-/// The tokens of a [`Login`] that uses none.
-#[derive(Clone, Copy, Debug)]
-pub struct NoTokens;
-
-impl Authenticator for NoTokens {
-    async fn access_token(&self) -> Result<AccessToken> {
-        Err(Error::Auth("there is no OAuth2 sign-in".into()))
     }
 }
 
 /// Sends mail through an SMTP server.
 pub struct SmtpSender<A = NoTokens> {
     settings: SmtpSettings,
-    login: Login<A>,
+    login: Option<Login<A>>,
 }
 
 impl<A> fmt::Debug for SmtpSender<A> {
@@ -133,8 +58,9 @@ impl<A> fmt::Debug for SmtpSender<A> {
 }
 
 impl<A: Authenticator> SmtpSender<A> {
-    /// A sender for the server `settings` describe, logging in as `login`.
-    pub fn new(settings: SmtpSettings, login: Login<A>) -> Self {
+    /// A sender for the server `settings` describe, logging in as `login`
+    /// (or, with `None`, without logging in).
+    pub fn new(settings: SmtpSettings, login: Option<Login<A>>) -> Self {
         Self { settings, login }
     }
 
@@ -161,7 +87,7 @@ impl<A: Authenticator> SmtpSender<A> {
         )
         .map_err(|e| Error::NotSent(e.to_string()))?;
         match &self.login {
-            Login::OAuth { user, tokens } => {
+            Some(Login::OAuth { user, tokens }) => {
                 let token = tokens.access_token().await.map_err(not_sent)?;
                 let sent = self
                     .deliver(&envelope, &composed.sent, Some(oauth(user, &token)), true)
@@ -179,12 +105,12 @@ impl<A: Authenticator> SmtpSender<A> {
                 self.deliver(&envelope, &composed.sent, Some(oauth(user, &fresh)), true)
                     .await?;
             }
-            Login::Password { user, password } => {
+            Some(Login::Password { user, password }) => {
                 let credentials = Credentials::new(user.clone(), password.clone());
                 self.deliver(&envelope, &composed.sent, Some(credentials), false)
                     .await?;
             }
-            Login::None => {
+            None => {
                 self.deliver(&envelope, &composed.sent, None, false).await?;
             }
         }
@@ -198,7 +124,7 @@ impl<A: Authenticator> SmtpSender<A> {
         credentials: Option<Credentials>,
         xoauth2: bool,
     ) -> Result<()> {
-        let settings = &self.settings;
+        let settings = &self.settings.server;
         let tls = || {
             let mut tls = TlsParameters::builder(settings.host.clone());
             for pem in &settings.ca_certificates {
@@ -212,10 +138,8 @@ impl<A: Authenticator> SmtpSender<A> {
                 // (its platform verifier is all or nothing): the system's,
                 // which are loaded here, and the extra ones above.
                 tls = tls.certificate_store(CertificateStore::None);
-                for root in rustls_native_certs::load_native_certs().certs {
-                    if let Ok(root) = Certificate::from_der(root.to_vec()) {
-                        tls = tls.add_root_certificate(root);
-                    }
+                for root in native_roots() {
+                    tls = tls.add_root_certificate(root.clone());
                 }
                 tls = tls.dangerous_accept_invalid_hostnames(true);
             }
@@ -251,6 +175,27 @@ impl<A: Authenticator> SmtpSender<A> {
             ))),
         }
     }
+}
+
+/// The system's certificate authorities, as lettre takes them. They are
+/// loaded once per process: loading reads the system's store, which is too
+/// much to do for each message.
+///
+/// Only `verify_host` off needs them. TLS here and in `mett-imap` is
+/// verified by two stacks with the same intent but one difference: with
+/// `verify_host` on, both use the platform verifier (system roots plus the
+/// extra ones), but with it off lettre can only skip the name check by
+/// verifying the chain itself against a root store, so it doesn't apply the
+/// platform's policy; IMAP's verifier forgives only a name mismatch.
+fn native_roots() -> &'static [Certificate] {
+    static ROOTS: OnceLock<Vec<Certificate>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        rustls_native_certs::load_native_certs()
+            .certs
+            .into_iter()
+            .filter_map(|root| Certificate::from_der(root.to_vec()).ok())
+            .collect()
+    })
 }
 
 fn oauth(user: &str, token: &AccessToken) -> Credentials {
@@ -317,4 +262,14 @@ fn handshake_failed(e: &smtp::Error) -> bool {
         source = error.source();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::native_roots;
+
+    #[test]
+    fn the_system_roots_are_loaded_once() {
+        assert!(std::ptr::eq(native_roots(), native_roots()));
+    }
 }

@@ -14,6 +14,7 @@ mod invitation;
 mod join;
 mod message;
 mod ports;
+mod server;
 
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
@@ -35,3 +36,4 @@ pub use ports::{
     AccessToken, Authenticator, FolderChanges, MailSender, MailStore, MessagePage, Page,
     RECENT_UNREAD,
 };
+pub use server::{Login, NoTokens, Security, ServerSettings};

@@ -105,8 +105,14 @@ for an Exchange Online token. `mett-tui` picks the adapter at startup
 (`use_ews`); an enum of the two implements the ports by delegating, so the
 worker stays generic over a single type.
 
+`mett-core` holds the connection settings both mail adapters share
+(`ServerSettings`, `Security`, `Login`). The two keep their own TLS stacks
+(lettre's, and rustls through `async-imap`); both verify with the platform
+verifier, except that with `verify_host` off lettre must check the chain
+itself against the system's roots, without the platform's policy.
+
 `mett-smtp` sends a `Draft` over SMTP (plain, STARTTLS or TLS; a password or
-an OAuth2 token for the login), wrapping the `lettre` crate. It also writes
+an OAuth2 token for the login, or none), wrapping the `lettre` crate. It also writes
 the `Draft` as the MIME message (`compose`), which a mailbox that keeps its
 own Sent and Drafts folders (IMAP) stores. Replies are threaded by the
 `Message-ID:` and `References:` of the original, which the caller looks up
