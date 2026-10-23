@@ -7,6 +7,7 @@
 
 mod attachment;
 mod draft;
+mod draft_session;
 mod error;
 mod folder;
 mod ids;
@@ -20,6 +21,7 @@ pub mod mock;
 
 pub use attachment::{Attachment, AttachmentKind, OutgoingAttachment, content_type_for};
 pub use draft::{Draft, DraftOrigin};
+pub use draft_session::{DraftBackend, DraftSession, is_recalled, may_be_left, unsent};
 pub use error::{Error, Result};
 pub use folder::{Folder, UnknownWellKnownFolder, WellKnownFolder};
 pub use ids::{AccountId, AttachmentId, FolderId, MessageId, PageCursor, SyncState};
