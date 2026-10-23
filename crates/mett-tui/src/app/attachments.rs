@@ -3,6 +3,7 @@
 //! (`a` and `D` in the compose menu).
 
 use super::StatusKind;
+use super::retry::{Retry, RetryKind};
 use std::path::PathBuf;
 
 use mett_core::{Attachment, AttachmentKind, MessageId, OutgoingAttachment};
@@ -137,7 +138,11 @@ impl App {
             effects.push(request);
         }
         // While its menu is there (under the help, say).
-        if let Some((message, attachment, to)) = self.unfetched_attachment.take()
+        if let Some(Retry::Attach {
+            message,
+            attachment,
+            to,
+        }) = self.retries.take(RetryKind::Attach)
             && self
                 .screens
                 .iter()
@@ -308,7 +313,11 @@ impl App {
             Ok(data) => data,
             // Fetched again once the user signs in.
             Err(e @ mett_core::Error::Auth(_)) => {
-                self.unfetched_attachment = Some((message, attachment, to));
+                self.retries.push(Retry::Attach {
+                    message,
+                    attachment,
+                    to,
+                });
                 self.report(e);
                 return Vec::new();
             }

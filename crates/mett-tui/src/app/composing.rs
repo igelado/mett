@@ -8,6 +8,7 @@ use mett_core::{Address, Draft, DraftOrigin, Message, WellKnownFolder};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::mailbox::Choose;
+use super::retry::{Retry, RetryKind};
 use super::{App, Effect, Screen, effect_id};
 use crate::action::Action;
 use crate::alias;
@@ -271,7 +272,7 @@ impl App {
                 // Without a sign-in, the sign-in window's Retry starts the
                 // reply or forward again.
                 if matches!(e, mett_core::Error::Auth(_)) {
-                    self.compose_unfetched = Some((message, kind));
+                    self.retries.push(Retry::ComposeFetch { id: message, kind });
                 }
                 self.report(e);
                 Vec::new()
@@ -282,7 +283,8 @@ impl App {
     /// Starts again a reply or forward whose message couldn't be fetched
     /// for want of a sign-in, if its message is still the one selected.
     pub(super) fn retry_compose_fetch(&mut self) -> Vec<Effect> {
-        let Some((id, kind)) = self.compose_unfetched.take() else {
+        let Some(Retry::ComposeFetch { id, kind }) = self.retries.take(RetryKind::ComposeFetch)
+        else {
             return Vec::new();
         };
         let selected = self.messages.get(self.selected).map(|m| &m.id);
@@ -576,7 +578,7 @@ impl App {
             // So does a browser to open again after a sign-in.
             Question::OpenMailbox | Question::SaveTo | Question::CopyTo => {
                 self.browsed = None;
-                self.unbrowsed = None;
+                self.retries.forget(RetryKind::Browse);
                 self.question_message = None;
             }
             Question::Search | Question::Limit | Question::Command | Question::AttachFile => {}

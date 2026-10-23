@@ -3,6 +3,7 @@
 //! changing folders, and the folder browser.
 
 use super::StatusKind;
+use super::retry::{Retry, RetryKind};
 use std::collections::{HashMap, HashSet};
 
 use mett_core::{Error, FlagsUpdate, Folder, FolderId, MessageId, Page, WellKnownFolder};
@@ -332,7 +333,7 @@ impl App {
     /// Acts on the mailbox the user typed.
     pub(super) fn answer_mailbox(&mut self, question: Question, text: String) -> Vec<Effect> {
         // Answered: a browser to open again after a sign-in is moot.
-        self.unbrowsed = None;
+        self.retries.forget(RetryKind::Browse);
         if text.trim().is_empty() {
             // Nothing chosen: the question is over.
             self.browsed = None;
@@ -462,7 +463,7 @@ impl App {
             let (ids, to) = (transfer_ids(request), destination(request));
             let folder_ids = &self.folder_ids;
             let mut again: Option<HashSet<&MessageId>> = None;
-            for (failed, retry) in &mut self.failed_transfers {
+            for (failed, retry) in self.retries.transfers_mut() {
                 // Moved again, anywhere (or purged again): the earlier one
                 // is moot.
                 let same = *transfer != Transfer::Copy
@@ -552,7 +553,7 @@ impl App {
     /// Sends again the moves, copies and purges that failed for want of a
     /// sign-in.
     pub(super) fn retry_transfers(&mut self) -> Vec<Effect> {
-        let failed = std::mem::take(&mut self.failed_transfers);
+        let failed = self.retries.take_transfers();
         self.writes.extend(
             failed
                 .into_iter()
@@ -573,7 +574,7 @@ impl App {
         self.transfer_failures
             .remove(&(id.clone(), Transfer::Purge, None));
         let mut emptied = false;
-        for (transfer, retry) in &mut self.failed_transfers {
+        for (transfer, retry) in self.retries.transfers_mut() {
             if *transfer == Transfer::Purge {
                 let ids = transfer_ids_mut(retry);
                 let before = ids.len();
@@ -589,8 +590,8 @@ impl App {
 
     /// Forgets the retries left with no messages.
     fn prune_retries(&mut self) {
-        self.failed_transfers
-            .retain(|(_, retry)| !transfer_ids(retry).is_empty());
+        self.retries
+            .retain_transfers(|_, retry| !transfer_ids(retry).is_empty());
     }
 
     /// Cancels a purge question: nothing is purged, now or by a retry,
@@ -602,8 +603,8 @@ impl App {
 
     /// Gives up a purge to retry after a sign-in: the user said not to.
     fn give_up_purge_retries(&mut self) {
-        self.failed_transfers
-            .retain(|(transfer, _)| *transfer != Transfer::Purge);
+        self.retries
+            .retain_transfers(|transfer, _| transfer != Transfer::Purge);
         self.transfer_failures
             .retain(|(_, transfer, _), _| *transfer != Transfer::Purge);
     }
@@ -625,13 +626,13 @@ impl App {
     pub(super) fn change_folder(&mut self, path: FolderPath) -> Vec<Effect> {
         // A recall on its way gives way to the folder the user wants.
         self.recall = None;
-        self.unrecalled = false;
+        self.retries.forget(RetryKind::Recall);
         if self.folder.is_none() {
             self.reset_folder();
             self.path = path;
             return self.open_folder();
         }
-        self.unswitched = None;
+        self.retries.forget(RetryKind::Switch);
         let request = self.request(Request::OpenFolder(path.clone()));
         self.switching = Some((effect_id(&request), path));
         self.status.info("Opening folder...");
@@ -646,7 +647,7 @@ impl App {
         match result {
             Ok(folder) => {
                 // An earlier folder change waiting for a sign-in is moot.
-                self.unswitched = None;
+                self.retries.forget(RetryKind::Switch);
                 self.see_index();
                 self.reset_folder();
                 self.previous = Some(std::mem::replace(&mut self.path, path));
@@ -662,7 +663,7 @@ impl App {
             Err(e) => {
                 // Without a sign-in, the sign-in window's Retry opens it.
                 if matches!(e, Error::Auth(_)) {
-                    self.unswitched = Some(path);
+                    self.retries.push(Retry::Switch(path));
                 }
                 self.report(e);
                 Vec::new()
@@ -672,9 +673,10 @@ impl App {
 
     /// Opens again the folder whose opening failed for want of a sign-in.
     pub(super) fn retry_switch(&mut self) -> Vec<Effect> {
-        self.unswitched
-            .take()
-            .map_or_else(Vec::new, |path| self.change_folder(path))
+        match self.retries.take(RetryKind::Switch) {
+            Some(Retry::Switch(path)) => self.change_folder(path),
+            _ => Vec::new(),
+        }
     }
 
     /// Forgets the open folder's index. Moves, copies and saves that are
@@ -703,8 +705,7 @@ impl App {
         self.listing_page = None;
         self.unlisted = None;
         self.pending = None;
-        self.unfetched = None;
-        self.unfetched_search = None;
+        self.retries.forget(RetryKind::Open);
         self.relist_on_return = false;
         self.saved_flags.clear();
         self.removed_while_listing.clear();
@@ -736,7 +737,7 @@ impl App {
                 Write::Transfer(transfer, request) => follow(*transfer, request),
             }
         }
-        for (transfer, request) in &mut self.failed_transfers {
+        for (transfer, request) in self.retries.transfers_mut() {
             follow(*transfer, request);
         }
         self.prune_retries();
@@ -806,7 +807,7 @@ impl App {
                 // A purge to retry after a sign-in still quits or leaves
                 // once it is done; one that failed otherwise doesn't.
                 if matches!(e, Error::Auth(_)) {
-                    self.failed_transfers.push((transfer, request));
+                    self.retries.push(Retry::Transfer(transfer, request));
                 } else if transfer == Transfer::Purge {
                     self.then = None;
                 }
@@ -903,7 +904,7 @@ impl App {
         // fails for want of a sign-in once more, which is retried now.
         let folder_ids = &self.folder_ids;
         let unauthorized_ids: HashSet<&MessageId> = unauthorized.iter().collect();
-        for (failed, retry) in &mut self.failed_transfers {
+        for (failed, retry) in self.retries.transfers_mut() {
             if transfer == Transfer::Purge {
                 transfer_ids_mut(retry).retain(|id| !done.contains(id));
             } else if *failed == transfer {
@@ -920,8 +921,8 @@ impl App {
         // window.
         let unauthorized_count = unauthorized.len();
         if !unauthorized.is_empty() {
-            self.failed_transfers
-                .push((transfer, with_ids(request, unauthorized)));
+            self.retries
+                .push(Retry::Transfer(transfer, with_ids(request, unauthorized)));
         }
         if let Some(e) = failure {
             // Whatever failed stays where it was, still marked; don't go
@@ -1048,7 +1049,7 @@ impl App {
     pub(super) fn open_browser(&mut self, purpose: Choose) -> Vec<Effect> {
         // This one takes the place of a browser to open again after a
         // sign-in.
-        self.unbrowsed = None;
+        self.retries.forget(RetryKind::Browse);
         // As in mutt, the mailboxes come first, if there are any; the
         // browser can switch to every folder.
         if !self.mailboxes.is_empty() {
@@ -1107,8 +1108,10 @@ impl App {
     /// Opens again the browser whose folders couldn't be listed for want of
     /// a sign-in.
     pub(super) fn retry_browser(&mut self) -> Vec<Effect> {
-        match self.unbrowsed.take() {
-            Some(purpose) if matches!(self.screen(), Screen::Index | Screen::Pager(_)) => {
+        match self.retries.take(RetryKind::Browse) {
+            Some(Retry::Browse(purpose))
+                if matches!(self.screen(), Screen::Index | Screen::Pager(_)) =>
+            {
                 // The browser takes the keys, not the question it answers,
                 // which comes back when it closes.
                 self.input = None;
@@ -1156,7 +1159,7 @@ impl App {
                 if matches!(e, Error::Auth(_))
                     && let Some(Screen::Browser(browser)) = self.screens.last()
                 {
-                    self.unbrowsed = Some(browser.purpose.clone());
+                    self.retries.push(Retry::Browse(browser.purpose.clone()));
                 }
                 self.leave_browser(None);
                 // Back at the question, which hides the status: say why

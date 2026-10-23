@@ -2,6 +2,137 @@
 
 use super::*;
 
+/// What failed for want of a sign-in, to do again when the user signs in
+/// and retries.
+#[derive(Debug)]
+pub(super) enum Retry {
+    /// Opening the message that failed to open, with the pager search that
+    /// was waiting for it.
+    Open {
+        id: MessageId,
+        search: Option<String>,
+    },
+    /// Changing to the folder that couldn't be found.
+    Switch(FolderPath),
+    /// Opening again the browser whose folders couldn't be listed.
+    Browse(mailbox::Choose),
+    /// Starting again the recall of a postponed message.
+    Recall,
+    /// Fetching again an attachment, and what for.
+    Attach {
+        message: MessageId,
+        attachment: mett_core::Attachment,
+        to: attachments::Use,
+    },
+    /// Starting again a reply or forward whose message couldn't be fetched.
+    ComposeFetch { id: MessageId, kind: Kind },
+    /// Sending again a move, copy or purge.
+    Transfer(Transfer, Request),
+}
+
+/// What a [`Retry`] is, apart from what it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RetryKind {
+    Open,
+    Switch,
+    Browse,
+    Recall,
+    Attach,
+    ComposeFetch,
+    Transfer,
+}
+
+impl Retry {
+    fn kind(&self) -> RetryKind {
+        match self {
+            Self::Open { .. } => RetryKind::Open,
+            Self::Switch(_) => RetryKind::Switch,
+            Self::Browse(_) => RetryKind::Browse,
+            Self::Recall => RetryKind::Recall,
+            Self::Attach { .. } => RetryKind::Attach,
+            Self::ComposeFetch { .. } => RetryKind::ComposeFetch,
+            Self::Transfer(..) => RetryKind::Transfer,
+        }
+    }
+}
+
+/// Everything waiting for a retry. Each kind but transfers keeps only the
+/// last one pushed, which takes the place of the one before. [`App::retry`]
+/// takes them in an order of its own, not the order they were pushed in.
+#[derive(Debug, Default)]
+pub(super) struct Retries(Vec<Retry>);
+
+impl Retries {
+    /// Keeps `retry` for the next retry, in place of an earlier one of its
+    /// kind (unless it's a transfer, of which there may be many).
+    pub(super) fn push(&mut self, retry: Retry) {
+        let kind = retry.kind();
+        if kind != RetryKind::Transfer {
+            self.forget(kind);
+        }
+        self.0.push(retry);
+    }
+
+    /// Takes the retry of `kind`, if there is one.
+    pub(super) fn take(&mut self, kind: RetryKind) -> Option<Retry> {
+        let at = self.0.iter().position(|r| r.kind() == kind)?;
+        Some(self.0.remove(at))
+    }
+
+    /// Drops what is kept of `kind`: it no longer holds.
+    pub(super) fn forget(&mut self, kind: RetryKind) {
+        self.0.retain(|r| r.kind() != kind);
+    }
+
+    /// Drops what the user gave up on by dismissing the sign-in window: a
+    /// reply or forward, and a recall. (The rest is kept: it is work already
+    /// asked for, which a later retry still does.)
+    pub(super) fn dismiss(&mut self) {
+        self.forget(RetryKind::ComposeFetch);
+        self.forget(RetryKind::Recall);
+    }
+
+    /// Takes every transfer.
+    pub(super) fn take_transfers(&mut self) -> Vec<(Transfer, Request)> {
+        let (transfers, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|r| r.kind() == RetryKind::Transfer);
+        self.0 = rest;
+        transfers
+            .into_iter()
+            .filter_map(|r| match r {
+                Retry::Transfer(transfer, request) => Some((transfer, request)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The transfers, to change in place.
+    pub(super) fn transfers_mut(&mut self) -> impl Iterator<Item = (&mut Transfer, &mut Request)> {
+        self.0.iter_mut().filter_map(|r| match r {
+            Retry::Transfer(transfer, request) => Some((transfer, request)),
+            _ => None,
+        })
+    }
+
+    /// The transfers.
+    #[cfg(test)]
+    pub(super) fn transfers(&self) -> impl Iterator<Item = (&Transfer, &Request)> {
+        self.0.iter().filter_map(|r| match r {
+            Retry::Transfer(transfer, request) => Some((transfer, request)),
+            _ => None,
+        })
+    }
+
+    /// Keeps the transfers `keep` says to, and everything else.
+    pub(super) fn retain_transfers(&mut self, mut keep: impl FnMut(Transfer, &Request) -> bool) {
+        self.0.retain(|r| match r {
+            Retry::Transfer(transfer, request) => keep(*transfer, request),
+            _ => true,
+        });
+    }
+}
+
 impl App {
     /// The server throttled request `id`, which is tried again after
     /// `wait`, for the `attempt`th time.
@@ -113,8 +244,10 @@ impl App {
         // Open the message that failed to open, if it is still the one
         // selected. (Opening another message forgets the failure.) The
         // screen, not the menu: another sign-in window may be over it.
-        let failed = self.unfetched.take();
-        let search = self.unfetched_search.take();
+        let (failed, search) = match self.retries.take(RetryKind::Open) {
+            Some(Retry::Open { id, search }) => (Some(id), search),
+            _ => (None, None),
+        };
         let selected = self.messages.get(self.selected).map(|s| &s.id);
         if failed.is_some() && failed.as_ref() == selected && self.screen() == &Screen::Index {
             effects.extend(self.open_selected());
@@ -175,5 +308,43 @@ impl App {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod retries_tests {
+    use super::*;
+
+    fn named(name: &str) -> FolderPath {
+        FolderPath::Named(vec![name.to_owned()])
+    }
+
+    #[test]
+    fn the_last_retry_of_a_kind_takes_the_place_of_the_one_before() {
+        let mut retries = Retries::default();
+        retries.push(Retry::Switch(named("a")));
+        retries.push(Retry::Recall);
+        retries.push(Retry::Switch(named("b")));
+        assert!(matches!(
+            retries.take(RetryKind::Switch),
+            Some(Retry::Switch(path)) if path == named("b")
+        ));
+        assert!(retries.take(RetryKind::Switch).is_none(), "taken once");
+        assert!(retries.take(RetryKind::Recall).is_some());
+    }
+
+    #[test]
+    fn dismissing_gives_up_only_what_the_user_didnt_ask_to_retry() {
+        let mut retries = Retries::default();
+        retries.push(Retry::Recall);
+        retries.push(Retry::ComposeFetch {
+            id: MessageId::new("m"),
+            kind: Kind::Reply,
+        });
+        retries.push(Retry::Switch(named("a")));
+        retries.dismiss();
+        assert!(retries.take(RetryKind::Recall).is_none());
+        assert!(retries.take(RetryKind::ComposeFetch).is_none());
+        assert!(retries.take(RetryKind::Switch).is_some());
     }
 }
