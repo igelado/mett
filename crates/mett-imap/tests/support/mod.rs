@@ -309,10 +309,11 @@ impl Session {
             if greet {
                 let _ = stream.write_all(b"* OK IMAP4rev1 ready\r\n").await;
             }
+            let mut ahead = false;
             loop {
-                // A command already in the buffer was sent without waiting
-                // for the answer to the one before it.
-                let queued = !stream.buffer().is_empty();
+                // A command that came before the answer to the one before
+                // it was sent without waiting for that answer.
+                let queued = ahead || !stream.buffer().is_empty();
                 let Some((line, literal)) = command(&mut stream).await else {
                     break;
                 };
@@ -325,6 +326,17 @@ impl Session {
                     state.commands.push(rest.clone());
                     state.pipelined += u32::from(queued);
                 }
+                // Whether the next is already on its way (or sent after
+                // the answer, which a client that waits does) is not left
+                // to the timing of the packets: the answers to these wait
+                // a little for the next.
+                if (upper.starts_with("STATUS ") || upper.starts_with("LIST "))
+                    && stream.buffer().is_empty()
+                {
+                    let wait = std::time::Duration::from_millis(100);
+                    let _ = tokio::time::timeout(wait, stream.fill_buf()).await;
+                }
+                ahead = !stream.buffer().is_empty();
                 let mut out = String::new();
                 let ok =
                     |out: &mut String, text: &str| out.push_str(&format!("{tag} OK {text}\r\n"));

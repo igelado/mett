@@ -510,7 +510,7 @@ async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
 
 /// How many `STATUS` commands go out before the answers are read: no
 /// more than a server (or the connection, in both directions) takes
-/// unanswered, and the time allowed is for each round.
+/// unanswered.
 const PIPELINE: usize = 50;
 
 /// How many messages `names` hold, from the server, asked of without
@@ -523,7 +523,9 @@ async fn counted(live: &mut Live, names: &[&str], timeout: Duration) -> Res<Coun
             .iter()
             .map(|name| format!("STATUS {} (MESSAGES UNSEEN)", quoted(&wire(name))))
             .collect();
-        let got = bounded(timeout, batch(live, &commands)).await?;
+        // The time allowed is for each of them: a server may take each
+        // that long.
+        let got = bounded(timeout * round.len() as u32, batch(live, &commands)).await?;
         for (name, ended) in round.iter().zip(got.ended) {
             ended?;
             // A server that says nothing of a folder says it is empty.
