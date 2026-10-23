@@ -127,16 +127,29 @@ pub(crate) fn message(folder: &str, validity: u32, fetched: &Fetched) -> Result<
     let text: Vec<_> = (0..parsed.text_body_count())
         .filter_map(|n| parsed.body_text(n))
         .collect();
+    // Mail with HTML only (which the parser may not count as text): the
+    // HTML is the body.
+    let body = if text.is_empty() && parsed.html_body_count() > 0 {
+        let html: Vec<_> = (0..parsed.html_body_count())
+            .filter_map(|n| parsed.body_html(n))
+            .collect();
+        Body {
+            kind: BodyKind::Html,
+            content: html.join("\n"),
+        }
+    } else {
+        Body {
+            kind: BodyKind::Text,
+            content: text.join("\n"),
+        }
+    };
     Ok(Message {
         summary,
         cc: addresses(parsed.cc()),
         bcc: addresses(parsed.bcc()),
         reply_to: addresses(parsed.reply_to()),
         internet_message_id: parsed.message_id().map(bracketed),
-        body: Body {
-            kind: BodyKind::Text,
-            content: text.join("\n"),
-        },
+        body,
         invitation: None,
     })
 }

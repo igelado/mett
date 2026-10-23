@@ -121,7 +121,9 @@ named by their names on the server and messages by folder, `UIDVALIDITY` and
 `UID`, so a message that moves is a new one, as with Graph. IMAP can't say
 what changed in a folder as the Exchange APIs do (without the `QRESYNC`
 extension, which isn't used), so this adapter neither syncs nor watches
-folders, and mett doesn't cache its mailbox.
+folders, and mett doesn't cache its mailbox. To find what is new it remembers
+how each folder stood (the next `UID`, and with `CONDSTORE` the modification
+sequence); messages are ordered by date with `SORT` where the server has it.
 `mett-tui` picks IMAP when the `spoolfile` is an `imap://` or `imaps://` URL.
 
 - **Pros:**

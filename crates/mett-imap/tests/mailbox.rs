@@ -978,3 +978,248 @@ async fn a_message_that_has_gone_is_not_found() {
             .is_empty()
     );
 }
+
+fn dated(subject: &str, date: &str) -> String {
+    format!(
+        "From: a@example.org\nTo: me@example.com\nSubject: {subject}\nDate: {date}\nMessage-ID: <{subject}@example.org>\n\nbody\n"
+    )
+}
+
+#[tokio::test]
+async fn lists_messages_by_the_dates_they_say_where_the_server_can_sort() {
+    let (server, store) = plain().await;
+    deliver(
+        &server,
+        "INBOX",
+        &dated("middle", "Tue, 20 Oct 2026 09:00:00 +0000"),
+        &[],
+    );
+    deliver(
+        &server,
+        "INBOX",
+        &dated("newest", "Wed, 21 Oct 2026 09:00:00 +0000"),
+        &[],
+    );
+    // Arrived last, with an old date: the UID is the highest, the date the lowest.
+    deliver(
+        &server,
+        "INBOX",
+        &dated("oldest", "Thu, 01 Oct 2026 09:00:00 +0000"),
+        &[],
+    );
+    let inbox = FolderId::new("INBOX");
+    let subjects = |page: &mett_core::MessagePage| {
+        page.messages
+            .iter()
+            .map(|m| m.subject.clone())
+            .collect::<Vec<_>>()
+    };
+    let first = store.list_messages(&inbox, Page::first(2)).await.unwrap();
+    assert_eq!(subjects(&first), ["newest", "middle"]);
+    let second = store
+        .list_messages(&inbox, Page::after(first.next.clone().unwrap(), 2))
+        .await
+        .unwrap();
+    assert_eq!(subjects(&second), ["oldest"]);
+    assert!(second.next.is_none());
+
+    // Where it can't, by UID.
+    server.state.lock().unwrap().no_sort = true;
+    let (_, unsorted) = {
+        let settings = settings(&server, Security::None);
+        ((), ImapMailStore::new(settings, login(), Address::new(ME)))
+    };
+    let page = unsorted
+        .list_messages(&inbox, Page::first(3))
+        .await
+        .unwrap();
+    assert_eq!(subjects(&page), ["oldest", "newest", "middle"]);
+}
+
+#[tokio::test]
+async fn sees_flags_another_client_changed_where_the_server_tracks_changes() {
+    let (server, store) = plain().await;
+    let read = deliver(&server, "INBOX", &simple("read"), &["\\Seen"]);
+    let other = deliver(&server, "INBOX", &simple("other"), &["\\Seen"]);
+    let inbox = FolderId::new("INBOX");
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    // The first look only marks where the folder stands.
+    assert!(
+        store
+            .changed_messages(&inbox, since, Page::first(10))
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+    assert!(
+        store
+            .recent_unread(&inbox, Some(since))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Another client marks an old message unread and another flagged.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.set_flags("INBOX", read, &[]);
+        state.set_flags("INBOX", other, &["\\Seen", "\\Flagged"]);
+    }
+    let changed = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    let mut subjects: Vec<_> = changed.messages.iter().map(|m| m.subject.clone()).collect();
+    subjects.sort();
+    assert_eq!(subjects, ["other", "read"]);
+    let unread = store.recent_unread(&inbox, Some(since)).await.unwrap();
+    assert_eq!(unread.len(), 1);
+    assert!(unread[0].0.as_str().contains(&format!(".{read}.")));
+
+    // Seen once, they are not changed again.
+    assert!(
+        store
+            .changed_messages(&inbox, since, Page::first(10))
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn pages_of_changes_keep_the_mark_of_the_first() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("first"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    store
+        .changed_messages(&inbox, since, Page::first(2))
+        .await
+        .unwrap();
+    for n in 0..5 {
+        deliver(&server, "INBOX", &simple(&format!("copied {n}")), &[]);
+    }
+    let mut page = store
+        .changed_messages(&inbox, since, Page::first(2))
+        .await
+        .unwrap();
+    let mut all = page.messages.clone();
+    while let Some(next) = page.next.clone() {
+        page = store
+            .changed_messages(&inbox, since, Page::after(next, 2))
+            .await
+            .unwrap();
+        all.extend(page.messages.clone());
+    }
+    assert_eq!(all.len(), 5);
+}
+
+#[tokio::test]
+async fn finds_new_mail_without_condstore_by_uid_and_date() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_condstore = true;
+    let store = {
+        let settings = settings(&server, Security::None);
+        drop(store);
+        ImapMailStore::new(settings, login(), Address::new(ME))
+    };
+    deliver(&server, "INBOX", &simple("old"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    assert!(
+        store
+            .changed_messages(&inbox, since, Page::first(10))
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+    deliver(&server, "INBOX", &simple("copied in"), &[]);
+    let changed = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(changed.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn the_day_before_is_searched_for_the_zone_the_server_dates_in() {
+    let (server, store) = plain().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        // 22 Oct 01:00 UTC, as the server wrote it, a day earlier.
+        state.deliver_dated(
+            "INBOX",
+            &simple("late evening"),
+            "21-Oct-2026 18:00:00 -0700",
+        );
+    }
+    let inbox = FolderId::new("INBOX");
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:30:00Z")
+        .unwrap()
+        .to_utc();
+    let changed = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(changed.messages.len(), 1);
+    let before = since + chrono::TimeDelta::hours(1);
+    let changed = store
+        .changed_messages(&inbox, before, Page::first(10))
+        .await
+        .unwrap();
+    assert!(changed.messages.is_empty());
+}
+
+#[tokio::test]
+async fn reads_html_only_mail_in_parts_as_html() {
+    let (server, store) = plain().await;
+    let raw = mail(
+        "Rich",
+        "news@example.org",
+        "me@example.com",
+        "Content-Type: multipart/mixed; boundary=b\n",
+        "--b\nContent-Type: text/html; charset=utf-8\n\n<p>Hello <b>there</b></p>\n--b--",
+    );
+    deliver(&server, "INBOX", &raw, &[]);
+    let page = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(1))
+        .await
+        .unwrap();
+    let message = store.fetch_message(&page.messages[0].id).await.unwrap();
+    assert!(message.body.content.contains("Hello"), "{:?}", message.body);
+}
+
+#[tokio::test]
+async fn the_folder_of_a_message_is_known_only_while_it_is_there() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("here"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    assert_eq!(store.message_folder(&id).await.unwrap(), inbox);
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .clear();
+    assert!(matches!(
+        store.message_folder(&id).await,
+        Err(Error::NotFound { .. })
+    ));
+}

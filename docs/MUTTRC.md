@@ -450,7 +450,10 @@ set realname  = "Alice Example"
 - **Limits.** mett logs in with a password only (`LOGIN`; OAuth2 isn't
   wired to the configuration yet). IMAP can't tell what changed in a folder,
   so mett doesn't cache the mailbox and looks again every `mail_check`
-  seconds rather than being told when mail arrives. Threads are those of
+  seconds rather than being told when mail arrives (flags that another client
+  changes are noticed that way only where the server has `CONDSTORE`). The
+  index is in the order of the messages' dates where the server has `SORT`,
+  and of their arrival (UID) where it hasn't. Threads are those of
   `References:`. Meeting invitations aren't shown as such (their `text/calendar`
   part is an attachment) and can't be answered.
 

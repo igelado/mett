@@ -7,8 +7,9 @@ implements `mett-core`'s ports against any IMAP server:
 
 - **`ImapMailStore`** implements `MailStore`: folders (their roles from the
   server's `SPECIAL-USE` attributes, or their usual names; counts from
-  `STATUS`), messages (newest first, a page at a time by `UID`; threaded by
-  `References:`), message bodies (HTML-only mail as text) and attachments,
+  `STATUS`), messages (newest first by their dates where the server has
+  `SORT`, by `UID` where it hasn't; a page at a time; threaded by
+  `References:`), message bodies (HTML-only mail as HTML) and attachments,
   read and flagged state, move (`MOVE`, else copy and delete), copy and delete
   (`UID EXPUNGE` when the server has `UIDPLUS`), new-mail checks, and drafts
   (appended to the Drafts folder, with `\Draft`).
@@ -31,8 +32,13 @@ one of a folder the server made anew is gone.
 
 Limits: IMAP can't say what changed in a folder as Exchange's APIs do (no
 `QRESYNC`, no `IDLE` yet), so the adapter neither syncs nor watches, and mett
-doesn't cache its mailbox; meeting invitations are attachments, not answered;
-the folder listing counts messages with a `STATUS` for each folder.
+doesn't cache its mailbox. To find what is new it remembers, for each folder,
+the `UID` the next message would have and, with `CONDSTORE`, the modification
+sequence: mail copied in with an old date and flags that another client
+changed are found that way; without `CONDSTORE`, a flag another client
+changed is seen when the folder is opened again. Meeting invitations are
+attachments, not answered; the folder listing counts messages with a
+`STATUS` for each folder.
 
 The configuration (`imaps://` URLs, `imap_user`, `imap_pass`, `smtp_url`,
 `ssl_*`) is described in [docs/MUTTRC.md](../../docs/MUTTRC.md) §4.13.

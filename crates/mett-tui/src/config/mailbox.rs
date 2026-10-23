@@ -142,9 +142,16 @@ impl MailboxUrl {
         self
     }
 
-    /// Whether the mailbox is `account`'s: an IMAP URL that names no user
-    /// is of any user at its server.
-    pub fn is_of(&self, account: &AccountId) -> bool {
+    /// Whether the mailbox is `account`'s, at the server of `base` (the
+    /// URL of the account's mailboxes, `folder`), if that is a mailbox URL:
+    /// the same kind of server and, for IMAP, the same host and port. An
+    /// IMAP URL that names no user is of any user at its server.
+    pub fn is_of(&self, account: &AccountId, base: &str) -> bool {
+        if let Ok(base) = MailboxUrl::parse(base)
+            && !self.same_server(&base)
+        {
+            return false;
+        }
         if self.account.as_str().eq_ignore_ascii_case(account.as_str()) {
             return true;
         }
@@ -153,6 +160,18 @@ impl MailboxUrl {
                 .as_str()
                 .rsplit_once('@')
                 .is_some_and(|(_, host)| host.eq_ignore_ascii_case(&server.host)),
+            _ => false,
+        }
+    }
+
+    /// Whether both mailboxes are on the same server.
+    fn same_server(&self, other: &Self) -> bool {
+        match (&self.server, &other.server) {
+            (Server::Office365, Server::Office365) => true,
+            (Server::Imap(a), Server::Imap(b)) => {
+                let port = |s: &ServerUrl| s.port.unwrap_or(if s.tls { 993 } else { 143 });
+                a.host.eq_ignore_ascii_case(&b.host) && port(a) == port(b)
+            }
             _ => false,
         }
     }
@@ -258,7 +277,7 @@ pub fn folder_path(
     let expanded = expand_shortcut(text.trim(), folder);
     let url = if is_url(&expanded) {
         let url = MailboxUrl::parse(&expanded)?;
-        if !url.is_of(account) {
+        if !url.is_of(account, folder) {
             return Err(MailboxError(format!(
                 "{expanded}: mett can only use folders of {account}"
             )));
@@ -505,5 +524,28 @@ mod tests {
         assert!(path("imaps://mail.example.com/INBOX").is_ok());
         assert!(path("imaps://other.example.com/INBOX").is_err());
         assert!(path("imaps://you@mail.example.com/INBOX").is_err());
+    }
+
+    #[test]
+    fn a_folder_is_of_the_server_of_the_account_not_another_with_the_same_user() {
+        let account = AccountId::new("me@example.org");
+        let folder = "imaps://me%40example.org@mail.example.org/";
+        let path = |text| folder_path(text, folder, &account);
+        assert!(path("imaps://me%40example.org@mail.example.org/INBOX").is_ok());
+        // The same user at another server isn't this mailbox.
+        assert!(path("imaps://me%40example.org@other.example.net/INBOX").is_err());
+        // Nor is the same host on another port.
+        assert!(path("imaps://me%40example.org@mail.example.org:1993/INBOX").is_err());
+        // Nor Office365's.
+        assert!(path("msgraph://me@example.org/@inbox").is_err());
+        // Without a base that is a mailbox, the account is all there is to go by.
+        assert!(
+            folder_path(
+                "imaps://me%40example.org@other.example.net/INBOX",
+                "~/Mail",
+                &account
+            )
+            .is_ok()
+        );
     }
 }

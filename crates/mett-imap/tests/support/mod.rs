@@ -24,6 +24,7 @@ use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 #[derive(Clone, Debug)]
 pub struct Msg {
     pub uid: u32,
+    pub modseq: u64,
     pub flags: BTreeSet<String>,
     pub internal: String,
     pub raw: Vec<u8>,
@@ -35,6 +36,7 @@ pub struct Folder {
     pub attributes: Vec<String>,
     pub validity: u32,
     pub next_uid: u32,
+    pub modseq: u64,
     pub messages: Vec<Msg>,
 }
 
@@ -45,6 +47,7 @@ impl Folder {
             attributes: attributes.iter().map(|a| (*a).to_owned()).collect(),
             validity: 1000,
             next_uid: 1,
+            modseq: 1,
             messages: Vec::new(),
         }
     }
@@ -63,6 +66,30 @@ pub struct State {
     pub no_uidplus: bool,
     /// Leaves `MOVE` out of it.
     pub no_move: bool,
+    /// Leaves `SORT` out of it.
+    pub no_sort: bool,
+    /// Leaves `CONDSTORE` out of it.
+    pub no_condstore: bool,
+}
+
+impl State {
+    /// Another client changes the flags of a message.
+    pub fn set_flags(&mut self, name: &str, uid: u32, flags: &[&str]) {
+        let folder = self.folder(name);
+        folder.modseq += 1;
+        let modseq = folder.modseq;
+        let m = folder.messages.iter_mut().find(|m| m.uid == uid).unwrap();
+        m.flags = flags.iter().map(|f| (*f).to_owned()).collect();
+        m.modseq = modseq;
+    }
+
+    /// Mail arrives with the date it was first delivered with.
+    pub fn deliver_dated(&mut self, name: &str, raw: &str, internal: &str) -> u32 {
+        let uid = self.deliver(name, raw, &[]);
+        let folder = self.folder(name);
+        folder.messages.last_mut().unwrap().internal = internal.into();
+        uid
+    }
 }
 
 impl State {
@@ -78,8 +105,10 @@ impl State {
         let folder = self.folder(name);
         let uid = folder.next_uid;
         folder.next_uid += 1;
+        folder.modseq += 1;
         folder.messages.push(Msg {
             uid,
+            modseq: folder.modseq,
             flags: flags.iter().map(|f| (*f).to_owned()).collect(),
             internal: "20-Oct-2026 10:00:00 +0000".into(),
             raw: raw.replace('\n', "\r\n").into_bytes(),
@@ -258,15 +287,17 @@ impl Session {
                     } else {
                         ""
                     };
-                    let (uidplus, moves) = {
+                    let (uidplus, moves, sort, condstore) = {
                         let state = self.state.lock().unwrap();
                         (
                             if state.no_uidplus { "" } else { " UIDPLUS" },
                             if state.no_move { "" } else { " MOVE" },
+                            if state.no_sort { "" } else { " SORT" },
+                            if state.no_condstore { "" } else { " CONDSTORE" },
                         )
                     };
                     out.push_str(&format!(
-                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2{uidplus}{moves}\r\n"
+                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2{uidplus}{moves}{sort}{condstore}\r\n"
                     ));
                     ok(&mut out, "done");
                 } else if upper == "STARTTLS" {
@@ -393,11 +424,24 @@ impl Session {
                 None => out.push_str(&format!("{tag} NO [NONEXISTENT] no such folder\r\n")),
             }
         } else if upper.starts_with("SELECT ") {
-            let name = unquote(&rest[7..]);
+            let (name, condstore) = match rest[7..].split_once(" (") {
+                Some((name, _)) => (unquote(name), true),
+                None => (unquote(&rest[7..]), false),
+            };
+            let modseq = if condstore && !state.no_condstore {
+                state
+                    .folders
+                    .iter()
+                    .find(|f| f.name == name)
+                    .map(|f| format!("* OK [HIGHESTMODSEQ {}] ok\r\n", f.modseq))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             match state.folders.iter().find(|f| f.name == name) {
                 Some(f) => {
                     out.push_str(&format!(
-                        "* {} EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY {}] ok\r\n* OK [UIDNEXT {}] ok\r\n* FLAGS (\\Seen \\Flagged \\Draft \\Deleted)\r\n{tag} OK [READ-WRITE] done\r\n",
+                        "* {} EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY {}] ok\r\n* OK [UIDNEXT {}] ok\r\n{modseq}* FLAGS (\\Seen \\Flagged \\Draft \\Deleted)\r\n{tag} OK [READ-WRITE] done\r\n",
                         f.messages.len(),
                         f.validity,
                         f.next_uid
@@ -420,8 +464,10 @@ impl Session {
             };
             let uid = folder.next_uid;
             folder.next_uid += 1;
+            folder.modseq += 1;
             folder.messages.push(Msg {
                 uid,
+                modseq: folder.modseq,
                 flags,
                 internal: "21-Oct-2026 09:00:00 +0000".into(),
                 raw: literal.unwrap_or_default(),
@@ -479,62 +525,48 @@ impl Session {
             out.push_str(&format!("{tag} BAD nothing selected\r\n"));
             return;
         };
-        if let Some(criteria) = upper.strip_prefix("SEARCH ") {
-            let folder = state.folder(&name);
+        if upper.starts_with("SEARCH ") {
             let words: Vec<&str> = rest[7..].split_whitespace().collect();
-            let _ = criteria;
-            let folder_uids: Vec<u32> = folder.messages.iter().map(|m| m.uid).collect();
-            let mut found = Vec::new();
-            for m in &folder.messages {
-                let mut keep = true;
-                let mut i = 0;
-                while i < words.len() {
-                    match words[i].to_uppercase().as_str() {
-                        "ALL" => {}
-                        "UNSEEN" => keep &= !m.flags.contains("\\Seen"),
-                        "DELETED" => keep &= m.flags.contains("\\Deleted"),
-                        "UID" => {
-                            i += 1;
-                            let all: Vec<u32> = folder_uids.clone();
-                            keep &= uids(words[i], &all).contains(&m.uid);
-                        }
-                        "SINCE" => {
-                            // The day, which the server compares with the
-                            // day it took the message in.
-                            i += 1;
-                            keep &= since(&m.internal, words[i]);
-                        }
-                        "HEADER" => {
-                            let (field, value) = (words[i + 1], unquote(words[i + 2]));
-                            i += 2;
-                            let header = String::from_utf8_lossy(&header_of(&m.raw)).to_string();
-                            keep &= header.lines().any(|l| {
-                                l.to_lowercase()
-                                    .starts_with(&format!("{}:", field.to_lowercase()))
-                                    && l.contains(&value)
-                            });
-                        }
-                        other => panic!("search key {other}"),
-                    }
-                    i += 1;
-                }
-                if keep {
-                    found.push(m.uid.to_string());
-                }
-            }
+            let found = matching(state.folder(&name), &words);
+            let found: Vec<String> = found.iter().map(u32::to_string).collect();
             let list = if found.is_empty() {
                 String::new()
             } else {
                 format!(" {}", found.join(" "))
             };
             out.push_str(&format!("* SEARCH{list}\r\n{tag} OK done\r\n"));
+        } else if upper.starts_with("SORT ") {
+            // SORT (REVERSE DATE) US-ASCII criteria...
+            let words: Vec<&str> = rest[5..].split_whitespace().skip(3).collect();
+            let folder = state.folder(&name);
+            let mut found = matching(folder, &words);
+            let date = |uid: &u32| {
+                let m = folder.messages.iter().find(|m| m.uid == *uid).unwrap();
+                String::from_utf8_lossy(&header_of(&m.raw))
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Date: "))
+                    .and_then(|d| chrono::DateTime::parse_from_rfc2822(d.trim()).ok())
+                    .map(|d| d.timestamp())
+                    .unwrap_or(0)
+            };
+            found.sort_by_key(|uid| std::cmp::Reverse((date(uid), *uid)));
+            let found: Vec<String> = found.iter().map(u32::to_string).collect();
+            let list = if found.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", found.join(" "))
+            };
+            out.push_str(&format!("* SORT{list}\r\n{tag} OK done\r\n"));
         } else if upper.starts_with("FETCH ") {
             let folder = state.folder(&name);
             let all: Vec<u32> = folder.messages.iter().map(|m| m.uid).collect();
             let (set, items) = rest[6..].split_once(' ').unwrap_or((&rest[6..], ""));
             let wanted = uids(set, &all);
+            let changed_since: Option<u64> = items
+                .split_once("CHANGEDSINCE ")
+                .and_then(|(_, n)| n.trim_end_matches(')').trim().parse().ok());
             for (n, m) in folder.messages.iter().enumerate() {
-                if !wanted.contains(&m.uid) {
+                if !wanted.contains(&m.uid) || changed_since.is_some_and(|c| m.modseq <= c) {
                     continue;
                 }
                 let flags = m.flags.iter().cloned().collect::<Vec<_>>().join(" ");
@@ -574,8 +606,11 @@ impl Session {
                 .map(str::to_owned)
                 .collect();
             let silent = how.contains("SILENT");
+            folder.modseq += 1;
+            let modseq = folder.modseq;
             for (n, m) in folder.messages.iter_mut().enumerate() {
                 if uids(set, &all).contains(&m.uid) {
+                    m.modseq = modseq;
                     for flag in &flags {
                         if how.starts_with('+') {
                             m.flags.insert(flag.clone());
@@ -617,6 +652,8 @@ impl Session {
             for mut m in taken {
                 m.uid = target.next_uid;
                 target.next_uid += 1;
+                target.modseq += 1;
+                m.modseq = target.modseq;
                 target.messages.push(m);
             }
             out.push_str(&format!("{tag} OK done\r\n"));
@@ -624,6 +661,49 @@ impl Session {
             out.push_str(&format!("{tag} BAD unknown UID command\r\n"));
         }
     }
+}
+
+/// The UIDs of the messages of `folder` that the search keys match.
+fn matching(folder: &Folder, words: &[&str]) -> Vec<u32> {
+    let folder_uids: Vec<u32> = folder.messages.iter().map(|m| m.uid).collect();
+    let mut found = Vec::new();
+    for m in &folder.messages {
+        let mut keep = true;
+        let mut i = 0;
+        while i < words.len() {
+            match words[i].to_uppercase().as_str() {
+                "ALL" => {}
+                "UNSEEN" => keep &= !m.flags.contains("\\Seen"),
+                "DELETED" => keep &= m.flags.contains("\\Deleted"),
+                "UID" => {
+                    i += 1;
+                    keep &= uids(words[i], &folder_uids).contains(&m.uid);
+                }
+                "SINCE" => {
+                    // The day, which the server compares with the day it
+                    // took the message in.
+                    i += 1;
+                    keep &= since(&m.internal, words[i]);
+                }
+                "HEADER" => {
+                    let (field, value) = (words[i + 1], unquote(words[i + 2]));
+                    i += 2;
+                    let header = String::from_utf8_lossy(&header_of(&m.raw)).to_string();
+                    keep &= header.lines().any(|l| {
+                        l.to_lowercase()
+                            .starts_with(&format!("{}:", field.to_lowercase()))
+                            && l.contains(&value)
+                    });
+                }
+                other => panic!("search key {other}"),
+            }
+            i += 1;
+        }
+        if keep {
+            found.push(m.uid);
+        }
+    }
+    found
 }
 
 /// Whether a message dated `internal` (`20-Oct-2026 10:00:00 +0000`) is

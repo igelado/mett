@@ -16,10 +16,14 @@
 //!
 //! IMAP can't tell what changed in a folder as Exchange's APIs can, so
 //! this adapter doesn't sync (mett doesn't cache it) or watch folders:
-//! mett asks again.
+//! mett asks again, and the adapter remembers how each folder stood the last
+//! time (the next `UID` and, with `CONDSTORE`, the modification sequence) to
+//! find what is new. Messages are listed in the order of their dates where
+//! the server can sort (`SORT`), and by `UID` where it can't.
 
 mod conn;
 mod ids;
+mod marks;
 mod parse;
 mod settings;
 mod store;

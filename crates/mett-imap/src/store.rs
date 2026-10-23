@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_imap::Session;
-use async_imap::imap_proto::NameAttribute;
+use async_imap::imap_proto::{MailboxDatum, NameAttribute, Response, Status};
 use async_imap::types::{Fetch, Flag, Name};
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
@@ -15,12 +15,11 @@ use mett_core::{
 };
 use mett_smtp::{SmtpSender, Threading};
 use tokio::sync::{Mutex, MutexGuard};
-
-use std::sync::Mutex as Blocking;
 use utf7_imap::{decode_utf7_imap, encode_utf7_imap};
 
 use crate::conn::{self, Conn, Credentials, LoginFailure, within};
 use crate::ids::Ref;
+use crate::marks::{Floor, Marks, Watch};
 use crate::parse::{self, Fetched};
 use crate::settings::{ImapSettings, Login, NoTokens};
 
@@ -63,6 +62,10 @@ struct Caps {
     moves: bool,
     /// `UIDPLUS`, which expunges just the messages asked for.
     uidplus: bool,
+    /// `SORT`, which orders messages by their dates.
+    sort: bool,
+    /// `CONDSTORE`, which tells what changed since a modification sequence.
+    condstore: bool,
 }
 
 /// A connection that is logged in.
@@ -85,18 +88,8 @@ pub struct ImapMailStore<A = NoTokens> {
     from: Address,
     smtp: Option<SmtpSender<A>>,
     live: Mutex<Option<Live>>,
-    /// Where the `UID`s of each folder had got to when it was last asked
-    /// about new mail, by what asked.
-    marks: Blocking<HashMap<(Watch, String), (u32, u32)>>,
-}
-
-/// What asks about new mail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Watch {
-    /// [`MailStore::changed_messages`].
-    Changes,
-    /// [`MailStore::recent_unread`].
-    Unread,
+    /// How each folder stood when it was last asked about new mail.
+    marks: Marks,
 }
 
 impl<A: Authenticator> ImapMailStore<A> {
@@ -109,7 +102,7 @@ impl<A: Authenticator> ImapMailStore<A> {
             from,
             smtp: None,
             live: Mutex::new(None),
-            marks: Blocking::default(),
+            marks: Marks::default(),
         }
     }
 
@@ -118,21 +111,6 @@ impl<A: Authenticator> ImapMailStore<A> {
     pub fn with_smtp(mut self, smtp: SmtpSender<A>) -> Self {
         self.smtp = Some(smtp);
         self
-    }
-
-    /// The `UID` the folder's next message had when `watch` last asked, if
-    /// it was the same folder (`validity`); and notes `selected` for the next
-    /// time. Messages from there on are new, whatever their dates say: mail
-    /// copied or moved in keeps its old `INTERNALDATE`.
-    fn arrivals(&self, watch: Watch, folder: &str, selected: &Selected) -> Option<u32> {
-        let mut marks = self.marks.lock().expect("no panic holds the marks");
-        let before = marks.insert(
-            (watch, folder.to_owned()),
-            (selected.validity, selected.next),
-        );
-        before
-            .filter(|(validity, _)| *validity == selected.validity)
-            .map(|(_, next)| next)
     }
 
     /// The account: the user at the server.
@@ -175,6 +153,8 @@ impl<A: Authenticator> ImapMailStore<A> {
             caps: Caps {
                 moves: caps.has_str("MOVE"),
                 uidplus: caps.has_str("UIDPLUS"),
+                sort: caps.has_str("SORT"),
+                condstore: caps.has_str("CONDSTORE") || caps.has_str("QRESYNC"),
             },
             used: Instant::now(),
         })
@@ -479,17 +459,38 @@ struct Selected {
     validity: u32,
     /// The `UID` the next message to come in will have.
     next: u32,
+    /// How many messages it holds.
+    exists: u32,
+    /// Its highest modification sequence, if the server has them.
+    modseq: Option<u64>,
+}
+
+impl Selected {
+    /// How the folder stands.
+    fn floor(&self) -> Floor {
+        Floor {
+            next: self.next,
+            modseq: self.modseq,
+        }
+    }
 }
 
 /// Selects `name`.
 async fn select(live: &mut Live, name: &str) -> Res<Selected> {
-    let mailbox = live.session.select(wire(name)).await.map_err(|e| match e {
+    let selected = if live.caps.condstore {
+        live.session.select_condstore(wire(name)).await
+    } else {
+        live.session.select(wire(name)).await
+    };
+    let mailbox = selected.map_err(|e| match e {
         async_imap::error::Error::No(_) => Fail::Core(Error::not_found("folder", name)),
         e => Fail::Imap(e),
     })?;
     Ok(Selected {
         validity: mailbox.uid_validity.unwrap_or(0),
         next: mailbox.uid_next.unwrap_or(0),
+        exists: mailbox.exists,
+        modseq: mailbox.highest_modseq,
     })
 }
 
@@ -537,31 +538,145 @@ async fn search(live: &mut Live, query: &str) -> Res<Vec<u32>> {
     Ok(uids)
 }
 
-/// A page of the newest messages of `folder`: of all of them, or of `only`
-/// (newest first).
+/// The UIDs a search finds in the selected folder, newest first by the
+/// dates the messages say, where the server can sort, and else by UID.
+async fn ordered(live: &mut Live, criteria: &str) -> Res<Vec<u32>> {
+    if !live.caps.sort {
+        return search(live, criteria).await;
+    }
+    let id = live
+        .session
+        .run_command(format!("UID SORT (REVERSE DATE) US-ASCII {criteria}"))
+        .await?;
+    let mut found = Vec::new();
+    loop {
+        let response = live
+            .session
+            .read_response()
+            .await
+            .map_err(async_imap::error::Error::Io)?;
+        let Some(response) = response else {
+            return Err(async_imap::error::Error::ConnectionLost.into());
+        };
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::Sort(uids)) => found.clone_from(uids),
+            Response::Done {
+                tag,
+                status,
+                outcome,
+            } if tag.0 == id.0 => {
+                let why = outcome
+                    .information
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_owned();
+                return match status {
+                    Status::Ok => Ok(found),
+                    Status::No => Err(async_imap::error::Error::No(why).into()),
+                    _ => Err(async_imap::error::Error::Bad(why).into()),
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Where a page starts: after the message it says it got to, if that is
+/// still there, else where it counted to.
+fn start_of(cursor: Option<&PageCursor>, all: &[u32]) -> usize {
+    let Some((counted, last)) =
+        cursor
+            .and_then(|c| c.as_str().split_once(':'))
+            .and_then(|(counted, last)| {
+                Some((counted.parse::<usize>().ok()?, last.parse::<u32>().ok()?))
+            })
+    else {
+        return 0;
+    };
+    all.iter()
+        .position(|uid| *uid == last)
+        .map_or(counted.min(all.len()), |at| at + 1)
+}
+
+/// A page of the newest messages of `folder`: of all of them, or of `only`.
 async fn page_of(
     live: &mut Live,
     folder: &str,
-    only: Option<Vec<u32>>,
+    only: Option<BTreeSet<u32>>,
     page: &Page,
 ) -> Res<MessagePage> {
     let validity = select(live, folder).await?.validity;
     let all = match only {
-        Some(only) => only,
-        None => search(live, "ALL").await?,
+        Some(only) if only.is_empty() => Vec::new(),
+        Some(only) => ordered(live, &format!("UID {}", set(only))).await?,
+        None => ordered(live, "ALL").await?,
     };
-    let after = page.cursor().and_then(|c| c.as_str().parse::<u32>().ok());
-    let rest: Vec<u32> = all
-        .into_iter()
-        .filter(|u| after.is_none_or(|after| *u < after))
-        .collect();
+    let start = start_of(page.cursor(), &all);
     let size = page.size() as usize;
-    let taken = &rest[..rest.len().min(size)];
-    let next = (rest.len() > size)
-        .then(|| taken.last().map(|u| PageCursor::new(u.to_string())))
+    let taken = &all[start..(start + size).min(all.len())];
+    let next = (start + size < all.len())
+        .then(|| {
+            taken
+                .last()
+                .map(|uid| PageCursor::new(format!("{}:{uid}", start + taken.len())))
+        })
         .flatten();
     let messages = summaries(live, folder, validity, taken).await?;
     Ok(MessagePage { messages, next })
+}
+
+/// The messages that came in at or after `since` (the server dates them by
+/// the day, in its own zone, so this asks for the day before too, and
+/// keeps those that did by the minute).
+async fn arrived_since(live: &mut Live, since: DateTime<Utc>, unseen: bool) -> Res<BTreeSet<u32>> {
+    let day = day(since - chrono::TimeDelta::days(1));
+    let query = if unseen {
+        format!("UNSEEN SINCE {day}")
+    } else {
+        format!("SINCE {day}")
+    };
+    let uids: Vec<u32> = search(live, &query).await?;
+    let dates: HashMap<u32, Option<DateTime<Utc>>> =
+        fetch(live, &uids, "(UID FLAGS INTERNALDATE)", false)
+            .await?
+            .into_iter()
+            .map(|f| (f.uid, f.internal))
+            .collect();
+    Ok(uids
+        .into_iter()
+        .filter(|uid| {
+            dates
+                .get(uid)
+                .copied()
+                .flatten()
+                .is_none_or(|at| at >= since)
+        })
+        .collect())
+}
+
+/// What is new in the selected folder since `floor`: the messages from its
+/// `UID` on, which came in (even if they are as old as the mail that was
+/// copied in), and, where the server has modification sequences, those that
+/// changed since it (a flag another client changed too).
+async fn changed_since(live: &mut Live, selected: &Selected, floor: Floor) -> Res<BTreeSet<u32>> {
+    let mut changed = BTreeSet::new();
+    match floor.modseq.filter(|_| live.caps.condstore) {
+        Some(modseq) if selected.exists > 0 => {
+            let fetches: Vec<Fetch> = live
+                .session
+                .uid_fetch("1:*", format!("(UID FLAGS) (CHANGEDSINCE {modseq})"))
+                .await?
+                .try_collect()
+                .await?;
+            changed.extend(fetches.iter().filter_map(|f| f.uid));
+        }
+        Some(_) => {}
+        None => {
+            let fresh = search(live, &format!("UID {}:*", floor.next)).await?;
+            changed.extend(fresh.into_iter().filter(|uid| *uid >= floor.next));
+        }
+    }
+    Ok(changed)
 }
 
 /// `IMAP`'s date for a search: the day, which is as exact as it gets.
@@ -609,44 +724,59 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let r = bounded(t, async {
             let live = g.live();
             let selected = select(live, folder.as_str()).await?;
-            let arrived = self.arrivals(Watch::Unread, folder.as_str(), &selected);
-            // IMAP dates what it took in by the day, so this asks for the
-            // days since and keeps what came in after `since`. Messages
-            // since the last time this asked are new, whatever their dates.
-            let query = match since {
-                Some(since) => format!("UNSEEN SINCE {}", day(since)),
-                None => "UNSEEN".to_owned(),
-            };
-            let mut uids: BTreeSet<u32> = search(live, &query).await?.into_iter().collect();
-            let fresh: BTreeSet<u32> = match arrived {
-                Some(next) => search(live, &format!("UNSEEN UID {next}:*"))
-                    .await?
-                    .into_iter()
-                    .filter(|uid| *uid >= next)
-                    .collect(),
-                None => BTreeSet::new(),
-            };
-            uids.extend(&fresh);
-            let uids: Vec<u32> = uids.into_iter().collect();
-            let found = fetch(live, &uids, "(UID FLAGS INTERNALDATE)", false).await?;
-            let now = Utc::now();
+            let floor = self
+                .marks
+                .floor(Watch::Unread, folder.as_str(), selected.validity, true);
+            // What came in at or after `since`, and what is new since the
+            // last time this asked, whatever its date says (it may have
+            // been copied in, or marked unread by another client).
+            let mut found: HashMap<u32, DateTime<Utc>> = HashMap::new();
+            let unseen: BTreeSet<u32> = search(live, "UNSEEN").await?.into_iter().collect();
+            if let Some(since) = since {
+                let dated = arrived_since(live, since, true).await?;
+                let dates = fetch(
+                    live,
+                    &dated.iter().copied().collect::<Vec<_>>(),
+                    "(UID FLAGS INTERNALDATE)",
+                    false,
+                )
+                .await?;
+                found.extend(dates.into_iter().filter_map(|f| Some((f.uid, f.internal?))));
+            } else {
+                let dates = fetch(
+                    live,
+                    &unseen.iter().copied().collect::<Vec<_>>(),
+                    "(UID FLAGS INTERNALDATE)",
+                    false,
+                )
+                .await?;
+                found.extend(dates.into_iter().filter_map(|f| Some((f.uid, f.internal?))));
+            }
+            if let Some(floor) = floor {
+                let now = Utc::now();
+                for uid in changed_since(live, &selected, floor).await? {
+                    if unseen.contains(&uid) {
+                        found.insert(uid, now);
+                    }
+                }
+            }
+            self.marks.commit(
+                Watch::Unread,
+                folder.as_str(),
+                selected.validity,
+                selected.floor(),
+                floor,
+            );
             let mut out: Vec<(MessageId, DateTime<Utc>)> = found
                 .into_iter()
-                .filter_map(|f| {
-                    let (at, new) = if fresh.contains(&f.uid) {
-                        (now, true)
-                    } else {
-                        (f.internal?, false)
-                    };
-                    (new || since.is_none_or(|s| at >= s)).then(|| {
-                        let id = Ref {
-                            folder: folder.as_str().to_owned(),
-                            validity: selected.validity,
-                            uid: f.uid,
-                        }
-                        .id();
-                        (id, at)
-                    })
+                .map(|(uid, at)| {
+                    let id = Ref {
+                        folder: folder.as_str().to_owned(),
+                        validity: selected.validity,
+                        uid,
+                    }
+                    .id();
+                    (id, at)
                 })
                 .collect();
             out.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
@@ -692,37 +822,36 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     ) -> Result<MessagePage> {
         let mut g = self.lock().await?;
         let t = g.timeout;
+        let first = page.cursor().is_none();
         let r = bounded(t, async {
             let live = g.live();
             let selected = select(live, folder.as_str()).await?;
-            let arrived = self.arrivals(Watch::Changes, folder.as_str(), &selected);
-            // The server dates what it took in by the day, so this asks
-            // for the days since and keeps what came in after `since`;
-            // and what came in since the last time this asked, whatever its
-            // date says.
-            let mut uids: BTreeSet<u32> = search(live, &format!("SINCE {}", day(since)))
-                .await?
-                .into_iter()
-                .collect();
-            let recent = fetch(
-                live,
-                &uids.iter().copied().collect::<Vec<_>>(),
-                "(UID FLAGS INTERNALDATE)",
-                false,
-            )
-            .await?;
-            uids.retain(|uid| {
-                recent
-                    .iter()
-                    .find(|f| f.uid == *uid)
-                    .is_none_or(|f| f.internal.is_none_or(|at| at >= since))
-            });
-            if let Some(next) = arrived {
-                let fresh = search(live, &format!("UID {next}:*")).await?;
-                uids.extend(fresh.into_iter().filter(|uid| *uid >= next));
+            // The pages of one scan compare with how the folder stood when
+            // its first began, so that the mark can move on at once.
+            let floor = self
+                .marks
+                .floor(Watch::Changes, folder.as_str(), selected.validity, first);
+            let uids = match floor {
+                Some(floor) => changed_since(live, &selected, floor).await?,
+                None => BTreeSet::new(),
+            };
+            // Without a mark to compare with, or beyond it, what came in
+            // after `since`, by the dates the server gives.
+            let mut uids = uids;
+            if floor.is_none_or(|f| f.modseq.is_none() || !live.caps.condstore) {
+                uids.extend(arrived_since(live, since, false).await?);
             }
-            let uids: Vec<u32> = uids.into_iter().rev().collect();
-            page_of(live, folder.as_str(), Some(uids), &page).await
+            let page = page_of(live, folder.as_str(), Some(uids), &page).await?;
+            if first {
+                self.marks.commit(
+                    Watch::Changes,
+                    folder.as_str(),
+                    selected.validity,
+                    selected.floor(),
+                    floor,
+                );
+            }
+            Ok(page)
         })
         .await;
         g.done(r)
@@ -746,7 +875,21 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     }
 
     async fn message_folder(&self, id: &MessageId) -> Result<FolderId> {
-        Ok(Ref::parse(id)?.folder_id())
+        let at = Ref::parse(id)?;
+        let mut g = self.lock().await?;
+        let t = g.timeout;
+        let r = bounded(t, async {
+            let live = g.live();
+            select_ref(live, &at).await?;
+            // Not just the folder the identifier names: the message has to
+            // be there still.
+            if search(live, &format!("UID {}", at.uid)).await?.is_empty() {
+                return Err(Error::not_found("message", id).into());
+            }
+            Ok(at.folder_id())
+        })
+        .await;
+        g.done(r)
     }
 
     async fn list_attachments(&self, message: &MessageId) -> Result<Vec<Attachment>> {
