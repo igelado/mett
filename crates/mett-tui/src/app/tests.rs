@@ -983,3 +983,67 @@ fn the_mailbox_tells_the_users_own_addresses_once() {
     let effects = listed(&mut app, list, Vec::new(), None);
     assert!(effects.is_empty(), "{effects:?}");
 }
+
+/// The folder's counts, counted afresh.
+fn counted(app: &App) -> (usize, usize) {
+    (
+        app.folder_messages().filter(|m| !m.flags.read).count(),
+        app.folder_messages().filter(|m| m.flags.flagged).count(),
+    )
+}
+
+#[test]
+fn the_folder_counts_follow_the_messages() {
+    let (mut app, more) = opened(Settings::default(), 24, summaries(3), Some("p2"));
+    assert_eq!(app.folder_counts(), counted(&app));
+    // Asked again, the same.
+    let before = app.folder_counts();
+    assert_eq!(app.folder_counts(), before);
+    // Flags change.
+    act(&mut app, Action::ToggleNew);
+    assert_eq!(app.folder_counts(), counted(&app));
+    assert_ne!(app.folder_counts(), before);
+    act(&mut app, Action::FlagMessage);
+    act(&mut app, Action::NextEntry);
+    act(&mut app, Action::FlagMessage);
+    assert_eq!(app.folder_counts().1, 2);
+    assert_eq!(app.folder_counts(), counted(&app));
+    act(&mut app, Action::ToggleNew);
+    assert_eq!(app.folder_counts(), counted(&app));
+    // Messages arrive: the next page.
+    let mut next = summaries(2);
+    for (i, m) in next.iter_mut().enumerate() {
+        m.id = mett_core::MessageId::new(format!("p{i}"));
+        m.flags.read = i == 0;
+    }
+    let (unread, flagged) = counted(&app);
+    let more = more.expect("a page is asked for");
+    let page = mett_core::MessagePage {
+        messages: next,
+        next: None,
+    };
+    respond(&mut app, more, Event::MessagesListed(Ok(page)));
+    assert_eq!(app.total_messages(), 5);
+    assert_eq!(app.folder_counts(), counted(&app));
+    assert_eq!(app.folder_counts(), (unread + 1, flagged));
+    // Drawing again (as the screen does) starts from the folder as it is.
+    app.before_draw();
+    assert_eq!(app.folder_counts(), counted(&app));
+}
+
+#[test]
+fn addresses_are_the_user_s_whatever_their_case() {
+    let mut app = empty_app();
+    app.settings.me = vec!["me@contoso.com".to_owned()];
+    let address = |email: &str| mett_core::Address {
+        name: None,
+        email: email.to_owned(),
+    };
+    assert!(app.is_me(&address("me@contoso.com")));
+    assert!(app.is_me(&address("Me@Contoso.COM")));
+    assert!(!app.is_me(&address("me@contoso.co")));
+    assert!(!app.is_me(&address("you@contoso.com")));
+    // Not ASCII: lowercased as before.
+    app.settings.me.push("ünï@contoso.com".to_owned());
+    assert!(app.is_me(&address("ÜNÏ@Contoso.com")));
+}

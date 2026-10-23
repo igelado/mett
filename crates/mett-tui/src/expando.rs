@@ -1,11 +1,13 @@
 //! What the expandos of mutt's `index_format`, `pager_format` and
 //! `status_format` stand for (`docs/MUTTRC.md` §3).
 
+use std::borrow::Cow;
+
 use mett_core::{Address, MessageSummary};
 use regex::Regex;
 
 use crate::color::Colors;
-use crate::format::{Expandos, date};
+use crate::format::{Expandos, date, truthy};
 
 /// How the screen is drawn: the formats and colors.
 #[derive(Clone, Debug)]
@@ -141,37 +143,38 @@ pub fn display_name(address: &Address) -> &str {
 }
 
 impl Expandos for Entry<'_> {
-    fn expando(&self, code: char, arg: Option<&str>) -> String {
+    fn expando(&self, code: char, arg: Option<&str>) -> Cow<'_, str> {
         let summary = self.summary;
         let author = summary.from.as_ref();
         let flags = summary.flags;
         match code {
-            'a' => author.map(|a| a.email.clone()).unwrap_or_default(),
-            'C' => self.number.to_string(),
-            'D' | 'd' => date(summary.received, self.date_format),
-            '{' | '[' | '(' => date(summary.received, arg.unwrap_or("")),
+            'a' => author.map_or("", |a| a.email.as_str()).into(),
+            'C' => self.number.to_string().into(),
+            'D' | 'd' => date(summary.received, self.date_format).into(),
+            '{' | '[' | '(' => date(summary.received, arg.unwrap_or("")).into(),
             // The sender, or for the user's own mail, who it went to.
             'F' | 'L' => match summary.to.first() {
-                Some(to) if self.from_me => format!("To {}", display_name(to)),
-                _ => author.map(display_name).unwrap_or_default().to_owned(),
+                Some(to) if self.from_me => format!("To {}", display_name(to)).into(),
+                _ => author.map_or("", display_name).into(),
             },
-            'f' => author.map(ToString::to_string).unwrap_or_default(),
-            'm' => self.total.to_string(),
-            'n' => author.map(display_name).unwrap_or_default().to_owned(),
-            'P' => self.position.unwrap_or_default().to_owned(),
+            'f' => author.map(ToString::to_string).unwrap_or_default().into(),
+            'm' => self.total.to_string().into(),
+            'n' => author.map_or("", display_name).into(),
+            'P' => self.position.unwrap_or_default().into(),
             // The thread's lines, then the subject, unless it is its
             // parent's.
             's' => match self.thread {
-                Some(thread) if thread.same_subject => thread.tree.clone(),
-                Some(thread) => format!("{}{}", thread.tree, summary.subject),
-                None => summary.subject.clone(),
+                Some(thread) if thread.same_subject => thread.tree.as_str().into(),
+                Some(thread) => format!("{}{}", thread.tree, summary.subject).into(),
+                None => summary.subject.as_str().into(),
             },
             // How many messages a collapsed thread folds away.
             'M' => self
                 .thread
                 .filter(|t| t.folded > 0)
                 .map(|t| t.folded.to_string())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
             'S' => if self.deleted {
                 "D"
             } else if flags.flagged {
@@ -181,37 +184,45 @@ impl Expandos for Entry<'_> {
             } else {
                 " "
             }
-            .to_owned(),
-            't' => summary
-                .to
-                .first()
-                .map(|to| to.email.clone())
-                .unwrap_or_default(),
+            .into(),
+            't' => summary.to.first().map_or("", |to| to.email.as_str()).into(),
             'u' => author
                 .and_then(|a| a.email.split('@').next())
                 .unwrap_or_default()
-                .to_owned(),
+                .into(),
             'v' => author
-                .map(|a| match a.name.as_deref().filter(|n| !n.is_empty()) {
-                    Some(name) => name.split_whitespace().next().unwrap_or(name).to_owned(),
-                    None => a.email.split('@').next().unwrap_or_default().to_owned(),
+                .map_or("", |a| match a.name.as_deref().filter(|n| !n.is_empty()) {
+                    Some(name) => name.split_whitespace().next().unwrap_or(name),
+                    None => a.email.split('@').next().unwrap_or_default(),
                 })
-                .unwrap_or_default(),
+                .into(),
             // The attachments, as far as the index knows: some or none.
-            'X' => u8::from(summary.has_attachments).to_string(),
+            'X' => if summary.has_attachments { "1" } else { "0" }.into(),
             'Z' => {
                 let status = if self.deleted {
-                    'D'
+                    "D"
                 } else if flags.read {
-                    ' '
+                    " "
                 } else {
-                    'N'
+                    "N"
                 };
-                let flagged = if flags.flagged { '!' } else { ' ' };
-                let attachments = if summary.has_attachments { '+' } else { ' ' };
-                format!("{status}{flagged}{attachments}")
+                let flagged = if flags.flagged { "!" } else { " " };
+                let attachments = if summary.has_attachments { "+" } else { " " };
+                format!("{status}{flagged}{attachments}").into()
             }
-            _ => String::new(),
+            _ => "".into(),
+        }
+    }
+
+    /// As the default, without making the text of the expandos that are
+    /// only a number or a flag.
+    fn is_set(&self, code: char) -> bool {
+        match code {
+            'C' => self.number != 0,
+            'm' => self.total != 0,
+            'X' => self.summary.has_attachments,
+            'M' => self.thread.is_some_and(|t| t.folded > 0),
+            code => truthy(&self.expando(code, None)),
         }
     }
 }
@@ -258,26 +269,26 @@ impl Expandos for Status<'_> {
         }
     }
 
-    fn expando(&self, code: char, _arg: Option<&str>) -> String {
+    fn expando(&self, code: char, _arg: Option<&str>) -> Cow<'_, str> {
         // A count of none shows as 0 (which conditionals take as unset).
-        let count = |n: usize| n.to_string();
+        let count = |n: usize| Cow::from(n.to_string());
         match code {
             'b' => count(self.incoming),
             'd' => count(self.deleted),
             'F' => count(self.flagged),
-            'f' => self.folder.to_owned(),
-            'h' => hostname(),
-            'I' => if self.incomplete { "1" } else { "" }.to_owned(),
-            'M' => self.shown.map(|n| n.to_string()).unwrap_or_default(),
-            'm' => self.total.to_string(),
+            'f' => self.folder.into(),
+            'h' => hostname().into(),
+            'I' => if self.incomplete { "1" } else { "" }.into(),
+            'M' => self.shown.map(|n| n.to_string()).unwrap_or_default().into(),
+            'm' => self.total.to_string().into(),
             'n' | 'u' => count(self.new),
-            'P' => self.position.to_owned(),
-            'r' => if self.changed { "*" } else { "-" }.to_owned(),
-            's' => self.sort.0.to_owned(),
-            'S' => self.sort.1.to_owned(),
-            'V' => self.limit.unwrap_or_default().to_owned(),
-            'v' => format!("mett {}", env!("CARGO_PKG_VERSION")),
-            _ => String::new(),
+            'P' => self.position.into(),
+            'r' => if self.changed { "*" } else { "-" }.into(),
+            's' => self.sort.0.into(),
+            'S' => self.sort.1.into(),
+            'V' => self.limit.unwrap_or_default().into(),
+            'v' => format!("mett {}", env!("CARGO_PKG_VERSION")).into(),
+            _ => "".into(),
         }
     }
 }

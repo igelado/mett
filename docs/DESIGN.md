@@ -203,6 +203,19 @@ The built-in editor is part of the model, like any screen. edtui lays its
 text out while drawing, so the model holds it in a `RefCell`: the one
 place the view changes anything, and only that layout.
 
+The view runs for every frame and every visible row, so it keeps its
+per-frame work small. Format strings (`index_format` and the others) are
+compiled once into tokens, found again by their text (`format::compile`),
+so a changed variable simply gets a new entry; `strftime` formats are
+parsed once likewise. Rows are expanded in one pass into one buffer,
+tracking the width as they go (the line is measured again only where a
+combining character could join its neighbour), and plain ASCII lines
+skip grapheme segmentation. The open folder's unread and flagged counts
+(`App::folder_counts`) are counted once and shared by the status bar, the
+sidebar and the sidebar's sort, and counted again after each `update` and
+before each draw. A test keeps the old formatter as a reference to check
+the compiled one against.
+
 ### 5.3 Command pattern for key bindings
 
 Every user-visible operation is a named `Action` (for example `NextEntry`,

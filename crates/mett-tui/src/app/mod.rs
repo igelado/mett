@@ -361,6 +361,9 @@ pub struct App {
     pub input_note: Option<String>,
     /// `alternates`, compiled: the index asks for every row.
     alternates: Vec<regex::Regex>,
+    /// The open folder's unread and flagged counts, as [`App::folder_counts`]
+    /// counted them since the folder last changed.
+    folder_counts: std::cell::Cell<Option<(usize, usize)>>,
     /// Keys and functions a macro or `push` queued, played before new
     /// input.
     strokes: VecDeque<Stroke>,
@@ -717,6 +720,7 @@ impl App {
             error: None,
             input_note: None,
             alternates: compile_alternates(&settings.compose.alternates),
+            folder_counts: std::cell::Cell::new(None),
             strokes: VecDeque::new(),
             sign_in_strokes: VecDeque::new(),
             configuring: 0,
@@ -889,6 +893,7 @@ impl App {
 
     /// Applies `msg` and returns the side effects to carry out.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        self.folder_counts.set(None);
         if matches!(msg, Msg::Action(_)) {
             self.retry_sidebar();
         }
@@ -912,6 +917,7 @@ impl App {
         // The sidebar lists every folder, if it shows them, once it is
         // on screen and they may have changed.
         effects.extend(self.list_sidebar_folders());
+        self.folder_counts.set(None);
         effects
     }
 
@@ -1825,6 +1831,25 @@ impl App {
         self.messages.iter().chain(&self.hidden).chain(&self.folded)
     }
 
+    /// How many of the whole folder's messages are unread, and how many
+    /// flagged. Drawing asks for them several times a frame (the status
+    /// bar, the sidebar, the sidebar's sort), so they are counted once,
+    /// when first asked for, and again after anything that could change
+    /// the folder: an [`App::update`], or [`App::before_draw`].
+    pub fn folder_counts(&self) -> (usize, usize) {
+        if let Some(counts) = self.folder_counts.get() {
+            return counts;
+        }
+        let counts = self.folder_messages().fold((0, 0), |(unread, flagged), m| {
+            (
+                unread + usize::from(!m.flags.read),
+                flagged + usize::from(m.flags.flagged),
+            )
+        });
+        self.folder_counts.set(Some(counts));
+        counts
+    }
+
     /// Whether part of the folder could not be listed. The index then
     /// shows only the messages loaded so far.
     pub fn incomplete(&self) -> bool {
@@ -2176,11 +2201,24 @@ impl App {
 
     /// Whether the user sent mail from `address`.
     pub fn is_me(&self, address: &mett_core::Address) -> bool {
-        self.settings.me.contains(&address.email.to_lowercase())
-            || self
-                .alternates
-                .iter()
-                .any(|alternate| alternate.is_match(&address.email))
+        let email = address.email.as_str();
+        // `me` is lowercase: ASCII addresses (nearly all) are compared
+        // without making a lowercase copy of one for every row.
+        let mine = if email.is_ascii() {
+            self.settings.me.iter().any(|me| {
+                me.len() == email.len()
+                    && me
+                        .bytes()
+                        .zip(email.bytes())
+                        .all(|(me, c)| me == c.to_ascii_lowercase())
+            })
+        } else {
+            self.settings.me.contains(&email.to_lowercase())
+        };
+        mine || self
+            .alternates
+            .iter()
+            .any(|alternate| alternate.is_match(&address.email))
     }
 }
 
