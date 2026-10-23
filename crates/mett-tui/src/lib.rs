@@ -20,6 +20,7 @@ mod expando;
 mod format;
 #[cfg(feature = "gui")]
 mod gui;
+mod imap;
 mod keymap;
 mod lineedit;
 mod pattern;
@@ -344,14 +345,23 @@ fn settings_keeping(
         }
         _ => return Err("office365_page_size must be a positive number".into()),
     };
-    let sync_interval = match config.get("office365_sync_interval") {
+    // How often mail is looked for: mutt's `mail_check` for an IMAP mailbox,
+    // Office365's own setting for those.
+    let interval = match account::Api::from_config(config) {
+        account::Api::Imap => "mail_check",
+        account::Api::Graph | account::Api::Ews => "office365_sync_interval",
+    };
+    let sync_interval = match config.get(interval) {
         Some(config::Value::Number(0)) => None,
         Some(config::Value::Number(n)) if *n > 0 => {
             Some(std::time::Duration::from_secs(n.unsigned_abs()))
         }
-        _ => return Err("office365_sync_interval must be 0 (off) or a number of seconds".into()),
+        _ => return Err(format!("{interval} must be 0 (off) or a number of seconds")),
     };
-    let folder = config.string("folder");
+    // Without the password a URL may hold: the mailboxes, as `mailboxes`
+    // keeps them, don't have it either, and are shown relative to this.
+    let folder = config::server::strip_password(config.string("folder"));
+    let folder = folder.as_str();
     let mailboxes = config
         .mailboxes()
         .iter()
@@ -434,7 +444,8 @@ fn settings_keeping(
         sync_interval,
         compose,
         account: account.clone(),
-        folder: config.string("folder").to_owned(),
+        // The mailboxes are shown relative to it: without a password in it.
+        folder: config::server::strip_password(config.string("folder")),
         trash,
         delete: config.quad("delete"),
         resolve: config.flag("resolve"),
@@ -457,7 +468,8 @@ fn sidebar_settings(
         }
         _ => Err(format!("{name} must be 0 or more")),
     };
-    let folder = config.string("folder");
+    let folder = config::server::strip_password(config.string("folder"));
+    let folder = folder.as_str();
     // Those that name no folder of the account can't match a mailbox.
     let path = |text: &str| config::mailbox::folder_path(text, folder, account).ok();
     Ok(app::SidebarSettings {
@@ -1376,7 +1388,8 @@ fn run_command(
         changed.push("header_cache");
         changed.sort_unstable();
     }
-    // The mailbox and its sign-in were set up when mett started.
+    // The mailbox, its sign-in and its connections were set up when mett
+    // started.
     if let Ok(warnings) = &mut outcome {
         warnings.extend(
             changed
@@ -1384,7 +1397,17 @@ fn run_command(
                 .filter(|name| {
                     (name.starts_with("office365_")
                         || name.starts_with("msgraph_")
-                        || ["use_ews", "ews_url", "header_cache"].contains(*name))
+                        || name.starts_with("ssl_")
+                        || [
+                            "use_ews",
+                            "ews_url",
+                            "header_cache",
+                            "imap_user",
+                            "imap_pass",
+                            "smtp_url",
+                            "smtp_pass",
+                        ]
+                        .contains(*name))
                         && ![
                             "office365_page_size",
                             "office365_sync_interval",
@@ -1813,6 +1836,16 @@ mod tests {
             ])
         );
         assert_eq!(demo.config.string("office365_client_id"), "abc", "kept");
+        // The IMAP and SMTP connections were made then too.
+        let done = demo.run("set imap_pass=x smtp_url=smtps://smtp.example.com ssl_force_tls=yes");
+        assert_eq!(
+            done.outcome,
+            Ok(vec![
+                "imap_pass: takes effect when mett starts again".to_owned(),
+                "smtp_url: takes effect when mett starts again".to_owned(),
+                "ssl_force_tls: takes effect when mett starts again".to_owned(),
+            ])
+        );
         // Unsetting the cache keeps its empty value, but stops caching.
         let done = demo.run("unset header_cache");
         assert_eq!(
@@ -1900,6 +1933,47 @@ mod tests {
     }
 
     #[test]
+    fn an_imap_mailbox_is_checked_every_mail_check_seconds() {
+        let mut config = config::Config::new(None);
+        for line in [
+            "set spoolfile=imaps://me@mail.example.com/INBOX signature=\"\"",
+            "set office365_sync_interval=0",
+        ] {
+            config.run_line(line).unwrap();
+        }
+        let account = mett_core::AccountId::new("me@mail.example.com");
+        let settings = settings_from_config(&config, &account).unwrap();
+        // Office365's setting is not IMAP's.
+        assert_eq!(
+            settings.sync_interval,
+            Some(std::time::Duration::from_secs(5))
+        );
+        config.run_line("set mail_check=30").unwrap();
+        let settings = settings_from_config(&config, &account).unwrap();
+        assert_eq!(
+            settings.sync_interval,
+            Some(std::time::Duration::from_secs(30))
+        );
+        config.run_line("set mail_check=0").unwrap();
+        assert_eq!(
+            settings_from_config(&config, &account)
+                .unwrap()
+                .sync_interval,
+            None
+        );
+        // And an Office365 mailbox is not checked by `mail_check`.
+        config
+            .run_line("set spoolfile=msgraph://me@contoso.com/@inbox office365_sync_interval=60")
+            .unwrap();
+        let account = mett_core::AccountId::new("me@contoso.com");
+        let settings = settings_from_config(&config, &account).unwrap();
+        assert_eq!(
+            settings.sync_interval,
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    #[test]
     fn demo_commands_keep_the_demo_folders() {
         let (mut config, settings) = demo_config(Some("/home/alice".into()));
         assert_eq!(settings.folder, "");
@@ -1939,5 +2013,27 @@ mod tests {
         let done = demo.run("set resolve=no; set timeout=soon");
         assert!(done.outcome.is_err());
         assert!(demo.config.changed_since(&before).is_empty());
+    }
+
+    #[test]
+    fn passwords_in_mailbox_urls_are_not_shown() {
+        let mut config = config::Config::new(None);
+        for line in [
+            "set folder=imaps://alice:secret@mail.example.com/ signature=\"\"",
+            "mailboxes =INBOX imaps://alice:secret@mail.example.com/Work",
+        ] {
+            config.run_line(line).unwrap();
+        }
+        let account = mett_core::AccountId::new("alice@mail.example.com");
+        let settings = settings_from_config(&config, &account).unwrap();
+        assert!(!settings.folder.contains("secret"), "{}", settings.folder);
+        assert_eq!(settings.folder, "imaps://alice@mail.example.com/");
+        for mailbox in &settings.mailboxes {
+            assert!(!mailbox.text.contains("secret"), "{}", mailbox.text);
+            assert!(!mailbox.name.contains("secret"), "{}", mailbox.name);
+        }
+        // They still name their folders.
+        let names: Vec<_> = settings.mailboxes.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["=INBOX", "=Work"]);
     }
 }

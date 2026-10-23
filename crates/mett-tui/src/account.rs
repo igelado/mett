@@ -1,7 +1,7 @@
-//! Connecting to an Office365 account from the configuration: building the
-//! sign-in settings and token store from the `office365_*` variables, and the
-//! mailbox, through Microsoft Graph or Exchange Web Services (`use_ews`,
-//! `ews_url`) (`docs/CONFIG-OFFICE365.md` §4).
+//! Connecting to an account from the configuration: for Office365, building
+//! the sign-in settings and token store from the `office365_*` variables, and
+//! the mailbox, through Microsoft Graph or Exchange Web Services (`use_ews`,
+//! `ews_url`) (`docs/CONFIG-OFFICE365.md` §4); for IMAP, see [`crate::imap`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use mett_core::{
     SyncState, WellKnownFolder,
 };
 use mett_ews::EwsMailStore;
+use mett_imap::ImapMailStore;
 use mett_msgraph::{
     AuthFlow, AuthSettings, FileStore, GraphAuthenticator, GraphMailStore, IdentityCheck,
     KeyringStore, TokenStore, TokenStoreError,
@@ -20,7 +21,7 @@ use mett_msgraph::{
 use mett_sqlite::{Cache, CachedStore, Progress};
 use url::Url;
 
-use crate::config::mailbox::MailboxUrl;
+use crate::config::mailbox::{MailboxUrl, Server};
 use crate::config::{Config, Value};
 use crate::signin::TuiPrompter;
 
@@ -36,12 +37,20 @@ pub enum Api {
     Graph,
     /// Exchange Web Services.
     Ews,
+    /// An IMAP server, with SMTP to send.
+    Imap,
 }
 
 impl Api {
-    /// The API `config` chooses.
+    /// The API `config` chooses: IMAP for an `imap://` mailbox, else EWS
+    /// with `use_ews`.
     pub fn from_config(config: &Config) -> Self {
-        if config.flag("use_ews") {
+        if config
+            .spoolfile()
+            .is_ok_and(|url| matches!(url.server, Server::Imap(_)))
+        {
+            Self::Imap
+        } else if config.flag("use_ews") {
             Self::Ews
         } else {
             Self::Graph
@@ -54,6 +63,8 @@ impl Api {
         match self {
             Self::Graph => mett_msgraph::needs_server_draft(draft),
             Self::Ews => mett_ews::needs_server_draft(draft),
+            // Mail goes out through SMTP: nothing is kept on a server.
+            Self::Imap => false,
         }
     }
 
@@ -63,7 +74,7 @@ impl Api {
     pub fn always_copies(self, draft: &Draft) -> bool {
         match self {
             Self::Graph => mett_msgraph::needs_server_draft(draft),
-            Self::Ews => false,
+            Self::Ews | Self::Imap => false,
         }
     }
 }
@@ -75,6 +86,8 @@ pub enum Mailbox {
     Graph(GraphMailStore<Auth>),
     /// Through Exchange Web Services.
     Ews(EwsMailStore<Auth>),
+    /// Over IMAP and SMTP.
+    Imap(Box<ImapMailStore>),
 }
 
 /// `$body`, with `$store` bound to the mailbox's store, whichever API it
@@ -84,6 +97,7 @@ macro_rules! either {
         match $mailbox {
             Mailbox::Graph($store) => $body,
             Mailbox::Ews($store) => $body,
+            Mailbox::Imap($store) => $body,
         }
     };
 }
@@ -187,6 +201,10 @@ impl MailStore for Mailbox {
         either!(self, s => s.can_sync())
     }
 
+    fn folder_names_ignore_case(&self) -> bool {
+        either!(self, s => s.folder_names_ignore_case())
+    }
+
     fn can_watch(&self) -> bool {
         either!(self, s => s.can_watch())
     }
@@ -243,13 +261,19 @@ pub fn cached(
     mailbox: Mailbox,
     progress: Progress,
 ) -> (CachedStore<Mailbox>, Option<String>) {
-    let path = cache_path(
-        config,
-        url,
-        std::env::var_os("XDG_CACHE_HOME"),
-        // The home mett found, which on Windows may not be `$HOME`.
-        config.home().map(Into::into),
-    );
+    // IMAP can't tell what changed in a folder: there is nothing to sync
+    // into a cache.
+    let path = (!matches!(mailbox, Mailbox::Imap(_)))
+        .then(|| {
+            cache_path(
+                config,
+                url,
+                std::env::var_os("XDG_CACHE_HOME"),
+                // The home mett found, which on Windows may not be `$HOME`.
+                config.home().map(Into::into),
+            )
+        })
+        .flatten();
     let Some(path) = path else {
         return (CachedStore::new(mailbox, None), None);
     };
@@ -361,6 +385,7 @@ pub fn auth_settings(config: &Config, url: &MailboxUrl) -> Result<AuthSettings, 
         }
         // EWS takes one scope, of the cloud's Exchange Online. Graph doesn't
         // take its tokens, so they tell who signed in themselves.
+        Api::Imap => return Err(format!("{url}: an IMAP mailbox has no Office365 sign-in")),
         Api::Ews => {
             settings.scopes = vec![
                 format!("{}EWS.AccessAsUser.All", settings.cloud.exchange_url()),
@@ -445,6 +470,9 @@ pub fn mailbox(
     url: &MailboxUrl,
     prompter: TuiPrompter,
 ) -> Result<Mailbox, String> {
+    if matches!(url.server, Server::Imap(_)) {
+        return crate::imap::mailbox(config, url).map(|store| Mailbox::Imap(Box::new(store)));
+    }
     if !config.string("office365_oauth_refresh_command").is_empty() {
         return Err("office365_oauth_refresh_command is not supported yet".into());
     }
@@ -459,6 +487,7 @@ pub fn mailbox(
     ));
     Ok(match Api::from_config(config) {
         Api::Graph => Mailbox::Graph(GraphMailStore::new(http, &settings, auth)),
+        Api::Imap => unreachable!("IMAP mailboxes are made above"),
         Api::Ews => Mailbox::Ews(EwsMailStore::new(
             http,
             ews_url(config, &settings)?,

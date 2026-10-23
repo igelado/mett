@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
+use lettre::transport::smtp::client::{Certificate, CertificateStore, Tls, TlsParameters};
 use lettre::transport::smtp::{self, AsyncSmtpTransport};
 use lettre::{Address as MailAddress, AsyncTransport, Tokio1Executor};
 use mett_core::{AccessToken, Address, Authenticator, Draft, Error, Result};
@@ -17,6 +17,10 @@ use crate::compose::{Threading, compose};
 pub enum Security {
     /// None: everything, passwords included, goes in plain text.
     None,
+    /// The connection starts in plain text and is upgraded with STARTTLS
+    /// if the server offers it (mutt's `ssl_starttls` without
+    /// `ssl_force_tls`); one that doesn't is used in plain text.
+    StartTlsIfOffered,
     /// The connection starts in plain text and is upgraded with STARTTLS
     /// (and fails if the server won't).
     #[default]
@@ -34,9 +38,11 @@ pub struct SmtpSettings {
     pub port: u16,
     /// How the connection is protected.
     pub security: Security,
-    /// Whether to check the server's certificate (and its name). Turning
-    /// this off leaves the connection open to impersonation.
-    pub verify: bool,
+    /// Whether to check that the server's certificate is for the name the
+    /// connection is made to (mutt's `ssl_verify_host`). The certificate is
+    /// always checked against the authorities; turning this off leaves the
+    /// connection open to anyone with a certificate from one of them.
+    pub verify_host: bool,
     /// Certificate authorities to trust besides the system's, as PEM.
     pub ca_certificates: Vec<Vec<u8>>,
     /// The sender's address, for messages that don't name another.
@@ -55,11 +61,11 @@ impl SmtpSettings {
             host: host.into(),
             port: match security {
                 Security::None => 25,
-                Security::StartTls => 587,
+                Security::StartTls | Security::StartTlsIfOffered => 587,
                 Security::Tls => 465,
             },
             security,
-            verify: true,
+            verify_host: true,
             ca_certificates: Vec::new(),
             from,
             timeout: Duration::from_secs(60),
@@ -117,6 +123,15 @@ pub struct SmtpSender<A = NoTokens> {
     login: Login<A>,
 }
 
+impl<A> fmt::Debug for SmtpSender<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SmtpSender")
+            .field("settings", &self.settings)
+            .field("login", &self.login)
+            .finish()
+    }
+}
+
 impl<A: Authenticator> SmtpSender<A> {
     /// A sender for the server `settings` describe, logging in as `login`.
     pub fn new(settings: SmtpSettings, login: Login<A>) -> Self {
@@ -132,6 +147,9 @@ impl<A: Authenticator> SmtpSender<A> {
     /// mailbox. The mailbox (IMAP) implements the port, and stores the
     /// copy this returns.
     pub async fn send(&self, draft: &Draft, threading: &Threading) -> Result<(String, Vec<u8>)> {
+        if !draft.has_recipients() {
+            return Err(Error::NotSent("the message has no recipients".into()));
+        }
         let composed = compose(draft, &self.settings.from, threading)?;
         let envelope = Envelope::new(
             Some(address(&composed.sender)?),
@@ -189,16 +207,24 @@ impl<A: Authenticator> SmtpSender<A> {
                         .map_err(|e| Error::NotSent(format!("CA certificate: {e}")))?,
                 );
             }
-            if !settings.verify {
-                tls = tls
-                    .dangerous_accept_invalid_certs(true)
-                    .dangerous_accept_invalid_hostnames(true);
+            if !settings.verify_host {
+                // Lettre skips the name check only with roots it is given
+                // (its platform verifier is all or nothing): the system's,
+                // which are loaded here, and the extra ones above.
+                tls = tls.certificate_store(CertificateStore::None);
+                for root in rustls_native_certs::load_native_certs().certs {
+                    if let Ok(root) = Certificate::from_der(root.to_vec()) {
+                        tls = tls.add_root_certificate(root);
+                    }
+                }
+                tls = tls.dangerous_accept_invalid_hostnames(true);
             }
             tls.build_rustls()
                 .map_err(|e| Error::NotSent(format!("TLS: {e}")))
         };
         let tls = match settings.security {
             Security::None => Tls::None,
+            Security::StartTlsIfOffered => Tls::Opportunistic(tls()?),
             Security::StartTls => Tls::Required(tls()?),
             Security::Tls => Tls::Wrapper(tls()?),
         };

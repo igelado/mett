@@ -9,6 +9,7 @@
 
 mod lexer;
 pub mod mailbox;
+pub mod server;
 mod vars;
 
 use std::collections::HashMap;
@@ -345,12 +346,13 @@ impl Config {
         let spoolfile = self.string("spoolfile");
         if spoolfile.is_empty() {
             return Err(mailbox::MailboxError(
-                "spoolfile is not set; set it to a mailbox such as msgraph://you@example.com/@inbox"
+                "spoolfile is not set; set it to a mailbox such as msgraph://you@example.com/@inbox or imaps://you@example.com/INBOX"
                     .into(),
             ));
         }
         let url = mailbox::expand_shortcut(spoolfile, self.string("folder"));
         mailbox::MailboxUrl::parse(&url)
+            .map(|url| url.with_user(self.string("imap_user")))
             .map_err(|e| mailbox::MailboxError(format!("spoolfile: {e}")))
     }
 
@@ -730,7 +732,10 @@ impl Config {
             "<" => self.string("record"),
             _ => path.trim(),
         };
-        mailbox::expand_shortcut(path, self.string("folder"))
+        // A password in a mailbox's URL is no use to a mailbox of the
+        // account (only its server and user are looked at), and the path is
+        // shown: it is kept without.
+        server::strip_password(&mailbox::expand_shortcut(path, self.string("folder")))
     }
 
     fn bind(&mut self, menus: &Word, key: &Word, function: &Word) -> Result<(), String> {
@@ -1292,7 +1297,7 @@ mod tests {
 
     #[test]
     fn warns_about_each_ignored_item_once() {
-        let config = load("score a b c\nscore d e f\nset imap_user=x\nset imap_user=y\n");
+        let config = load("score a b c\nscore d e f\nset imap_keepalive=x\nset imap_keepalive=y\n");
         assert_eq!(config.warnings.len(), 2, "{:?}", config.warnings);
         // A variable and a command with the same name are different items.
         let both = load("set score=1\nscore a b c\n");
@@ -1370,7 +1375,7 @@ mod tests {
         let marker = std::env::temp_dir().join(format!("mett-ran-{}", std::process::id()));
         let _ = fs::remove_file(&marker);
         let config = load(&format!(
-            "set imap_pass=`touch {0}; false`\nscore x `touch {0}`\n",
+            "set imap_keepalive=`touch {0}; false`\nscore x `touch {0}`\n",
             marker.display()
         ));
         assert!(config.errors.is_empty(), "{:?}", config.errors);

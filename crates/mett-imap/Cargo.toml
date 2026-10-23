@@ -1,0 +1,32 @@
+[package]
+name = "mett-imap"
+description = "IMAP adapter for mett: mailbox access, and sending through SMTP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mett-core.workspace = true
+mett-smtp.workspace = true
+
+async-channel.workspace = true
+async-imap.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+mail-parser.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio-rustls.workspace = true
+utf7-imap.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
+
+[lints]
+workspace = true

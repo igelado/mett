@@ -44,10 +44,10 @@ enum Accept {
     Challenge(&'static str),
 }
 
-fn acceptor() -> (TlsAcceptor, Vec<u8>) {
+fn acceptor(name: &str) -> (TlsAcceptor, Vec<u8>) {
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(Vec::new()).unwrap();
-    params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
+    params.subject_alt_names = vec![SanType::IpAddress(name.parse().unwrap())];
     let cert = params.self_signed(&key).unwrap();
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -60,7 +60,12 @@ fn acceptor() -> (TlsAcceptor, Vec<u8>) {
 }
 
 async fn server(wrapper: bool, accept: Accept) -> Server {
-    let (acceptor, ca) = acceptor();
+    server_for(wrapper, accept, "127.0.0.1").await
+}
+
+/// A server whose certificate is for the address `name`.
+async fn server_for(wrapper: bool, accept: Accept, name: &str) -> Server {
+    let (acceptor, ca) = acceptor(name);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -282,13 +287,28 @@ async fn refuses_a_certificate_it_does_not_trust() {
 }
 
 #[tokio::test]
-async fn accepts_any_certificate_when_not_verifying() {
-    let server = server(true, Accept::Everything).await;
+async fn takes_a_certificate_for_another_name_only_when_not_checking_names() {
+    // Its certificate is for 127.0.0.2, the connection is to 127.0.0.1.
+    let server = server_for(true, Accept::Everything, "127.0.0.2").await;
     let mut settings = settings(&server, Security::Tls);
-    settings.ca_certificates.clear();
-    settings.verify = false;
-    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
+    let error = sender
+        .send(&draft(), &Threading::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSent(_)), "{error}");
+    assert!(server.seen.lock().unwrap().is_empty());
+
+    settings.verify_host = false;
+    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
     sender.send(&draft(), &Threading::default()).await.unwrap();
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
+
+    // Not checking the name doesn't mean taking any certificate: one no
+    // authority vouches for is not taken.
+    settings.ca_certificates.clear();
+    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    assert!(sender.send(&draft(), &Threading::default()).await.is_err());
     assert_eq!(server.seen.lock().unwrap().len(), 1);
 }
 
@@ -442,4 +462,13 @@ async fn asks_for_another_token_when_refused_with_a_challenge() {
     let sender = SmtpSender::new(settings(&server, Security::StartTls), login);
     sender.send(&draft(), &Threading::default()).await.unwrap();
     assert_eq!(server.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn upgrades_when_the_server_offers_starttls_if_asked_to_only_then() {
+    let server = server(false, Accept::Everything).await;
+    let sender =
+        SmtpSender::<NoTokens>::new(settings(&server, Security::StartTlsIfOffered), Login::None);
+    sender.send(&draft(), &Threading::default()).await.unwrap();
+    assert!(server.seen.lock().unwrap()[0].encrypted);
 }

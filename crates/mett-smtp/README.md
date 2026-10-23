@@ -6,13 +6,14 @@ crate (with rustls):
 - **`SmtpSender`** connects to an SMTP server and sends a `Draft`. It
   returns the copy to keep and leaves keeping it (and so `mett-core`'s
   `MailSender` port, which promises a copy in Sent) to the mailbox, IMAP. The
-  connection is `Security::None` (plain text), `Security::StartTls` (upgraded,
-  and refused if the server won't) or `Security::Tls` (TLS from the first
+  connection is `Security::None` (plain text), `Security::StartTlsIfOffered`
+  (upgraded if the server offers it), `Security::StartTls` (upgraded, and
+  refused if the server won't) or `Security::Tls` (TLS from the first
   byte, port 465). The login is a password (`Login::Password`: PLAIN or
   LOGIN) or an OAuth2 token from any `Authenticator` (`Login::OAuth`: SASL
   XOAUTH2; a token the server turns down is replaced once). The server's
   certificate is checked against the system's roots and any `ca_certificates`
-  given, unless `verify` is off.
+  given, and for the name it is made to unless `verify_host` is off.
 - **`compose`** writes a `Draft` as MIME: plain text UTF-8 and, with
   attachments, `multipart/mixed`. It returns the message as it goes out
   (without `Bcc:`) and as the sender keeps it (with), sharing a `Message-ID:`.

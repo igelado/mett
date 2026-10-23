@@ -12,6 +12,7 @@ repository.workspace = true
 mett-core.workspace = true
 
 lettre.workspace = true
+rustls-native-certs.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]

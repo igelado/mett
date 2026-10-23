@@ -828,6 +828,10 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         self.inner.can_sync()
     }
 
+    fn folder_names_ignore_case(&self) -> bool {
+        self.inner.folder_names_ignore_case()
+    }
+
     fn can_watch(&self) -> bool {
         self.inner.can_watch()
     }

@@ -44,6 +44,11 @@ pub enum Error {
     #[error("not sent: {0}")]
     NotSent(String),
 
+    /// A message was sent, but the copy it asked to keep in the sent-items
+    /// folder could not be kept. It is not to be sent again.
+    #[error("the message was sent, but no copy of it was kept: {0}")]
+    SentNotKept(String),
+
     /// A sync state ([`crate::SyncState`]) is no longer good: the folder
     /// has to be synced again from the start.
     #[error("the folder has to be synced again from the start")]

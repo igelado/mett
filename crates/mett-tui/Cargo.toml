@@ -34,7 +34,9 @@ gui = [
 # The `mock` store backs `mett --demo`.
 mett-core = { workspace = true, features = ["mock"] }
 mett-ews.workspace = true
+mett-imap.workspace = true
 mett-msgraph.workspace = true
+mett-smtp.workspace = true
 mett-sqlite.workspace = true
 
 base64.workspace = true

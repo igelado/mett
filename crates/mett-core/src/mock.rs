@@ -42,6 +42,8 @@ struct State {
     syncs: u64,
     /// The answers to invitations, as given.
     answers: Vec<(MessageId, crate::Answer)>,
+    /// Whether folder names are exact ([`MemoryStore::with_exact_names`]).
+    exact_names: bool,
 }
 
 impl MemoryStore {
@@ -91,6 +93,13 @@ impl MemoryStore {
             message.summary.has_attachments = true;
         }
         drop(state);
+        self
+    }
+
+    /// Makes folder names exact, as on most IMAP servers: `Archive` is not
+    /// `archive` ([`MailStore::folder_names_ignore_case`]).
+    pub fn with_exact_names(self) -> Self {
+        self.state().exact_names = true;
         self
     }
 
@@ -535,6 +544,10 @@ impl MailStore for MemoryStore {
         }
         state.answers.push((id.clone(), answer.clone()));
         Ok(())
+    }
+
+    fn folder_names_ignore_case(&self) -> bool {
+        !self.state().exact_names
     }
 
     fn can_sync(&self) -> bool {

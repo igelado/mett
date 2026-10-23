@@ -1050,6 +1050,11 @@ impl App {
         let Screen::Compose(compose) = &mut self.screens[position] else {
             return Vec::new();
         };
+        // A message that was sent, though its copy wasn't kept, was sent.
+        let (result, not_kept) = match result {
+            Err(mett_core::Error::SentNotKept(why)) => (Ok(()), Some(why)),
+            other => (other, None),
+        };
         let delivery = compose.delivery.take().map(|(_, d)| d);
         compose.unauthorized = None;
         compose.kept_draft = kept;
@@ -1066,6 +1071,9 @@ impl App {
                     _ => "Mail sent.",
                 }
                 .into();
+                if let Some(why) = &not_kept {
+                    self.fail(format!("Mail sent, but no copy was kept: {why}"));
+                }
                 // The message landed in the open folder: list it again.
                 // (A sent message lands in Sent Items only if a copy was
                 // kept.)
@@ -1547,6 +1555,24 @@ mod tests {
         respond(&mut app, id, Event::Sent(Ok(()), false));
         assert_eq!(app.screen(), &Screen::Index);
         assert_eq!(app.status, "Mail sent.");
+        assert!(!app.saving());
+    }
+
+    #[test]
+    fn a_message_sent_without_its_copy_kept_is_sent() {
+        let mut app = app(settings());
+        written(&mut app, "text");
+        let (id, _) = request(&act(&mut app, Action::SendMessage));
+        respond(
+            &mut app,
+            id,
+            Event::Sent(Err(Error::SentNotKept("no Sent folder".into())), false),
+        );
+        // It left the compose menu: sending it again would send it twice.
+        assert_eq!(app.screen(), &Screen::Index);
+        assert!(app.status.starts_with("Mail sent, but no copy was kept"));
+        assert!(app.status.contains("no Sent folder"));
+        assert!(app.error.is_some(), "said as a problem");
         assert!(!app.saving());
     }
 
