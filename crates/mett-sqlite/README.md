@@ -20,7 +20,9 @@ of each folder listed, and each message read, in a database file: mutt's
   synced to the end is listed, as it was.
 - **Messages:** a message's body is kept once it is read, and goes with
   its message. One that changes on the server (EWS lets bodies be edited)
-  is fetched again; drafts' bodies aren't kept, as drafts change.
+  is fetched again; drafts' bodies aren't kept, as drafts change. Bodies
+  live in a table of their own, so a sync that rewrites a message's flags
+  doesn't rewrite its (large) body.
 - **Changes:** flags, moves and deletions go to the server first; the
   cache follows at once, and the next sync confirms them. What mett puts
   elsewhere (a move, a copy, a draft, a sent message) makes folders sync

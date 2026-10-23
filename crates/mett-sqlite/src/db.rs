@@ -15,7 +15,7 @@ use crate::invitation::StoredInvitation;
 
 /// The schema's version. A cache of another version is dropped and filled
 /// again: it holds nothing the server doesn't.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Marks mett's caches (SQLite's `application_id`): "mett".
 const APPLICATION_ID: i64 = 0x6D65_7474;
@@ -46,11 +46,22 @@ const SCHEMA: &str = "
         flagged INTEGER NOT NULL,
         -- The rest of the summary, as JSON.
         summary TEXT NOT NULL,
-        -- The rest of the message, once it was fetched.
-        extras TEXT,
         -- Whether the sync that started over reported it.
         seen INTEGER NOT NULL DEFAULT 1
     );
+    -- The rest of a message, once it was fetched. Apart from `messages`,
+    -- whose rows a sync rewrites on every flag change: a body is large.
+    CREATE TABLE bodies (
+        id TEXT PRIMARY KEY,
+        -- The message's `modified` when the body was kept: the body is
+        -- good while the message still has it.
+        modified INTEGER,
+        extras TEXT NOT NULL
+    );
+    -- A body goes with its message.
+    CREATE TRIGGER bodies_go AFTER DELETE ON messages BEGIN
+        DELETE FROM bodies WHERE id = old.id;
+    END;
     -- The folders as last seen, to find them offline.
     CREATE TABLE folder_info (
         id TEXT PRIMARY KEY,
@@ -241,6 +252,8 @@ impl Db {
                 "DROP INDEX IF EXISTS messages_by_date;
                  DROP INDEX IF EXISTS messages_by_change;
                  DROP INDEX IF EXISTS messages_unread;
+                 DROP TRIGGER IF EXISTS bodies_go;
+                 DROP TABLE IF EXISTS bodies;
                  DROP TABLE IF EXISTS messages;
                  DROP TABLE IF EXISTS folders;
                  DROP TABLE IF EXISTS folder_info;
@@ -364,9 +377,6 @@ impl Db {
             let mut summary = summary.clone();
             summary.modified.get_or_insert(synced_at);
             let stored = serde_json::to_string(&StoredSummary::from(&summary)).map_err(failed)?;
-            // A message whose change date moved may have a new body (EWS
-            // lets bodies be edited), and a draft's may change without
-            // one: either is fetched again.
             tx.prepare_cached(
                 "INSERT INTO messages
                     (id, folder, received, modified, unread, flagged, summary, seen)
@@ -374,9 +384,7 @@ impl Db {
                  ON CONFLICT (id) DO UPDATE SET
                     folder = excluded.folder, received = excluded.received,
                     modified = excluded.modified, unread = excluded.unread,
-                    flagged = excluded.flagged, summary = excluded.summary, seen = 1,
-                    extras = CASE WHEN ?8 OR (NOT ?9 AND modified IS NOT excluded.modified)
-                        THEN NULL ELSE extras END",
+                    flagged = excluded.flagged, summary = excluded.summary, seen = 1",
             )
             .and_then(|mut upsert| {
                 upsert.execute(params![
@@ -387,8 +395,22 @@ impl Db {
                     !summary.flags.read,
                     summary.flags.flagged,
                     stored,
+                ])
+            })
+            .map_err(failed)?;
+            // A message whose change date moved may have a new body (EWS
+            // lets bodies be edited), and a draft's may change without
+            // one: either is fetched again. (The body is in a table of its
+            // own, so a flag change doesn't rewrite it.)
+            tx.prepare_cached(
+                "DELETE FROM bodies WHERE id = ?1 AND (?2 OR (NOT ?3 AND modified IS NOT ?4))",
+            )
+            .and_then(|mut stale| {
+                stale.execute(params![
+                    summary.id.as_str(),
                     summary.draft,
                     self.bodies_stay,
+                    summary.modified.map(|m| m.timestamp_micros()),
                 ])
             })
             .map_err(failed)?;
@@ -556,7 +578,8 @@ impl Db {
             .prepare_cached(concat!(
                 "SELECT ",
                 summary_columns!(),
-                ", extras FROM messages WHERE id = ?1"
+                ", (SELECT extras FROM bodies WHERE id = messages.id)
+                 FROM messages WHERE id = ?1"
             ))
             .and_then(|mut q| {
                 q.query_row([id.as_str()], |r| {
@@ -591,7 +614,10 @@ impl Db {
         let extras = serde_json::to_string(&StoredExtras::from(message)).map_err(failed)?;
         self.conn
             .prepare_cached(
-                "UPDATE messages SET extras = ?2 WHERE id = ?1 AND (?4 OR modified = ?3)",
+                "INSERT INTO bodies (id, modified, extras)
+                 SELECT id, ?3, ?2 FROM messages WHERE id = ?1 AND (?4 OR modified = ?3)
+                 ON CONFLICT (id) DO UPDATE SET
+                    modified = excluded.modified, extras = excluded.extras",
             )
             .and_then(|mut update| {
                 update.execute(params![
@@ -1324,6 +1350,77 @@ mod tests {
         message.summary.modified = Some(at(2));
         db.keep_body(&message).unwrap();
         assert!(db.message(&message.summary.id).unwrap().is_some());
+    }
+
+    /// Syncs `folder` from the start, reporting `changed` and `removed`.
+    fn resync(db: &mut Db, changed: Vec<MessageSummary>, removed: Vec<MessageId>) {
+        let inbox = FolderId::new("in");
+        db.start_over(&inbox).unwrap();
+        let changes = FolderChanges {
+            changed,
+            removed,
+            state: SyncState::new("s"),
+            more: false,
+        };
+        assert!(db.apply(&inbox, None, &changes, false).unwrap().is_some());
+    }
+
+    fn bodies(db: &Db) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM bodies", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_body_outlives_a_flag_change_but_not_a_newer_summary() {
+        let mut message = mett_core::mock::message("m1", "in", "hi", DateTime::UNIX_EPOCH);
+        message.summary.modified = DateTime::from_timestamp_micros(1);
+        let mut db = filled(vec![message.summary.clone()]);
+        db.keep_body(&message).unwrap();
+        let mut read = message.summary.clone();
+        read.flags.read = true;
+        resync(&mut db, vec![read.clone()], Vec::new());
+        let kept = db.message(&message.summary.id).unwrap().unwrap();
+        assert!(kept.summary.flags.read, "the flags are the sync's");
+        assert_eq!(kept.body, message.body);
+        read.modified = DateTime::from_timestamp_micros(2);
+        resync(&mut db, vec![read], Vec::new());
+        assert_eq!(db.message(&message.summary.id).unwrap(), None);
+        assert_eq!(bodies(&db), 0);
+    }
+
+    #[test]
+    fn a_body_stays_where_bodies_do_not_change_but_not_a_drafts() {
+        let mut message = mett_core::mock::message("m1", "in", "hi", DateTime::UNIX_EPOCH);
+        message.summary.modified = DateTime::from_timestamp_micros(1);
+        let mut db = filled(vec![message.summary.clone()]);
+        db.set_bodies_stay(true);
+        db.keep_body(&message).unwrap();
+        let mut newer = message.summary.clone();
+        newer.modified = DateTime::from_timestamp_micros(2);
+        resync(&mut db, vec![newer.clone()], Vec::new());
+        assert!(db.message(&message.summary.id).unwrap().is_some());
+        newer.draft = true;
+        resync(&mut db, vec![newer], Vec::new());
+        assert_eq!(db.message(&message.summary.id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_body_goes_with_its_message() {
+        let mut a = mett_core::mock::message("a", "in", "hi", DateTime::UNIX_EPOCH);
+        let mut b = mett_core::mock::message("b", "in", "hi", DateTime::UNIX_EPOCH);
+        a.summary.modified = DateTime::from_timestamp_micros(1);
+        b.summary.modified = DateTime::from_timestamp_micros(1);
+        let mut db = filled(vec![a.summary.clone(), b.summary.clone()]);
+        db.keep_body(&a).unwrap();
+        db.keep_body(&b).unwrap();
+        assert_eq!(bodies(&db), 2);
+        // `a` is reported removed; `b` isn't reported by a sync that
+        // started over, so it is gone with the rest.
+        resync(&mut db, Vec::new(), vec![a.summary.id.clone()]);
+        assert_eq!(bodies(&db), 0);
+        db.keep_body(&a).unwrap();
+        assert_eq!(bodies(&db), 0, "no body without a message");
     }
 
     #[test]
