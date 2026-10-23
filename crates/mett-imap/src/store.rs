@@ -45,6 +45,14 @@ const SYNCS_UNKNOWN: u8 = 0;
 const SYNCS_YES: u8 = 1;
 const SYNCS_NO: u8 = 2;
 
+/// Whether messages are dated by when they came in: where the server can't
+/// sort them by the dates they say, and so lists them by arrival. (With
+/// `CONDSTORE`, the server is synced and the cache lists them, in the order
+/// of the dates they say, as the app does.)
+fn by_arrival(caps: &Caps) -> bool {
+    !caps.sort && !caps.condstore
+}
+
 /// How many messages a sync takes in at a time.
 const BATCH_SIZE: usize = 100;
 
@@ -623,7 +631,7 @@ async fn summaries(
     uids: &[u32],
 ) -> Res<Vec<MessageSummary>> {
     let found = fetch(live, uids, SUMMARY, false).await?;
-    let by_arrival = !live.caps.sort;
+    let by_arrival = by_arrival(&live.caps);
     let by_uid: HashMap<u32, &Fetched> = found.iter().map(|f| (f.uid, f)).collect();
     // A message that is gone by now is left out.
     uids.iter()
@@ -803,6 +811,11 @@ fn day(at: DateTime<Utc>) -> String {
 
 impl<A: Authenticator> MailStore for ImapMailStore<A> {
     fn folder_names_ignore_case(&self) -> bool {
+        false
+    }
+
+    /// A message's body is the one it came with: only its flags change.
+    fn bodies_change(&self) -> bool {
         false
     }
 

@@ -238,22 +238,28 @@ pub fn cache_path(
     let file = match &url.server {
         Server::Imap(server) => {
             let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
-            let name = format!("imap-{}-{}-{}", url.account, server.host, port);
             // What a file name may not hold, or could be confused with, is
-            // written as `%` and its code, so that two accounts never share
-            // a name.
-            let name: String = name
-                .chars()
-                .flat_map(|c| {
-                    if c.is_ascii_alphanumeric() || "@.-".contains(c) {
-                        c.to_string()
-                    } else {
-                        c.to_string().bytes().map(|b| format!("%{b:02X}")).collect()
-                    }
-                    .chars()
-                    .collect::<Vec<_>>()
-                })
-                .collect();
+            // written as `%` and its code; the parts are told apart by a `~`
+            // (which is one of those), so that two accounts never share a
+            // name.
+            let part = |text: &str| -> String {
+                text.chars()
+                    .flat_map(|c| {
+                        if c.is_ascii_alphanumeric() || "@.-".contains(c) {
+                            c.to_string()
+                        } else {
+                            c.to_string().bytes().map(|b| format!("%{b:02X}")).collect()
+                        }
+                        .chars()
+                        .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            let name = format!(
+                "imap~{}~{}~{port}",
+                part(url.account.as_str()),
+                part(&server.host.to_lowercase())
+            );
             format!("{name}.sqlite")
         }
         Server::Office365 => format!("{}.sqlite", url.account),
@@ -688,23 +694,28 @@ mod tests {
         // The same address at two servers is two accounts, with two caches.
         assert_eq!(
             name("imaps://me%40example.org@mail.one.net/INBOX").as_deref(),
-            Some("imap-me@example.org-mail.one.net-993.sqlite")
+            Some("imap~me@example.org~mail.one.net~993.sqlite")
         );
         assert_eq!(
             name("imaps://me%40example.org@mail.two.net/INBOX").as_deref(),
-            Some("imap-me@example.org-mail.two.net-993.sqlite")
+            Some("imap~me@example.org~mail.two.net~993.sqlite")
         );
         // Names that were alike once are told apart.
         assert_ne!(name("imap://a%2Fb@h/"), name("imap://a_b@h/"));
+        // A `-` in the user or the host doesn't blur where one ends.
+        assert_ne!(
+            name("imap://alice%40company-mail@example.net/"),
+            name("imap://alice%40company@mail-example.net/")
+        );
         // Another port is another server.
         assert_eq!(
             name("imaps://me@mail.one.net:1993/").as_deref(),
-            Some("imap-me@mail.one.net-mail.one.net-1993.sqlite")
+            Some("imap~me@mail.one.net~mail.one.net~1993.sqlite")
         );
         // Whatever a file name can't hold is made harmless.
         assert_eq!(
             name("imap://a%2Fb@h/").as_deref(),
-            Some("imap-a%2Fb@h-h-143.sqlite")
+            Some("imap~a%2Fb@h~h~143.sqlite")
         );
     }
 

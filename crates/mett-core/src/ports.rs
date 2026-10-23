@@ -228,6 +228,13 @@ pub trait MailStore: Send + Sync {
         )))
     }
 
+    /// Whether a message's body can change after it is fetched (Exchange
+    /// lets one be edited): the cache fetches it again when the message
+    /// changes. Where it can't (IMAP), a body kept stays good.
+    fn bodies_change(&self) -> bool {
+        true
+    }
+
     /// Whether the backend takes folder names that differ only in case as
     /// the same folder, as Office365 does. Where it doesn't (most IMAP
     /// servers), a name that isn't a folder's exactly names no folder.

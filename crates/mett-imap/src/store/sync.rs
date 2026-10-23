@@ -171,7 +171,7 @@ async fn batch(
     let first = state.initial;
     let (uids, rest) = state.pending.split_newest(BATCH_SIZE);
     state.pending = rest;
-    let by_arrival = !live.caps.sort;
+    let by_arrival = super::by_arrival(&live.caps);
     let found: Vec<Fetched> = fetch(live, &uids, SUMMARY, false).await?;
     let now = chrono::Utc::now();
     let mut changed = Vec::with_capacity(found.len());

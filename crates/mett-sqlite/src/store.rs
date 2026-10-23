@@ -102,12 +102,16 @@ impl Cache {
     }
 }
 
-impl<S> CachedStore<S> {
+impl<S: MailStore> CachedStore<S> {
     /// `inner` with `cache`, or without one.
     pub fn new(inner: S, cache: Option<Cache>) -> Self {
+        let stay = !inner.bodies_change();
         Self {
             inner,
-            db: cache.map(|Cache(db)| Mutex::new(db)),
+            db: cache.map(|Cache(mut db)| {
+                db.set_bodies_stay(stay);
+                Mutex::new(db)
+            }),
             broken: AtomicBool::new(false),
             writes: AtomicU64::new(0),
             synced: Mutex::new(HashMap::new()),

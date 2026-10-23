@@ -311,6 +311,37 @@ async fn what_mett_does_is_in_the_cache_at_once_and_agrees_with_the_server() {
 }
 
 #[tokio::test]
+async fn an_opened_message_keeps_its_body_in_the_cache_when_its_flags_change() {
+    let server = server(Mode::Plain, Accept::Password("me", "secret"), folders()).await;
+    let store = cached(store_for(&server));
+    store.child_folders(None).await.unwrap();
+    let uid = deliver(&server, "INBOX", "one", &[]);
+    let page = store
+        .list_messages(&inbox(), Page::first(10))
+        .await
+        .unwrap();
+    let id = page.messages[0].id.clone();
+    store.fetch_message(&id).await.unwrap();
+
+    // Another client reads it: the sync brings the new flags, not a new body.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .set_flags("INBOX", uid, &["\\Seen"]);
+    after_fresh().await;
+    let page = store
+        .list_messages(&inbox(), Page::first(10))
+        .await
+        .unwrap();
+    assert!(page.messages[0].flags.read);
+    let fetches = server.state.lock().unwrap().fetches;
+    let message = store.fetch_message(&id).await.unwrap();
+    assert_eq!(message.summary.subject, "one");
+    assert_eq!(server.state.lock().unwrap().fetches, fetches);
+}
+
+#[tokio::test]
 async fn every_batch_of_the_first_sync_keeps_the_dates_the_messages_came_in() {
     let (server, store) = plain().await;
     for n in 0..150 {
