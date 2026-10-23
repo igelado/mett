@@ -1388,7 +1388,8 @@ fn run_command(
         changed.push("header_cache");
         changed.sort_unstable();
     }
-    // The mailbox and its sign-in were set up when mett started.
+    // The mailbox, its sign-in and its connections were set up when mett
+    // started.
     if let Ok(warnings) = &mut outcome {
         warnings.extend(
             changed
@@ -1396,7 +1397,17 @@ fn run_command(
                 .filter(|name| {
                     (name.starts_with("office365_")
                         || name.starts_with("msgraph_")
-                        || ["use_ews", "ews_url", "header_cache"].contains(*name))
+                        || name.starts_with("ssl_")
+                        || [
+                            "use_ews",
+                            "ews_url",
+                            "header_cache",
+                            "imap_user",
+                            "imap_pass",
+                            "smtp_url",
+                            "smtp_pass",
+                        ]
+                        .contains(*name))
                         && ![
                             "office365_page_size",
                             "office365_sync_interval",
@@ -1825,6 +1836,16 @@ mod tests {
             ])
         );
         assert_eq!(demo.config.string("office365_client_id"), "abc", "kept");
+        // The IMAP and SMTP connections were made then too.
+        let done = demo.run("set imap_pass=x smtp_url=smtps://smtp.example.com ssl_force_tls=yes");
+        assert_eq!(
+            done.outcome,
+            Ok(vec![
+                "imap_pass: takes effect when mett starts again".to_owned(),
+                "smtp_url: takes effect when mett starts again".to_owned(),
+                "ssl_force_tls: takes effect when mett starts again".to_owned(),
+            ])
+        );
         // Unsetting the cache keeps its empty value, but stops caching.
         let done = demo.run("unset header_cache");
         assert_eq!(

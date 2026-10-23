@@ -450,6 +450,8 @@ set realname  = "Alice Example"
   the server says it is (the `\Sent`, `\Drafts`, `\Trash`, `\Junk` and `\Archive`
   attributes), or by its usual name (`Sent`, `Drafts`, `Trash`, `Spam`,
   `Archive`).
+- **Changing them** with `:set` takes effect when mett starts again: the
+  connections are made at start-up (mett says so).
 - **Limits.** mett logs in with a password only (`LOGIN`; OAuth2 isn't
   wired to the configuration yet). IMAP can't tell what changed in a folder,
   so mett doesn't cache the mailbox and looks again every `mail_check`
