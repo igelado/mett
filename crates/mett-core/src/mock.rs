@@ -1,13 +1,16 @@
 //! In-memory adapters for tests.
 //!
 //! Enabled by the `mock` feature, so that other crates (the TUI, the worker)
-//! can be tested against [`MemoryStore`] without a network connection.
+//! can be tested against [`MemoryStore`] without a network connection. The
+//! test [`Authenticator`]s ([`StaticAuth`], [`RotatingAuth`],
+//! [`CountingAuth`]) are shared by the adapters' tests.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
 use crate::attachment::{Attachment, AttachmentKind};
 use crate::draft::{Draft, DraftOrigin};
@@ -15,7 +18,9 @@ use crate::error::{Error, Result};
 use crate::folder::{Folder, WellKnownFolder};
 use crate::ids::{AttachmentId, FolderId, MessageId, PageCursor, SyncState};
 use crate::message::{Address, Body, BodyKind, Flags, FlagsUpdate, Message, MessageSummary};
-use crate::ports::{FolderChanges, MailSender, MailStore, MessagePage, Page};
+use crate::ports::{
+    AccessToken, Authenticator, FolderChanges, MailSender, MailStore, MessagePage, Page,
+};
 
 /// A [`MailStore`] and [`MailSender`] that keeps everything in memory.
 /// Sent drafts are recorded (see [`MemoryStore::sent`]), and copies and
@@ -729,6 +734,59 @@ pub fn message(id: &str, folder: &str, subject: &str, received: DateTime<Utc>) -
             content: format!("Body of {subject}"),
         },
         invitation: None,
+    }
+}
+
+/// An [`Authenticator`] that hands out a fixed token.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StaticAuth;
+
+impl Authenticator for StaticAuth {
+    async fn access_token(&self) -> Result<AccessToken> {
+        Ok(AccessToken::new("tok", Utc::now() + TimeDelta::hours(1)))
+    }
+}
+
+/// An [`Authenticator`] that hands out the token `old` until told it was
+/// rejected, then `new`. Being told that any other token was rejected fails
+/// the test.
+#[derive(Debug, Default)]
+pub struct RotatingAuth {
+    /// Whether a token was rejected.
+    pub rejected: AtomicBool,
+}
+
+impl Authenticator for RotatingAuth {
+    async fn access_token(&self) -> Result<AccessToken> {
+        let secret = if self.rejected.load(Ordering::SeqCst) {
+            "new"
+        } else {
+            "old"
+        };
+        Ok(AccessToken::new(secret, DateTime::<Utc>::MAX_UTC))
+    }
+
+    async fn token_rejected(&self, token: &AccessToken) {
+        assert_eq!(token.secret(), "old");
+        self.rejected.store(true, Ordering::SeqCst);
+    }
+}
+
+/// An [`Authenticator`] that hands out one token and counts how many times
+/// it was told that it was rejected.
+#[derive(Debug, Default)]
+pub struct CountingAuth {
+    /// How many times a token was rejected.
+    pub rejected: AtomicUsize,
+}
+
+impl Authenticator for CountingAuth {
+    async fn access_token(&self) -> Result<AccessToken> {
+        Ok(AccessToken::new("tok", DateTime::<Utc>::MAX_UTC))
+    }
+
+    async fn token_rejected(&self, _: &AccessToken) {
+        self.rejected.fetch_add(1, Ordering::SeqCst);
     }
 }
 

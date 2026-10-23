@@ -24,6 +24,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"
 url.workspace = true
 
 [dev-dependencies]
+mett-core = { workspace = true, features = ["mock"] }
 open.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock.workspace = true
