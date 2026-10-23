@@ -316,6 +316,13 @@ impl Config {
         else {
             return;
         };
+        // Read once, on its own: what an account has set is above it.
+        let mut shared = Config::new(self.home.clone());
+        if file.exists() {
+            shared.source(&file, 1);
+            self.errors.append(&mut shared.errors);
+            self.warnings.append(&mut shared.warnings);
+        }
         for account in &mut self.accounts {
             let config = &mut account.config;
             if config.was_set("alias_file") {
@@ -324,11 +331,13 @@ impl Config {
             // Set as it is, not written in a mettrc line: a path may hold
             // what a mettrc takes for quotes.
             config.store("alias_file", Value::Str(file.display().to_string()));
-            if file.exists() {
-                config.source(&file, 1);
+            for alias in &shared.aliases {
+                let key = crate::alias::folded_key(&alias.key);
+                if !config.alias_places.contains_key(&key) {
+                    config.alias_places.insert(key, config.aliases.len());
+                    config.aliases.push(alias.clone());
+                }
             }
-            self.errors.append(&mut config.errors);
-            self.warnings.append(&mut config.warnings);
         }
     }
 
@@ -1903,9 +1912,17 @@ mod tests {
     fn accounts_share_a_file_of_aliases_beside_the_mettrc() {
         let dir = std::env::temp_dir().join(format!("mett-aliases-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("one"), "set from=a@x.org\n").unwrap();
+        fs::write(
+            dir.join("one"),
+            "set from=a@x.org\nalias bob Bob Own <bob@own.org>\n",
+        )
+        .unwrap();
         fs::write(dir.join("two"), "set from=b@x.org alias_file=/tmp/mine\n").unwrap();
-        fs::write(dir.join("aliases"), "alias bob Bob <bob@x.org>\n").unwrap();
+        fs::write(
+            dir.join("aliases"),
+            "alias bob Bob <bob@x.org>\nalias carol Carol <carol@x.org>\n",
+        )
+        .unwrap();
         let mut config = Config::new(None);
         config.set_user_file(Some(dir.join("mettrc")));
         config.load_str("account One one\naccount Two two\n", &dir.join("mettrc"));
@@ -1914,7 +1931,13 @@ mod tests {
         let accounts = config.accounts();
         let written = dir.join("aliases").display().to_string();
         assert_eq!(accounts[0].config.string("alias_file"), written);
-        assert_eq!(accounts[0].config.aliases().len(), 1, "read");
+        // Read, but not over what the account says itself.
+        assert_eq!(accounts[0].config.aliases().len(), 2);
+        assert_eq!(
+            accounts[0].config.aliases()[0].value,
+            "Bob Own <bob@own.org>"
+        );
+        assert_eq!(accounts[0].config.aliases()[1].key, "carol");
         // One that names its own file keeps it.
         assert_eq!(accounts[1].config.string("alias_file"), "/tmp/mine");
         assert!(accounts[1].config.aliases().is_empty());

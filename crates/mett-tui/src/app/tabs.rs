@@ -83,6 +83,14 @@ impl App {
         !self.deleted.is_empty()
     }
 
+    /// Whether a message is being written: it isn't lost by quitting
+    /// another account.
+    pub fn is_composing(&self) -> bool {
+        self.screens
+            .iter()
+            .any(|screen| matches!(screen, crate::app::Screen::Compose(_)))
+    }
+
     /// The keys still to play (a macro, `push`), and how many have been
     /// played in a row, which go on in the account that is shown next when
     /// one is gone to: a macro that goes back and forth between accounts

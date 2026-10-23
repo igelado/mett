@@ -894,26 +894,30 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             }
         }
         if done.iter().any(|done| *done) {
-            // Messages marked deleted in another account are the user's to
-            // decide on, as they would be quitting it alone: it is shown,
-            // and asked, once.
-            let to_ask = (0..slots.len())
-                .find(|at| !done[*at] && !asked[*at] && slots[*at].app.has_deleted());
+            // What is unfinished in another account (messages marked deleted,
+            // a message being written) is the user's to decide on, as it
+            // would be quitting that account alone: it is shown, and asked,
+            // once.
+            let unfinished = |slot: &Slot| slot.app.has_deleted() || slot.app.is_composing();
+            let to_ask =
+                (0..slots.len()).find(|at| !done[*at] && !asked[*at] && unfinished(&slots[*at]));
             match to_ask {
                 Some(other) => {
                     asked[other] = true;
                     active = other;
                     stale = true;
-                    // An account that needs a sign-in first has its window
+                    // The purge is asked by quitting; a message being written
+                    // is shown, for the user to send, postpone or abandon. An
+                    // account that needs a sign-in first has its window
                     // shown: the user deals with it, and quits again.
-                    if slots[other].app.sign_in.is_none() {
+                    if slots[other].app.sign_in.is_none() && slots[other].app.has_deleted() {
                         let effects = slots[other].app.update(Msg::Action(action::Action::Quit));
                         slots[other].absorb(effects);
                     }
                 }
                 // Nothing is left to ask: mett quits. (An account asked and
                 // not answered keeps it going: the user may have said no.)
-                None if (0..slots.len()).all(|at| done[at] || !slots[at].app.has_deleted()) => {
+                None if (0..slots.len()).all(|at| done[at] || !unfinished(&slots[at])) => {
                     break 'run;
                 }
                 None => {}
