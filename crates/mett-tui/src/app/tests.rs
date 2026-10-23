@@ -122,7 +122,7 @@ fn answered_requests_wait_no_more() {
     for query in 0..100 {
         app.request(Request::Cancel(RequestId(1000 + query)));
     }
-    assert_eq!(app.given_up.len(), GIVEN_UP_KEPT);
+    assert_eq!(app.throttle.given_up.len(), GIVEN_UP_KEPT);
     // Calls of one request waiting at once: the longest wait counts.
     for wait in [20, 5] {
         let throttled = Event::Throttled {
@@ -1104,6 +1104,18 @@ fn resetting_the_folder_forgets_only_the_flags_saved_while_listing() {
     // Changes on their way and failed ones don't depend on the folder.
     assert!(app.flag_sync.mailbox.contains_key(&id));
     assert!(app.flag_sync.failures.contains_key(&id));
+}
+
+#[test]
+fn resetting_the_folder_keeps_the_throttled_requests_waiting() {
+    let mut app = empty_app();
+    let throttled = Event::Throttled {
+        wait: Duration::from_secs(5),
+        attempt: 1,
+    };
+    respond(&mut app, RequestId(90), throttled);
+    app.reset_folder();
+    assert!(app.throttled_notice().is_some());
 }
 
 #[test]

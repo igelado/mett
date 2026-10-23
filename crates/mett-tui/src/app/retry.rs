@@ -144,34 +144,20 @@ impl App {
     ) -> Vec<Effect> {
         // Whole seconds, so that the countdown ends when the wait does.
         let wait = Duration::from_secs(wait.as_secs() + u64::from(wait.subsec_nanos() > 0));
-        if self.given_up.contains(&id) {
-            return Vec::new();
+        match self.throttle.throttled(id, wait, attempt) {
+            Some(timer) => vec![Effect::Later(SECOND, Timer::Throttled(timer))],
+            None => Vec::new(),
         }
-        let counting = !self.throttled.is_empty();
-        // Calls of one request may wait at once: the longest wait counts.
-        let entry = self.throttled.entry(id).or_insert((wait, attempt));
-        *entry = (entry.0.max(wait), entry.1.max(attempt));
-        if counting {
-            return Vec::new();
-        }
-        self.throttle_timer += 1;
-        vec![Effect::Later(SECOND, Timer::Throttled(self.throttle_timer))]
     }
 
     /// A second of the wait for the server went by: the countdown goes on
     /// while a request still waits.
     pub(super) fn count_down_throttled(&mut self, timer: u64) -> Vec<Effect> {
-        if timer != self.throttle_timer {
-            return Vec::new();
+        if self.throttle.count_down(timer) {
+            vec![Effect::Later(SECOND, Timer::Throttled(timer))]
+        } else {
+            Vec::new()
         }
-        for (left, _) in self.throttled.values_mut() {
-            *left = left.saturating_sub(SECOND);
-        }
-        self.throttled.retain(|_, (left, _)| !left.is_zero());
-        if self.throttled.is_empty() {
-            return Vec::new();
-        }
-        vec![Effect::Later(SECOND, Timer::Throttled(timer))]
     }
 
     /// What the message line says while requests wait for a throttling
@@ -183,8 +169,7 @@ impl App {
 
     /// [`App::throttled_notice`], and a shorter one for a narrow line.
     pub fn throttled_notices(&self) -> Option<[String; 2]> {
-        let left = self.throttled.values().map(|(left, _)| *left).max()?;
-        let attempt = self.throttled.values().map(|(_, attempt)| *attempt).max()?;
+        let (left, attempt) = self.throttle.longest()?;
         let seconds = left.as_secs();
         Some([
             format!(
