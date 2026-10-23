@@ -77,6 +77,25 @@ impl Switch {
 }
 
 impl App {
+    /// Whether messages are marked deleted that nothing has purged yet: on
+    /// quitting, the user is asked what to do with them.
+    pub fn has_deleted(&self) -> bool {
+        !self.deleted.is_empty()
+    }
+
+    /// The keys still to play (a macro, `push`), which go on in the account
+    /// that is shown next when one is gone to.
+    pub fn take_strokes(&mut self) -> std::collections::VecDeque<crate::keymap::Stroke> {
+        std::mem::take(&mut self.strokes)
+    }
+
+    /// Plays `strokes` first (see [`App::take_strokes`]).
+    pub fn give_strokes(&mut self, strokes: std::collections::VecDeque<crate::keymap::Stroke>) {
+        for stroke in strokes.into_iter().rev() {
+            self.strokes.push_front(stroke);
+        }
+    }
+
     /// Goes to another account, if there are any.
     pub(super) fn switch_account(&mut self, action: Action) -> Vec<Effect> {
         let Some(tabs) = &self.tabs else {
@@ -178,6 +197,21 @@ mod tests {
         // One there isn't.
         assert!(act(&mut app, Action::Account5).is_empty());
         assert_eq!(app.status, "There is no account 5.");
+    }
+
+    #[test]
+    fn keys_still_to_play_can_be_handed_over() {
+        let mut from = app();
+        from.strokes.extend([
+            crate::keymap::Stroke::Key(crate::keymap::Key::char('j')),
+            crate::keymap::Stroke::Key(crate::keymap::Key::char('k')),
+        ]);
+        let mut to = app();
+        let strokes = from.take_strokes();
+        assert_eq!(strokes.len(), 2);
+        assert!(from.take_strokes().is_empty());
+        to.give_strokes(strokes);
+        assert_eq!(to.take_strokes().len(), 2);
     }
 
     #[test]

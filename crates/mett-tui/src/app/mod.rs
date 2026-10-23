@@ -548,6 +548,10 @@ pub struct App {
     /// The tabs of the accounts, if there are several: the main loop gives
     /// them to the account shown, to draw.
     pub tabs: Option<Tabs>,
+    /// Whether new mail was announced since the account was last looked at,
+    /// which its tab says when another account is shown (the main loop
+    /// clears it once it is shown).
+    pub arrived: bool,
     /// How the screen is drawn: formats and colors.
     pub display: crate::expando::Display,
     /// The last error reported on the message line, so that the view can
@@ -909,6 +913,7 @@ impl App {
             sign_in: None,
             keymap: Keymap::mutt_defaults(),
             tabs: None,
+            arrived: false,
             display: settings.display,
             error: None,
             input_note: None,
