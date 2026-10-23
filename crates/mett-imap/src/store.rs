@@ -10,8 +10,9 @@ use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use mett_core::{
     AccountId, Address, Attachment, AttachmentId, Authenticator, Draft, DraftOrigin, Error, Flags,
-    FlagsUpdate, Folder, FolderId, MailSender, MailStore, Message, MessageId, MessagePage,
-    MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, WellKnownFolder,
+    FlagsUpdate, Folder, FolderChanges, FolderId, MailSender, MailStore, Message, MessageId,
+    MessagePage, MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, SyncState,
+    WellKnownFolder,
 };
 use mett_smtp::{SmtpSender, Threading};
 use tokio::sync::{Mutex, MutexGuard};
@@ -38,6 +39,9 @@ const STALE: Duration = Duration::from_secs(60);
 /// header, to make the index line, and its parts, to tell whether it has
 /// attachments.
 const SUMMARY: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER] BODYSTRUCTURE)";
+
+/// How many messages a sync takes in at a time.
+const BATCH_SIZE: usize = 100;
 
 /// The whole message.
 const WHOLE: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[])";
@@ -102,6 +106,8 @@ pub struct ImapMailStore<A = NoTokens> {
     live: Mutex<Option<Live>>,
     /// How each folder stood when it was last asked about new mail.
     marks: Marks,
+    /// Whether the server can be synced (see [`MailStore::can_sync`]).
+    syncs: std::sync::atomic::AtomicBool,
 }
 
 impl<A: Authenticator> ImapMailStore<A> {
@@ -115,6 +121,7 @@ impl<A: Authenticator> ImapMailStore<A> {
             smtp: None,
             live: Mutex::new(None),
             marks: Marks::default(),
+            syncs: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -160,6 +167,9 @@ impl<A: Authenticator> ImapMailStore<A> {
         let caps = within(self.settings.timeout, session.capabilities())
             .await?
             .map_err(|e| conn::lost(host, &e.to_string()))?;
+        let condstore = caps.has_str("CONDSTORE") || caps.has_str("QRESYNC");
+        self.syncs
+            .store(condstore, std::sync::atomic::Ordering::SeqCst);
         Ok(Live {
             session,
             caps: Caps {
@@ -788,6 +798,24 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         false
     }
 
+    /// Whether the server tells what changed since a modification sequence
+    /// (`CONDSTORE`), which a sync needs to find flags that changed: known
+    /// once connected (the first request connects).
+    fn can_sync(&self) -> bool {
+        self.syncs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&SyncState>,
+    ) -> Result<FolderChanges> {
+        let mut g = self.lock().await?;
+        let t = g.timeout;
+        let r = bounded(t, sync::sync_folder(g.live(), folder.as_str(), state)).await;
+        g.done(r)
+    }
+
     async fn own_addresses(&self) -> Result<Vec<String>> {
         let mut own = vec![self.from.email.clone()];
         if self.login.user().contains('@') && self.login.user() != self.from.email {
@@ -1349,6 +1377,8 @@ impl<A: Authenticator> MailSender for ImapMailStore<A> {
 }
 
 /// How the lists of messages a page holds are cut: here for the tests.
+mod sync;
+
 #[cfg(test)]
 mod tests {
     use super::*;

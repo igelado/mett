@@ -454,10 +454,13 @@ set realname  = "Alice Example"
 - **Changing them** with `:set` takes effect when mett starts again: the
   connections are made at start-up (mett says so).
 - **Limits.** mett logs in with a password only (`LOGIN`; OAuth2 isn't
-  wired to the configuration yet). IMAP can't tell what changed in a folder,
-  so mett doesn't cache the mailbox and looks again every `mail_check`
-  seconds rather than being told when mail arrives (flags that another client
-  changes are noticed that way only where the server has `CONDSTORE`). The
+  wired to the configuration yet). With `CONDSTORE` (nearly every server)
+  the mailbox is cached as the Office365 ones are (`header_cache`: one file
+  per user and server): folders open from the cache, and a check asks the
+  server only for what changed. Without it, mett doesn't cache and notices
+  flags that other clients change only when a folder is opened again. IMAP
+  can't tell when mail arrives, so mett looks again every `mail_check`
+  seconds. The
   index is in the order of the messages' dates where the server has `SORT`,
   and of their arrival (UID, and they are dated by it) where it hasn't. Threads are those of
   `References:`. Meeting invitations aren't shown as such (their `text/calendar`

@@ -25,6 +25,7 @@ tokio-rustls.workspace = true
 utf7-imap.workspace = true
 
 [dev-dependencies]
+mett-sqlite.workspace = true
 rcgen = "0.14.10"
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
 

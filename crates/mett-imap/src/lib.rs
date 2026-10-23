@@ -28,6 +28,7 @@ mod parse;
 mod settings;
 mod store;
 mod tls;
+mod uidset;
 
 pub use settings::{ImapSettings, Login, NoTokens, Security};
 pub use store::{ImapMailStore, account};

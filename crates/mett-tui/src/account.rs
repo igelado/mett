@@ -233,7 +233,25 @@ pub fn cache_path(
     xdg_cache_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    let file = format!("{}.sqlite", url.account);
+    // An IMAP account is named by its user, who may be the same address at
+    // another server: the server is in the name too.
+    let file = match &url.server {
+        Server::Imap(server) => {
+            let name = format!("imap-{}-{}", url.account, server.host);
+            let name: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || "@._-".contains(c) {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            format!("{name}.sqlite")
+        }
+        Server::Office365 => format!("{}.sqlite", url.account),
+    };
     if !config.was_set("header_cache") {
         // The XDG Base Directory spec says to ignore relative values.
         let cache = xdg_cache_home
@@ -261,19 +279,13 @@ pub fn cached(
     mailbox: Mailbox,
     progress: Progress,
 ) -> (CachedStore<Mailbox>, Option<String>) {
-    // IMAP can't tell what changed in a folder: there is nothing to sync
-    // into a cache.
-    let path = (!matches!(mailbox, Mailbox::Imap(_)))
-        .then(|| {
-            cache_path(
-                config,
-                url,
-                std::env::var_os("XDG_CACHE_HOME"),
-                // The home mett found, which on Windows may not be `$HOME`.
-                config.home().map(Into::into),
-            )
-        })
-        .flatten();
+    let path = cache_path(
+        config,
+        url,
+        std::env::var_os("XDG_CACHE_HOME"),
+        // The home mett found, which on Windows may not be `$HOME`.
+        config.home().map(Into::into),
+    );
     let Some(path) = path else {
         return (CachedStore::new(mailbox, None), None);
     };
@@ -652,6 +664,29 @@ mod tests {
             ..delegated
         }));
         assert!(!Api::Ews.always_copies(&attached));
+    }
+
+    #[test]
+    fn an_imap_cache_is_named_by_the_user_and_the_server() {
+        let name = |text: &str| {
+            let url = MailboxUrl::parse(text).unwrap();
+            cache_path(&config(""), &url, Some("/xdg".into()), None)
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        };
+        // The same address at two servers is two accounts, with two caches.
+        assert_eq!(
+            name("imaps://me%40example.org@mail.one.net/INBOX").as_deref(),
+            Some("imap-me@example.org-mail.one.net.sqlite")
+        );
+        assert_eq!(
+            name("imaps://me%40example.org@mail.two.net/INBOX").as_deref(),
+            Some("imap-me@example.org-mail.two.net.sqlite")
+        );
+        // Whatever a file name can't hold is made harmless.
+        assert_eq!(
+            name("imap://a%2Fb@h/").as_deref(),
+            Some("imap-a_b@h-h.sqlite")
+        );
     }
 
     #[test]

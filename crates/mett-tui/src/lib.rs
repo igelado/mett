@@ -206,13 +206,13 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
         };
         let several = named.len() > 1;
         let mut list: Vec<Opened<_>> = Vec::with_capacity(named.len());
-        // The accounts whose cache is a file named by the account (not IMAP's,
-        // which has none): two tabs for one would share it, though their
-        // backends may not agree on what is in it.
-        let mut cached: Vec<mett_core::AccountId> = Vec::new();
+        // The caches the accounts use, named by the account (and for IMAP the
+        // server): two tabs for one would share it, though their backends
+        // may not agree on what is in it.
+        let mut cached: Vec<String> = Vec::new();
         for (label, config) in named {
             match open_account(&mut launch, label.clone(), config, &keymap) {
-                Ok((opened, true)) if cached.contains(&opened.session.account) => {
+                Ok((opened, cache)) if cached.contains(&cache) => {
                     return fail(
                         &mut launch,
                         format!(
@@ -221,10 +221,8 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
                         ),
                     );
                 }
-                Ok((opened, uses_cache)) => {
-                    if uses_cache {
-                        cached.push(opened.session.account.clone());
-                    }
+                Ok((opened, cache)) => {
+                    cached.push(cache);
                     list.push(opened);
                 }
                 Err(e) if several || !label.is_empty() => {
@@ -273,13 +271,13 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
 
 /// The account of `config`, opened: its mailbox (which signs in when first
 /// used, in the TUI's sign-in window), its cache and the app's settings; and
-/// whether it has a cache file.
+/// what its cache is called (for telling two tabs for one account).
 fn open_account(
     launch: &mut impl Launch,
     label: String,
     mut config: config::Config,
     keymap: &Keymap,
-) -> Result<(Opened<mett_sqlite::CachedStore<account::Mailbox>>, bool), String> {
+) -> Result<(Opened<mett_sqlite::CachedStore<account::Mailbox>>, String), String> {
     let spoolfile = config.spoolfile().map_err(|e| e.to_string())?;
     let settings = settings_from_config(&config, &spoolfile.account)?;
     let editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
@@ -312,7 +310,12 @@ fn open_account(
     } else {
         label
     };
-    let uses_cache = !matches!(spoolfile.server, config::mailbox::Server::Imap(_));
+    let cache = match &spoolfile.server {
+        config::mailbox::Server::Imap(server) => {
+            format!("imap/{}/{}", spoolfile.account, server.host.to_lowercase())
+        }
+        config::mailbox::Server::Office365 => format!("office365/{}", spoolfile.account),
+    };
     Ok((
         Opened {
             label,
@@ -331,7 +334,7 @@ fn open_account(
                 notice: None,
             },
         },
-        uses_cache,
+        cache,
     ))
 }
 

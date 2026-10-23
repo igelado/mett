@@ -2576,6 +2576,7 @@ dependencies = [
  "mail-parser",
  "mett-core",
  "mett-smtp",
+ "mett-sqlite",
  "rcgen",
  "rustls",
  "rustls-platform-verifier",

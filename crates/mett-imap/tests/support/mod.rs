@@ -74,6 +74,8 @@ pub struct State {
     pub refuse_starttls: bool,
     /// How many times every folder was listed.
     pub full_lists: u32,
+    /// How many times messages were fetched (`UID FETCH`).
+    pub fetches: u32,
     /// Says which folders are Sent, Drafts and so on only when asked to
     /// (`RETURN (SPECIAL-USE)`), as the servers allowed to do.
     pub special_use_only_on_request: bool,
@@ -580,6 +582,7 @@ impl Session {
             };
             out.push_str(&format!("* SORT{list}\r\n{tag} OK done\r\n"));
         } else if upper.starts_with("FETCH ") {
+            state.fetches += 1;
             let folder = state.folder(&name);
             let all: Vec<u32> = folder.messages.iter().map(|m| m.uid).collect();
             let (set, items) = rest[6..].split_once(' ').unwrap_or((&rest[6..], ""));
