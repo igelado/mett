@@ -13,6 +13,7 @@ repository.workspace = true
 mock = []
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

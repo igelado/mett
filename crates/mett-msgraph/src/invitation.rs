@@ -1,8 +1,10 @@
 //! Meeting invitations in Graph messages: what an `eventMessage` says,
 //! with the calendar event it is about.
 
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc, Weekday};
-use mett_core::{Address, Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc, Weekday};
+use mett_core::{
+    Address, Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp, nth_of, whole_day,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -344,14 +346,7 @@ impl DateTimeZone {
         // against a real tenant). If it shifted them, 13 hours later is on
         // the day's date for the zones from UTC-10 to UTC+13, so the date
         // is right in both cases for nearly every zone.
-        Some(if all_day {
-            (time + Duration::hours(13))
-                .date_naive()
-                .and_time(chrono::NaiveTime::MIN)
-                .and_utc()
-        } else {
-            time
-        })
+        Some(if all_day { whole_day(time) } else { time })
     }
 }
 
@@ -380,14 +375,7 @@ impl GraphRecurrence {
             result.day_of_month = pattern.day_of_month;
         }
         if pattern.kind.starts_with("relative") {
-            result.nth = match pattern.index.as_deref() {
-                Some("first") => Some(1),
-                Some("second") => Some(2),
-                Some("third") => Some(3),
-                Some("fourth") => Some(4),
-                Some("last") => Some(-1),
-                _ => None,
-            };
+            result.nth = pattern.index.as_deref().and_then(nth_of);
         }
         if unit == RecurrenceUnit::Year {
             result.month = pattern.month;

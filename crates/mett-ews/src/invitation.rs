@@ -1,8 +1,11 @@
 //! Meeting invitations in EWS items: what `MeetingRequest`,
 //! `MeetingCancellation` and `MeetingResponse` items say.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc, Weekday};
-use mett_core::{Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc, Weekday};
+use mett_core::{
+    Invitation, InvitationKind, Recurrence, RecurrenceUnit, Reply, Rsvp, nth_of, occurrence_window,
+    parse_time, whole_day,
+};
 use roxmltree::Node;
 
 use crate::soap::{child, child_text, children, escape};
@@ -54,11 +57,7 @@ pub(crate) fn invitation(item: Node<'_, '_>) -> Option<Invitation> {
         _ => return None,
     };
     let all_day = child_text(item, "IsAllDayEvent").as_deref() == Some("true");
-    let time = |name: &str| {
-        child_text(item, name)
-            .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
-            .map(|t| t.with_timezone(&Utc))
-    };
+    let time = |name: &str| child_text(item, name).as_deref().and_then(parse_time);
     // A meeting of whole days is by its dates, which the wall clock times
     // (in the zone the meeting was made in) give exactly.
     let wall = |name: &str| {
@@ -138,11 +137,7 @@ pub(crate) fn answer_xml(rsvp: Rsvp, reference: &str, comment: Option<&str>) -> 
 /// `start` and ends at `end`, as `StartDate` and `EndDate` attributes.
 pub(crate) fn occurrence_view(start: DateTime<Utc>, end: Option<DateTime<Utc>>) -> String {
     let format = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    // The view lists what is there in its window: a window of an instant
-    // can have nothing at its end.
-    let end = end
-        .filter(|e| *e > start)
-        .unwrap_or(start + Duration::seconds(1));
+    let (start, end) = occurrence_window(start, end);
     format!(
         "StartDate=\"{}\" EndDate=\"{}\"",
         format(start),
@@ -162,11 +157,7 @@ pub(crate) fn find_occurrence(
     all_day: bool,
 ) -> Option<String> {
     let starts = |item: &Node<'_, '_>| {
-        let time = |name: &str| {
-            child_text(*item, name)
-                .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
-                .map(|t| t.with_timezone(&Utc))
-        };
+        let time = |name: &str| child_text(*item, name).as_deref().and_then(parse_time);
         if !all_day {
             return time("Start") == Some(start);
         }
@@ -185,18 +176,6 @@ pub(crate) fn find_occurrence(
     child(found, "ItemId")
         .and_then(|id| id.attribute("Id"))
         .map(str::to_owned)
-}
-
-/// The midnight (UTC) of the day an all-day meeting's time falls in, for
-/// a server that gave no wall clock time. EWS gives it as its midnight in
-/// the time zone it was made in, shifted to UTC. Adding 13 hours gives the
-/// day's date for the zones from UTC-10 (Hawaii) to UTC+13 (New Zealand
-/// in summer): a few zones beyond, such as UTC+14, are off by a day.
-fn whole_day(time: DateTime<Utc>) -> DateTime<Utc> {
-    (time + Duration::hours(13))
-        .date_naive()
-        .and_time(chrono::NaiveTime::MIN)
-        .and_utc()
 }
 
 /// The weekdays of a `DaysOfWeek` value, such as `Tuesday Thursday` (or
@@ -247,18 +226,6 @@ fn month(value: &str) -> Option<u32> {
     Some(date.month())
 }
 
-/// A `DayOfWeekIndex` value as the n-th (-1 for the last).
-fn nth(value: &str) -> Option<i8> {
-    Some(match value.trim() {
-        "First" => 1,
-        "Second" => 2,
-        "Third" => 3,
-        "Fourth" => 4,
-        "Last" => -1,
-        _ => return None,
-    })
-}
-
 /// A `Recurrence` element: a pattern, then how it ends.
 fn recurrence(node: Node<'_, '_>) -> Option<Recurrence> {
     let pattern = node.children().find(|n| {
@@ -290,7 +257,7 @@ fn recurrence(node: Node<'_, '_>) -> Option<Recurrence> {
         "RelativeMonthlyRecurrence" => {
             let mut r = Recurrence::new(RecurrenceUnit::Month, every);
             r.weekdays = days.unwrap_or_default();
-            r.nth = child_text(pattern, "DayOfWeekIndex").and_then(|n| nth(&n));
+            r.nth = child_text(pattern, "DayOfWeekIndex").and_then(|n| nth_of(&n));
             r
         }
         "AbsoluteYearlyRecurrence" => {
@@ -302,7 +269,7 @@ fn recurrence(node: Node<'_, '_>) -> Option<Recurrence> {
         _ => {
             let mut r = Recurrence::new(RecurrenceUnit::Year, 1);
             r.weekdays = days.unwrap_or_default();
-            r.nth = child_text(pattern, "DayOfWeekIndex").and_then(|n| nth(&n));
+            r.nth = child_text(pattern, "DayOfWeekIndex").and_then(|n| nth_of(&n));
             r.month = child_text(pattern, "Month").and_then(|m| month(&m));
             r
         }
@@ -320,7 +287,7 @@ fn recurrence(node: Node<'_, '_>) -> Option<Recurrence> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
     use mett_core::Address;
 
     /// The invitation in an item given as XML.

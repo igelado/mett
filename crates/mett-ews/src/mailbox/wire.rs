@@ -270,6 +270,20 @@ pub(super) struct EwsFolder {
     pub(super) total: u32,
 }
 
+impl From<EwsFolder> for Folder {
+    /// The folder, not yet labelled by [`Roles::folder`] with its role.
+    fn from(folder: EwsFolder) -> Self {
+        Self {
+            id: FolderId::new(folder.id),
+            parent: folder.parent.map(FolderId::new),
+            name: folder.name,
+            well_known: None,
+            unread_count: folder.unread,
+            total_count: folder.total,
+        }
+    }
+}
+
 impl EwsFolder {
     pub(super) fn parse(node: Node<'_, '_>) -> Option<Self> {
         let number = |name: &str| {
@@ -424,13 +438,6 @@ pub(crate) fn address(mailbox: Node<'_, '_>) -> Address {
     }
 }
 
-/// An EWS timestamp, if it parses.
-pub(super) fn parse_time(time: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(time.trim())
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
-}
-
 /// An item's summary.
 pub(super) fn summary(item: Node<'_, '_>) -> Result<MessageSummary> {
     let id = item_id(item).ok_or_else(|| unexpected("GetItem", "an item without an ID"))?;
@@ -474,7 +481,7 @@ pub(super) fn summary(item: Node<'_, '_>) -> Result<MessageSummary> {
             conversation,
             path: child_text(item, "ConversationIndex")
                 .as_deref()
-                .map(thread_path)
+                .map(mett_core::thread_path)
                 .unwrap_or_default(),
         }),
     })
@@ -498,23 +505,4 @@ pub(super) fn full_message(item: Node<'_, '_>) -> Result<Message> {
         },
         invitation: invitation(item),
     })
-}
-
-/// A message's path in its conversation, from Outlook's conversation
-/// index: the 22-byte header (the conversation's first message), then a
-/// 5-byte block for each reply. An index that doesn't decode, or doesn't
-/// have that shape, gives none.
-fn thread_path(index: &str) -> Vec<Vec<u8>> {
-    use base64::Engine;
-
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(index.trim()) else {
-        return Vec::new();
-    };
-    if bytes.len() < 22 || (bytes.len() - 22) % 5 != 0 {
-        return Vec::new();
-    }
-    let (header, replies) = bytes.split_at(22);
-    std::iter::once(header.to_vec())
-        .chain(replies.chunks(5).map(<[u8]>::to_vec))
-        .collect()
 }

@@ -1,3 +1,5 @@
+use mett_core::occurrence_window;
+
 use super::*;
 
 impl<A: Authenticator> GraphMailStore<A> {
@@ -49,12 +51,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         let Some(start) = invitation.start else {
             return Err(Error::Backend("the meeting has no start".into()));
         };
-        // The window lists what is there: an instant can have nothing at
-        // its end.
-        let end = invitation
-            .end
-            .filter(|e| *e > start)
-            .unwrap_or(start + chrono::TimeDelta::seconds(1));
+        let (start, end) = occurrence_window(start, invitation.end);
         let mut url = self.url(&["me", "events", master, "instances"]);
         url.query_pairs_mut()
             .append_pair(

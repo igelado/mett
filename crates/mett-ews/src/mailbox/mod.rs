@@ -23,9 +23,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, AccountId, Address, Answer, Attachment, AttachmentId, AttachmentKind,
     Authenticator, Body, BodyKind, Draft, DraftOrigin, DraftSession, Error, Flags, FlagsUpdate,
-    Folder, FolderChanges, FolderId, Invitation, MailSender, MailStore, Message, MessageId,
-    MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor, RECENT_UNREAD, Result,
-    Scope, SyncState, ThreadPosition, WellKnownFolder, unsent,
+    Folder, FolderChanges, FolderId, Invitation, MAX_PAGE_SIZE, MailSender, MailStore, Message,
+    MessageId, MessagePage, MessageSummary, OutgoingAttachment, Page, PageCursor, RECENT_UNREAD,
+    ROOT, Result, Roles, Scope, SyncState, ThreadPosition, WellKnownFolder, error_for_status,
+    first_then, parse_time, retry_after, unsent, with_fresh_token,
 };
 use reqwest::StatusCode;
 use roxmltree::Node;
@@ -38,13 +39,13 @@ use crate::soap::{
     About, check, child, child_text, children, coded_fault, descendant, envelope, escape,
     only_message, parse, response_code, response_messages, text,
 };
-use folders::{Roles, distinguished, first_then, mail_folders, sort_by_name, tree_order};
+use folders::{distinguished, mail_folders, sort_by_name, tree_order};
 use wire::{
     EwsFolder, FoundItem, MESSAGE_FIELDS, Resolved, SUMMARY_FIELDS, attachment, create_item,
     created_id, cursor, decode_base64, field, file_attachment_xml, first_item, folder_id,
     folder_shape, full_message, item_id, item_id_xml, item_shape, mailboxes, message_xml,
-    modified_since, next_offset, only_message_or_none, parse_cursor, parse_time, set_field,
-    summary, unexpected,
+    modified_since, next_offset, only_message_or_none, parse_cursor, set_field, summary,
+    unexpected,
 };
 
 /// Upper bound on each EWS request with a small body. Larger ones (with
@@ -57,9 +58,6 @@ const BYTES_PER_SECOND: usize = 64 * 1024;
 /// Upper bound on a request whose response may be large (an attachment's
 /// content), which its own size doesn't tell.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-/// The most items or folders EWS returns per request.
-const MAX_PAGE_SIZE: u32 = 1000;
 
 /// The most items looked up in one `GetItem`: Exchange's limit (its
 /// `EWSMaxBatchSize`, by default) is often 100.
@@ -248,24 +246,17 @@ impl<A: Authenticator> Connection<A> {
         before: fn(Error) -> Error,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
-        let token = self.auth.access_token().await.map_err(before)?;
-        let response = self.attempt(xml, &token, timeout).await?;
-        if response.status() != StatusCode::UNAUTHORIZED {
-            return Ok(response);
-        }
-        // EWS rejected a token that hadn't expired (it may have been
-        // revoked): get a new one and try once more.
-        self.auth.token_rejected(&token).await;
-        let fresh = self.auth.access_token().await.map_err(before)?;
-        if fresh == token {
-            return Ok(response);
-        }
-        let response = self.attempt(xml, &fresh, timeout).await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            // Rejected too: don't let the next request reuse it.
-            self.auth.token_rejected(&fresh).await;
-        }
-        Ok(response)
+        // EWS may reject a token that hadn't expired (it may have been
+        // revoked): `with_fresh_token` gets a new one and tries once more.
+        with_fresh_token(
+            &*self.auth,
+            before,
+            true,
+            |response: &reqwest::Response| response.status() == StatusCode::UNAUTHORIZED,
+            |token| async move { self.attempt(xml, &token, timeout).await },
+        )
+        .await
+        .map(|(response, _)| response)
     }
 
     async fn attempt(
@@ -292,12 +283,12 @@ impl<A: Authenticator> Connection<A> {
 /// reports.
 async fn checked(response: reqwest::Response, about: About<'_>) -> Result<String> {
     let status = response.status();
-    let retry_after = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
+    let retry_after = retry_after(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+    );
     let body = response
         .text()
         .await
@@ -314,13 +305,7 @@ async fn checked(response: reqwest::Response, about: About<'_>) -> Result<String
         return Err(e);
     }
     let detail = format!("EWS returned HTTP {status}");
-    Err(match status {
-        StatusCode::TOO_MANY_REQUESTS => Error::Throttled { retry_after },
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Error::Auth(detail),
-        StatusCode::REQUEST_TIMEOUT => Error::Network(detail),
-        s if s.is_server_error() => Error::Network(detail),
-        _ => Error::Backend(detail),
-    })
+    Err(error_for_status(status.as_u16(), retry_after, detail, None))
 }
 
 impl<A: Authenticator + 'static> EwsMailStore<A> {
