@@ -219,10 +219,7 @@ mod tests {
         );
         assert_eq!(redact("imaps://me@host/INBOX"), "imaps://me@host/INBOX");
         assert_eq!(redact("INBOX"), "INBOX");
-        assert_eq!(
-            redact("imap:/me:hunter2@host/INBOX"),
-            "imap:/me:***@host/INBOX"
-        );
+        assert_eq!(redact("imap:/me:hunter2@host/INBOX"), "imap:***@host/INBOX");
         assert_eq!(
             redact("imaps://alice:p/ss@host/INBOX"),
             "imaps://alice:***@host/INBOX"

@@ -1522,3 +1522,34 @@ async fn asks_about_many_messages_in_batches_and_in_ranges() {
         .unwrap();
     assert_eq!(page.messages.len(), 450);
 }
+
+#[tokio::test]
+async fn new_unread_mail_is_reported_by_every_check_until_it_is_read() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("old"), &["\\Seen"]);
+    let inbox = FolderId::new("INBOX");
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    // Unread mail copied in with an old date.
+    let copied = deliver(&server, "INBOX", &simple("copied in"), &[]);
+    for _ in 0..3 {
+        let unread = store.recent_unread(&inbox, Some(since)).await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert!(unread[0].0.as_str().contains(&format!(".{copied}.")));
+    }
+    // Read by another client, it is not new any more.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .set_flags("INBOX", copied, &["\\Seen"]);
+    assert!(
+        store
+            .recent_unread(&inbox, Some(since))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

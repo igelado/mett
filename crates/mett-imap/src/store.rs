@@ -811,13 +811,24 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
                 let dates = fetch(live, &newest, "(UID FLAGS INTERNALDATE)", false).await?;
                 found.extend(dates.into_iter().filter_map(|f| Some((f.uid, f.internal?))));
             }
+            let mut fresh = BTreeSet::new();
             if let Some(floor) = floor {
-                let now = Utc::now();
                 for uid in changed_since(live, &selected, floor).await? {
                     if unseen.contains(&uid) {
-                        found.insert(uid, now);
+                        fresh.insert(uid);
                     }
                 }
+            }
+            // What was found new stays reported until it is read: the user
+            // may not have visited the folder when the next check comes.
+            for (uid, at) in self.marks.new_unread(
+                folder.as_str(),
+                selected.validity,
+                fresh,
+                Utc::now(),
+                &unseen,
+            ) {
+                found.insert(uid, at);
             }
             self.marks.commit(
                 Watch::Unread,

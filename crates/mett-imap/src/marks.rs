@@ -7,8 +7,10 @@
 //! there on is new) and, where the server has `CONDSTORE`, the folder's
 //! highest modification sequence (everything changed after it is changed).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
+
+use chrono::{DateTime, Utc};
 
 /// What asks about new mail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,16 +41,24 @@ struct Mark {
     scanning: Option<Floor>,
 }
 
-/// The marks of every folder.
+/// The marks of every folder, and the unread mail found since them that is
+/// still unread: a check reports it until it is read, as the user may not
+/// have visited the folder yet when the next check comes.
 #[derive(Default)]
-pub(crate) struct Marks(Mutex<HashMap<(Watch, String), Mark>>);
+pub(crate) struct Marks {
+    marks: Mutex<HashMap<(Watch, String), Mark>>,
+    unread: Mutex<HashMap<String, Found>>,
+}
+
+/// The unread mail found new in a folder (of this `UIDVALIDITY`), and when.
+type Found = (u32, HashMap<u32, DateTime<Utc>>);
 
 impl Marks {
     /// What to compare the folder with: how it stood when last asked (the
     /// first page of a scan), or what the scan under way compares with (the
     /// pages after it). `None` if it was never asked about.
     pub fn floor(&self, watch: Watch, folder: &str, validity: u32, first: bool) -> Option<Floor> {
-        let marks = self.0.lock().expect("no panic holds the marks");
+        let marks = self.marks.lock().expect("no panic holds the marks");
         let mark = marks.get(&(watch, folder.to_owned()))?;
         if mark.validity != validity {
             return None;
@@ -56,12 +66,38 @@ impl Marks {
         if first { Some(mark.now) } else { mark.scanning }
     }
 
+    /// The unread mail found new in the folder, with when it was found: what
+    /// `found` adds (at `now`) to what was found before, less what is no
+    /// longer in `unseen`. A folder made anew (`validity`) has none from
+    /// before.
+    pub fn new_unread(
+        &self,
+        folder: &str,
+        validity: u32,
+        found: impl IntoIterator<Item = u32>,
+        now: DateTime<Utc>,
+        unseen: &BTreeSet<u32>,
+    ) -> Vec<(u32, DateTime<Utc>)> {
+        let mut all = self.unread.lock().expect("no panic holds the unread");
+        let entry = all
+            .entry(folder.to_owned())
+            .or_insert_with(|| (validity, HashMap::new()));
+        if entry.0 != validity {
+            *entry = (validity, HashMap::new());
+        }
+        for uid in found {
+            entry.1.entry(uid).or_insert(now);
+        }
+        entry.1.retain(|uid, _| unseen.contains(uid));
+        entry.1.iter().map(|(uid, at)| (*uid, *at)).collect()
+    }
+
     /// Notes how the folder stands when it is first listed, for both
     /// askers, unless they have marks already (the polls list it again): what
     /// comes in between the listing and the first poll is new, whatever its
     /// date says.
     pub fn start(&self, folder: &str, validity: u32, now: Floor) {
-        let mut marks = self.0.lock().expect("no panic holds the marks");
+        let mut marks = self.marks.lock().expect("no panic holds the marks");
         for watch in [Watch::Changes, Watch::Unread] {
             let key = (watch, folder.to_owned());
             if marks.get(&key).is_none_or(|mark| mark.validity != validity) {
@@ -80,7 +116,7 @@ impl Marks {
     /// Takes back the mark a scan moved on, because a later page of it
     /// failed: the next scan compares with what this one did.
     pub fn rollback(&self, watch: Watch, folder: &str) {
-        let mut marks = self.0.lock().expect("no panic holds the marks");
+        let mut marks = self.marks.lock().expect("no panic holds the marks");
         let key = (watch, folder.to_owned());
         let restored = marks
             .get_mut(&key)
@@ -101,7 +137,7 @@ impl Marks {
         now: Floor,
         floor: Option<Floor>,
     ) {
-        let mut marks = self.0.lock().expect("no panic holds the marks");
+        let mut marks = self.marks.lock().expect("no panic holds the marks");
         marks.insert(
             (watch, folder.to_owned()),
             Mark {
@@ -196,6 +232,27 @@ mod tests {
         marks.commit(Watch::Unread, "INBOX", 1, floor(20), None);
         marks.rollback(Watch::Unread, "INBOX");
         assert_eq!(marks.floor(Watch::Unread, "INBOX", 1, true), None);
+    }
+
+    #[test]
+    fn unread_mail_found_stays_found_until_it_is_read() {
+        let marks = Marks::default();
+        let (t0, t1) = (
+            DateTime::UNIX_EPOCH,
+            DateTime::UNIX_EPOCH + chrono::TimeDelta::minutes(5),
+        );
+        let unseen: BTreeSet<u32> = [3, 4].into();
+        let mut found = marks.new_unread("INBOX", 1, [3], t0, &unseen);
+        assert_eq!(found, [(3, t0)]);
+        // The next check finds nothing new, and still has it, as first found.
+        found = marks.new_unread("INBOX", 1, [], t1, &unseen);
+        assert_eq!(found, [(3, t0)]);
+        // Read since, it is gone.
+        found = marks.new_unread("INBOX", 1, [], t1, &[4].into());
+        assert!(found.is_empty());
+        // A folder made anew forgets.
+        marks.new_unread("INBOX", 1, [4], t1, &[4].into());
+        assert!(marks.new_unread("INBOX", 2, [], t1, &[4].into()).is_empty());
     }
 
     #[test]
