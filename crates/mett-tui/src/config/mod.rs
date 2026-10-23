@@ -119,6 +119,16 @@ pub struct Mailbox {
     pub poll: bool,
 }
 
+/// An account from the `account` command: a configuration of its own, which
+/// is the one when the command ran plus what its file sets.
+#[derive(Clone, Debug)]
+pub struct Account {
+    /// What the account's tab says (`account LABEL FILE`).
+    pub label: String,
+    /// Its configuration.
+    pub config: Box<Config>,
+}
+
 /// The loaded configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -165,6 +175,11 @@ pub struct Config {
     home: Option<String>,
     /// See [`Config::set_user_file`].
     user_file: Option<PathBuf>,
+    /// `account`, in the order given.
+    accounts: Vec<Account>,
+    /// Whether this is an account's configuration, which has no accounts
+    /// of its own.
+    in_account: bool,
 }
 
 /// Where a command came from, for messages and relative `source` paths.
@@ -197,6 +212,8 @@ impl Config {
             answers: Vec::new(),
             home,
             user_file: None,
+            accounts: Vec::new(),
+            in_account: false,
         };
         for var in VARS {
             config.reset(var);
@@ -277,6 +294,18 @@ impl Config {
     /// The aliases (`alias`).
     pub fn aliases(&self) -> &[crate::alias::Alias] {
         &self.aliases
+    }
+
+    /// The accounts the `account` commands made, in order: with any, mett
+    /// opens each in a tab, with its own configuration.
+    #[cfg(test)]
+    pub fn accounts(&self) -> &[Account] {
+        &self.accounts
+    }
+
+    /// Takes the accounts (see [`Config::accounts`]).
+    pub fn take_accounts(&mut self) -> Vec<Account> {
+        std::mem::take(&mut self.accounts)
     }
 
     /// The mailboxes to check for new mail (`mailboxes`).
@@ -408,6 +437,38 @@ impl Config {
                 .errors
                 .push(format!("{}: cannot read: {e}", path.display())),
         }
+    }
+
+    /// `account LABEL FILE`: the configuration so far, and what the file
+    /// sets, as an account of its own. What the commands after it set is not
+    /// in it: share settings by putting them before the accounts.
+    fn add_account(&mut self, label: String, path: &Path, depth: usize) -> Result<(), String> {
+        if self.in_account {
+            return Err("account: not in an account's own file".to_owned());
+        }
+        if label.trim().is_empty() {
+            return Err("account: the label is empty".to_owned());
+        }
+        if self.accounts.iter().any(|a| a.label == label) {
+            return Err(format!("account: there is an account {label} already"));
+        }
+        let mut config = self.clone();
+        config.accounts.clear();
+        config.in_account = true;
+        // Its own: what it says, not what was said before.
+        (config.errors, config.warnings) = (Vec::new(), Vec::new());
+        config.key_commands.clear();
+        config.pushed.clear();
+        config.source(path, depth);
+        self.errors.append(&mut config.errors);
+        self.warnings.append(&mut config.warnings);
+        // Keys are the same in every account.
+        self.key_commands.append(&mut config.key_commands);
+        self.accounts.push(Account {
+            label,
+            config: Box::new(config),
+        });
+        Ok(())
     }
 
     fn run(&mut self, source: &str, origin: &Origin<'_>) {
@@ -563,6 +624,17 @@ impl Config {
                     Ok(())
                 }),
                 "exec" => Err("exec: expected a function".to_owned()),
+                "account" => match args {
+                    [label, path] => self.expand(label).and_then(|label| {
+                        let path = self.expand(path)?;
+                        let path = self.resolve_source(&path, origin.file);
+                        // This line's warnings are this line's, not the
+                        // account file's.
+                        self.flush_warnings(&at);
+                        self.add_account(label, &path, origin.depth + 1)
+                    }),
+                    _ => Err("account: expected a label and a file name".to_owned()),
+                },
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
                         let path = self.resolve_source(&path, origin.file);
@@ -1712,6 +1784,89 @@ mod tests {
             no_system: true,
         };
         assert_eq!(locate(&files, &env), [PathBuf::from("/x/custom")]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_are_configurations_of_their_own() {
+        let dir = std::env::temp_dir().join(format!("mett-accounts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("work"),
+            "set from=me@work.example.com spoolfile=imaps://me@work.example.com/INBOX\nbind index X quit\nmailboxes =Projects\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("home"),
+            "set from=me@home.example.org spoolfile=imaps://me@home.example.org/INBOX\npush <last-entry>\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("mettrc"),
+            "set realname=Me sort=threads\naccount Work work\naccount Home home\nset realname=Changed\n",
+        )
+        .unwrap();
+
+        let mut config = Config::new(None);
+        config.load_file(&dir.join("mettrc"));
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        let accounts = config.accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Work", "Home"]
+        );
+        // Each has what was set before it, and its own.
+        let (work, home) = (&accounts[0].config, &accounts[1].config);
+        assert_eq!(work.string("realname"), "Me");
+        assert_eq!(work.string("sort"), "threads");
+        assert_eq!(work.string("from"), "me@work.example.com");
+        assert_eq!(home.string("from"), "me@home.example.org");
+        assert_eq!(work.mailboxes().len(), 1);
+        assert!(home.mailboxes().is_empty());
+        // What comes after isn't in them.
+        assert_eq!(config.string("realname"), "Changed");
+        assert_eq!(work.string("realname"), "Me");
+        // The account's own startup keys stay with it; key bindings are shared.
+        let mut home = accounts[1].config.clone();
+        assert_eq!(home.take_pushed(), ["<last-entry>"]);
+        assert!(config.take_pushed().is_empty());
+        assert_eq!(config.take_key_commands().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_report_their_errors_where_they_are() {
+        let dir = std::env::temp_dir().join(format!("mett-accounts-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("bad"),
+            "set no_such_thing_at_all=1\nset sort=\"\\\n",
+        )
+        .unwrap();
+        fs::write(dir.join("nested"), "account Inner bad\n").unwrap();
+        fs::write(dir.join("ok"), "set from=me@x.org\n").unwrap();
+        let mut config = Config::new(None);
+        config.load_str(
+            "account A ok\naccount A ok\naccount \"\" ok\naccount B nested\naccount C missing\naccount\n",
+            &dir.join("mettrc"),
+        );
+        let errors = config.errors.join("\n");
+        assert!(errors.contains("an account A already"), "{errors}");
+        assert!(errors.contains("the label is empty"), "{errors}");
+        assert!(errors.contains("not in an account's own file"), "{errors}");
+        assert!(errors.contains("cannot read"), "{errors}");
+        assert!(
+            errors.contains("expected a label and a file name"),
+            "{errors}"
+        );
+        // The one that worked is there, once.
+        assert_eq!(
+            config.accounts().iter().filter(|a| a.label == "A").count(),
+            1
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

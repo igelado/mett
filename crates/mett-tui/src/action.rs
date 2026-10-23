@@ -96,6 +96,17 @@ actions! {
     AcceptInvite => "accept-invite", "Accept the meeting the message invites to";
     TentativeInvite => "tentative-invite", "Tentatively accept the meeting the message invites to";
     DeclineInvite => "decline-invite", "Decline the meeting the message invites to";
+    NextAccount => "next-account", "Go to the next account's tab";
+    PreviousAccount => "previous-account", "Go to the previous account's tab";
+    Account1 => "account-1", "Go to the first account's tab";
+    Account2 => "account-2", "Go to the second account's tab";
+    Account3 => "account-3", "Go to the third account's tab";
+    Account4 => "account-4", "Go to the fourth account's tab";
+    Account5 => "account-5", "Go to the fifth account's tab";
+    Account6 => "account-6", "Go to the sixth account's tab";
+    Account7 => "account-7", "Go to the seventh account's tab";
+    Account8 => "account-8", "Go to the eighth account's tab";
+    Account9 => "account-9", "Go to the ninth account's tab";
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";

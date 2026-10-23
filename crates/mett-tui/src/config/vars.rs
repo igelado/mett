@@ -217,6 +217,7 @@ pub const VARS: &[Var] = &[
         Kind::String,
         "-%r-mett: %f [Msgs:%?M?%M/?%m%?n? New:%n?%?d? Del:%d?%?F? Flag:%F?%?b? Inc:%b?]%?V? [Limit: %V]?%?I? [incomplete]?---%>-(%P)---",
     ),
+    var("tab_position", Kind::String, "top"),
     var("timeout", Kind::Number, "600"),
     var("tmpdir", Kind::Path, ""),
     var("trash", Kind::Path, ""),
