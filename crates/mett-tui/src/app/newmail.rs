@@ -948,6 +948,8 @@ impl App {
     /// Says that new mail arrived, unless an error is on the message line:
     /// that matters more (the mail is still counted as new).
     fn announce(&mut self, text: &str) {
+        // The account's tab says so too, until it is looked at.
+        self.arrived = true;
         if self.status.is_empty() || self.error.as_deref() != Some(self.status.as_str()) {
             self.status = text.to_owned();
         }
@@ -2625,5 +2627,13 @@ mod tests {
         assert_eq!(text(&app), "=Lists");
         key(&mut app, KeyCode::Char(' '));
         assert_eq!(text(&app), "=Work");
+    }
+
+    #[test]
+    fn an_announcement_of_new_mail_marks_the_account_for_its_tab() {
+        let mut app = opened(Settings::default(), 24, Vec::new(), None).0;
+        assert!(!app.arrived);
+        app.announce("New mail in the Inbox.");
+        assert!(app.arrived);
     }
 }

@@ -32,7 +32,7 @@ use winit::window::{Window, WindowId};
 
 use crate::app::App;
 use crate::editor::Editor;
-use crate::{InputEvents, Launch, Session, UserEvent};
+use crate::{Accounts, InputEvents, Launch, UserEvent};
 
 /// The colors of a terminal (xterm's), so that the window, like most
 /// terminals, shows light text on black.
@@ -106,18 +106,19 @@ impl Launch for &mut InWindow {
     }
 
     fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
-        mut self,
+        self,
         runtime: tokio::runtime::Runtime,
-        store: Arc<S>,
-        mut session: Session,
+        mut accounts: Accounts<S>,
     ) -> ExitCode {
         self.started = true;
         crate::remove_viewed_before();
-        let font = Fonts::from_config(&session.config, &mut |warning| self.say(&warning));
+        // The first account's configuration is the window's.
+        let first = &mut accounts.list[0].session;
+        let font = Fonts::from_config(&first.config, &mut |warning| self.said.push(warning));
         // Warnings from the configuration go on the message line.
-        session.notice = Some(self.said.join("; ")).filter(|notice| !notice.is_empty());
+        first.notice = Some(self.said.join("; ")).filter(|notice| !notice.is_empty());
         let start: StartApp = Box::new(move |screen, events| {
-            let result = runtime.block_on(crate::run(screen, events, store, session));
+            let result = runtime.block_on(crate::run(screen, events, accounts));
             crate::wait_for_saves();
             result
         });

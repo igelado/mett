@@ -15,6 +15,7 @@ mod query;
 mod recall;
 mod search;
 mod sidebar;
+mod tabs;
 #[cfg(test)]
 pub(crate) mod testing;
 mod threads;
@@ -37,6 +38,7 @@ pub use self::query::{QueryMenu, QuerySettings};
 pub use self::recall::PostponedMenu;
 pub use self::search::{Limit, highlighted};
 pub use self::sidebar::{Sidebar, SidebarEntry, SidebarSettings, SidebarSort};
+pub use self::tabs::{Switch, Tab, TabPosition, Tabs};
 pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
 use crate::compose::Kind;
@@ -218,6 +220,8 @@ pub enum Msg {
 pub enum Effect {
     /// Send `Request` to the worker.
     Request(RequestId, Request),
+    /// Show another account's tab.
+    Account(Switch),
     /// Open a URL in the user's browser.
     OpenUrl(String),
     /// Cancel the sign-in in progress.
@@ -541,6 +545,13 @@ pub struct App {
     pub sign_in: Option<SignIn>,
     /// The key bindings, which `:bind` and `:macro` change.
     pub keymap: Keymap,
+    /// The tabs of the accounts, if there are several: the main loop gives
+    /// them to the account shown, to draw.
+    pub tabs: Option<Tabs>,
+    /// Whether new mail was announced since the account was last looked at,
+    /// which its tab says when another account is shown (the main loop
+    /// clears it once it is shown).
+    pub arrived: bool,
     /// How the screen is drawn: formats and colors.
     pub display: crate::expando::Display,
     /// The last error reported on the message line, so that the view can
@@ -901,6 +912,8 @@ impl App {
             quit: false,
             sign_in: None,
             keymap: Keymap::mutt_defaults(),
+            tabs: None,
+            arrived: false,
             display: settings.display,
             error: None,
             input_note: None,
@@ -1195,6 +1208,27 @@ impl App {
         if self.input.is_some() && menu != Menu::SignIn {
             self.fail("Not available in a prompt.");
             return Vec::new();
+        }
+        // Another account's tab can be gone to from the index and the pager,
+        // and leaves what is pending here to be taken up when it is shown
+        // again.
+        if matches!(menu, Menu::Index | Menu::Pager)
+            && matches!(
+                action,
+                Action::NextAccount
+                    | Action::PreviousAccount
+                    | Action::Account1
+                    | Action::Account2
+                    | Action::Account3
+                    | Action::Account4
+                    | Action::Account5
+                    | Action::Account6
+                    | Action::Account7
+                    | Action::Account8
+                    | Action::Account9
+            )
+        {
+            return self.switch_account(action);
         }
         // Any new action in a menu replaces a pending move, and a reply or
         // forward still waiting for its message: the user has moved on,

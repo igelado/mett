@@ -131,6 +131,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `wrap` | number | Where the pager wraps text (also text attachments viewed in it, but not the help screen, as in mutt). `0` (the default) wraps at the pager's width (the terminal's, less the sidebar's, if shown); a positive number wraps at that many columns, or at the terminal's width if it is narrower; a negative number leaves that many columns empty on the right, or wraps at the terminal's width if that leaves no room. Changing it with `:set` wraps an open message again. |
 | | `collapse_links` | boolean | mett's own: the pager shows a link written as its text followed by its URL in angle brackets (`docs<https://...>`, as Exchange writes links in text bodies, and as mett shows `<a href>` in HTML ones) as only its text, underlined (default `yes`). `<toggle-links>` (`L` in the pager) shows the open message's URLs, underlined, or hides them again. URLs on their own (with no text right before them) are always shown, underlined. Text bodies don't say where a link's text starts, so only the word right before the URL is underlined; HTML links are underlined whole. |
 | | `sidebar_visible`, `sidebar_width`, `sidebar_format` | boolean, number, string | The sidebar (§4.10). |
+| | `tab_position` | `top` or `bottom` | mett's own: where the accounts' tabs are (§4.14). |
 | | `mailcap_path` | string | mailcap files used to view MIME parts. |
 | | `query_command` | path | External address-book query. |
 | | `alias_file` | path | Where aliases created with `a` (`<create-alias>`) are saved. Defaults to the user's own mettrc (`~/.config/mett/mettrc` for a user who has none yet). |
@@ -461,6 +462,57 @@ set realname  = "Alice Example"
   and of their arrival (UID, and they are dated by it) where it hasn't. Threads are those of
   `References:`. Meeting invitations aren't shown as such (their `text/calendar`
   part is an attachment) and can't be answered.
+
+### 4.14 Several accounts
+
+mutt has no tabs for accounts: it keeps one session, and users switch
+between accounts with `account-hook` and `folder-hook`, or by `source`ing a
+file for each. mett keeps that style for the configuration, and adds tabs:
+
+```
+account <label> <file>
+```
+
+reads `<file>` (a mettrc, relative to the file with the command) as the
+configuration of one account: everything set before the command, plus what
+the file sets. Each account opens in a tab with its own mailbox, folders,
+sign-in, `mailboxes`, aliases and settings, so one can be Office365 and
+another IMAP. For example:
+
+```muttrc
+# ~/.config/mett/mettrc
+set realname      = "Alice Example"          # shared
+source ~/.config/mett/colors
+set tab_position  = bottom                    # shared, like the keys below
+
+account Work ~/.config/mett/work              # set spoolfile, imap_*, smtp_* ... there
+account Home ~/.config/mett/home
+```
+
+- **What counts where.** Put settings the accounts share before the `account`
+  commands; what comes after isn't in them. `bind` and `macro` in an account's
+  file are shared by all (mett reads them once); `push` plays in its own
+  account. A `:set` or `:bind` at the prompt changes the account shown (a
+  `:bind` is that account's: bind keys in the mettrc to have them everywhere).
+  `set spoolfile` in the main file is not used when there are accounts.
+  `mett -D` prints the settings of the main file, and then those of each account.
+  Aliases made with `a` are saved, unless `alias_file` says otherwise, in a file
+  called `aliases` beside the mettrc, which every account reads when mett
+  starts: one made in a tab is in the others after that.
+- **Tabs.** With more than one account, a line of the screen holds the tabs,
+  `1 Work  2 Home*`, with the account shown highlighted (`color indicator`)
+  and a `*` and bold on those with new mail (`color sidebar_new` adds to
+  it); `tab_position` (`top`, the default, or `bottom`) puts it at the top or
+  the bottom. With one, there are none.
+- **Keys**, in the index and the pager: `<next-account>` (`M-n`),
+  `<previous-account>` (`M-p`), and `<account-1>` to `<account-9>`
+  (`M-1` to `M-9`), which go to the tab. The accounts you aren't looking at
+  go on working: they check for mail (the tab says when it comes), send and
+  save what you asked for, and quit with mett. `q` quits all of them.
+- **Limits.** Everything in mett that was said of "the account" is about the one
+  shown: `mailboxes`, the sidebar, searches and the folder browser are its.
+  Copying or moving a message to another account's folder isn't possible.
+  Up to nine accounts have number keys.
 
 ## 5. Mailbox shortcuts
 

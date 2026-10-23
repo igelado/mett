@@ -119,6 +119,16 @@ pub struct Mailbox {
     pub poll: bool,
 }
 
+/// An account from the `account` command: a configuration of its own, which
+/// is the one when the command ran plus what its file sets.
+#[derive(Clone, Debug)]
+pub struct Account {
+    /// What the account's tab says (`account LABEL FILE`).
+    pub label: String,
+    /// Its configuration.
+    pub config: Box<Config>,
+}
+
 /// The loaded configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -165,6 +175,11 @@ pub struct Config {
     home: Option<String>,
     /// See [`Config::set_user_file`].
     user_file: Option<PathBuf>,
+    /// `account`, in the order given.
+    accounts: Vec<Account>,
+    /// Whether this is an account's configuration, which has no accounts
+    /// of its own.
+    in_account: bool,
 }
 
 /// Where a command came from, for messages and relative `source` paths.
@@ -197,6 +212,8 @@ impl Config {
             answers: Vec::new(),
             home,
             user_file: None,
+            accounts: Vec::new(),
+            in_account: false,
         };
         for var in VARS {
             config.reset(var);
@@ -277,6 +294,73 @@ impl Config {
     /// The aliases (`alias`).
     pub fn aliases(&self) -> &[crate::alias::Alias] {
         &self.aliases
+    }
+
+    /// The accounts the `account` commands made, in order: with any, mett
+    /// opens each in a tab, with its own configuration.
+    pub fn accounts(&self) -> &[Account] {
+        &self.accounts
+    }
+
+    /// With accounts, an alias made with `a` is saved by default in `aliases`
+    /// beside the mettrc, which every account reads: the mettrc itself is
+    /// read once, before the accounts are made, so what is added to it later
+    /// would be in none of them. An account that sets `alias_file` keeps its
+    /// own. Call it once the files are loaded.
+    pub fn share_aliases_with_accounts(&mut self) {
+        if self.accounts.is_empty() {
+            return;
+        }
+        let Some(file) = self
+            .user_file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("aliases"))
+        else {
+            return;
+        };
+        // Only if an account will use it.
+        if !self
+            .accounts
+            .iter()
+            .any(|account| account.config.string("alias_file").is_empty())
+        {
+            return;
+        }
+        // Read once, with what the mettrc has set (`$my_addr`) but on its
+        // own: what an account has set is above it.
+        let mut shared = self.clone();
+        shared.accounts.clear();
+        shared.aliases.clear();
+        shared.alias_places.clear();
+        (shared.errors, shared.warnings) = (Vec::new(), Vec::new());
+        if file.exists() {
+            shared.source(&file, 1);
+            self.errors.append(&mut shared.errors);
+            self.warnings.append(&mut shared.warnings);
+        }
+        for account in &mut self.accounts {
+            let config = &mut account.config;
+            // One that says where (not "": no file) keeps its own.
+            if !config.string("alias_file").is_empty() {
+                continue;
+            }
+            // Set as it is, not written in a mettrc line: a path may hold
+            // what a mettrc takes for quotes.
+            config.store("alias_file", Value::Str(file.display().to_string()));
+            for alias in &shared.aliases {
+                let key = crate::alias::folded_key(&alias.key);
+                if !config.alias_places.contains_key(&key) {
+                    config.alias_places.insert(key, config.aliases.len());
+                    config.aliases.push(alias.clone());
+                }
+            }
+        }
+    }
+
+    /// Takes the accounts (see [`Config::accounts`]).
+    pub fn take_accounts(&mut self) -> Vec<Account> {
+        std::mem::take(&mut self.accounts)
     }
 
     /// The mailboxes to check for new mail (`mailboxes`).
@@ -408,6 +492,38 @@ impl Config {
                 .errors
                 .push(format!("{}: cannot read: {e}", path.display())),
         }
+    }
+
+    /// `account LABEL FILE`: the configuration so far, and what the file
+    /// sets, as an account of its own. What the commands after it set is not
+    /// in it: share settings by putting them before the accounts.
+    fn add_account(&mut self, label: String, path: &Path, depth: usize) -> Result<(), String> {
+        if self.in_account {
+            return Err("account: not in an account's own file".to_owned());
+        }
+        if label.trim().is_empty() {
+            return Err("account: the label is empty".to_owned());
+        }
+        if self.accounts.iter().any(|a| a.label == label) {
+            return Err(format!("account: there is an account {label} already"));
+        }
+        let mut config = self.clone();
+        config.accounts.clear();
+        config.in_account = true;
+        // Its own: what it says, not what was said before.
+        (config.errors, config.warnings) = (Vec::new(), Vec::new());
+        config.key_commands.clear();
+        config.pushed.clear();
+        config.source(path, depth);
+        self.errors.append(&mut config.errors);
+        self.warnings.append(&mut config.warnings);
+        // Keys are the same in every account.
+        self.key_commands.append(&mut config.key_commands);
+        self.accounts.push(Account {
+            label,
+            config: Box::new(config),
+        });
+        Ok(())
     }
 
     fn run(&mut self, source: &str, origin: &Origin<'_>) {
@@ -563,6 +679,23 @@ impl Config {
                     Ok(())
                 }),
                 "exec" => Err("exec: expected a function".to_owned()),
+                // The accounts are opened when mett starts: one made at the
+                // prompt (which has no file) would open nothing.
+                "account" if origin.file.as_os_str().is_empty() => Err(
+                    "account: can only be used in a mettrc, which is read when mett starts"
+                        .to_owned(),
+                ),
+                "account" => match args {
+                    [label, path] => self.expand(label).and_then(|label| {
+                        let path = self.expand(path)?;
+                        let path = self.resolve_source(&path, origin.file);
+                        // This line's warnings are this line's, not the
+                        // account file's.
+                        self.flush_warnings(&at);
+                        self.add_account(label, &path, origin.depth + 1)
+                    }),
+                    _ => Err("account: expected a label and a file name".to_owned()),
+                },
                 "source" => match args {
                     [path] => self.expand(path).map(|path| {
                         let path = self.resolve_source(&path, origin.file);
@@ -1712,6 +1845,175 @@ mod tests {
             no_system: true,
         };
         assert_eq!(locate(&files, &env), [PathBuf::from("/x/custom")]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_are_configurations_of_their_own() {
+        let dir = std::env::temp_dir().join(format!("mett-accounts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("work"),
+            "set from=me@work.example.com spoolfile=imaps://me@work.example.com/INBOX\nbind index X quit\nmailboxes =Projects\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("home"),
+            "set from=me@home.example.org spoolfile=imaps://me@home.example.org/INBOX\npush <last-entry>\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("mettrc"),
+            "set realname=Me sort=threads\naccount Work work\naccount Home home\nset realname=Changed\n",
+        )
+        .unwrap();
+
+        let mut config = Config::new(None);
+        config.load_file(&dir.join("mettrc"));
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        let accounts = config.accounts();
+        assert_eq!(
+            accounts
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Work", "Home"]
+        );
+        // Each has what was set before it, and its own.
+        let (work, home) = (&accounts[0].config, &accounts[1].config);
+        assert_eq!(work.string("realname"), "Me");
+        assert_eq!(work.string("sort"), "threads");
+        assert_eq!(work.string("from"), "me@work.example.com");
+        assert_eq!(home.string("from"), "me@home.example.org");
+        assert_eq!(work.mailboxes().len(), 1);
+        assert!(home.mailboxes().is_empty());
+        // What comes after isn't in them.
+        assert_eq!(config.string("realname"), "Changed");
+        assert_eq!(work.string("realname"), "Me");
+        // The account's own startup keys stay with it; key bindings are shared.
+        let mut home = accounts[1].config.clone();
+        assert_eq!(home.take_pushed(), ["<last-entry>"]);
+        assert!(config.take_pushed().is_empty());
+        assert_eq!(config.take_key_commands().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_cannot_be_made_at_the_prompt() {
+        let mut config = Config::new(None);
+        let error = config.run_line("account Work /tmp/work").unwrap_err();
+        assert!(error.contains("only be used in a mettrc"), "{error}");
+        assert!(config.accounts().is_empty());
+    }
+
+    #[test]
+    fn accounts_report_their_errors_where_they_are() {
+        let dir = std::env::temp_dir().join(format!("mett-accounts-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("bad"),
+            "set no_such_thing_at_all=1\nset sort=\"\\\n",
+        )
+        .unwrap();
+        fs::write(dir.join("nested"), "account Inner bad\n").unwrap();
+        fs::write(dir.join("ok"), "set from=me@x.org\n").unwrap();
+        let mut config = Config::new(None);
+        config.load_str(
+            "account A ok\naccount A ok\naccount \"\" ok\naccount B nested\naccount C missing\naccount\n",
+            &dir.join("mettrc"),
+        );
+        let errors = config.errors.join("\n");
+        assert!(errors.contains("an account A already"), "{errors}");
+        assert!(errors.contains("the label is empty"), "{errors}");
+        assert!(errors.contains("not in an account's own file"), "{errors}");
+        assert!(errors.contains("cannot read"), "{errors}");
+        assert!(
+            errors.contains("expected a label and a file name"),
+            "{errors}"
+        );
+        // The one that worked is there, once.
+        assert_eq!(
+            config.accounts().iter().filter(|a| a.label == "A").count(),
+            1
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_share_a_file_of_aliases_beside_the_mettrc() {
+        let dir = std::env::temp_dir().join(format!("mett-aliases-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("one"),
+            "set from=a@x.org\nalias bob Bob Own <bob@own.org>\n",
+        )
+        .unwrap();
+        fs::write(dir.join("two"), "set from=b@x.org alias_file=/tmp/mine\n").unwrap();
+        fs::write(
+            dir.join("aliases"),
+            "alias bob Bob <bob@x.org>\nalias carol Carol <carol@x.org>\n",
+        )
+        .unwrap();
+        let mut config = Config::new(None);
+        config.set_user_file(Some(dir.join("mettrc")));
+        config.load_str("account One one\naccount Two two\n", &dir.join("mettrc"));
+        config.share_aliases_with_accounts();
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        let accounts = config.accounts();
+        let written = dir.join("aliases").display().to_string();
+        assert_eq!(accounts[0].config.string("alias_file"), written);
+        // Read, but not over what the account says itself.
+        assert_eq!(accounts[0].config.aliases().len(), 2);
+        assert_eq!(
+            accounts[0].config.aliases()[0].value,
+            "Bob Own <bob@own.org>"
+        );
+        assert_eq!(accounts[0].config.aliases()[1].key, "carol");
+        // One that names its own file keeps it.
+        assert_eq!(accounts[1].config.string("alias_file"), "/tmp/mine");
+        assert!(accounts[1].config.aliases().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_shared_aliases_see_the_mettrcs_variables_and_are_read_only_when_used() {
+        let dir = std::env::temp_dir().join(format!("mett-aliases-vars-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("one"), "set from=a@x.org\n").unwrap();
+        fs::write(dir.join("aliases"), "alias bob $my_addr\n").unwrap();
+        // With an account that takes it, the variable is there.
+        let mut config = Config::new(None);
+        config.set_user_file(Some(dir.join("mettrc")));
+        config.load_str(
+            "set my_addr=bob@x.org\naccount One one\n",
+            &dir.join("mettrc"),
+        );
+        config.share_aliases_with_accounts();
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        assert_eq!(config.accounts()[0].config.aliases()[0].value, "bob@x.org");
+        // An alias_file set to "" is no file: the shared one is used.
+        let mut empty = Config::new(None);
+        empty.set_user_file(Some(dir.join("mettrc")));
+        fs::write(dir.join("aliases"), "alias bob $my_addr\n").unwrap();
+        empty.load_str(
+            "set my_addr=bob@x.org alias_file=\"\"\naccount One one\n",
+            &dir.join("mettrc"),
+        );
+        empty.share_aliases_with_accounts();
+        assert_eq!(empty.accounts()[0].config.aliases().len(), 1);
+        // Without accounts, it isn't read: nothing asked for it.
+        fs::write(dir.join("aliases"), "this is not a mettrc\n").unwrap();
+        let mut single = Config::new(None);
+        single.set_user_file(Some(dir.join("mettrc")));
+        single.share_aliases_with_accounts();
+        assert!(single.errors.is_empty() && single.warnings.is_empty());
+        // Nor when every account has a file of its own.
+        fs::write(dir.join("two"), "set alias_file=/tmp/mine\n").unwrap();
+        let mut own = Config::new(None);
+        own.set_user_file(Some(dir.join("mettrc")));
+        own.load_str("account Two two\n", &dir.join("mettrc"));
+        own.share_aliases_with_accounts();
+        assert!(own.errors.is_empty() && own.warnings.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

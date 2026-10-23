@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::action::Action;
 use crate::app::{
     App, AttachMenu, Browser, Compose, Help, Input, Pager, PostponedMenu, QueryMenu, Row, Screen,
-    SignIn, TextView, highlighted,
+    SignIn, TabPosition, TextView, highlighted,
 };
 use crate::color::Colors;
 use crate::editor::{self, builtin::Builtin};
@@ -147,8 +147,10 @@ pub struct Overlay {
 /// Draws the whole screen, and returns text that the main loop should print
 /// over it, if any.
 pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
+    // With several accounts, a line of the screen is the tabs'.
+    let root = render_tabs(app, frame);
     if let Some(editing) = &app.editing {
-        return render_editor(app, &mut editing.borrow_mut(), frame);
+        return render_editor(app, &mut editing.borrow_mut(), frame, root);
     }
     let keymap = &app.keymap;
     let [help, body, status, message] = Layout::vertical([
@@ -157,10 +159,10 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(root);
     let colors = &app.display.colors;
     // Text without colors of its own is `normal`.
-    frame.render_widget(Block::new().style(colors.normal), frame.area());
+    frame.render_widget(Block::new().style(colors.normal), root);
     // As in mutt, the sidebar is beside the menu only: the help line and
     // the status bar span the screen.
     let (body, side) = sidebar::split(app, body);
@@ -233,20 +235,86 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
     // the index behind them.
     if let Some(window) = &app.sign_in {
         let [_, below_help] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(root);
         return render_sign_in(window, keymap, colors.normal, frame, below_help);
     }
     None
 }
 
+/// Draws the accounts' tabs, if there are several, and returns the part of
+/// the screen that is left for the rest.
+fn render_tabs(app: &App, frame: &mut Frame) -> Rect {
+    let area = frame.area();
+    let Some(tabs) = &app.tabs else {
+        return area;
+    };
+    let (bar, rest) = match tabs.position {
+        TabPosition::Top => {
+            let [bar, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+            (bar, rest)
+        }
+        TabPosition::Bottom => {
+            let [rest, bar] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+            (bar, rest)
+        }
+    };
+    let colors = &app.display.colors;
+    // Too many tabs for the line: those before the one shown go from the
+    // left until it fits.
+    let text = |at: usize, tab: &crate::app::Tab| {
+        let marker = if tab.new_mail { "*" } else { "" };
+        format!(" {} {}{marker} ", at + 1, tab.label)
+    };
+    let widths: Vec<usize> = tabs
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(at, tab)| text(at, tab).width())
+        .collect();
+    let mut first = 0;
+    while first < tabs.active
+        && widths[first..=tabs.active].iter().sum::<usize>() > usize::from(bar.width)
+    {
+        first += 1;
+    }
+    let spans: Vec<Span> = tabs
+        .tabs
+        .iter()
+        .enumerate()
+        .skip(first)
+        .map(|(at, tab)| {
+            let style = if at == tabs.active {
+                colors.indicator
+            } else if tab.new_mail {
+                // Mail waiting in another account: the tab stands out.
+                colors
+                    .status
+                    .patch(colors.sidebar.new)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                colors.status
+            };
+            Span::styled(text(at, tab), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(colors.status), bar);
+    rest
+}
+
 /// Draws the built-in editor: the text, and below it the line with its
 /// commands, questions and messages; the sign-in window over them, if it
 /// is up.
-fn render_editor(app: &App, editor: &mut Builtin, frame: &mut Frame) -> Option<Overlay> {
+fn render_editor(
+    app: &App,
+    editor: &mut Builtin,
+    frame: &mut Frame,
+    root: Rect,
+) -> Option<Overlay> {
     let colors = &app.display.colors;
-    frame.render_widget(Block::new().style(colors.normal), frame.area());
-    let [text, bottom] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+    frame.render_widget(Block::new().style(colors.normal), root);
+    let [text, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(root);
     let mut cursor = editor.render(text, frame.buffer_mut(), colors.normal, colors.indicator);
     let width = usize::from(bottom.width);
     let line = match editor.bottom(width) {
@@ -269,7 +337,7 @@ fn render_editor(app: &App, editor: &mut Builtin, frame: &mut Frame) -> Option<O
     }
     if let Some(window) = &app.sign_in {
         let [_, below_help] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(frame.area());
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(root);
         return render_sign_in(window, &app.keymap, colors.normal, frame, below_help);
     }
     None
@@ -1809,5 +1877,101 @@ mod tests {
         let list = first_request(&act(&mut app, Action::BrowseMailboxes));
         respond(&mut app, list, Event::FoldersListed(Ok(Vec::new())));
         assert_eq!(screen(&app)[1], "No folders.");
+    }
+
+    /// Tabs for three accounts, the second shown, the third with new mail.
+    fn tabs(position: TabPosition) -> crate::app::Tabs {
+        use crate::app::{Tab, Tabs};
+        Tabs {
+            tabs: ["Work", "Home", "Club"]
+                .iter()
+                .enumerate()
+                .map(|(at, label)| Tab {
+                    label: (*label).to_owned(),
+                    new_mail: at == 2,
+                })
+                .collect(),
+            active: 1,
+            position,
+        }
+    }
+
+    #[test]
+    fn the_tabs_take_the_top_line_or_the_bottom_one() {
+        // One row of the screen is the tabs': the app has the rest.
+        let mut app = App::new(WIDTH, HEIGHT - 1).0;
+        app.tabs = Some(tabs(TabPosition::Top));
+        let lines = screen(&app);
+        assert_eq!(lines[0], " 1 Work  2 Home  3 Club*");
+        // What follows is the app's own screen, from its help line down.
+        assert!(lines[1].starts_with("q:Quit"), "{:?}", lines[1]);
+
+        app.tabs = Some(tabs(TabPosition::Bottom));
+        let lines = screen(&app);
+        assert!(lines[0].starts_with("q:Quit"), "{:?}", lines[0]);
+        assert_eq!(lines[HEIGHT as usize - 1], " 1 Work  2 Home  3 Club*");
+    }
+
+    #[test]
+    fn the_tab_shown_is_the_indicator_and_one_with_new_mail_stands_out() {
+        use ratatui::style::Color;
+        let mut app = App::new(WIDTH, HEIGHT - 1).0;
+        colored(
+            &mut app,
+            &["color status white blue", "color indicator black yellow"],
+        );
+        app.tabs = Some(tabs(TabPosition::Top));
+        let buffer = styles(&app);
+        // " 1 Work " is 8 cells, " 2 Home " the next 8.
+        assert_eq!(buffer[(2, 0)].bg, Color::Blue, "another account's tab");
+        assert_eq!(buffer[(10, 0)].bg, Color::Yellow, "the one shown");
+        assert!(
+            buffer[(20, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(
+            buffer[(50, 0)].bg,
+            Color::Blue,
+            "the bar goes on to the edge"
+        );
+    }
+
+    #[test]
+    fn without_tabs_the_screen_is_the_apps_alone() {
+        let app = App::new(WIDTH, HEIGHT).0;
+        assert!(screen(&app)[0].starts_with("q:Quit"));
+    }
+
+    #[test]
+    fn the_tab_shown_stays_in_view_when_the_tabs_are_too_many_for_the_line() {
+        use crate::app::{Tab, Tabs};
+        let mut app = App::new(WIDTH, HEIGHT - 1).0;
+        let labels = [
+            "First account",
+            "Second account",
+            "Third account",
+            "Fourth account",
+        ];
+        app.tabs = Some(Tabs {
+            tabs: labels
+                .iter()
+                .map(|label| Tab {
+                    label: (*label).to_owned(),
+                    new_mail: false,
+                })
+                .collect(),
+            active: 3,
+            position: TabPosition::Top,
+        });
+        // 60 columns: the four need more than that.
+        let line = screen(&app)[0].clone();
+        assert!(line.contains("4 Fourth account"), "{line}");
+        assert!(!line.contains("1 First account"), "{line}");
+        // With the first shown, they start from it.
+        if let Some(tabs) = &mut app.tabs {
+            tabs.active = 0;
+        }
+        assert!(screen(&app)[0].starts_with(" 1 First account"));
     }
 }

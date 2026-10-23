@@ -102,12 +102,11 @@ trait Launch {
     /// Tells the user `message`, before mett starts or when it can't.
     fn say(&mut self, message: &str);
 
-    /// Runs mett on `store`.
+    /// Runs mett on `accounts`.
     fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         self,
         runtime: tokio::runtime::Runtime,
-        store: Arc<S>,
-        session: Session,
+        accounts: Accounts<S>,
     ) -> ExitCode;
 }
 
@@ -159,6 +158,7 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
         for file in files {
             config.load_file(&file);
         }
+        config.share_aliases_with_accounts();
         for warning in &config.warnings {
             launch.say(&format!("warning: {warning}"));
         }
@@ -172,66 +172,68 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
             for line in config.dump() {
                 println!("{line}");
             }
+            // Each account's own settings, which are the ones it opens with.
+            for account in config.accounts() {
+                println!("# account {}", account.label);
+                for line in account.config.dump() {
+                    println!("{line}");
+                }
+            }
             return ExitCode::SUCCESS;
         }
-        let spoolfile = match config.spoolfile() {
-            Ok(spoolfile) => spoolfile,
-            Err(e) => return fail(&mut launch, e),
-        };
-        let settings = match settings_from_config(&config, &spoolfile.account) {
-            Ok(settings) => settings,
-            Err(e) => return fail(&mut launch, e),
-        };
         let (keymap, problems) = keymap_from_config(&mut config);
         for problem in problems {
             launch.say(&format!("warning: {problem}; ignored"));
         }
-        let editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
+        let position = match config.string("tab_position").parse::<app::TabPosition>() {
+            Ok(position) => position,
+            Err(e) => return fail(&mut launch, e),
+        };
         let runtime = match runtime() {
             Ok(runtime) => runtime,
             Err(e) => return fail(&mut launch, e),
         };
-        // Signing in happens in the TUI, in the sign-in window, when the
-        // folder is first opened.
-        let (events, sign_in) = mpsc::unbounded_channel();
-        let (prompter, cancel) = TuiPrompter::new(spoolfile.account.clone(), events);
-        let mailbox = match account::mailbox(&config, &spoolfile, prompter) {
-            Ok(mailbox) => mailbox,
-            Err(e) => return fail(&mut launch, e),
+        // With `account` commands, each is a tab, with the configuration of
+        // its own; without, the configuration is the one account's.
+        let configured = config.take_accounts();
+        let named: Vec<(String, config::Config)> = if configured.is_empty() {
+            vec![(String::new(), config)]
+        } else {
+            configured
+                .into_iter()
+                .map(|account| (account.label, *account.config))
+                .collect()
         };
-        // The cache tells the app how far a folder's sync has got.
-        let (syncs, syncing) = mpsc::unbounded_channel();
-        let progress = Box::new(move |folder: &mett_core::FolderId, taken: u64| {
-            let _ = syncs.send(Msg::Syncing {
-                folder: folder.clone(),
-                taken,
-            });
-        });
-        let (mailbox, warning) = account::cached(&config, &spoolfile, mailbox, progress);
-        if let Some(warning) = warning {
-            launch.say(&format!("warning: {warning}"));
-        }
-        let mut pushed = Vec::new();
-        for keys in config.take_pushed() {
-            match keymap::parse_strokes(&keys) {
-                Ok(strokes) => pushed.extend(strokes),
-                Err(e) => launch.say(&format!("warning: push: {e}; ignored")),
+        let several = named.len() > 1;
+        let mut list: Vec<Opened<_>> = Vec::with_capacity(named.len());
+        // The accounts whose cache is a file named by the account (not IMAP's,
+        // which has none): two tabs for one would share it, though their
+        // backends may not agree on what is in it.
+        let mut cached: Vec<mett_core::AccountId> = Vec::new();
+        for (label, config) in named {
+            match open_account(&mut launch, label.clone(), config, &keymap) {
+                Ok((opened, true)) if cached.contains(&opened.session.account) => {
+                    return fail(
+                        &mut launch,
+                        format!(
+                            "account {}: {} is the account of another tab already",
+                            opened.label, opened.session.account
+                        ),
+                    );
+                }
+                Ok((opened, uses_cache)) => {
+                    if uses_cache {
+                        cached.push(opened.session.account.clone());
+                    }
+                    list.push(opened);
+                }
+                Err(e) if several || !label.is_empty() => {
+                    return fail(&mut launch, format!("account {label}: {e}"));
+                }
+                Err(e) => return fail(&mut launch, e),
             }
         }
-        let session = Session {
-            folder: spoolfile.folder,
-            settings,
-            keymap,
-            pushed,
-            account: spoolfile.account,
-            config,
-            editor,
-            sign_in,
-            syncing,
-            cancel: Some(cancel),
-            notice: None,
-        };
-        return launch.start(runtime, Arc::new(mailbox), session);
+        return launch.start(runtime, Accounts { list, position });
     }
 
     let runtime = match runtime() {
@@ -255,7 +257,82 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
         cancel: None,
         notice: None,
     };
-    launch.start(runtime, Arc::new(demo::mailbox()), session)
+    let account = Opened {
+        label: String::new(),
+        store: Arc::new(demo::mailbox()),
+        session,
+    };
+    launch.start(
+        runtime,
+        Accounts {
+            list: vec![account],
+            position: app::TabPosition::default(),
+        },
+    )
+}
+
+/// The account of `config`, opened: its mailbox (which signs in when first
+/// used, in the TUI's sign-in window), its cache and the app's settings; and
+/// whether it has a cache file.
+fn open_account(
+    launch: &mut impl Launch,
+    label: String,
+    mut config: config::Config,
+    keymap: &Keymap,
+) -> Result<(Opened<mett_sqlite::CachedStore<account::Mailbox>>, bool), String> {
+    let spoolfile = config.spoolfile().map_err(|e| e.to_string())?;
+    let settings = settings_from_config(&config, &spoolfile.account)?;
+    let editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
+    // Signing in happens in the TUI, in the sign-in window, when the
+    // folder is first opened.
+    let (events, sign_in) = mpsc::unbounded_channel();
+    let (prompter, cancel) = TuiPrompter::new(spoolfile.account.clone(), events);
+    let mailbox = account::mailbox(&config, &spoolfile, prompter)?;
+    // The cache tells the app how far a folder's sync has got.
+    let (syncs, syncing) = mpsc::unbounded_channel();
+    let progress = Box::new(move |folder: &mett_core::FolderId, taken: u64| {
+        let _ = syncs.send(Msg::Syncing {
+            folder: folder.clone(),
+            taken,
+        });
+    });
+    let (mailbox, warning) = account::cached(&config, &spoolfile, mailbox, progress);
+    if let Some(warning) = warning {
+        launch.say(&format!("warning: {warning}"));
+    }
+    let mut pushed = Vec::new();
+    for keys in config.take_pushed() {
+        match keymap::parse_strokes(&keys) {
+            Ok(strokes) => pushed.extend(strokes),
+            Err(e) => launch.say(&format!("warning: push: {e}; ignored")),
+        }
+    }
+    let label = if label.is_empty() {
+        spoolfile.account.to_string()
+    } else {
+        label
+    };
+    let uses_cache = !matches!(spoolfile.server, config::mailbox::Server::Imap(_));
+    Ok((
+        Opened {
+            label,
+            store: Arc::new(mailbox),
+            session: Session {
+                folder: spoolfile.folder,
+                settings,
+                keymap: keymap.clone(),
+                pushed,
+                account: spoolfile.account,
+                config,
+                editor,
+                sign_in,
+                syncing,
+                cancel: Some(cancel),
+                notice: None,
+            },
+        },
+        uses_cache,
+    ))
 }
 
 /// The demo's configuration, and the settings it gives. Its folders are
@@ -527,8 +604,7 @@ impl Launch for InTerminal {
     fn start<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         mut self,
         runtime: tokio::runtime::Runtime,
-        store: Arc<S>,
-        session: Session,
+        accounts: Accounts<S>,
     ) -> ExitCode {
         remove_viewed_before();
         // `init` also restores the terminal if mett panics.
@@ -539,7 +615,7 @@ impl Launch for InTerminal {
         let result = clear_screen().and_then(|()| {
             let (input, events) = Input::start();
             let screen = TerminalScreen { terminal, input };
-            runtime.block_on(run(screen, events, store, session))
+            runtime.block_on(run(screen, events, accounts))
         });
         ratatui::restore();
         wait_for_saves();
@@ -615,135 +691,380 @@ pub(crate) enum UserEvent {
     Paste,
 }
 
-/// Runs the app on `store`, drawn on `screen`, with input from `input_rx`.
+/// An account ready to run: what its tab shows, its mailbox and what the
+/// app needs to start.
+struct Opened<S> {
+    /// What the tab says.
+    label: String,
+    /// The mailbox.
+    store: Arc<S>,
+    /// The rest.
+    session: Session,
+}
+
+/// The accounts to run: one, or several, each in a tab.
+struct Accounts<S> {
+    /// The accounts, in the order of their tabs.
+    list: Vec<Opened<S>>,
+    /// Where the tabs are drawn, if there are several.
+    position: app::TabPosition,
+}
+
+/// What an account's app waits on, besides what the user types.
+#[allow(clippy::large_enum_variant)]
+enum Incoming {
+    /// A message for the app.
+    Msg(Msg),
+    /// A `:` command finished running, with the configuration it leaves.
+    Configured(Result<(Configuration, app::Reconfigured), oneshot::error::RecvError>),
+}
+
+/// One account while mett runs: its app, and the worker, the timers and the
+/// files it uses.
+struct Slot {
+    label: String,
+    app: App,
+    requests: mpsc::UnboundedSender<(RequestId, Request)>,
+    timers: mpsc::UnboundedSender<app::Timer>,
+    files: mpsc::UnboundedSender<Msg>,
+    cancel: Option<CancelHandle>,
+    account: mett_core::AccountId,
+    editor: Editor,
+    commands: Commands,
+    /// Whether a `:` command is running.
+    running: bool,
+    /// What effects done at once left for the main loop.
+    deferred: Deferred,
+}
+
+impl Slot {
+    /// Carries out `effects`.
+    fn carry_out(&mut self, effects: Vec<Effect>) -> Deferred {
+        dispatch(
+            &mut self.app,
+            &self.requests,
+            &self.timers,
+            &self.files,
+            self.cancel.as_ref(),
+            effects,
+        )
+    }
+
+    /// Puts what `effects` did at once in `deferred`.
+    fn absorb(&mut self, effects: Vec<Effect>) {
+        let done = self.carry_out(effects);
+        self.deferred.absorb(done);
+    }
+}
+
+/// Sends the app of account `id` what its sign-in, worker, cache, timers and
+/// files have to say, in that order of importance (a failed save's sign-in
+/// failure comes before the save's own response).
+#[allow(clippy::too_many_arguments)]
+fn forward(
+    id: usize,
+    mut sign_in: mpsc::UnboundedReceiver<SignInEvent>,
+    mut responses: mpsc::UnboundedReceiver<worker::Response>,
+    mut syncing: mpsc::UnboundedReceiver<Msg>,
+    mut timers: mpsc::UnboundedReceiver<app::Timer>,
+    mut files: mpsc::UnboundedReceiver<Msg>,
+    events: mpsc::UnboundedSender<(usize, Incoming)>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let msg = tokio::select! {
+                biased;
+                Some(event) = sign_in.recv() => Msg::SignIn(event),
+                Some(response) = responses.recv() => Msg::Response(response),
+                Some(msg) = syncing.recv() => msg,
+                Some(timer) = timers.recv() => Msg::Timer(timer),
+                Some(msg) = files.recv() => msg,
+                else => break,
+            };
+            if events.send((id, Incoming::Msg(msg))).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// The rows an app has, of a screen of `height`: with tabs, one is theirs.
+fn rows(height: u16, tabs: bool) -> u16 {
+    height.saturating_sub(u16::from(tabs))
+}
+
+/// Gives every account's app the tabs, as the account `active` shows them.
+fn show_tabs(slots: &mut [Slot], active: usize, position: app::TabPosition) {
+    if slots.len() < 2 {
+        return;
+    }
+    // What is shown is looked at.
+    slots[active].app.arrived = false;
+    let tabs: Vec<app::Tab> = slots
+        .iter()
+        .map(|slot| app::Tab {
+            label: slot.label.clone(),
+            new_mail: slot.app.mailboxes_with_new_mail() > 0 || slot.app.arrived,
+        })
+        .collect();
+    for slot in slots.iter_mut() {
+        slot.app.tabs = Some(app::Tabs {
+            tabs: tabs.clone(),
+            active,
+            position,
+        });
+    }
+}
+
+/// Runs the accounts, each with an app of its own, and shows the one that is
+/// current on `screen`, with input from `input_rx`.
 async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     mut screen: impl Frontend,
     mut input_rx: InputEvents,
-    store: Arc<S>,
-    session: Session,
+    accounts: Accounts<S>,
 ) -> std::io::Result<()> {
-    let Session {
-        folder,
-        settings,
-        keymap,
-        pushed,
-        account,
-        config,
-        mut editor,
-        sign_in: mut sign_in_rx,
-        syncing: mut syncing_rx,
-        cancel,
-        notice,
-    } = session;
-
-    let (request_tx, request_rx) = mpsc::unbounded_channel::<(RequestId, Request)>();
-    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-    tokio::spawn(worker::run(store, request_rx, response_tx));
-
-    let (timer_tx, mut timer_rx) = mpsc::unbounded_channel();
-    // What reading, saving and opening files (on threads of their own)
-    // has to say.
-    let (file_tx, mut file_rx) = mpsc::unbounded_channel();
-
-    // `:` commands run on their own thread, one at a time: `source` and
-    // backticks may take a while, and the UI doesn't wait for them.
-    let mut commands = Commands::new(Configuration {
-        // Kept for `:` commands that don't change it.
-        signature: settings.compose.signature.clone(),
-        config,
-    });
-    let mut running: Option<oneshot::Receiver<(Configuration, app::Reconfigured)>> = None;
-    let carry_out = |app: &mut App, effects| {
-        dispatch(
-            app,
-            &request_tx,
-            &timer_tx,
-            &file_tx,
-            cancel.as_ref(),
-            effects,
-        )
-    };
+    let Accounts { list, position } = accounts;
+    let tabbed = list.len() > 1;
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<(usize, Incoming)>();
     let size = screen.size()?;
-    let (mut app, effects) = App::open(size.width, size.height, folder, settings);
-    app.keymap = keymap;
-    if let Some(notice) = notice {
-        app.notice(notice);
-    }
-    // Played once the folder is listed, so that `push <last-entry>` has
-    // somewhere to go.
-    app.push_after_load(pushed);
-    let mut deferred = carry_out(&mut app, effects);
+    let mut slots: Vec<Slot> = Vec::with_capacity(list.len());
+    for (id, opened) in list.into_iter().enumerate() {
+        let Opened {
+            label,
+            store,
+            session,
+        } = opened;
+        let Session {
+            folder,
+            settings,
+            keymap,
+            pushed,
+            account,
+            config,
+            editor,
+            sign_in: sign_in_rx,
+            syncing: syncing_rx,
+            cancel,
+            notice,
+        } = session;
 
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<(RequestId, Request)>();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        tokio::spawn(worker::run(store, request_rx, response_tx));
+        let (timer_tx, timer_rx) = mpsc::unbounded_channel();
+        // What reading, saving and opening files (on threads of their own)
+        // has to say.
+        let (file_tx, file_rx) = mpsc::unbounded_channel();
+        forward(
+            id,
+            sign_in_rx,
+            response_rx,
+            syncing_rx,
+            timer_rx,
+            file_rx,
+            events_tx.clone(),
+        );
+
+        // `:` commands run on their own thread, one at a time: `source` and
+        // backticks may take a while, and the UI doesn't wait for them.
+        let commands = Commands::new(Configuration {
+            // Kept for `:` commands that don't change it.
+            signature: settings.compose.signature.clone(),
+            config,
+        });
+        let (mut app, effects) = App::open(size.width, rows(size.height, tabbed), folder, settings);
+        app.keymap = keymap;
+        if let Some(notice) = notice {
+            app.notice(notice);
+        }
+        // Played once the folder is listed, so that `push <last-entry>` has
+        // somewhere to go.
+        app.push_after_load(pushed);
+        let mut slot = Slot {
+            label,
+            app,
+            requests: request_tx,
+            timers: timer_tx,
+            files: file_tx,
+            cancel,
+            account,
+            editor,
+            commands,
+            running: false,
+            deferred: Deferred::default(),
+        };
+        slot.absorb(effects);
+        slots.push(slot);
+    }
+
+    // The account shown; the others go on in the background, checking for
+    // mail and saving what the user changed.
+    let mut active = 0;
     // Whether the screen may differ from what was drawn last: it is drawn
     // only before waiting, once everything ready has been taken in.
     let mut stale = true;
-    while !app.quit {
-        // What effects done at once answered goes to the app first.
-        while !deferred.msgs.is_empty() {
-            for msg in std::mem::take(&mut deferred.msgs) {
-                let effects = app.update(msg);
-                deferred.absorb(carry_out(&mut app, effects));
-                stale = true;
+    // The accounts that have said they are done (quit), and those asked
+    // about their deleted messages first.
+    let mut done = vec![false; slots.len()];
+    let mut asked = vec![false; slots.len()];
+    'run: loop {
+        // Quitting in any account quits mett, as it would in one alone: it
+        // may be one that isn't shown (a `push <quit>`, or a purge that was
+        // being done when the user went to another tab).
+        for (at, slot) in slots.iter().enumerate() {
+            done[at] |= slot.app.quit;
+        }
+        if done.iter().any(|done| *done) {
+            // What is unfinished in another account (messages marked deleted,
+            // a message being written) is the user's to decide on, as it
+            // would be quitting that account alone: it is shown, and asked,
+            // once.
+            let unfinished = |slot: &Slot| slot.app.has_deleted() || slot.app.is_composing();
+            let to_ask =
+                (0..slots.len()).find(|at| !done[*at] && !asked[*at] && unfinished(&slots[*at]));
+            match to_ask {
+                Some(other) => {
+                    asked[other] = true;
+                    active = other;
+                    stale = true;
+                    // The purge is asked by quitting; a message being written
+                    // is shown, for the user to send, postpone or abandon. An
+                    // account that needs a sign-in first has its window
+                    // shown: the user deals with it, and quits again.
+                    if slots[other].app.sign_in.is_none() && slots[other].app.has_deleted() {
+                        let effects = slots[other].app.update(Msg::Action(action::Action::Quit));
+                        slots[other].absorb(effects);
+                    }
+                }
+                // Nothing is left to ask: mett quits. (An account asked and
+                // not answered keeps it going: the user may have said no.)
+                None if (0..slots.len()).all(|at| done[at] || !unfinished(&slots[at])) => {
+                    break 'run;
+                }
+                None => {}
             }
         }
-        if !deferred.copies.is_empty() {
-            copy_all(&mut screen, &mut app, std::mem::take(&mut deferred.copies));
-            stale = true;
+        for at in 0..slots.len() {
+            // What effects done at once answered goes to the app first.
+            while !slots[at].deferred.msgs.is_empty() {
+                for msg in std::mem::take(&mut slots[at].deferred.msgs) {
+                    let slot = &mut slots[at];
+                    let effects = slot.app.update(msg);
+                    slot.absorb(effects);
+                    stale = true;
+                }
+            }
+            if !slots[at].deferred.copies.is_empty() {
+                let copies = std::mem::take(&mut slots[at].deferred.copies);
+                copy_all(&mut screen, &mut slots[at].app, copies);
+                stale = true;
+            }
+            // The editor runs between messages, with the terminal handed
+            // over.
+            let slot = &mut slots[at];
+            let commands: Vec<String> = slot.deferred.commands.drain(..).collect();
+            slot.commands.queue.extend(commands);
+            // The editor takes over the terminal: only for the account
+            // shown (another's waits until it is).
+            while at == active
+                && let Some(text) = slots[at].deferred.edit.take()
+            {
+                let result = screen.edit(&slots[at].editor, &mut input_rx, &text)?;
+                // The terminal was cleared: all of it is drawn again.
+                stale = true;
+                // The terminal may have been resized meanwhile.
+                let size = screen.size()?;
+                for slot in &mut slots {
+                    slot.app.update(Msg::Resize {
+                        width: size.width,
+                        height: rows(size.height, tabbed),
+                    });
+                }
+                let slot = &mut slots[at];
+                let effects = slot.app.update(Msg::Edited(result));
+                slot.absorb(effects);
+                let commands: Vec<String> = slot.deferred.commands.drain(..).collect();
+                slot.commands.queue.extend(commands);
+            }
+            if let Some(switch) = slots[at].deferred.switch.take()
+                && at == active
+                && let Some(to) = switch.target(active, slots.len())
+            {
+                // The keys a macro has still to play go on in the account
+                // gone to.
+                let strokes = slots[active].app.take_strokes();
+                slots[to].app.give_strokes(strokes);
+                active = to;
+                stale = true;
+            }
+            if !slots[at].running
+                && let Some((command, mut configuration)) = slots[at].commands.start()
+            {
+                let account = slots[at].account.clone();
+                let (done, result) = oneshot::channel();
+                slots[at].running = true;
+                let events = events_tx.clone();
+                tokio::spawn(async move {
+                    let _ = events.send((at, Incoming::Configured(result.await)));
+                });
+                // A thread of its own, not the runtime's blocking pool:
+                // quitting doesn't wait for a command that takes its time.
+                std::thread::spawn(move || {
+                    let reconfigured = run_command(
+                        &mut configuration.config,
+                        &account,
+                        &mut configuration.signature,
+                        &command,
+                    );
+                    let _ = done.send((configuration, reconfigured));
+                });
+            }
         }
-        // The editor runs between messages, with the terminal handed over.
-        commands.queue.extend(deferred.commands.drain(..));
-        while let Some(text) = deferred.edit.take() {
-            let result = screen.edit(&editor, &mut input_rx, &text)?;
-            // The terminal was cleared: all of it is drawn again.
-            stale = true;
-            // The terminal may have been resized meanwhile.
-            let size = screen.size()?;
-            app.update(Msg::Resize {
-                width: size.width,
-                height: size.height,
-            });
-            let effects = app.update(Msg::Edited(result));
-            deferred.absorb(carry_out(&mut app, effects));
-            commands.queue.extend(deferred.commands.drain(..));
-        }
-        if running.is_none()
-            && let Some((command, mut configuration)) = commands.start()
+        if slots
+            .iter()
+            .zip(&done)
+            .any(|(slot, done)| slot.app.quit && !done)
         {
-            let account = account.clone();
-            let (done, result) = oneshot::channel();
-            running = Some(result);
-            // A thread of its own, not the runtime's blocking pool: quitting
-            // doesn't wait for a command that takes its time.
-            std::thread::spawn(move || {
-                let reconfigured = run_command(
-                    &mut configuration.config,
-                    &account,
-                    &mut configuration.signature,
-                    &command,
-                );
-                let _ = done.send((configuration, reconfigured));
-            });
+            continue 'run;
         }
+        // The keys a `push` in an account's own file queued play there even
+        // if it isn't the one shown.
+        for at in (0..slots.len()).filter(|at| *at != active) {
+            while let Some(msg) = slots[at].app.next_stroke() {
+                let slot = &mut slots[at];
+                let effects = slot.app.update(msg);
+                slot.absorb(effects);
+                stale = true;
+                // A `push <quit>` there quits mett, as it would in any
+                // account (see above).
+                if slots[at].app.quit && !done[at] {
+                    continue 'run;
+                }
+                // A question there (a purge, asked by a `push <quit>`) needs
+                // the user: that account is shown.
+                if slots[at].app.input.is_some() {
+                    active = at;
+                    continue 'run;
+                }
+            }
+        }
+        show_tabs(&mut slots, active, position);
         // Keys a macro or `push` queued come before new input, once the
         // last action has what it was waiting for. They are played without
         // drawing the screen between them.
-        let stroke = app.next_stroke();
-        stale |= app.take_redraw();
-        let received = match stroke {
-            Some(msg) => Received::Msg(msg),
+        let stroke = slots[active].app.next_stroke();
+        stale |= slots[active].app.take_redraw();
+        let (at, received) = match stroke {
+            Some(msg) => (active, Received::Msg(msg)),
             None => {
                 let mut next = std::pin::pin!(async {
                     tokio::select! {
-                        event = input_rx.recv() => Received::Input(event),
-                        Some(response) = response_rx.recv() => Received::Msg(Msg::Response(response)),
-                        Some(event) = sign_in_rx.recv() => Received::Msg(Msg::SignIn(event)),
-                        Some(msg) = syncing_rx.recv() => Received::Msg(msg),
-                        Some(timer) = timer_rx.recv() => Received::Msg(Msg::Timer(timer)),
-                        Some(msg) = file_rx.recv() => Received::Msg(msg),
-                        done = async { running.as_mut().expect("checked").await }, if running.is_some() => {
-                            Received::Configured(done)
-                        }
-                        else => Received::Closed,
+                        event = input_rx.recv() => (active, Received::Input(event)),
+                        Some((at, incoming)) = events_rx.recv() => (at, match incoming {
+                            Incoming::Msg(msg) => Received::Msg(msg),
+                            Incoming::Configured(done) => Received::Configured(done),
+                        }),
+                        else => (active, Received::Closed),
                     }
                 });
                 // What is ready already is taken in first; the screen is
@@ -752,8 +1073,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                     Some(received) => received,
                     None => {
                         if std::mem::take(&mut stale) {
-                            app.before_draw();
-                            screen.draw(&app)?;
+                            slots[active].app.before_draw();
+                            screen.draw(&slots[active].app)?;
                         }
                         next.await
                     }
@@ -769,19 +1090,27 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 Some(event) => match event {
                     // Repeats too, so holding a key keeps moving.
                     UserEvent::Term(TermEvent::Key(key)) if key.kind != KeyEventKind::Release => {
-                        app.typed();
+                        slots[active].app.typed();
                         Msg::Key(key)
                     }
                     UserEvent::Term(TermEvent::Resize(width, height)) => {
-                        Msg::Resize { width, height }
+                        // Every account's app has the new size.
+                        for slot in &mut slots {
+                            slot.app.update(Msg::Resize {
+                                width,
+                                height: rows(height, tabbed),
+                            });
+                        }
+                        stale = true;
+                        continue;
                     }
                     UserEvent::Term(TermEvent::Paste(text)) => {
-                        app.typed();
+                        slots[active].app.typed();
                         Msg::Paste(text)
                     }
                     UserEvent::Close => Msg::Close,
                     UserEvent::Paste => {
-                        app.typed();
+                        slots[active].app.typed();
                         Msg::PasteClipboard
                     }
                     // Nothing changed: nothing to draw again.
@@ -789,164 +1118,241 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 },
             },
             Received::Configured(done) => {
-                running = None;
+                let slot = &mut slots[at];
+                slot.running = false;
                 let (configuration, reconfigured) =
                     done.map_err(|_| std::io::Error::other("a : command stopped"))?;
                 // `editor` and `tmpdir` may have changed.
                 let config = &configuration.config;
-                editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
-                commands.finish(configuration);
+                slot.editor = Editor::from_env(config.string("editor"), config.string("tmpdir"));
+                slot.commands.finish(configuration);
                 Msg::Configured(reconfigured)
             }
             Received::Closed => break,
         };
-        let effects = app.update(msg);
-        deferred.absorb(carry_out(&mut app, effects));
+        let slot = &mut slots[at];
+        let effects = slot.app.update(msg);
+        slot.absorb(effects);
         stale = true;
     }
 
+    finish(
+        &mut screen,
+        &mut input_rx,
+        &mut events_rx,
+        &mut slots,
+        active,
+        position,
+    )
+    .await
+}
+
+/// What a main loop that is quitting takes in of what an account says, and
+/// how much longer to wait for it, if it should be: only what concerns
+/// saving matters. Anything else (say, a late message fetch) could start new
+/// work that would never be sent.
+fn when_quitting(slot: &Slot, incoming: Incoming) -> Option<(Msg, Option<std::time::Duration>)> {
+    let Incoming::Msg(msg) = incoming else {
+        return None;
+    };
+    match msg {
+        Msg::Response(response) => match &response.event {
+            worker::Event::Throttled { wait, .. } if slot.app.saves(response.id) => {
+                let wait = *wait + SAVE_TIMEOUT;
+                Some((Msg::Response(response), Some(wait)))
+            }
+            worker::Event::FlagsUpdated(_)
+            | worker::Event::Sent(..)
+            | worker::Event::DraftSaved(..)
+            | worker::Event::KeptDiscarded(_)
+            | worker::Event::Transferred(_)
+            | worker::Event::Purged(_)
+            | worker::Event::Watched(_) => Some((Msg::Response(response), None)),
+            _ => None,
+        },
+        // A sign-in that nothing left to save needs: the user has quit, so
+        // don't send them to the browser.
+        Msg::SignIn(SignInEvent::Prompt { .. }) if !slot.app.saving() => {
+            if let Some(cancel) = &slot.cancel {
+                cancel.cancel();
+            }
+            None
+        }
+        Msg::SignIn(event) => Some((Msg::SignIn(event), None)),
+        // The countdown of a throttled save goes on; other timers would
+        // start new work.
+        Msg::Timer(timer @ app::Timer::Throttled(_)) => Some((Msg::Timer(timer), None)),
+        _ => None,
+    }
+}
+
+/// What the main loop is waiting for, once the user has quit: the changes
+/// not yet saved, and watching stopped on the server.
+async fn finish(
+    screen: &mut impl Frontend,
+    input_rx: &mut InputEvents,
+    events_rx: &mut mpsc::UnboundedReceiver<(usize, Incoming)>,
+    slots: &mut [Slot],
+    active: usize,
+    position: app::TabPosition,
+) -> std::io::Result<()> {
     // Give pending changes (such as marking a message read) a moment to
     // reach the mailbox, rather than cancelling them by exiting.
     // The outcome is reported after the terminal is restored, so a change
     // that couldn't be saved isn't lost silently.
     // A save's sign-in failure may still be queued, behind its response
     // and the key that quit: take it in, so its window can offer a retry.
-    while let Ok(event) = sign_in_rx.try_recv() {
-        // A sign-in that nothing left to save needs: the user has quit, so
-        // don't send them to the browser.
-        if matches!(event, SignInEvent::Prompt { .. }) && !app.saving() {
-            if let Some(cancel) = &cancel {
-                cancel.cancel();
-            }
+    while let Ok((at, incoming)) = events_rx.try_recv() {
+        let slot = &mut slots[at];
+        // What was saved meanwhile is saved: its response is taken in, or
+        // the app would wait for it, and call it a failure.
+        let Some((msg, _)) = when_quitting(slot, incoming) else {
             continue;
-        }
-        let effects = app.update(Msg::SignIn(event));
-        carry_out(&mut app, effects);
+        };
+        let effects = slot.app.update(msg);
+        slot.carry_out(effects);
     }
     // Watching stops on the server too, while changes are saved.
-    let effects = app.unwatch();
-    carry_out(&mut app, effects);
-    let unsaved = !app.save_failures().is_empty();
-    if app.saving() || (unsaved && app.sign_in.is_some()) {
-        app.status = "Saving changes...".into();
-        stale = true;
+    for slot in slots.iter_mut() {
+        let effects = slot.app.unwatch();
+        slot.carry_out(effects);
+    }
+    // The account with a sign-in window to use shows it.
+    let mut shown = active;
+    let unsaved = |slot: &Slot| !slot.app.save_failures().is_empty();
+    let waiting = |slots: &[Slot]| {
+        slots
+            .iter()
+            .any(|s| s.app.saving() || (unsaved(s) && s.app.sign_in.is_some()))
+    };
+    // Whether the user is signing in for changes that wait for it.
+    let signing_in = |slots: &[Slot]| {
+        slots
+            .iter()
+            .any(|s| s.app.sign_in.is_some() && (s.app.saving() || unsaved(s)))
+    };
+    if waiting(slots) {
+        for slot in slots.iter_mut() {
+            if slot.app.saving() {
+                slot.app.status = "Saving changes...".into();
+            }
+        }
+        let mut stale = true;
         // A save the server throttled before the user quit waits that much
         // longer.
-        let mut deadline =
-            tokio::time::Instant::now() + SAVE_TIMEOUT + app.save_wait().unwrap_or_default();
+        let wait = |slots: &[Slot]| {
+            slots
+                .iter()
+                .filter_map(|s| s.app.save_wait())
+                .max()
+                .unwrap_or_default()
+        };
+        let mut deadline = tokio::time::Instant::now() + SAVE_TIMEOUT + wait(slots);
         loop {
-            // A failed save's sign-in failure is sent before the save's own
-            // response; take it in first, so the window opens and the
-            // save can be retried even after nothing is left pending.
-            while let Ok(event) = sign_in_rx.try_recv() {
-                let effects = app.update(Msg::SignIn(event));
-                carry_out(&mut app, effects);
-                stale = true;
+            // The window that takes the keys is the one of an account whose
+            // changes wait for a sign-in (not one that is only signing in).
+            if let Some(at) = slots
+                .iter()
+                .position(|s| s.app.sign_in.is_some() && (s.app.saving() || unsaved(s)))
+            {
+                shown = at;
+            } else if let Some(at) = slots.iter().position(|s| s.app.saving()) {
+                shown = at;
             }
             // A macro run in the sign-in window plays there.
-            while let Some(msg) = app.next_sign_in_stroke() {
-                let effects = app.update(msg);
-                let copies = carry_out(&mut app, effects).copies;
-                copy_all(&mut screen, &mut app, copies);
+            while let Some(msg) = slots[shown].app.next_sign_in_stroke() {
+                let slot = &mut slots[shown];
+                let effects = slot.app.update(msg);
+                let copies = slot.carry_out(effects).copies;
+                copy_all(screen, &mut slots[shown].app, copies);
                 stale = true;
             }
-            stale |= app.take_redraw();
+            stale |= slots[shown].app.take_redraw();
             // A sign-in window keeps mett here only while a change is
             // still unsaved, so the user can sign in or retry it; other
             // sign-ins don't matter any more.
-            let unsaved = !app.save_failures().is_empty();
-            let waiting = app.saving() || (unsaved && app.sign_in.is_some());
-            if !waiting {
+            if !waiting(slots) {
                 break;
             }
             // What was ignored changed nothing to draw.
             if std::mem::take(&mut stale) {
-                app.before_draw();
-                screen.draw(&app)?;
+                // The tab shown may be another's now.
+                show_tabs(slots, shown, position);
+                slots[shown].app.before_draw();
+                screen.draw(&slots[shown].app)?;
             }
-            let msg = tokio::select! {
+            let (at, msg) = tokio::select! {
                 // Saving may need the user to sign in: the sign-in window
                 // still works, and only it takes keys.
                 event = input_rx.recv() => match event.transpose()? {
                     None => break,
                     Some(UserEvent::Term(TermEvent::Key(key)))
-                        if key.kind != KeyEventKind::Release && app.sign_in.is_some() =>
+                        if key.kind != KeyEventKind::Release
+                            && slots[shown].app.sign_in.is_some() =>
                     {
-                        Msg::Key(key)
+                        (shown, Msg::Key(key))
                     }
                     Some(UserEvent::Term(TermEvent::Resize(width, height))) => {
-                        Msg::Resize { width, height }
+                        let tabbed = slots.len() > 1;
+                        for slot in slots.iter_mut() {
+                            slot.app.update(Msg::Resize {
+                                width,
+                                height: rows(height, tabbed),
+                            });
+                        }
+                        stale = true;
+                        continue;
                     }
                     // Closing the window again: no more waiting.
                     Some(UserEvent::Close) => break,
                     // Already quitting.
                     Some(_) => continue,
                 },
-                response = response_rx.recv() => match response {
-                    // A save the server throttled is tried again after the
-                    // wait it asked for: wait for it that much longer.
-                    Some(response)
-                        if matches!(response.event, worker::Event::Throttled { .. })
-                            && app.saves(response.id) =>
-                    {
-                        if let worker::Event::Throttled { wait, .. } = response.event {
-                            deadline =
-                                deadline.max(tokio::time::Instant::now() + wait + SAVE_TIMEOUT);
+                incoming = events_rx.recv() => match incoming {
+                    Some((at, incoming)) => match when_quitting(&slots[at], incoming) {
+                        Some((msg, wait)) => {
+                            // A save the server throttled is tried again
+                            // after the wait it asked for: wait for it that
+                            // much longer.
+                            if let Some(wait) = wait {
+                                deadline = deadline.max(tokio::time::Instant::now() + wait);
+                            }
+                            (at, msg)
                         }
-                        Msg::Response(response)
-                    }
-                    // Only save results matter now. Anything else (say, a
-                    // late message fetch) could start new work that would
-                    // never be sent.
-                    Some(response)
-                        if matches!(
-                            response.event,
-                            worker::Event::FlagsUpdated(_)
-                                | worker::Event::Sent(..)
-                                | worker::Event::DraftSaved(..)
-                                | worker::Event::KeptDiscarded(_)
-                                | worker::Event::Transferred(_)
-                                | worker::Event::Purged(_)
-                                | worker::Event::Watched(_)
-                        ) =>
-                    {
-                        Msg::Response(response)
-                    }
-                    Some(_) => continue,
+                        None => continue,
+                    },
                     None => break,
                 },
-                Some(event) = sign_in_rx.recv() => Msg::SignIn(event),
-                // The countdown of a throttled save goes on; other timers
-                // would start new work.
-                Some(timer @ app::Timer::Throttled(_)) = timer_rx.recv() => Msg::Timer(timer),
                 // The user may take a while to sign in; the wait only
                 // counts while they don't have to.
-                () = tokio::time::sleep_until(deadline), if app.sign_in.is_none() => break,
+                () = tokio::time::sleep_until(deadline), if !signing_in(slots) => break,
             };
-            let window_was_open = app.sign_in.is_some();
-            let effects = app.update(msg);
+            let window_was_open = signing_in(slots);
+            let slot = &mut slots[at];
+            let effects = slot.app.update(msg);
             stale = true;
             // Nothing is edited, nor configured, any more; the sign-in
             // window may copy its link.
-            let copies = carry_out(&mut app, effects).copies;
-            copy_all(&mut screen, &mut app, copies);
+            let copies = slot.carry_out(effects).copies;
+            copy_all(screen, &mut slots[at].app, copies);
             // The wait starts again once the user is done signing in.
             // (Still with what a throttled save has left to wait.)
-            if window_was_open || app.sign_in.is_some() {
-                deadline = tokio::time::Instant::now()
-                    + SAVE_TIMEOUT
-                    + app.save_wait().unwrap_or_default();
+            if window_was_open || signing_in(slots) {
+                deadline = tokio::time::Instant::now() + SAVE_TIMEOUT + wait(slots);
             }
         }
     }
     // Not for long: what is left on the server expires anyway.
     let deadline = tokio::time::Instant::now() + UNWATCH_TIMEOUT;
-    while app.unwatching() {
+    while slots.iter().any(|s| s.app.unwatching()) {
         tokio::select! {
-            response = response_rx.recv() => match response {
-                Some(response) if matches!(response.event, worker::Event::Watched(_)) => {
-                    let effects = app.update(Msg::Response(response));
-                    carry_out(&mut app, effects);
+            incoming = events_rx.recv() => match incoming {
+                Some((at, Incoming::Msg(Msg::Response(response))))
+                    if matches!(response.event, worker::Event::Watched(_)) =>
+                {
+                    let slot = &mut slots[at];
+                    let effects = slot.app.update(Msg::Response(response));
+                    slot.carry_out(effects);
                 }
                 Some(_) => {}
                 None => break,
@@ -954,12 +1360,21 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             () = tokio::time::sleep_until(deadline) => break,
         }
     }
-    if app.saving() {
+    if slots.iter().any(|s| s.app.saving()) {
         return Err(std::io::Error::other(
             "gave up waiting for changes to be saved; some messages may still be unread",
         ));
     }
-    let failures = app.save_failures();
+    let failures: Vec<String> = slots
+        .iter()
+        .flat_map(|slot| {
+            let many = slots_len_label(slot);
+            slot.app
+                .save_failures()
+                .into_iter()
+                .map(move |failure| format!("{many}{failure}"))
+        })
+        .collect();
     if !failures.is_empty() {
         return Err(std::io::Error::other(format!(
             "some changes could not be saved: {}",
@@ -967,6 +1382,15 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         )));
     }
     Ok(())
+}
+
+/// What a saving failure of `slot`'s account starts with: its tab, if it
+/// has one.
+fn slots_len_label(slot: &Slot) -> String {
+    match &slot.app.tabs {
+        Some(_) => format!("{}: ", slot.label),
+        None => String::new(),
+    }
 }
 
 /// Puts each of `copies` on the clipboard, saying why one couldn't be.
@@ -982,7 +1406,7 @@ fn copy_all(screen: &mut impl Frontend, app: &mut App, copies: Vec<String>) {
 /// size of the large ones doesn't matter.
 #[allow(clippy::large_enum_variant)]
 enum Received {
-    /// A message for the app.
+    /// A message for an app.
     Msg(Msg),
     /// What the user did, a read error, or `None` once input closed.
     Input(Option<std::io::Result<UserEvent>>),
@@ -1065,6 +1489,8 @@ struct Deferred {
     copies: Vec<String>,
     /// What effects done at once answered, for the app.
     msgs: Vec<Msg>,
+    /// Another account's tab to show.
+    switch: Option<app::Switch>,
 }
 
 impl Deferred {
@@ -1075,6 +1501,9 @@ impl Deferred {
         self.commands.extend(other.commands);
         self.copies.extend(other.copies);
         self.msgs.extend(other.msgs);
+        if other.switch.is_some() {
+            self.switch = other.switch;
+        }
     }
 }
 
@@ -1406,6 +1835,7 @@ fn run_command(
                             "imap_pass",
                             "smtp_url",
                             "smtp_pass",
+                            "tab_position",
                         ]
                         .contains(*name))
                         && ![
@@ -1478,6 +1908,7 @@ fn dispatch(
                 }
             }
             Effect::Copy(text) => deferred.copies.push(text),
+            Effect::Account(switch) => deferred.switch = Some(switch),
             Effect::Edit(text) => deferred.edit = Some(text),
             // Files are read and written on threads of their own: a slow
             // disk (or a FIFO) doesn't hold up the screen, nor quitting.
@@ -1837,13 +2268,16 @@ mod tests {
         );
         assert_eq!(demo.config.string("office365_client_id"), "abc", "kept");
         // The IMAP and SMTP connections were made then too.
-        let done = demo.run("set imap_pass=x smtp_url=smtps://smtp.example.com ssl_force_tls=yes");
+        let done = demo.run(
+            "set imap_pass=x smtp_url=smtps://smtp.example.com ssl_force_tls=yes tab_position=bottom",
+        );
         assert_eq!(
             done.outcome,
             Ok(vec![
                 "imap_pass: takes effect when mett starts again".to_owned(),
                 "smtp_url: takes effect when mett starts again".to_owned(),
                 "ssl_force_tls: takes effect when mett starts again".to_owned(),
+                "tab_position: takes effect when mett starts again".to_owned(),
             ])
         );
         // Unsetting the cache keeps its empty value, but stops caching.
@@ -2035,5 +2469,390 @@ mod tests {
         // They still name their folders.
         let names: Vec<_> = settings.mailboxes.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["=INBOX", "=Work"]);
+    }
+
+    /// What a draw showed: the tab, the messages in the index, the status,
+    /// and whether a question was on the message line.
+    type Shown = (Option<String>, usize, String, bool);
+
+    /// A screen that records what each draw showed: the tab shown (with
+    /// several accounts) and how many messages its index had.
+    struct Recording {
+        drawn: Arc<std::sync::Mutex<Vec<Shown>>>,
+    }
+
+    impl Frontend for Recording {
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            Ok(ratatui::layout::Size {
+                width: 80,
+                height: 24,
+            })
+        }
+
+        fn draw(&mut self, app: &App) -> std::io::Result<()> {
+            let shown = app.tabs.as_ref().map(|t| t.tabs[t.active].label.clone());
+            self.drawn.lock().unwrap().push((
+                shown,
+                app.messages.len(),
+                app.status.clone(),
+                app.input.is_some(),
+            ));
+            Ok(())
+        }
+
+        fn edit(
+            &mut self,
+            _: &Editor,
+            _: &mut InputEvents,
+            _: &str,
+        ) -> std::io::Result<Result<String, String>> {
+            Err(std::io::Error::other("no editor here"))
+        }
+
+        fn copy(&mut self, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A demo account with this tab `label`.
+    fn demo_account(label: &str) -> Opened<mett_core::mock::MemoryStore> {
+        demo_account_pushing(label, Vec::new())
+    }
+
+    /// A demo account that plays `pushed` once its folder is listed.
+    fn demo_account_pushing(
+        label: &str,
+        pushed: Vec<keymap::Stroke>,
+    ) -> Opened<mett_core::mock::MemoryStore> {
+        let (_, sign_in) = mpsc::unbounded_channel();
+        let settings = demo::settings();
+        Opened {
+            label: label.to_owned(),
+            store: Arc::new(demo::mailbox()),
+            session: Session {
+                folder: FolderPath::WellKnown(mett_core::WellKnownFolder::Inbox, Vec::new()),
+                account: settings.account.clone(),
+                settings,
+                keymap: Keymap::mutt_defaults(),
+                pushed,
+                config: config::Config::new(None),
+                editor: Editor::from_env("", ""),
+                sign_in,
+                syncing: mpsc::unbounded_channel().1,
+                cancel: None,
+                notice: None,
+            },
+        }
+    }
+
+    fn key(c: char, alt: bool) -> std::io::Result<UserEvent> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let modifiers = if alt {
+            KeyModifiers::ALT
+        } else {
+            KeyModifiers::NONE
+        };
+        Ok(UserEvent::Term(TermEvent::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            modifiers,
+        ))))
+    }
+
+    /// Waits until a draw satisfies `wanted`, and returns it.
+    async fn drawn_until(
+        drawn: &Arc<std::sync::Mutex<Vec<Shown>>>,
+        wanted: impl Fn(&Shown) -> bool,
+    ) -> Shown {
+        for _ in 0..500 {
+            if let Some(found) = drawn.lock().unwrap().iter().rev().find(|d| wanted(d)) {
+                return found.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("never drawn: {:?}", drawn.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn several_accounts_run_at_once_and_the_tabs_switch_between_them() {
+        // The app isn't `Send`: it runs on this task's thread.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                let accounts = Accounts {
+                    list: vec![demo_account("Work"), demo_account("Home")],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+
+                // The first is shown, with its mail.
+                let first = drawn_until(&drawn, |(tab, messages, ..)| {
+                    tab.as_deref() == Some("Work") && *messages > 0
+                })
+                .await;
+                assert_eq!(first.0.as_deref(), Some("Work"));
+                // Alt-n goes to the next, whose mail was listed in the
+                // background.
+                input.send(key('n', true)).unwrap();
+                let home = drawn_until(&drawn, |(tab, messages, ..)| {
+                    tab.as_deref() == Some("Home") && *messages > 0
+                })
+                .await;
+                assert!(home.1 > 0, "listed while it was in the background");
+                // Alt-1 and Alt-2 go to them by number; Alt-9 to none.
+                input.send(key('1', true)).unwrap();
+                drawn_until(&drawn, |(tab, ..)| tab.as_deref() == Some("Work")).await;
+                input.send(key('9', true)).unwrap();
+                drawn_until(&drawn, |(_, _, status, _)| {
+                    status == "There is no account 9."
+                })
+                .await;
+                input.send(key('2', true)).unwrap();
+                drawn_until(&drawn, |(tab, ..)| tab.as_deref() == Some("Home")).await;
+                input.send(key('p', true)).unwrap();
+                drawn_until(&drawn, |(tab, ..)| tab.as_deref() == Some("Work")).await;
+
+                // Quitting quits them all.
+                input.send(key('q', false)).unwrap();
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn quitting_asks_about_the_deleted_messages_of_an_account_in_the_background() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                let accounts = Accounts {
+                    list: vec![demo_account("Work"), demo_account("Home")],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                // In Home, a message is marked deleted; then Work is shown.
+                input.send(key('2', true)).unwrap();
+                drawn_until(&drawn, |(tab, messages, ..)| {
+                    tab.as_deref() == Some("Home") && *messages > 0
+                })
+                .await;
+                input.send(key('d', false)).unwrap();
+                input.send(key('1', true)).unwrap();
+                drawn_until(&drawn, |(tab, ..)| tab.as_deref() == Some("Work")).await;
+                let before = drawn.lock().unwrap().len();
+                // Quitting from Work shows Home, and asks about the purge.
+                input.send(key('q', false)).unwrap();
+                for _ in 0..500 {
+                    let asked = drawn.lock().unwrap()[before..]
+                        .iter()
+                        .any(|(tab, _, _, question)| tab.as_deref() == Some("Home") && *question);
+                    if asked {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(
+                    drawn.lock().unwrap()[before..]
+                        .iter()
+                        .any(|(tab, _, _, question)| tab.as_deref() == Some("Home") && *question),
+                    "{:?}",
+                    drawn.lock().unwrap()
+                );
+                assert!(!running.is_finished(), "waits for the answer");
+                // Not purging, it quits.
+                input.send(key('n', false)).unwrap();
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_push_in_an_account_not_shown_plays_there() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                // Home's own file pushes `d`: its first message is marked
+                // deleted, though Work is the account shown.
+                let delete = keymap::Stroke::Key(keymap::Key::char('d'));
+                let accounts = Accounts {
+                    list: vec![
+                        demo_account("Work"),
+                        demo_account_pushing("Home", vec![delete]),
+                    ],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                drawn_until(&drawn, |(tab, messages, ..)| {
+                    tab.as_deref() == Some("Work") && *messages > 0
+                })
+                .await;
+                // So quitting asks about Home's deleted message.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let before = drawn.lock().unwrap().len();
+                input.send(key('q', false)).unwrap();
+                drawn_until(&drawn, |(tab, _, _, question)| {
+                    tab.as_deref() == Some("Home") && *question
+                })
+                .await;
+                assert!(drawn.lock().unwrap().len() > before);
+                input.send(key('n', false)).unwrap();
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_quit_that_finishes_after_going_to_another_account_still_quits() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                let accounts = Accounts {
+                    list: vec![demo_account("Work"), demo_account("Home")],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                input.send(key('2', true)).unwrap();
+                drawn_until(&drawn, |(tab, messages, ..)| {
+                    tab.as_deref() == Some("Home") && *messages > 0
+                })
+                .await;
+                // In Home: a message deleted, then quit, purge, and straight
+                // to Work, before the purge is done.
+                for stroke in [
+                    key('d', false),
+                    key('q', false),
+                    key('y', false),
+                    key('1', true),
+                ] {
+                    input.send(stroke).unwrap();
+                }
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_question_asked_in_the_background_shows_the_account() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                // Home's file deletes a message and quits: asking whether to
+                // purge it.
+                let push = vec![
+                    keymap::Stroke::Key(keymap::Key::char('d')),
+                    keymap::Stroke::Key(keymap::Key::char('q')),
+                ];
+                let accounts = Accounts {
+                    list: vec![demo_account("Work"), demo_account_pushing("Home", push)],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                // Home is shown, with the question, though Work was first.
+                drawn_until(&drawn, |(tab, _, _, question)| {
+                    tab.as_deref() == Some("Home") && *question
+                })
+                .await;
+                input.send(key('n', false)).unwrap();
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_push_that_quits_in_an_account_not_shown_quits_mett() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let screen = Recording {
+                    drawn: Arc::default(),
+                };
+                let (_input, events) = mpsc::unbounded_channel();
+                let quit = keymap::Stroke::Key(keymap::Key::char('q'));
+                let accounts = Accounts {
+                    list: vec![
+                        demo_account("Work"),
+                        demo_account_pushing("Home", vec![quit]),
+                    ],
+                    position: app::TabPosition::Top,
+                };
+                let ended = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::task::spawn_local(run(screen, events, accounts)),
+                )
+                .await
+                .expect("quits")
+                .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn one_account_has_no_tabs() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                let accounts = Accounts {
+                    list: vec![demo_account("Work")],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                drawn_until(&drawn, |(_, messages, ..)| *messages > 0).await;
+                assert!(drawn.lock().unwrap().iter().all(|(tab, ..)| tab.is_none()));
+                // There is nothing to go to.
+                input.send(key('n', true)).unwrap();
+                drawn_until(&drawn, |(_, _, status, _)| {
+                    status == "There is only one account."
+                })
+                .await;
+                input.send(key('q', false)).unwrap();
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
     }
 }

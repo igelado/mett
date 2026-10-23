@@ -380,6 +380,32 @@ series or one occurrence; for one occurrence, EWS finds the occurrence's
 calendar item in a calendar view and Graph finds the series' instance. Times of a meeting of whole days are
 midnights (UTC) of its dates, so they show as dates in any time zone.
 
+### 5.11 Several accounts
+
+mutt has none, so mett's own design: every account is a complete,
+independent unit, and tabs only choose which is shown. The `account` command
+(`config`) makes a configuration for each: a clone of the one so far, with
+its file's commands on top. At start-up `mett-tui` builds a mailbox, a cache
+and an `App` for each (an `Opened`), as it did for the single account, and
+`run` keeps a `Slot` for each: the app, its worker (§5.4), its timers, its
+file threads and its `:` command thread. Everything an account's worker,
+sign-in, cache, timers and files say is forwarded into one channel, tagged
+with the slot, by one task per account that takes them in a fixed order (a
+failed save's sign-in failure before the save's response, as before); the
+loop takes in that channel and the user's input, gives input to the account
+shown, and everything else to the account it is for, so the others go on in
+the background. Each app is given the `Tabs` (labels and whether new mail
+is waiting) before the screen is drawn; the view takes a line for them
+(`view::render_tabs`). Going to another account is an `Effect::Account` the
+loop carries out. Quitting waits for every account's unsaved changes, with
+one deadline. One account is the case of a single slot with no tabs.
+
+- **Pros:** the apps know nothing of each other; every account keeps its own
+  mailbox type, so Office365 and IMAP can be mixed; no shared mutable state.
+- **Cons:** settings are copied into each configuration when the `account`
+  command runs, and `:` commands change one account's copy; the key bindings
+  are read once for all, and `:bind` changes the shown account's alone.
+
 ## 6. Example flow: opening a message
 
 1. The user presses `Enter` in the index. The index keymap resolves it to
