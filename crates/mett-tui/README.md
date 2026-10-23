@@ -3,8 +3,11 @@
 The `mett` binary, the mutt-like terminal UI, and `mett-gui`, which shows
 the same screens in a window of its own (the default `gui` feature;
 `--no-default-features` leaves it out). Both are thin: `lib.rs` has the
-main loop, over a `Frontend` (the terminal, or `gui.rs`'s window). It
-follows the Elm Architecture (`docs/DESIGN.md` §5.2):
+main loop, over a `Frontend` (`frontend.rs`: the terminal, or `gui.rs`'s
+window). Around it, `settings.rs` maps the configuration to the app's
+settings, `commands.rs` runs `:` commands, `files.rs` does file I/O off
+the main loop, `input.rs` reads the terminal's input and `quit.rs` is
+what the loop does once the user quits. It follows the Elm Architecture (`docs/DESIGN.md` §5.2):
 
 - **`app/`:** the model and `update`. All UI logic lives here;
   `app/composing.rs` has the steps of writing a message.
@@ -19,7 +22,12 @@ follows the Elm Architecture (`docs/DESIGN.md` §5.2):
   keeps.
 - **`action.rs` and `keymap.rs`:** mutt-style named actions, and key bindings
   for each menu (the Command pattern, §5.3).
-- **`worker.rs`:** the background actor that owns all mailbox I/O (§5.4).
+- **`worker/`:** the background actor that owns all mailbox I/O (§5.4);
+  `worker/patient.rs` tries throttled calls again, `worker/check.rs`
+  checks mailboxes for new mail and `worker/query.rs` runs
+  `query_command`.
+- **`text/`:** turns message bodies into terminal text; `text/html.rs`
+  converts HTML and `text/wrap.rs` wraps lines.
 - **`config/`:** reads `mettrc`, mutt's configuration format with mett's
   extensions ([docs/CONFIG-OFFICE365.md](../../docs/CONFIG-OFFICE365.md)).
 
