@@ -331,8 +331,15 @@ async fn a_folder_without_modification_sequences_is_not_synced() {
     server.state.lock().unwrap().nomodseq = true;
     deliver(&server, "INBOX", "one", &[]);
     let error = store.sync_folder(&inbox(), None).await.unwrap_err();
-    assert!(
-        error.to_string().contains("modification sequences"),
-        "{error}"
-    );
+    assert!(matches!(error, Error::CannotSync), "{error}");
+
+    // The cache then leaves the folder to the ordinary listing, which works.
+    let cached = cached(store_for(&server));
+    cached.child_folders(None).await.unwrap();
+    assert_eq!(listed(&cached).await, ["one"]);
+    // So does a server that learns it can't sync only when asked to.
+    let server = server_without_condstore().await;
+    deliver(&server, "INBOX", "two", &[]);
+    let cached = self::cached(store_for(&server));
+    assert_eq!(listed(&cached).await, ["two"]);
 }

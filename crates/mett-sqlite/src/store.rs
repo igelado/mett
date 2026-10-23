@@ -59,6 +59,8 @@ pub struct CachedStore<S> {
     synced: Mutex<HashMap<FolderId, Arc<tokio::sync::Mutex<LastSync>>>>,
     /// Told how far each sync has got.
     progress: Option<Progress>,
+    /// The folders the backend said it can't sync: listed by the backend.
+    unsyncable: Mutex<std::collections::HashSet<FolderId>>,
 }
 
 /// Told, as a folder syncs, how many of its messages the cache has, batch
@@ -110,6 +112,7 @@ impl<S> CachedStore<S> {
             writes: AtomicU64::new(0),
             synced: Mutex::new(HashMap::new()),
             progress: None,
+            unsyncable: Mutex::default(),
         }
     }
 
@@ -253,6 +256,14 @@ impl<S: MailStore> CachedStore<S> {
     /// where it stopped. `false` if the cache can't tell the folder yet
     /// (another mett sharing it is still filling it): the server has to.
     async fn sync(&self, folder: &FolderId) -> Result<bool> {
+        if self
+            .unsyncable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(folder)
+        {
+            return Ok(false);
+        }
         let lock = Arc::clone(
             self.synced
                 .lock()
@@ -285,6 +296,15 @@ impl<S: MailStore> CachedStore<S> {
                     state = None;
                     here = None;
                     continue;
+                }
+                // Not this folder: the backend lists it, as it would
+                // without a cache.
+                Err(Error::CannotSync) => {
+                    self.unsyncable
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(folder.clone());
+                    return Ok(false);
                 }
                 changes => changes?,
             };

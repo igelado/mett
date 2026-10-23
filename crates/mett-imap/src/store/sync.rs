@@ -73,12 +73,10 @@ pub(super) async fn sync_folder(
 ) -> Res<FolderChanges> {
     let selected = select(live, folder).await?;
     let stale = || Fail::Core(Error::StaleSync);
-    // Without modification sequences, a change of flags would go unseen.
-    let Some(modseq) = selected.modseq else {
-        return Err(Error::Backend(format!(
-            "{folder}: the server keeps no modification sequences for it, so it can't be synced"
-        ))
-        .into());
+    // Without modification sequences, a change of flags would go unseen: the
+    // folder is left to the ordinary listing.
+    let Some(modseq) = selected.modseq.filter(|_| live.caps.condstore) else {
+        return Err(Error::CannotSync.into());
     };
     let (state, removed) = match state {
         // Everything is a change; what the cache has that isn't is gone

@@ -75,17 +75,50 @@ impl UidSet {
         (taken, Self(ranges))
     }
 
-    /// This set and `more`.
+    /// This set and `more`, merged range by range.
     #[must_use]
     pub fn with(&self, more: impl IntoIterator<Item = u32>) -> Self {
-        Self::of(self.newest_first().chain(more))
+        let mut all = self.0.clone();
+        all.extend(more.into_iter().map(|uid| (uid, uid)));
+        all.sort_unstable();
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(all.len());
+        for (from, to) in all {
+            match merged.last_mut() {
+                Some((_, last)) if from <= last.saturating_add(1) => *last = (*last).max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        Self(merged)
     }
 
-    /// This set less `gone`.
+    /// This set less `gone`, cut out of the ranges.
     #[must_use]
     pub fn without(&self, gone: impl IntoIterator<Item = u32>) -> Self {
-        let gone = Self::of(gone);
-        Self::of(self.newest_first().filter(|uid| !gone.contains(*uid)))
+        let mut gone: Vec<u32> = gone.into_iter().collect();
+        gone.sort_unstable();
+        gone.dedup();
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(self.0.len());
+        let mut at = 0;
+        for (from, to) in &self.0 {
+            // Skip those below the range.
+            while at < gone.len() && gone[at] < *from {
+                at += 1;
+            }
+            let mut start = *from;
+            let mut taken = at;
+            while taken < gone.len() && gone[taken] <= *to {
+                let uid = gone[taken];
+                if uid > start {
+                    ranges.push((start, uid - 1));
+                }
+                start = uid + 1;
+                taken += 1;
+            }
+            if start <= *to {
+                ranges.push((start, *to));
+            }
+        }
+        Self(ranges)
     }
 
     /// Those of this set that `other` doesn't have.
@@ -159,6 +192,10 @@ mod tests {
         let set = UidSet::of([1, 2, 3, 7]);
         assert_eq!(set.with([4, 8]).to_string(), "1:4,7:8");
         assert_eq!(set.without([2, 7]).to_string(), "1,3");
+        assert_eq!(set.without([1, 3, 9]).to_string(), "2,7");
+        assert_eq!(set.without([]), set);
+        assert_eq!(set.with([]), set);
+        assert_eq!(set.with([5, 6, 4]).to_string(), "1:7");
         assert_eq!(set.minus(&UidSet::of([2, 3])), [7, 1]);
         let (taken, rest) = set.split_newest(3);
         assert_eq!(taken, [7, 3, 2]);
