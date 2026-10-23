@@ -114,7 +114,9 @@ pub(crate) fn summary(folder: &str, validity: u32, fetched: &Fetched) -> Result<
         has_attachments: multipart_mixed,
         draft: fetched.draft,
         delivered: fetched.internal,
-        modified: None,
+        // When it came in is the nearest thing to when it changed: the
+        // new-mail checks count from the newest of what the user has seen.
+        modified: fetched.internal,
         thread,
     })
 }

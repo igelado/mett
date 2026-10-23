@@ -1356,3 +1356,40 @@ async fn a_quoted_message_id_is_found_where_it_was_copied() {
         "quoted"
     );
 }
+
+#[tokio::test]
+async fn a_page_whose_place_is_lost_says_to_list_again() {
+    let (server, store) = plain().await;
+    for n in 1..=6 {
+        deliver(&server, "INBOX", &simple(&format!("message {n}")), &[]);
+    }
+    let inbox = FolderId::new("INBOX");
+    let first = store.list_messages(&inbox, Page::first(2)).await.unwrap();
+    // Every message the page names is deleted.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .retain(|m| m.uid < 5);
+    let error = store
+        .list_messages(&inbox, Page::after(first.next.unwrap(), 2))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("list it again"), "{error}");
+}
+
+#[tokio::test]
+async fn summaries_say_when_they_came_in_for_the_new_mail_checks() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    let page = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.messages[0].modified.unwrap().to_rfc3339(),
+        "2026-10-20T10:00:00+00:00"
+    );
+}

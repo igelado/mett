@@ -592,24 +592,32 @@ async fn ordered(live: &mut Live, criteria: &str) -> Res<Vec<u32>> {
 /// deleted before the next page was asked for, the one before it will do.
 const ANCHORS: usize = 16;
 
-/// The cursor after the page `taken`, which `counted` messages of the list
-/// ended at.
-fn cursor_after(counted: usize, taken: &[u32]) -> PageCursor {
+/// The cursor after the page `taken`: the page's last messages.
+fn cursor_after(taken: &[u32]) -> PageCursor {
     let tail = &taken[taken.len().saturating_sub(ANCHORS)..];
-    PageCursor::new(format!("{counted}:{}", set(tail.iter().copied())))
+    PageCursor::new(set(tail.iter().copied()))
 }
 
 /// Where a page starts: after the last of the messages its cursor names that
-/// is still there, else where it counted to.
-fn start_of(cursor: Option<&PageCursor>, all: &[u32]) -> usize {
-    let Some((counted, tail)) = cursor.and_then(|c| c.as_str().split_once(':')) else {
-        return 0;
+/// is still there. If every one is gone, the place is lost: the folder
+/// changed too much while it was being listed, and has to be listed again.
+fn start_of(cursor: Option<&PageCursor>, all: &[u32]) -> Res<usize> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
     };
-    let tail: Vec<u32> = tail.split(',').filter_map(|u| u.parse().ok()).collect();
+    let tail: Vec<u32> = cursor
+        .as_str()
+        .split(',')
+        .filter_map(|u| u.parse().ok())
+        .collect();
     tail.iter()
         .rev()
         .find_map(|last| all.iter().position(|uid| uid == last))
-        .map_or(counted.parse().unwrap_or(0).min(all.len()), |at| at + 1)
+        .map(|at| at + 1)
+        .ok_or_else(|| {
+            Error::Backend("the folder changed while it was being listed: list it again".into())
+                .into()
+        })
 }
 
 /// A page of the newest messages of `folder`: of all of them, or of `only`.
@@ -626,10 +634,10 @@ async fn page_of(
         Some(only) => ordered(live, &format!("UID {}", set(only))).await?,
         None => ordered(live, "ALL").await?,
     };
-    let start = start_of(page.cursor(), &all);
+    let start = start_of(page.cursor(), &all)?;
     let size = page.size() as usize;
     let taken = &all[start..(start + size).min(all.len())];
-    let next = (start + size < all.len()).then(|| cursor_after(start + taken.len(), taken));
+    let next = (start + size < all.len()).then(|| cursor_after(taken));
     let messages = summaries(live, folder, validity, taken).await?;
     Ok((MessagePage { messages, next }, selected))
 }
