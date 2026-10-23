@@ -39,6 +39,9 @@ enum Accept {
     Everything,
     /// Only logins with this token (XOAUTH2) or password (PLAIN).
     Only(&'static str),
+    /// Like `Only`, but a refusal is a `334` challenge, as Google and
+    /// Microsoft answer XOAUTH2.
+    Challenge(&'static str),
 }
 
 fn acceptor() -> (TlsAcceptor, Vec<u8>) {
@@ -130,6 +133,12 @@ fn converse(
                 let decoded = decode(&credentials);
                 match accept {
                     Accept::Only(wanted) if !decoded.contains(wanted) => {
+                        "535 5.7.8 authentication failed\r\n".to_owned()
+                    }
+                    Accept::Challenge(wanted) if !decoded.contains(wanted) => {
+                        let _ = stream.write_all(b"334 eyJzdGF0dXMiOiI0MDEifQ==\r\n").await;
+                        line.clear();
+                        let _ = stream.read_line(&mut line).await;
                         "535 5.7.8 authentication failed\r\n".to_owned()
                     }
                     _ => "235 2.7.0 welcome\r\n".to_owned(),
@@ -417,4 +426,20 @@ async fn a_server_that_never_answers_is_given_up_on() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::Network(_)), "{error}");
+}
+
+#[tokio::test]
+async fn asks_for_another_token_when_refused_with_a_challenge() {
+    let server = server(false, Accept::Challenge("good-token")).await;
+    let tokens = Tokens(
+        Mutex::new(vec!["stale-token", "good-token"]),
+        Mutex::default(),
+    );
+    let login = Login::OAuth {
+        user: "me@example.com".into(),
+        tokens,
+    };
+    let sender = SmtpSender::new(settings(&server, Security::StartTls), login);
+    sender.send(&draft(), &Threading::default()).await.unwrap();
+    assert_eq!(server.seen.lock().unwrap().len(), 1);
 }

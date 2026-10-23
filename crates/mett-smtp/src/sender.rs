@@ -148,7 +148,10 @@ impl<A: Authenticator> SmtpSender<A> {
                 let sent = self
                     .deliver(&envelope, &composed.sent, Some(oauth(user, &token)), true)
                     .await;
-                let Err(Error::Auth(_)) = &sent else {
+                // A server may turn a token down with a `334` challenge
+                // (Google's and Microsoft's do), which lettre can't answer
+                // and reports as a failure of its own.
+                let (Err(Error::Auth(_)) | Err(Error::NotSent(_))) = &sent else {
                     return sent.map(|()| (composed.message_id, composed.kept));
                 };
                 // The server turned down a token that hadn't expired (it
