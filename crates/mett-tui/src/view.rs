@@ -803,6 +803,7 @@ fn render_index(app: &App, first: usize, current: Option<usize>, frame: &mut Fra
     let width = usize::from(area.width);
     let colors = &app.display.colors;
     let total = app.total_messages();
+    let index_format = format::compile(&app.display.index_format);
     // The threads with unread mail folded into them, found once for the
     // page, and only if a collapsed thread on it needs them.
     let unread_roots = std::cell::OnceCell::new();
@@ -843,10 +844,7 @@ fn render_index(app: &App, first: usize, current: Option<usize>, frame: &mut Fra
                 thread,
             };
             // Padded to the right edge, so that the row's colors cover it.
-            let mut text = format::expand(&app.display.index_format, &entry, width);
-            let used = text.width();
-            text.push_str(&" ".repeat(width.saturating_sub(used)));
-            let line = Line::raw(text);
+            let line = Line::raw(index_format.expand_padded(&entry, width));
             // The selected one is in the indicator's colors instead.
             if Some(i) == current {
                 return line;
@@ -869,12 +867,7 @@ fn index_status(app: &App, first: usize, height: usize, width: usize) -> String 
     let (sort, aux) = (app.ordering.sort.name(), app.ordering.aux.name());
     // The whole folder, as in mutt, whatever the limit shows: counted in
     // one pass.
-    let (new, flagged) = app.folder_messages().fold((0, 0), |(new, flagged), m| {
-        (
-            new + usize::from(!m.flags.read),
-            flagged + usize::from(m.flags.flagged),
-        )
-    });
+    let (new, flagged) = app.folder_counts();
     let status = Status {
         folder: app.folder.as_ref().map_or("", |f| f.name.as_str()),
         total: app.total_messages(),

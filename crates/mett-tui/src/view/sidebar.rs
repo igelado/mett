@@ -1,6 +1,8 @@
 //! Drawing the sidebar (`app/sidebar.rs`): its divider, and the page of
 //! entries with its cursor, each from `sidebar_format`, as mutt draws them.
 
+use std::borrow::Cow;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -63,6 +65,7 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
     let top = sidebar.highlight / height * height;
     // The open folder's counts are the index's, counted once if shown.
     let mut live = None;
+    let format = format::compile(&settings.format);
     for (row, (i, entry)) in sidebar.entries.iter().enumerate().skip(top).enumerate() {
         let Ok(row) = u16::try_from(row) else { break };
         if row >= area.height {
@@ -72,8 +75,7 @@ pub(super) fn render(app: &App, frame: &mut Frame, area: Rect) {
             .open
             .then(|| *live.get_or_insert_with(|| Live::of(app)));
         let values = Values { entry, open };
-        let mut text = format::expand(&settings.format, &values, width);
-        text.push_str(&" ".repeat(width.saturating_sub(text.width())));
+        let text = format.expand_padded(&values, width);
         let style = entry_style(app, &values, i == sidebar.highlight);
         buffer.set_stringn(x, area.y + row, &text, width, style);
     }
@@ -129,12 +131,7 @@ struct Live {
 
 impl Live {
     fn of(app: &App) -> Self {
-        let (unread, flagged) = app.folder_messages().fold((0, 0), |(unread, flagged), m| {
-            (
-                unread + usize::from(!m.flags.read),
-                flagged + usize::from(m.flags.flagged),
-            )
-        });
+        let (unread, flagged) = app.folder_counts();
         Self {
             unread,
             total: app.total_messages(),
@@ -171,11 +168,11 @@ impl Values<'_> {
 impl Expandos for Values<'_> {
     /// mutt's: counts not known (Office365 counts no flagged mail but the
     /// open folder's, and mett has no tags) are empty.
-    fn expando(&self, code: char, _arg: Option<&str>) -> String {
-        let number = |n: Option<usize>| n.map_or_else(String::new, |n| n.to_string());
+    fn expando(&self, code: char, _arg: Option<&str>) -> Cow<'_, str> {
+        let number = |n: Option<usize>| n.map_or(Cow::Borrowed(""), |n| Cow::from(n.to_string()));
         let flagged = self.open.map(|live| live.flagged);
         match code {
-            'B' => self.entry.name.clone(),
+            'B' => self.entry.name.as_str().into(),
             'd' => number(Some(self.open.map_or(0, |live| live.deleted))),
             'F' => number(flagged),
             'L' => number(self.open.and_then(|live| live.limited).or(self.total())),
@@ -184,12 +181,12 @@ impl Expandos for Values<'_> {
             'S' => number(self.total()),
             't' => "0".into(),
             '!' => match flagged.unwrap_or(0) {
-                0 => String::new(),
+                0 => "".into(),
                 1 => "!".into(),
                 2 => "!!".into(),
-                n => format!("{n}!"),
+                n => format!("{n}!").into(),
             },
-            _ => String::new(),
+            _ => "".into(),
         }
     }
 

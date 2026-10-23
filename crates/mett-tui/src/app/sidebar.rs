@@ -504,10 +504,10 @@ impl App {
             self.sidebar.settings.sort.method,
             SortMethod::Count | SortMethod::Unread
         );
-        let counts = (by_counts && self.sidebar_shown() && self.folder.is_some()).then(|| {
-            let unread = self.folder_messages().filter(|m| !m.flags.read).count();
-            (unread, self.total_messages())
-        });
+        // The drawing that follows shares these counts.
+        self.folder_counts.set(None);
+        let counts = (by_counts && self.sidebar_shown() && self.folder.is_some())
+            .then(|| (self.folder_counts().0, self.total_messages()));
         if counts != self.sidebar.open_counts {
             self.sidebar.open_counts = counts;
             self.rebuild_sidebar(false);
