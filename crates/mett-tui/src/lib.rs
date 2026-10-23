@@ -360,7 +360,7 @@ fn settings_keeping(
     };
     // Without the password a URL may hold: the mailboxes, as `mailboxes`
     // keeps them, don't have it either, and are shown relative to this.
-    let folder = config::server::redact(config.string("folder"));
+    let folder = config::server::strip_password(config.string("folder"));
     let folder = folder.as_str();
     let mailboxes = config
         .mailboxes()
@@ -445,7 +445,7 @@ fn settings_keeping(
         compose,
         account: account.clone(),
         // The mailboxes are shown relative to it: without a password in it.
-        folder: config::server::redact(config.string("folder")),
+        folder: config::server::strip_password(config.string("folder")),
         trash,
         delete: config.quad("delete"),
         resolve: config.flag("resolve"),
@@ -468,7 +468,7 @@ fn sidebar_settings(
         }
         _ => Err(format!("{name} must be 0 or more")),
     };
-    let folder = config::server::redact(config.string("folder"));
+    let folder = config::server::strip_password(config.string("folder"));
     let folder = folder.as_str();
     // Those that name no folder of the account can't match a mailbox.
     let path = |text: &str| config::mailbox::folder_path(text, folder, account).ok();
@@ -2006,6 +2006,7 @@ mod tests {
         let account = mett_core::AccountId::new("alice@mail.example.com");
         let settings = settings_from_config(&config, &account).unwrap();
         assert!(!settings.folder.contains("secret"), "{}", settings.folder);
+        assert_eq!(settings.folder, "imaps://alice@mail.example.com/");
         for mailbox in &settings.mailboxes {
             assert!(!mailbox.text.contains("secret"), "{}", mailbox.text);
             assert!(!mailbox.name.contains("secret"), "{}", mailbox.name);

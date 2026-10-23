@@ -39,6 +39,32 @@ pub fn redact(url: &str) -> String {
     }
 }
 
+/// `url` without its password, if it has one, and otherwise as it is: for
+/// what is kept and shown (unlike [`redact`], which is for the messages
+/// about a URL that may be a mistake, and hides all it can't tell is not a
+/// password). Only the authority is looked at, so a path with an `@` in it
+/// stays as it is.
+pub fn strip_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+    let authority = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => match userinfo.split_once(':') {
+            Some((user, _)) => format!("{user}@{host}"),
+            None => authority.to_owned(),
+        },
+        None => authority.to_owned(),
+    };
+    match path {
+        Some(path) => format!("{scheme}://{authority}/{path}"),
+        None => format!("{scheme}://{authority}"),
+    }
+}
+
 impl ServerUrl {
     /// Parses `url`, whose scheme is `plain` (`imap`) or `secure`
     /// (`imaps`).
@@ -196,6 +222,27 @@ mod tests {
     fn escapes_round_trip() {
         for text in ["me@example.com", "p:ss/w%rd", "ünï"] {
             assert_eq!(decode(&encode(text)).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn a_password_is_dropped_from_the_authority_alone() {
+        assert_eq!(
+            strip_password("imaps://alice:secret@mail.example.com/@inbox"),
+            "imaps://alice@mail.example.com/@inbox"
+        );
+        assert_eq!(
+            strip_password("imaps://alice:secret@mail.example.com"),
+            "imaps://alice@mail.example.com"
+        );
+        for kept in [
+            "imaps://alice@mail.example.com/@inbox/Work",
+            "imaps://mail.example.com:993/@inbox",
+            "msgraph://a@b.c/@inbox",
+            "=Work",
+            "/var/mail/box",
+        ] {
+            assert_eq!(strip_password(kept), kept);
         }
     }
 
