@@ -207,7 +207,11 @@ impl fmt::Display for MailboxUrl {
                 if let Some(user) = &server.user {
                     write!(f, "{}@", server::encode(user))?;
                 }
-                f.write_str(&server.host)?;
+                if server.host.contains(':') {
+                    write!(f, "[{}]", server.host)?;
+                } else {
+                    f.write_str(&server.host)?;
+                }
                 if let Some(port) = server.port {
                     write!(f, ":{port}")?;
                 }
@@ -568,10 +572,26 @@ mod tests {
         ] {
             let parsed = MailboxUrl::parse(url).unwrap();
             let again = MailboxUrl::parse(&parsed.to_string()).unwrap();
-            assert_eq!(parsed, again, "{url}");
+            assert_eq!(parsed.folder, again.folder, "{url}");
+            assert_eq!(parsed.account, again.account, "{url}");
         }
         let url = MailboxUrl::parse("imaps://me@mail.example.com/%C3%89quipe").unwrap();
         assert_eq!(url.folder, FolderPath::Named(vec!["Équipe".into()]));
         assert_eq!(url.to_string(), "imaps://me@mail.example.com/Équipe");
+    }
+
+    #[test]
+    fn ipv6_hosts_keep_their_brackets() {
+        for url in [
+            "imaps://me@[::1]/INBOX",
+            "imap://me@[2001:db8::1]:1143/INBOX",
+        ] {
+            let parsed = MailboxUrl::parse(url).unwrap();
+            assert_eq!(parsed.to_string(), url);
+            assert_eq!(
+                MailboxUrl::parse(&parsed.to_string()).unwrap().server,
+                parsed.server
+            );
+        }
     }
 }

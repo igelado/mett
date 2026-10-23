@@ -1273,3 +1273,28 @@ async fn a_replaced_draft_is_saved_even_if_the_old_one_cannot_be_deleted() {
             .contains("Second")
     );
 }
+
+#[tokio::test]
+async fn a_page_goes_on_where_it_left_off_if_the_message_it_ended_at_is_gone() {
+    let (server, store) = plain().await;
+    for n in 1..=6 {
+        deliver(&server, "INBOX", &simple(&format!("message {n}")), &[]);
+    }
+    let inbox = FolderId::new("INBOX");
+    let first = store.list_messages(&inbox, Page::first(2)).await.unwrap();
+    assert_eq!(first.messages[1].subject, "message 5");
+    // Another client deletes the message the first page ended at.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .retain(|m| m.uid != 5);
+    let second = store
+        .list_messages(&inbox, Page::after(first.next.unwrap(), 2))
+        .await
+        .unwrap();
+    let subjects: Vec<_> = second.messages.iter().map(|m| m.subject.as_str()).collect();
+    assert_eq!(subjects, ["message 4", "message 3"]);
+}

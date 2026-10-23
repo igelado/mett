@@ -424,8 +424,12 @@ async fn folder_of(live: &mut Live, listed: &Listed, parent: Option<FolderId>) -
 /// The folders of the mailbox, or, with `under`, those directly below the
 /// folder it holds (the top ones if it holds none): counting messages takes
 /// a request to the server for each.
-async fn folders(live: &mut Live, under: Option<Option<&FolderId>>) -> Res<Vec<Folder>> {
-    let all = list(live, "*").await?;
+async fn folders(
+    live: &mut Live,
+    under: Option<Option<&FolderId>>,
+    timeout: Duration,
+) -> Res<Vec<Folder>> {
+    let all = bounded(timeout, list(live, "*")).await?;
     let names: HashSet<String> = all.iter().map(|l| l.name.clone()).collect();
     let mut out = Vec::with_capacity(all.len());
     for item in &all {
@@ -435,7 +439,9 @@ async fn folders(live: &mut Live, under: Option<Option<&FolderId>>) -> Res<Vec<F
         if under.is_some_and(|under| under != parent.as_ref()) {
             continue;
         }
-        out.push(folder_of(live, item, parent).await?);
+        // Each count takes a request: the time allowed is for each, not for
+        // a mailbox with many folders as a whole.
+        out.push(bounded(timeout, folder_of(live, item, parent)).await?);
     }
     Ok(out)
 }
@@ -582,21 +588,28 @@ async fn ordered(live: &mut Live, criteria: &str) -> Res<Vec<u32>> {
     }
 }
 
-/// Where a page starts: after the message it says it got to, if that is
-/// still there, else where it counted to.
+/// How many of a page's last messages its cursor names: if the last was
+/// deleted before the next page was asked for, the one before it will do.
+const ANCHORS: usize = 16;
+
+/// The cursor after the page `taken`, which `counted` messages of the list
+/// ended at.
+fn cursor_after(counted: usize, taken: &[u32]) -> PageCursor {
+    let tail = &taken[taken.len().saturating_sub(ANCHORS)..];
+    PageCursor::new(format!("{counted}:{}", set(tail.iter().copied())))
+}
+
+/// Where a page starts: after the last of the messages its cursor names that
+/// is still there, else where it counted to.
 fn start_of(cursor: Option<&PageCursor>, all: &[u32]) -> usize {
-    let Some((counted, last)) =
-        cursor
-            .and_then(|c| c.as_str().split_once(':'))
-            .and_then(|(counted, last)| {
-                Some((counted.parse::<usize>().ok()?, last.parse::<u32>().ok()?))
-            })
-    else {
+    let Some((counted, tail)) = cursor.and_then(|c| c.as_str().split_once(':')) else {
         return 0;
     };
-    all.iter()
-        .position(|uid| *uid == last)
-        .map_or(counted.min(all.len()), |at| at + 1)
+    let tail: Vec<u32> = tail.split(',').filter_map(|u| u.parse().ok()).collect();
+    tail.iter()
+        .rev()
+        .find_map(|last| all.iter().position(|uid| uid == last))
+        .map_or(counted.parse().unwrap_or(0).min(all.len()), |at| at + 1)
 }
 
 /// A page of the newest messages of `folder`: of all of them, or of `only`.
@@ -615,13 +628,7 @@ async fn page_of(
     let start = start_of(page.cursor(), &all);
     let size = page.size() as usize;
     let taken = &all[start..(start + size).min(all.len())];
-    let next = (start + size < all.len())
-        .then(|| {
-            taken
-                .last()
-                .map(|uid| PageCursor::new(format!("{}:{uid}", start + taken.len())))
-        })
-        .flatten();
+    let next = (start + size < all.len()).then(|| cursor_after(start + taken.len(), taken));
     let messages = summaries(live, folder, validity, taken).await?;
     Ok(MessagePage { messages, next })
 }
@@ -701,14 +708,14 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let mut g = self.lock().await?;
         let t = g.timeout;
-        let r = bounded(t, folders(g.live(), None)).await;
+        let r = folders(g.live(), None, t).await;
         g.done(r)
     }
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
         let mut g = self.lock().await?;
         let t = g.timeout;
-        let r = bounded(t, folders(g.live(), Some(parent))).await;
+        let r = folders(g.live(), Some(parent), t).await;
         g.done(r)
     }
 
