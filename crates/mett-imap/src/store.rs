@@ -618,8 +618,9 @@ async fn page_of(
     folder: &str,
     only: Option<BTreeSet<u32>>,
     page: &Page,
-) -> Res<MessagePage> {
-    let validity = select(live, folder).await?.validity;
+) -> Res<(MessagePage, Selected)> {
+    let selected = select(live, folder).await?;
+    let validity = selected.validity;
     let all = match only {
         Some(only) if only.is_empty() => Vec::new(),
         Some(only) => ordered(live, &format!("UID {}", set(only))).await?,
@@ -630,7 +631,7 @@ async fn page_of(
     let taken = &all[start..(start + size).min(all.len())];
     let next = (start + size < all.len()).then(|| cursor_after(start + taken.len(), taken));
     let messages = summaries(live, folder, validity, taken).await?;
-    Ok(MessagePage { messages, next })
+    Ok((MessagePage { messages, next }, selected))
 }
 
 /// The messages that came in at or after `since` (the server dates them by
@@ -822,7 +823,17 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
         let mut g = self.lock().await?;
         let t = g.timeout;
-        let r = bounded(t, page_of(g.live(), folder.as_str(), None, &page)).await;
+        let first = page.cursor().is_none();
+        let r = bounded(t, async {
+            let (listed, selected) = page_of(g.live(), folder.as_str(), None, &page).await?;
+            if first {
+                // What comes in from now on is new.
+                self.marks
+                    .start(folder.as_str(), selected.validity, selected.floor());
+            }
+            Ok(listed)
+        })
+        .await;
         g.done(r)
     }
 
@@ -853,7 +864,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             if floor.is_none_or(|f| f.modseq.is_none() || !live.caps.condstore) {
                 uids.extend(arrived_since(live, since, false).await?);
             }
-            let page = page_of(live, folder.as_str(), Some(uids), &page).await?;
+            let (page, _) = page_of(live, folder.as_str(), Some(uids), &page).await?;
             if first {
                 self.marks.commit(
                     Watch::Changes,
@@ -866,6 +877,11 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             Ok(page)
         })
         .await;
+        // A later page that fails leaves the scan unfinished: the mark its
+        // first page moved on is given back, for the next scan to cover it.
+        if r.is_err() && !first {
+            self.marks.rollback(Watch::Changes, folder.as_str());
+        }
         g.done(r)
     }
 

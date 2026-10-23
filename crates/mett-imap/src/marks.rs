@@ -56,6 +56,41 @@ impl Marks {
         if first { Some(mark.now) } else { mark.scanning }
     }
 
+    /// Notes how the folder stands when it is first listed, for both
+    /// askers, unless they have marks already (the polls list it again): what
+    /// comes in between the listing and the first poll is new, whatever its
+    /// date says.
+    pub fn start(&self, folder: &str, validity: u32, now: Floor) {
+        let mut marks = self.0.lock().expect("no panic holds the marks");
+        for watch in [Watch::Changes, Watch::Unread] {
+            let key = (watch, folder.to_owned());
+            if marks.get(&key).is_none_or(|mark| mark.validity != validity) {
+                marks.insert(
+                    key,
+                    Mark {
+                        validity,
+                        now,
+                        scanning: None,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Takes back the mark a scan moved on, because a later page of it
+    /// failed: the next scan compares with what this one did.
+    pub fn rollback(&self, watch: Watch, folder: &str) {
+        let mut marks = self.0.lock().expect("no panic holds the marks");
+        let key = (watch, folder.to_owned());
+        let restored = marks
+            .get_mut(&key)
+            .map(|mark| mark.scanning.inspect(|floor| mark.now = *floor).is_some());
+        // A scan that began with no mark leaves none.
+        if restored == Some(false) {
+            marks.remove(&key);
+        }
+    }
+
     /// Notes that the folder stands as `now`, after a scan that compared
     /// it with `floor`. A scan that failed notes nothing.
     pub fn commit(
@@ -119,6 +154,48 @@ mod tests {
         marks.commit(Watch::Changes, "INBOX", 1, floor(10), None);
         assert_eq!(marks.floor(Watch::Unread, "INBOX", 1, true), None);
         assert_eq!(marks.floor(Watch::Changes, "Sent", 1, true), None);
+    }
+
+    #[test]
+    fn listing_a_folder_marks_it_once() {
+        let marks = Marks::default();
+        marks.start("INBOX", 1, floor(10));
+        assert_eq!(
+            marks.floor(Watch::Changes, "INBOX", 1, true),
+            Some(floor(10))
+        );
+        assert_eq!(
+            marks.floor(Watch::Unread, "INBOX", 1, true),
+            Some(floor(10))
+        );
+        // The polls list it again: that doesn't move the mark.
+        marks.start("INBOX", 1, floor(20));
+        assert_eq!(
+            marks.floor(Watch::Changes, "INBOX", 1, true),
+            Some(floor(10))
+        );
+        // A folder made anew is marked anew.
+        marks.start("INBOX", 2, floor(5));
+        assert_eq!(
+            marks.floor(Watch::Changes, "INBOX", 2, true),
+            Some(floor(5))
+        );
+    }
+
+    #[test]
+    fn a_scan_that_failed_gives_its_mark_back() {
+        let marks = Marks::default();
+        marks.commit(Watch::Changes, "INBOX", 1, floor(10), None);
+        marks.commit(Watch::Changes, "INBOX", 1, floor(20), Some(floor(10)));
+        marks.rollback(Watch::Changes, "INBOX");
+        assert_eq!(
+            marks.floor(Watch::Changes, "INBOX", 1, true),
+            Some(floor(10))
+        );
+        // One that began with no mark leaves none.
+        marks.commit(Watch::Unread, "INBOX", 1, floor(20), None);
+        marks.rollback(Watch::Unread, "INBOX");
+        assert_eq!(marks.floor(Watch::Unread, "INBOX", 1, true), None);
     }
 
     #[test]

@@ -1298,3 +1298,32 @@ async fn a_page_goes_on_where_it_left_off_if_the_message_it_ended_at_is_gone() {
     let subjects: Vec<_> = second.messages.iter().map(|m| m.subject.as_str()).collect();
     assert_eq!(subjects, ["message 4", "message 3"]);
 }
+
+#[tokio::test]
+async fn what_comes_in_between_listing_a_folder_and_the_first_poll_is_new() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("listed"), &[]);
+    let inbox = FolderId::new("INBOX");
+    // The user opens the folder.
+    store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    // Mail with an old date is copied in, then the first poll comes.
+    deliver(&server, "INBOX", &simple("copied in"), &[]);
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let changed = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(changed.messages.len(), 1);
+    assert_eq!(changed.messages[0].subject, "copied in");
+    // The polls list the newest page again, which doesn't forget what they found.
+    store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    deliver(&server, "INBOX", &simple("copied in too"), &[]);
+    let changed = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(changed.messages.len(), 1);
+    assert_eq!(changed.messages[0].subject, "copied in too");
+}
