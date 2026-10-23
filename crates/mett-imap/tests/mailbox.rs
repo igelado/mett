@@ -195,7 +195,8 @@ async fn summarises_a_message() {
     assert_eq!(m.from.as_ref().unwrap().name.as_deref(), Some("Alice"));
     assert_eq!(m.to.len(), 2);
     assert!(m.flags.read && m.flags.flagged);
-    assert!(m.has_attachments);
+    // `multipart/mixed` with only text in it has no attachment.
+    assert!(!m.has_attachments);
     assert_eq!(m.received.to_rfc3339(), "2026-10-20T09:00:00+00:00");
     assert_eq!(
         m.delivered.unwrap().to_rfc3339(),
@@ -1432,4 +1433,92 @@ async fn never_sends_the_password_in_plain_text_after_an_offered_starttls_is_ref
     let error = store.list_folders().await.unwrap_err();
     assert!(error.to_string().contains("STARTTLS"), "{error}");
     assert!(server.state.lock().unwrap().logins.is_empty());
+}
+
+#[tokio::test]
+async fn tells_attachments_from_the_parts_not_the_top_level_type() {
+    let (server, store) = plain().await;
+    let nested = mail(
+        "nested",
+        "a@example.org",
+        "me@example.com",
+        "Content-Type: multipart/signed; boundary=s\n",
+        "--s\nContent-Type: multipart/mixed; boundary=m\n\n--m\nContent-Type: text/plain\n\nhi\n--m\nContent-Type: application/pdf; name=\"a.pdf\"\nContent-Disposition: attachment; filename=\"a.pdf\"\nContent-Transfer-Encoding: base64\n\nJVBERg==\n--m--\n--s--",
+    );
+    let inline = mail(
+        "inline",
+        "a@example.org",
+        "me@example.com",
+        "Content-Type: multipart/related; boundary=r\n",
+        "--r\nContent-Type: text/html\n\n<img src=cid:x>\n--r\nContent-Type: image/png\nContent-ID: <x>\nContent-Transfer-Encoding: base64\n\niVBORw==\n--r--",
+    );
+    let plain_text = simple("plain");
+    deliver(&server, "INBOX", &nested, &[]);
+    deliver(&server, "INBOX", &inline, &[]);
+    deliver(&server, "INBOX", &plain_text, &[]);
+    let page = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(10))
+        .await
+        .unwrap();
+    let has = |subject: &str| {
+        page.messages
+            .iter()
+            .find(|m| m.subject == subject)
+            .unwrap()
+            .has_attachments
+    };
+    assert!(has("nested"));
+    assert!(!has("inline"));
+    assert!(!has("plain"));
+}
+
+#[tokio::test]
+async fn a_message_id_that_is_part_of_another_is_not_it() {
+    let (server, store) = plain().await;
+    let with_id = |subject: &str, id: &str| {
+        mail(
+            subject,
+            "a@example.org",
+            "me@example.com",
+            &format!("Message-ID: <{id}>\n"),
+            "body",
+        )
+    };
+    deliver(&server, "INBOX", &with_id("mine", "a@example.org"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    // The destination holds a message whose id contains the one searched for.
+    deliver(&server, "Archive", &with_id("other", "xa@example.org"), &[]);
+    let copy = store
+        .copy_message(&id, &FolderId::new("Archive"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch_message(&copy).await.unwrap().summary.subject,
+        "mine"
+    );
+}
+
+#[tokio::test]
+async fn asks_about_many_messages_in_batches_and_in_ranges() {
+    let (server, store) = plain().await;
+    for n in 0..450 {
+        deliver(
+            &server,
+            "INBOX",
+            &simple(&format!("message {n}")),
+            &["\\Seen"],
+        );
+    }
+    let page = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(450))
+        .await
+        .unwrap();
+    assert_eq!(page.messages.len(), 450);
 }

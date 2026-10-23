@@ -29,8 +29,9 @@ use crate::settings::{ImapSettings, Login, NoTokens};
 const STALE: Duration = Duration::from_secs(60);
 
 /// What to ask of the server about each message of a listing: its
-/// header, to make the index line.
-const SUMMARY: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER])";
+/// header, to make the index line, and its parts, to tell whether it has
+/// attachments.
+const SUMMARY: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[HEADER] BODYSTRUCTURE)";
 
 /// The whole message.
 const WHOLE: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[])";
@@ -273,19 +274,45 @@ fn fetched(fetch: &Fetch, whole: bool) -> Option<Fetched> {
         flags,
         draft,
         internal: fetch.internal_date().map(|d| d.with_timezone(&Utc)),
+        attachments: fetch.bodystructure().map(parse::has_attachment),
         data: if whole { fetch.body() } else { fetch.header() }
             .unwrap_or_default()
             .to_vec(),
     })
 }
 
-/// A set of UIDs as a command takes them.
+/// A set of UIDs as a command takes them: ranges where they run on, so that
+/// a long one doesn't make a command line too long for the server.
 fn set(uids: impl IntoIterator<Item = u32>) -> String {
-    uids.into_iter()
-        .map(|u| u.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut sorted: Vec<u32> = uids.into_iter().collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut parts: Vec<String> = Vec::new();
+    let mut run: Option<(u32, u32)> = None;
+    for uid in sorted {
+        run = match run {
+            Some((from, to)) if uid == to + 1 => Some((from, uid)),
+            Some((from, to)) => {
+                parts.push(range(from, to));
+                Some((uid, uid))
+            }
+            None => Some((uid, uid)),
+        };
+    }
+    parts.extend(run.map(|(from, to)| range(from, to)));
+    parts.join(",")
 }
+
+fn range(from: u32, to: u32) -> String {
+    if from == to {
+        from.to_string()
+    } else {
+        format!("{from}:{to}")
+    }
+}
+
+/// How many messages a `FETCH` asks about at once.
+const BATCH: usize = 200;
 
 /// The role a folder has, by what the server says of it (and then it is
 /// declared), or else by its name.
@@ -510,16 +537,19 @@ async fn select_ref(live: &mut Live, at: &Ref) -> Res<()> {
 
 /// The messages of the selected folder with `uids`, as `fetch` asks.
 async fn fetch(live: &mut Live, uids: &[u32], what: &str, whole: bool) -> Res<Vec<Fetched>> {
-    if uids.is_empty() {
-        return Ok(Vec::new());
+    let mut found = Vec::with_capacity(uids.len());
+    // In batches: a command for thousands of messages is more than some
+    // servers take.
+    for batch in uids.chunks(BATCH) {
+        let fetches: Vec<Fetch> = live
+            .session
+            .uid_fetch(set(batch.iter().copied()), what)
+            .await?
+            .try_collect()
+            .await?;
+        found.extend(fetches.iter().filter_map(|f| fetched(f, whole)));
     }
-    let fetches: Vec<Fetch> = live
-        .session
-        .uid_fetch(set(uids.iter().copied()), what)
-        .await?
-        .try_collect()
-        .await?;
-    Ok(fetches.iter().filter_map(|f| fetched(f, whole)).collect())
+    Ok(found)
 }
 
 /// The summaries of `uids` in the selected folder, in that order.
@@ -597,7 +627,8 @@ const ANCHORS: usize = 16;
 /// while the folder is the same).
 fn cursor_after(validity: u32, taken: &[u32]) -> PageCursor {
     let tail = &taken[taken.len().saturating_sub(ANCHORS)..];
-    PageCursor::new(format!("{validity}:{}", set(tail.iter().copied())))
+    let tail: Vec<String> = tail.iter().map(u32::to_string).collect();
+    PageCursor::new(format!("{validity}:{}", tail.join(",")))
 }
 
 /// Where a page starts: after the last of the messages its cursor names that
@@ -770,13 +801,14 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
                 .await?;
                 found.extend(dates.into_iter().filter_map(|f| Some((f.uid, f.internal?))));
             } else {
-                let dates = fetch(
-                    live,
-                    &unseen.iter().copied().collect::<Vec<_>>(),
-                    "(UID FLAGS INTERNALDATE)",
-                    false,
-                )
-                .await?;
+                // The newest are enough: no more than that are told.
+                let newest: Vec<u32> = unseen
+                    .iter()
+                    .rev()
+                    .take(RECENT_UNREAD * 4)
+                    .copied()
+                    .collect();
+                let dates = fetch(live, &newest, "(UID FLAGS INTERNALDATE)", false).await?;
                 found.extend(dates.into_iter().filter_map(|f| Some((f.uid, f.internal?))));
             }
             if let Some(floor) = floor {
@@ -1177,9 +1209,10 @@ async fn expunge(live: &mut Live, at: &Ref) -> Res<()> {
 }
 
 /// What the message that went into `folder` is called there: the newest
-/// with the `Message-ID:` `wanted`; or, without one, the newest from
-/// `before` on (the folder's `UIDNEXT` before it went in) whose header is
-/// `header`, which another client's mail that came in meanwhile doesn't have.
+/// from `before` on (the folder's `UIDNEXT` before it went in, so that
+/// what came in earlier is not it) that has the `Message-ID:` `wanted`
+/// exactly (a search finds those it is part of too), or, without one, whose
+/// header is `header`.
 async fn locate(
     live: &mut Live,
     folder: &str,
@@ -1187,30 +1220,37 @@ async fn locate(
     before: Option<u32>,
     header: &[u8],
 ) -> Res<MessageId> {
+    /// The newest this many candidates are looked at.
+    const LOOKED_AT: usize = 50;
     let validity = select(live, folder).await?.validity;
-    let found = match (wanted, before) {
-        (Some(id), _) => {
-            let query = format!(
-                "HEADER Message-ID \"{}\"",
-                id.replace('\\', "\\\\").replace('"', "\\\"")
-            );
-            search(live, &query).await?.first().copied()
-        }
-        (None, Some(before)) => {
-            let candidates: Vec<u32> = search(live, &format!("UID {before}:*"))
-                .await?
-                .into_iter()
-                .filter(|uid| *uid >= before)
-                .collect();
-            let headers = fetch(live, &candidates, SUMMARY, false).await?;
-            headers
-                .iter()
-                .filter(|f| f.data == header)
-                .map(|f| f.uid)
-                .max()
-        }
-        (None, None) => None,
+    let from = before.map_or_else(String::new, |before| format!("UID {before}:* "));
+    let query = match wanted {
+        Some(id) => format!(
+            "{from}HEADER Message-ID \"{}\"",
+            id.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        None if before.is_some() => from.trim_end().to_owned(),
+        None => String::new(),
     };
+    let mut candidates: Vec<u32> = if query.is_empty() {
+        Vec::new()
+    } else {
+        search(live, &query).await?
+    };
+    candidates.retain(|uid| before.is_none_or(|before| *uid >= before));
+    candidates.truncate(LOOKED_AT);
+    let headers = fetch(live, &candidates, SUMMARY, false).await?;
+    let found = headers
+        .iter()
+        .filter(|f| match wanted {
+            Some(id) => parse::threading(&f.data)
+                .ok()
+                .and_then(|(own, _)| own)
+                .is_some_and(|own| own == id),
+            None => f.data == header,
+        })
+        .map(|f| f.uid)
+        .max();
     let uid = found.ok_or_else(|| {
         Error::Backend(format!(
             "{folder}: the message went there, but where it is isn't known"

@@ -20,8 +20,30 @@ pub(crate) struct Fetched {
     pub draft: bool,
     /// When the server took the message in (`INTERNALDATE`).
     pub internal: Option<DateTime<Utc>>,
+    /// Whether the server's description of the message's parts
+    /// (`BODYSTRUCTURE`) says it has attachments, if it gave one.
+    pub attachments: Option<bool>,
     /// The message's header, or all of it.
     pub data: Vec<u8>,
+}
+
+/// Whether the parts of a message, as the server describes them, include
+/// an attachment: a part that says it is one, a message, or a part that
+/// isn't text and isn't shown in the body (no `Content-ID:`).
+pub(crate) fn has_attachment(structure: &async_imap::imap_proto::BodyStructure<'_>) -> bool {
+    use async_imap::imap_proto::BodyStructure::{Basic, Message, Multipart, Text};
+    let attached = |common: &async_imap::imap_proto::BodyContentCommon<'_>| {
+        common
+            .disposition
+            .as_ref()
+            .is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"))
+    };
+    match structure {
+        Multipart { bodies, .. } => bodies.iter().any(has_attachment),
+        Message { .. } => true,
+        Text { common, .. } => attached(common),
+        Basic { common, other, .. } => attached(common) || other.id.is_none(),
+    }
 }
 
 fn parse(data: &[u8]) -> Result<Parsed<'_>> {
@@ -98,6 +120,7 @@ pub(crate) fn summary(folder: &str, validity: u32, fetched: &Fetched) -> Result<
             path,
         }
     });
+    // From the header alone, a guess from the kind of message.
     let multipart_mixed = message.content_type().is_some_and(|t| {
         t.ctype().eq_ignore_ascii_case("multipart")
             && matches!(t.subtype(), Some(s) if s.eq_ignore_ascii_case("mixed"))
@@ -111,7 +134,7 @@ pub(crate) fn summary(folder: &str, validity: u32, fetched: &Fetched) -> Result<
         // A message that says no date is dated when it came in.
         received: sent.or(fetched.internal).unwrap_or(DateTime::UNIX_EPOCH),
         flags: fetched.flags,
-        has_attachments: multipart_mixed,
+        has_attachments: fetched.attachments.unwrap_or(multipart_mixed),
         draft: fetched.draft,
         delivered: fetched.internal,
         // When it came in is the nearest thing to when it changed: the

@@ -327,7 +327,8 @@ pub fn folder_path(
     };
     match url.folder {
         FolderPath::Root => Err(MailboxError(format!(
-            "{text}: the mailbox itself isn't a folder"
+            "{}: the mailbox itself isn't a folder",
+            server::redact(text)
         ))),
         folder => Ok(folder),
     }

@@ -22,7 +22,12 @@ pub struct ServerUrl {
 /// shown and may be logged.
 pub fn redact(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
+        // Not the form of a URL, so where a password would be is not known:
+        // all that comes before an `@` goes.
+        return match url.rsplit_once('@') {
+            Some((_, host)) => format!("***@{host}"),
+            None => url.to_owned(),
+        };
     };
     let (authority, path) = match rest.split_once('/') {
         Some((authority, path)) => (authority, Some(path)),
@@ -213,5 +218,11 @@ mod tests {
         );
         assert_eq!(redact("imaps://me@host/INBOX"), "imaps://me@host/INBOX");
         assert_eq!(redact("INBOX"), "INBOX");
+        assert_eq!(redact("imap:/me:hunter2@host/INBOX"), "***@host/INBOX");
+        assert!(
+            !imap("imap:/me:hunter2@host/INBOX")
+                .unwrap_err()
+                .contains("hunter2")
+        );
     }
 }

@@ -585,6 +585,9 @@ impl Session {
                 if items.contains("INTERNALDATE") {
                     line.push_str(&format!(" INTERNALDATE \"{}\"", m.internal));
                 }
+                if items.contains("BODYSTRUCTURE") {
+                    line.push_str(&format!(" BODYSTRUCTURE {}", structure(&m.raw)));
+                }
                 let mut bytes = line.into_bytes();
                 if items.contains("BODY.PEEK[HEADER]") {
                     let header = header_of(&m.raw);
@@ -669,6 +672,49 @@ impl Session {
             out.push_str(&format!("{tag} BAD unknown UID command\r\n"));
         }
     }
+}
+
+/// What the server says of the parts of a message (`BODYSTRUCTURE`).
+fn structure(raw: &[u8]) -> String {
+    let Some(message) = mail_parser::MessageParser::default().parse(raw) else {
+        return "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 0 0)".into();
+    };
+    part(&message, 0)
+}
+
+fn part(message: &mail_parser::Message<'_>, at: usize) -> String {
+    use mail_parser::{MimeHeaders, PartType};
+    let part = &message.parts[at];
+    let (ty, sub) = part
+        .content_type()
+        .map_or(("TEXT".into(), "PLAIN".into()), |c| {
+            (
+                c.ctype().to_uppercase(),
+                c.subtype().unwrap_or("plain").to_uppercase(),
+            )
+        });
+    if let PartType::Multipart(children) = &part.body {
+        let children: String = children.iter().map(|c| part_of(message, *c)).collect();
+        return format!("({children} \"{sub}\")");
+    }
+    let id = part
+        .content_id()
+        .map_or("NIL".to_owned(), |id| format!("\"{id}\""));
+    let disposition = part.content_disposition().map_or("NIL".to_owned(), |d| {
+        format!("(\"{}\" NIL)", d.ctype().to_uppercase())
+    });
+    let size = part.len();
+    if ty == "TEXT" {
+        format!(
+            "(\"TEXT\" \"{sub}\" (\"CHARSET\" \"UTF-8\") {id} NIL \"7BIT\" {size} 1 NIL {disposition})"
+        )
+    } else {
+        format!("(\"{ty}\" \"{sub}\" NIL {id} NIL \"BASE64\" {size} NIL {disposition})")
+    }
+}
+
+fn part_of(message: &mail_parser::Message<'_>, at: u32) -> String {
+    part(message, at as usize)
 }
 
 /// The UIDs of the messages of `folder` that the search keys match.
