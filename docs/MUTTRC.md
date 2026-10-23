@@ -495,6 +495,8 @@ account Home ~/.config/mett/home
   account. A `:set` or `:bind` at the prompt changes the account shown (a
   `:bind` is that account's: bind keys in the mettrc to have them everywhere).
   `set spoolfile` in the main file is not used when there are accounts.
+  Aliases made with `a` are saved, unless `alias_file` says otherwise, in a file
+  called `aliases` beside the mettrc, which every account reads.
 - **Tabs.** With more than one account, a line of the screen holds the tabs,
   `1 Work  2 Home*`, with the account shown highlighted (`color indicator`)
   and a `*` and bold on those with new mail (`color sidebar_new` adds to

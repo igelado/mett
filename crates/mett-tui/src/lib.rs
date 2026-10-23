@@ -158,6 +158,7 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
         for file in files {
             config.load_file(&file);
         }
+        config.share_aliases_with_accounts();
         for warning in &config.warnings {
             launch.say(&format!("warning: {warning}"));
         }
@@ -914,7 +915,11 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
             let slot = &mut slots[at];
             let commands: Vec<String> = slot.deferred.commands.drain(..).collect();
             slot.commands.queue.extend(commands);
-            while let Some(text) = slots[at].deferred.edit.take() {
+            // The editor takes over the terminal: only for the account
+            // shown (another's waits until it is).
+            while at == active
+                && let Some(text) = slots[at].deferred.edit.take()
+            {
                 let result = screen.edit(&slots[at].editor, &mut input_rx, &text)?;
                 // The terminal was cleared: all of it is drawn again.
                 stale = true;

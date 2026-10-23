@@ -303,6 +303,36 @@ impl Config {
         &self.accounts
     }
 
+    /// With accounts, an alias made with `a` is saved by default in `aliases`
+    /// beside the mettrc, which every account reads: the mettrc itself is
+    /// read once, before the accounts are made, so what is added to it later
+    /// would be in none of them. An account that sets `alias_file` keeps its
+    /// own. Call it once the files are loaded.
+    pub fn share_aliases_with_accounts(&mut self) {
+        let Some(file) = self
+            .user_file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("aliases"))
+        else {
+            return;
+        };
+        // In a mettrc `\` is an escape: paths are written with `/`.
+        let written = file.display().to_string().replace('\\', "/");
+        for account in &mut self.accounts {
+            let config = &mut account.config;
+            if config.was_set("alias_file") {
+                continue;
+            }
+            let _ = config.run_line(&format!("set alias_file='{written}'"));
+            if file.exists() {
+                config.source(&file, 1);
+            }
+            self.errors.append(&mut config.errors);
+            self.warnings.append(&mut config.warnings);
+        }
+    }
+
     /// Takes the accounts (see [`Config::accounts`]).
     pub fn take_accounts(&mut self) -> Vec<Account> {
         std::mem::take(&mut self.accounts)
@@ -1867,6 +1897,28 @@ mod tests {
             config.accounts().iter().filter(|a| a.label == "A").count(),
             1
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_share_a_file_of_aliases_beside_the_mettrc() {
+        let dir = std::env::temp_dir().join(format!("mett-aliases-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("one"), "set from=a@x.org\n").unwrap();
+        fs::write(dir.join("two"), "set from=b@x.org alias_file=/tmp/mine\n").unwrap();
+        fs::write(dir.join("aliases"), "alias bob Bob <bob@x.org>\n").unwrap();
+        let mut config = Config::new(None);
+        config.set_user_file(Some(dir.join("mettrc")));
+        config.load_str("account One one\naccount Two two\n", &dir.join("mettrc"));
+        config.share_aliases_with_accounts();
+        assert!(config.errors.is_empty(), "{:?}", config.errors);
+        let accounts = config.accounts();
+        let written = dir.join("aliases").display().to_string().replace('\\', "/");
+        assert_eq!(accounts[0].config.string("alias_file"), written);
+        assert_eq!(accounts[0].config.aliases().len(), 1, "read");
+        // One that names its own file keeps it.
+        assert_eq!(accounts[1].config.string("alias_file"), "/tmp/mine");
+        assert!(accounts[1].config.aliases().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 }
