@@ -298,7 +298,6 @@ impl Config {
 
     /// The accounts the `account` commands made, in order: with any, mett
     /// opens each in a tab, with its own configuration.
-    #[cfg(test)]
     pub fn accounts(&self) -> &[Account] {
         &self.accounts
     }

@@ -172,6 +172,13 @@ fn mett_main(mut launch: impl Launch) -> ExitCode {
             for line in config.dump() {
                 println!("{line}");
             }
+            // Each account's own settings, which are the ones it opens with.
+            for account in config.accounts() {
+                println!("# account {}", account.label);
+                for line in account.config.dump() {
+                    println!("{line}");
+                }
+            }
             return ExitCode::SUCCESS;
         }
         let (keymap, problems) = keymap_from_config(&mut config);
@@ -1106,6 +1113,14 @@ fn when_quitting(slot: &Slot, incoming: Incoming) -> Option<(Msg, Option<std::ti
             | worker::Event::Watched(_) => Some((Msg::Response(response), None)),
             _ => None,
         },
+        // A sign-in that nothing left to save needs: the user has quit, so
+        // don't send them to the browser.
+        Msg::SignIn(SignInEvent::Prompt { .. }) if !slot.app.saving() => {
+            if let Some(cancel) = &slot.cancel {
+                cancel.cancel();
+            }
+            None
+        }
         Msg::SignIn(event) => Some((Msg::SignIn(event), None)),
         // The countdown of a throttled save goes on; other timers would
         // start new work.
@@ -1132,18 +1147,6 @@ async fn finish(
     // and the key that quit: take it in, so its window can offer a retry.
     while let Ok((at, incoming)) = events_rx.try_recv() {
         let slot = &mut slots[at];
-        // A sign-in that nothing left to save needs: the user has quit, so
-        // don't send them to the browser.
-        if matches!(
-            incoming,
-            Incoming::Msg(Msg::SignIn(SignInEvent::Prompt { .. }))
-        ) && !slot.app.saving()
-        {
-            if let Some(cancel) = &slot.cancel {
-                cancel.cancel();
-            }
-            continue;
-        }
         // What was saved meanwhile is saved: its response is taken in, or
         // the app would wait for it, and call it a failure.
         let Some((msg, _)) = when_quitting(slot, incoming) else {
