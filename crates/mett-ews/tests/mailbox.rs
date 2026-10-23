@@ -1,10 +1,10 @@
 //! EwsMailStore against a mock Exchange Web Services endpoint.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
+use mett_core::mock::{RotatingAuth, StaticAuth};
 use mett_core::{
     AccessToken, Address, AttachmentKind, Authenticator, BodyKind, Draft, DraftOrigin, Error,
     FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page, SyncState,
@@ -14,15 +14,6 @@ use mett_ews::EwsMailStore;
 use url::Url;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockBuilder, MockServer, Request, ResponseTemplate};
-
-/// Hands out a fixed token.
-struct StaticAuth;
-
-impl Authenticator for StaticAuth {
-    async fn access_token(&self) -> mett_core::Result<AccessToken> {
-        Ok(AccessToken::new("tok", Utc::now() + TimeDelta::hours(1)))
-    }
-}
 
 const ENDPOINT: &str = "/EWS/Exchange.asmx";
 
@@ -999,28 +990,6 @@ async fn own_addresses_include_the_aliases() {
         store(&server).own_addresses().await.unwrap(),
         ["alice@contoso.com", "a.example@contoso.com"]
     );
-}
-
-/// Hands out "old" until it is rejected, then "new".
-#[derive(Default)]
-struct RotatingAuth {
-    rejected: AtomicBool,
-}
-
-impl Authenticator for RotatingAuth {
-    async fn access_token(&self) -> mett_core::Result<AccessToken> {
-        let secret = if self.rejected.load(Ordering::SeqCst) {
-            "new"
-        } else {
-            "old"
-        };
-        Ok(AccessToken::new(secret, DateTime::<Utc>::MAX_UTC))
-    }
-
-    async fn token_rejected(&self, token: &AccessToken) {
-        assert_eq!(token.secret(), "old");
-        self.rejected.store(true, Ordering::SeqCst);
-    }
 }
 
 #[tokio::test]

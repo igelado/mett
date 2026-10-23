@@ -3,7 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
+use mett_core::mock::{CountingAuth, RotatingAuth, StaticAuth};
 use mett_core::{
     AccessToken, Address, AttachmentKind, Authenticator, BodyKind, Draft, DraftOrigin, Error,
     FlagsUpdate, FolderId, MailSender, MailStore, MessageId, OutgoingAttachment, Page, PageCursor,
@@ -14,15 +15,6 @@ use serde_json::{Value, json};
 use url::Url;
 use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockBuilder, MockServer, ResponseTemplate};
-
-/// Hands out a fixed token.
-struct StaticAuth;
-
-impl Authenticator for StaticAuth {
-    async fn access_token(&self) -> mett_core::Result<AccessToken> {
-        Ok(AccessToken::new("tok", Utc::now() + TimeDelta::hours(1)))
-    }
-}
 
 fn store(server: &MockServer) -> GraphMailStore<StaticAuth> {
     store_with(server, Cloud::default(), Arc::new(StaticAuth))
@@ -1219,28 +1211,6 @@ async fn opening_the_inbox_needs_only_the_root() {
     }
 }
 
-/// Hands out `old` until told it was rejected, then `new`.
-struct RotatingAuth {
-    rejected: std::sync::atomic::AtomicBool,
-}
-
-impl Authenticator for RotatingAuth {
-    async fn access_token(&self) -> mett_core::Result<AccessToken> {
-        let secret = if self.rejected.load(std::sync::atomic::Ordering::SeqCst) {
-            "new"
-        } else {
-            "old"
-        };
-        Ok(AccessToken::new(secret, DateTime::<Utc>::MAX_UTC))
-    }
-
-    async fn token_rejected(&self, token: &AccessToken) {
-        assert_eq!(token.secret(), "old");
-        self.rejected
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 #[tokio::test]
 async fn retries_once_with_a_new_token_after_a_401() {
     let server = MockServer::start().await;
@@ -1307,23 +1277,6 @@ async fn recognises_well_known_folders_created_later() {
         .await;
     let second = store.list_folders().await.unwrap();
     assert_eq!(second[0].well_known, Some(WellKnownFolder::Archive));
-}
-
-/// Counts rejected tokens.
-#[derive(Default)]
-struct CountingAuth {
-    rejected: std::sync::atomic::AtomicUsize,
-}
-
-impl Authenticator for CountingAuth {
-    async fn access_token(&self) -> mett_core::Result<AccessToken> {
-        Ok(AccessToken::new("tok", DateTime::<Utc>::MAX_UTC))
-    }
-
-    async fn token_rejected(&self, _: &AccessToken) {
-        self.rejected
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
 }
 
 #[tokio::test]

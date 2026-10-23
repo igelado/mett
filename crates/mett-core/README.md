@@ -18,7 +18,8 @@ It performs no I/O and depends on no adapter.
 
 `mock` enables `mett_core::mock::MemoryStore`, an in-memory `MailStore` and
 `MailSender` (it records what it sends), plus
-helpers to build test folders and messages. Other crates use it in their
+helpers to build test folders and messages, and the test `Authenticator`s
+`StaticAuth`, `RotatingAuth` and `CountingAuth`. Other crates use it in their
 tests, and `mett-tui` uses it for `mett --demo`.
 
 ```toml
