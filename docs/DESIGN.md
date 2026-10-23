@@ -281,10 +281,11 @@ Graph delta queries, or EWS `SyncFolderItems`).
   A cache that fails for good (a full disk, corruption) is dropped for the
   session; one that is only busy (another mett writing) is skipped for
   that call alone.
-  SQLite blocks (a busy wait, a large sync batch), so each database call
-  runs on a blocking thread (`spawn_blocking`) and is awaited: the async
-  executor never waits on it, and a call dropped meanwhile still finishes
-  its transaction there.
+  SQLite blocks (a busy wait, a large sync batch), so the database lives on
+  a thread of its own, which runs the calls one at a time in the order
+  they were made, and each is awaited: the async executor never waits on
+  SQLite, and a call dropped meanwhile still finishes its transaction
+  there (before any later one).
 
 - **Pros:**
   - Browsing is fast, and the index opens instantly.

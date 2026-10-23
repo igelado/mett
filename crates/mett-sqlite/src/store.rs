@@ -66,12 +66,21 @@ pub struct CachedStore<S> {
     unsyncable: Mutex<std::collections::HashSet<FolderId>>,
 }
 
-/// The database, and what the calls on it found out about it. It lives in
-/// an `Arc`: the calls run on threads of their own ([`CachedStore::with_cache`]),
-/// and finish (and note how they ended) even if the call that made them is
-/// dropped.
+/// A call on the database, to run on its thread.
+type Job = Box<dyn FnOnce(&mut Db) + Send>;
+
+/// The database, on a thread of its own: its calls block (a busy wait, a
+/// large sync batch), and run there one at a time, in the order they were
+/// made, to their end even if the call that made one is dropped (a change
+/// can't be overtaken by a later one). Dropping this ends the thread.
 struct Shared {
-    db: Mutex<Db>,
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    state: Arc<State>,
+}
+
+/// What the calls on the database found out about it.
+struct State {
     /// Set when the cache fails (a full disk, say): from then on,
     /// everything goes to `S`.
     broken: AtomicBool,
@@ -81,7 +90,7 @@ struct Shared {
     busy_until: Mutex<Option<Instant>>,
 }
 
-impl Shared {
+impl State {
     /// Whether the cache failed, and is no longer used.
     fn broken(&self) -> bool {
         self.broken.load(Ordering::SeqCst)
@@ -95,17 +104,15 @@ impl Shared {
             .is_some_and(|until| Instant::now() < until)
     }
 
-    /// Runs `f` on the database, which waits for its turn: this blocks, so
-    /// it runs on a thread that may. If `f` fails, the cache is no longer
-    /// used, unless it was only busy.
-    fn run<T>(&self, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
-        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        // Calls that waited for the lock while another one found the cache
+    /// Runs `f` on `db`. If it fails, the cache is no longer used, unless
+    /// it was only busy.
+    fn run<T>(&self, db: &mut Db, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
+        // Calls that waited their turn while another one found the cache
         // busy don't wait on it again.
         if self.broken() || self.busy() {
             return Err(Error::Backend("cache: not caching".into()));
         }
-        let done = f(&mut db);
+        let done = f(db);
         match &done {
             Err(e) if is_busy(e) => {
                 *self.busy_until.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -115,6 +122,46 @@ impl Shared {
             Ok(_) => {}
         }
         done
+    }
+}
+
+impl Shared {
+    fn new(mut db: Db) -> Self {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        let state = Arc::new(State {
+            broken: AtomicBool::new(false),
+            busy_until: Mutex::new(None),
+        });
+        let thread = std::thread::Builder::new()
+            .name("mett-cache".into())
+            .spawn(move || {
+                for job in queue {
+                    job(&mut db);
+                }
+            })
+            .ok();
+        Self {
+            jobs: Some(jobs),
+            thread,
+            state,
+        }
+    }
+
+    /// Queues `job`; `false` if the thread is gone.
+    fn send(&self, job: Job) -> bool {
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(job).is_ok())
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // The thread finishes what was queued, closes the database and ends.
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -195,11 +242,7 @@ impl<S: MailStore> CachedStore<S> {
             inner,
             db: cache.map(|Cache(mut db)| {
                 db.set_bodies_stay(stay);
-                Arc::new(Shared {
-                    db: Mutex::new(db),
-                    broken: AtomicBool::new(false),
-                    busy_until: Mutex::new(None),
-                })
+                Arc::new(Shared::new(db))
             }),
             writes: AtomicU64::new(0),
             folder_writes: Mutex::default(),
@@ -318,13 +361,13 @@ impl<S: MailStore> CachedStore<S> {
     fn caching(&self) -> bool {
         self.db
             .as_ref()
-            .is_some_and(|db| !db.broken() && !db.busy())
+            .is_some_and(|db| !db.state.broken() && !db.state.busy())
             && self.inner.capabilities().can_sync
     }
 
     /// Whether the cache failed, and is no longer used.
     fn broken(&self) -> bool {
-        self.db.as_ref().is_some_and(|db| db.broken())
+        self.db.as_ref().is_some_and(|db| db.state.broken())
     }
 
     /// Runs `f` on the cache, off the executor (SQLite may wait for as long
@@ -344,14 +387,26 @@ impl<S: MailStore> CachedStore<S> {
             .as_ref()
             .filter(|_| self.caching())
             .ok_or_else(|| Error::Backend("cache: not caching".into()))?;
-        let db = Arc::clone(db);
-        match tokio::task::spawn_blocking(move || db.run(f)).await {
-            Ok(done) => done,
-            Err(e) => match e.try_into_panic() {
-                Ok(panic) => std::panic::resume_unwind(panic),
-                Err(_) => Err(Error::Backend("cache: stopped".into())),
-            },
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let state = Arc::clone(&db.state);
+        // Queued at once: calls reach the database in the order they are made.
+        let runtime = tokio::runtime::Handle::current();
+        let queued = db.send(Box::new(move |db| {
+            // The cache's clock is the runtime's (a test pauses it).
+            let _entered = runtime.enter();
+            // Dropped, the call is still made, and its end noted.
+            let _ = answer.send(state.run(db, f));
+        }));
+        let stopped = || Error::Backend("cache: stopped".into());
+        if !queued {
+            db.state.broken.store(true, Ordering::SeqCst);
+            return Err(stopped());
         }
+        answered.await.map_err(|_| {
+            // The thread ended without answering: a panic.
+            db.state.broken.store(true, Ordering::SeqCst);
+            stopped()
+        })?
     }
 
     /// Notes a change mett made that a sync may bring in elsewhere.
