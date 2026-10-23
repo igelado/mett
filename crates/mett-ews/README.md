@@ -20,6 +20,8 @@ Exchange Server, as an alternative to Microsoft Graph (`mett-msgraph`):
   a recalled one is updated in place and sent as itself, and is never
   deleted when an attempt fails. A draft whose send has no clear outcome is
   kept for the next attempt, as with Graph.
+  The folder roles are looked up by each full folder listing, and other
+  calls reuse them for 15 minutes.
 
 It has no sign-in of its own: it takes any `Authenticator`. mett gives it
 `mett-msgraph`'s, asking for the Exchange Online scope

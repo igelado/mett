@@ -19,6 +19,10 @@ against Microsoft Graph:
   threads them and forwards keep their attachments. Postponed messages are
   saved as drafts in the Drafts folder; a recalled one is updated in place
   and sent as itself, and is never deleted when an attempt fails.
+  Requests time out after 30 s, except attachment downloads (10 minutes)
+  and upload pieces (a second more for each 64 KiB). The folder roles
+  (`$batch`) are looked up by each full folder listing, and the listing of
+  the folders below one reuses them for 15 minutes.
 
 The configuration it implements (`office365_*` and `msgraph_*` variables)
 is described in

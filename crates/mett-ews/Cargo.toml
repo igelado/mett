@@ -12,6 +12,7 @@ repository.workspace = true
 mett-core.workspace = true
 
 base64.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 roxmltree.workspace = true

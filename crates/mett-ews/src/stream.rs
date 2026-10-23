@@ -18,26 +18,62 @@ pub(crate) enum Streamed {
     Unsubscribed,
 }
 
+/// The most the stream may hold of one envelope, when it is not complete.
+const MAX_ENVELOPE: usize = 16 * 1024 * 1024;
+
+const CLOSING: &[u8] = b"Envelope>";
+
 /// The complete envelopes at the start of `buffer`, which they are taken
-/// off; what is left is the start of one still on its way.
-pub(crate) fn take_envelopes(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
-    let mut envelopes = Vec::new();
+/// off; what is left is the start of one still on its way. `scanned` is
+/// how much of `buffer` is known to hold no end of an envelope: the caller
+/// starts it at 0 and passes it back with the same buffer, so bytes are not
+/// searched again as the rest of an envelope comes. An envelope that is
+/// not complete within [`MAX_ENVELOPE`] is an error, which
+/// [`check_pending`] tells (after the complete ones are used).
+pub(crate) fn take_envelopes(buffer: &mut Vec<u8>, scanned: &mut usize) -> Vec<Vec<u8>> {
+    // Where each ends; the buffer is taken from once.
+    let mut ends = Vec::new();
     let mut from = 0;
-    while let Some(end) = envelope_end(&buffer[from..]) {
-        envelopes.push(buffer[from..from + end].to_vec());
-        from += end;
+    while let Some(end) = envelope_end(buffer, from.max(*scanned)) {
+        ends.push(end);
+        from = end;
     }
-    buffer.drain(..from);
+    if ends.is_empty() {
+        // A closing tag may start in the last bytes, and be completed by
+        // the next chunk.
+        *scanned = buffer.len().saturating_sub(CLOSING.len() - 1);
+        return Vec::new();
+    }
+    let rest = buffer.split_off(from);
+    let mut taken = std::mem::replace(buffer, rest);
+    *scanned = buffer.len().saturating_sub(CLOSING.len() - 1);
+    // Each envelope is split off the end, so every byte moves once.
+    let mut envelopes: Vec<Vec<u8>> = Vec::with_capacity(ends.len());
+    for start in std::iter::once(0).chain(ends.iter().copied()).rev().skip(1) {
+        envelopes.push(taken.split_off(start));
+    }
+    envelopes.reverse();
     envelopes
 }
 
+/// Whether the start of an envelope left in `buffer` (after
+/// [`take_envelopes`]) is more than [`MAX_ENVELOPE`] already.
+pub(crate) fn check_pending(buffer: &[u8]) -> Result<(), Error> {
+    if buffer.len() > MAX_ENVELOPE {
+        return Err(Error::Backend(
+            "EWS sent an envelope too large to read".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Where the first envelope in `bytes` ends: just after its closing tag
-/// (`</soap:Envelope>`, whatever its prefix), if it is there.
-fn envelope_end(bytes: &[u8]) -> Option<usize> {
-    const NAME: &[u8] = b"Envelope>";
-    let mut from = 0;
-    while let Some(at) = find(&bytes[from..], NAME).map(|at| from + at) {
-        let end = at + NAME.len();
+/// (`</soap:Envelope>`, whatever its prefix), if it is there. The part
+/// before `scanned` is known not to hold one.
+fn envelope_end(bytes: &[u8], scanned: usize) -> Option<usize> {
+    let mut from = scanned;
+    while let Some(at) = find(&bytes[from..], CLOSING).map(|at| from + at) {
+        let end = at + CLOSING.len();
         // The tag's start: `</`, then maybe a prefix and `:`.
         if let Some(open) = bytes[..at].iter().rposition(|&b| b == b'<') {
             let tag = &bytes[open + 1..at];
@@ -150,14 +186,38 @@ mod tests {
         let mut buffer = format!("{first}{second}").into_bytes();
         // Only part of a third has come.
         buffer.extend_from_slice(b"<s:Envelope xmlns:s=\"x\"><s:Bo");
-        let envelopes = take_envelopes(&mut buffer);
+        let mut scanned = 0;
+        let envelopes = take_envelopes(&mut buffer, &mut scanned);
         assert_eq!(envelopes, [first.into_bytes(), second.into_bytes()]);
         assert_eq!(buffer, b"<s:Envelope xmlns:s=\"x\"><s:Bo");
         // An envelope without a prefix ends too, and text that only looks
         // like the tag doesn't.
         let mut buffer = b"<Envelope><Body>NotEnvelope></Body></Envelope>".to_vec();
-        assert_eq!(take_envelopes(&mut buffer).len(), 1);
+        assert_eq!(take_envelopes(&mut buffer, &mut 0).len(), 1);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn an_envelope_that_comes_in_pieces_is_found_once_whole() {
+        let whole = envelope(&message("Success", "NoError", "")).into_bytes();
+        let mut buffer = Vec::new();
+        let mut scanned = 0;
+        let mut found = Vec::new();
+        // The closing tag is split in every possible place.
+        for piece in whole.chunks(7) {
+            buffer.extend_from_slice(piece);
+            found.extend(take_envelopes(&mut buffer, &mut scanned));
+        }
+        assert_eq!(found, [whole]);
+        assert!(buffer.is_empty());
+        assert_eq!(scanned, 0);
+    }
+
+    #[test]
+    fn an_endless_envelope_is_an_error() {
+        let mut buffer = vec![b'x'; MAX_ENVELOPE + 1];
+        assert!(take_envelopes(&mut buffer, &mut 0).is_empty());
+        assert!(matches!(check_pending(&buffer), Err(Error::Backend(_))));
     }
 
     #[test]
@@ -167,7 +227,7 @@ mod tests {
             envelope(&message("Success", "NoError", ""))
         );
         let mut buffer = format!("{one}\r\n{one}").into_bytes();
-        for envelope in take_envelopes(&mut buffer) {
+        for envelope in take_envelopes(&mut buffer, &mut 0) {
             assert_eq!(read_envelope(&envelope).unwrap(), Streamed::Changed(vec![]));
         }
     }

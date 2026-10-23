@@ -1755,8 +1755,8 @@ mod tests {
                 ["/me/mailFolders", "/me/mailFolders/arc/childFolders"]
             );
             // The roles, which label well-known folders as a listing of
-            // them all does.
-            assert_eq!(requests.len(), 4, "{requests:?}");
+            // them all does: looked up once, as none were known.
+            assert_eq!(requests.len(), 3, "{requests:?}");
 
             // A name missing at any level, as before.
             let missing = FolderPath::Named(vec!["Archive".into(), "1999".into()]);
