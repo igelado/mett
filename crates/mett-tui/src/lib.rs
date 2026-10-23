@@ -884,8 +884,12 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 Some(other) => {
                     active = other;
                     stale = true;
-                    let effects = slots[other].app.update(Msg::Action(action::Action::Quit));
-                    slots[other].absorb(effects);
+                    // An account that needs a sign-in first has its window
+                    // shown: the user deals with it, and quits again.
+                    if slots[other].app.sign_in.is_none() {
+                        let effects = slots[other].app.update(Msg::Action(action::Action::Quit));
+                        slots[other].absorb(effects);
+                    }
                 }
                 None => break 'run,
             }
@@ -964,6 +968,16 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         }
         if slots[active].app.quit {
             continue 'run;
+        }
+        // The keys a `push` in an account's own file queued play there even
+        // if it isn't the one shown.
+        for at in (0..slots.len()).filter(|at| *at != active) {
+            while let Some(msg) = slots[at].app.next_stroke() {
+                let slot = &mut slots[at];
+                let effects = slot.app.update(msg);
+                slot.absorb(effects);
+                stale = true;
+            }
         }
         show_tabs(&mut slots, active, position);
         // Keys a macro or `push` queued come before new input, once the
@@ -2437,6 +2451,14 @@ mod tests {
 
     /// A demo account with this tab `label`.
     fn demo_account(label: &str) -> Opened<mett_core::mock::MemoryStore> {
+        demo_account_pushing(label, Vec::new())
+    }
+
+    /// A demo account that plays `pushed` once its folder is listed.
+    fn demo_account_pushing(
+        label: &str,
+        pushed: Vec<keymap::Stroke>,
+    ) -> Opened<mett_core::mock::MemoryStore> {
         let (_, sign_in) = mpsc::unbounded_channel();
         let settings = demo::settings();
         Opened {
@@ -2447,7 +2469,7 @@ mod tests {
                 account: settings.account.clone(),
                 settings,
                 keymap: Keymap::mutt_defaults(),
-                pushed: Vec::new(),
+                pushed,
                 config: config::Config::new(None),
                 editor: Editor::from_env("", ""),
                 sign_in,
@@ -2583,6 +2605,49 @@ mod tests {
                 );
                 assert!(!running.is_finished(), "waits for the answer");
                 // Not purging, it quits.
+                input.send(key('n', false)).unwrap();
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_push_in_an_account_not_shown_plays_there() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                // Home's own file pushes `d`: its first message is marked
+                // deleted, though Work is the account shown.
+                let delete = keymap::Stroke::Key(keymap::Key::char('d'));
+                let accounts = Accounts {
+                    list: vec![
+                        demo_account("Work"),
+                        demo_account_pushing("Home", vec![delete]),
+                    ],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                drawn_until(&drawn, |(tab, messages, ..)| {
+                    tab.as_deref() == Some("Work") && *messages > 0
+                })
+                .await;
+                // So quitting asks about Home's deleted message.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let before = drawn.lock().unwrap().len();
+                input.send(key('q', false)).unwrap();
+                drawn_until(&drawn, |(tab, _, _, question)| {
+                    tab.as_deref() == Some("Home") && *question
+                })
+                .await;
+                assert!(drawn.lock().unwrap().len() > before);
                 input.send(key('n', false)).unwrap();
                 let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
                     .await
