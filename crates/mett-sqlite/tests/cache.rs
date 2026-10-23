@@ -876,5 +876,7 @@ async fn a_busy_cache_is_not_a_broken_one() {
     later().await;
     assert_eq!(listing(&store, 10).await, ["m1", "m0"]);
     assert!(store.inner().syncs() > syncs, "the cache is used again");
+    // Windows can't remove files that are open.
+    drop((store, other));
     std::fs::remove_dir_all(&dir).unwrap();
 }

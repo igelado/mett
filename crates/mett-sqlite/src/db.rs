@@ -1219,6 +1219,8 @@ mod tests {
         other.execute_batch("DROP TABLE messages").unwrap();
         let broken = db.count(&inbox).unwrap_err();
         assert!(!is_busy(&broken), "{broken}");
+        // Windows can't remove files that are open.
+        drop((db, other));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
