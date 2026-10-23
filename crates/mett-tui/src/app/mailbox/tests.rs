@@ -1653,8 +1653,8 @@ fn copies_to_one_folder_by_two_names_are_retried_once() {
     // One retry is kept (changes go out one at a time, so look at what
     // is kept, not just what is sent first).
     let kept: Vec<_> = app
-        .failed_transfers
-        .iter()
+        .retries
+        .transfers()
         .flat_map(|(_, retry)| transfer_ids(retry).to_vec())
         .collect();
     assert_eq!(kept, [MessageId::new("m0")]);

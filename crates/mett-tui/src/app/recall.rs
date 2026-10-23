@@ -4,6 +4,7 @@
 //! then sent, or postponed again, as itself.
 
 use super::StatusKind;
+use super::retry::{Retry, RetryKind};
 use mett_core::{
     Attachment, BodyKind, Draft, DraftOrigin, Error, Folder, FolderId, Message, MessagePage,
     MessageSummary, Page, WellKnownFolder,
@@ -72,7 +73,7 @@ impl App {
         if self.recall.is_some() {
             return Vec::new();
         }
-        self.unrecalled = false;
+        self.retries.forget(RetryKind::Recall);
         let path = FolderPath::WellKnown(WellKnownFolder::Drafts, Vec::new());
         let request = self.request(Request::OpenFolder(path));
         self.recall = Some(Recall::Opening(effect_id(&request)));
@@ -263,7 +264,7 @@ impl App {
     fn recall_failed(&mut self, e: Error) -> Vec<Effect> {
         self.recall = None;
         if matches!(e, Error::Auth(_)) {
-            self.unrecalled = true;
+            self.retries.push(Retry::Recall);
         }
         self.report(e);
         Vec::new()
@@ -272,7 +273,7 @@ impl App {
     /// Starts again a recall that failed for want of a sign-in, from the
     /// index or the pager.
     pub(super) fn retry_recall(&mut self) -> Vec<Effect> {
-        if !std::mem::take(&mut self.unrecalled) {
+        if self.retries.take(RetryKind::Recall).is_none() {
             return Vec::new();
         }
         match self.screen() {

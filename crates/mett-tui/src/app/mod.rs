@@ -42,6 +42,7 @@ pub use self::newmail::MailboxEntry;
 pub use self::pager::Pager;
 pub use self::query::{QueryMenu, QuerySettings};
 pub use self::recall::PostponedMenu;
+use self::retry::{Retries, Retry, RetryKind};
 pub use self::search::{Limit, highlighted};
 pub use self::sidebar::{Sidebar, SidebarEntry, SidebarSettings, SidebarSort};
 pub use self::signin::{Row, SignIn};
@@ -411,13 +412,8 @@ pub struct App {
     added_words: Vec<(Option<std::path::PathBuf>, String)>,
     /// The request fetching a message to reply to or forward.
     compose_fetch: Option<(RequestId, Kind, MessageId)>,
-    /// The reply or forward whose message couldn't be fetched for want of
-    /// a sign-in, to start again on Retry.
-    compose_unfetched: Option<(MessageId, Kind)>,
     /// A recall of a postponed message on its way (`R`).
     recall: Option<recall::Recall>,
-    /// A recall failed for want of a sign-in: Retry starts it again.
-    unrecalled: bool,
     /// How to write messages.
     settings: crate::compose::Settings,
     /// The open folder gained a message while a pager was open: list it
@@ -499,18 +495,11 @@ pub struct App {
     switching: Option<(RequestId, FolderPath)>,
     /// The message a save or copy question is about.
     question_message: Option<MessageId>,
-    /// The folder change that failed for want of a sign-in, to try again
-    /// on Retry.
-    unswitched: Option<FolderPath>,
     /// A folder chosen in the browser to answer a question, with its path
     /// as shown there.
     browsed: Option<(String, FolderPath)>,
-    /// The browser whose folders couldn't be listed for want of a sign-in,
-    /// to open again on Retry.
-    unbrowsed: Option<mailbox::Choose>,
-    /// Moves, copies and purges that failed for want of a sign-in, to
-    /// retry.
-    failed_transfers: Vec<(Transfer, Request)>,
+    /// What failed for want of a sign-in, to do again on Retry.
+    retries: Retries,
     /// What to do once deleted messages are purged.
     then: Option<AfterPurge>,
     /// See [`Settings::account`].
@@ -574,11 +563,6 @@ pub struct App {
     /// The folders that mailbox paths moved or copied to turned out to be,
     /// to tell when two paths name the same folder.
     folder_ids: HashMap<FolderPath, mett_core::FolderId>,
-    /// The message that last failed to open, so that opening it can be
-    /// retried.
-    unfetched: Option<MessageId>,
-    /// The pager search that was waiting for that message.
-    unfetched_search: Option<String>,
     /// When the user asks to retry, the requests that had not reported
     /// back yet; what failed among them is retried once they all have.
     retry_after: HashSet<RequestId>,
@@ -591,9 +575,6 @@ pub struct App {
     answering: Option<invite::Answering>,
     /// The attachment being fetched, and what for.
     fetching: Option<attachments::Fetching>,
-    /// The attachment that failed to be fetched for want of a sign-in,
-    /// and what for: a retry fetches it again.
-    unfetched_attachment: Option<(MessageId, mett_core::Attachment, attachments::Use)>,
     /// The file being read (to attach) or saved: keys wait for it, as in
     /// mutt, but `^G` gives up on it.
     file_wait: Option<(FileOp, std::path::PathBuf)>,
@@ -736,9 +717,7 @@ impl App {
             speller_loading: None,
             added_words: Vec::new(),
             compose_fetch: None,
-            compose_unfetched: None,
             recall: None,
-            unrecalled: false,
             settings: settings.compose,
             relist_on_return: false,
             reselect: None,
@@ -767,10 +746,8 @@ impl App {
             deleted: HashSet::new(),
             writes: VecDeque::new(),
             writing: None,
-            failed_transfers: Vec::new(),
-            unbrowsed: None,
+            retries: Retries::default(),
             switching: None,
-            unswitched: None,
             question_message: None,
             browsed: None,
             then: None,
@@ -797,15 +774,12 @@ impl App {
             removed_while_listing: HashSet::new(),
             transfer_failures: HashMap::new(),
             folder_ids: HashMap::new(),
-            unfetched: None,
-            unfetched_search: None,
             retry_after: HashSet::new(),
             next_request: 0,
             last_draft: 0,
             page_size: settings.page_size,
             answering: None,
             fetching: None,
-            unfetched_attachment: None,
             file_wait: None,
             last_file_op: 0,
             unsaved: None,
@@ -1161,9 +1135,8 @@ impl App {
                 self.dismissed = true;
                 // Nor restart, on a later Retry, a reply or forward whose
                 // message couldn't be fetched.
-                self.compose_unfetched = None;
                 // Nor a recall.
-                self.unrecalled = false;
+                self.retries.dismiss();
                 // The user gave up: don't let a retry that was waiting
                 // start another sign-in.
                 self.retry_after.clear();
@@ -1484,8 +1457,7 @@ impl App {
             return Vec::new();
         };
         let id = summary.id.clone();
-        self.unfetched = None;
-        self.unfetched_search = None;
+        self.retries.forget(RetryKind::Open);
         let fetch = self.request(Request::FetchMessage(id.clone()));
         self.screens.push(Screen::Pager(Pager {
             id,
@@ -1780,9 +1752,11 @@ impl App {
             Ok(message) => message,
             Err(e) => {
                 if let Screen::Pager(pager) = self.screens.remove(position) {
-                    self.unfetched = Some(pager.id);
                     // A search waiting for it runs when it opens again.
-                    self.unfetched_search = pager.pending_search;
+                    self.retries.push(Retry::Open {
+                        id: pager.id,
+                        search: pager.pending_search,
+                    });
                 }
                 self.report(e);
                 return Vec::new();

@@ -347,6 +347,11 @@ loading, searching, ...). Code that reacts to a message (the view coloring an
 error, a loaded folder clearing its "Loading..."), asks for the kind, never
 compares words.
 
+What failed for want of a sign-in (a folder change, a recall, an attachment
+fetch, a message that wouldn't open, moves and purges) is kept as `Retry`
+values in `App::retries` (`app/retry.rs`); the sign-in window's Retry takes
+them in a fixed order, so the order they failed in doesn't matter.
+
 Questions on the message line (`To:`, `Postpone this message?`) are not
 screens: they sit over the current screen, as `App::input`, and take keys
 as typed rather than through the key bindings. Writing a message is a
