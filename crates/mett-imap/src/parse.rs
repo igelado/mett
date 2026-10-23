@@ -82,12 +82,15 @@ fn ids(value: &HeaderValue<'_>) -> Vec<String> {
 /// answers (`References:`, else `In-Reply-To:`), oldest first, all with
 /// angle brackets.
 pub(crate) fn threading(data: &[u8]) -> Result<(Option<String>, Vec<String>)> {
-    let message = parse(data)?;
+    Ok(threading_of(&parse(data)?))
+}
+
+fn threading_of(message: &Parsed<'_>) -> (Option<String>, Vec<String>) {
     let mut references = ids(message.references());
     if references.is_empty() {
         references = ids(message.in_reply_to());
     }
-    Ok((message.message_id().map(bracketed), references))
+    (message.message_id().map(bracketed), references)
 }
 
 fn utc(date: &mail_parser::DateTime) -> Option<DateTime<Utc>> {
@@ -106,14 +109,30 @@ pub(crate) fn summary(
     fetched: &Fetched,
     by_arrival: bool,
 ) -> Result<MessageSummary> {
-    let message = parse(&fetched.data)?;
+    Ok(summary_from(
+        &parse(&fetched.data)?,
+        folder,
+        validity,
+        fetched,
+        by_arrival,
+    ))
+}
+
+/// `summary` of a message that is parsed already.
+fn summary_from(
+    message: &Parsed<'_>,
+    folder: &str,
+    validity: u32,
+    fetched: &Fetched,
+    by_arrival: bool,
+) -> MessageSummary {
     let at = Ref {
         folder: folder.to_owned(),
         validity,
         uid: fetched.uid,
     };
     let sent = message.date().and_then(utc);
-    let (own, references) = threading(&fetched.data)?;
+    let (own, references) = threading_of(message);
     let thread = (own.is_some() || !references.is_empty()).then(|| {
         let mut path: Vec<Vec<u8>> = references.iter().map(|r| r.as_bytes().to_vec()).collect();
         path.push(
@@ -135,7 +154,7 @@ pub(crate) fn summary(
         t.ctype().eq_ignore_ascii_case("multipart")
             && matches!(t.subtype(), Some(s) if s.eq_ignore_ascii_case("mixed"))
     });
-    Ok(MessageSummary {
+    MessageSummary {
         id: at.id(),
         folder: FolderId::new(folder),
         subject: message.subject().unwrap_or_default().to_owned(),
@@ -156,7 +175,7 @@ pub(crate) fn summary(
         // new-mail checks count from the newest of what the user has seen.
         modified: fetched.internal,
         thread,
-    })
+    }
 }
 
 /// A whole message.
@@ -166,8 +185,8 @@ pub(crate) fn message(
     fetched: &Fetched,
     by_arrival: bool,
 ) -> Result<Message> {
-    let mut summary = summary(folder, validity, fetched, by_arrival)?;
     let parsed = parse(&fetched.data)?;
+    let mut summary = summary_from(&parsed, folder, validity, fetched, by_arrival);
     summary.has_attachments = parsed.attachment_count() > 0;
     let text: Vec<_> = (0..parsed.text_body_count())
         .filter_map(|n| parsed.body_text(n))

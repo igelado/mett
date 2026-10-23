@@ -23,6 +23,7 @@ use crate::ids::Ref;
 use crate::marks::{Floor, Marks, Watch};
 use crate::parse::{self, Fetched};
 use crate::settings::{ImapSettings, Login, NoTokens};
+use crate::uidset::UidSet;
 
 /// How long a listing of the folders is taken for what they are, where the
 /// listing is not what was asked for (a folder's counts, or the folder that
@@ -52,8 +53,9 @@ fn by_arrival(caps: &Caps) -> bool {
     !caps.sort
 }
 
-/// How many messages a sync takes in at a time.
-const BATCH_SIZE: usize = 100;
+/// How many messages a sync takes in at a time (the summaries of a round of
+/// `sync_folder`), whatever the number of `FETCH` commands that takes.
+const SYNC_BATCH: usize = 100;
 
 /// The whole message.
 const WHOLE: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[])";
@@ -322,35 +324,13 @@ fn fetched(fetch: &Fetch, whole: bool) -> Option<Fetched> {
 /// A set of UIDs as a command takes them: ranges where they run on, so that
 /// a long one doesn't make a command line too long for the server.
 fn set(uids: impl IntoIterator<Item = u32>) -> String {
-    let mut sorted: Vec<u32> = uids.into_iter().collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let mut parts: Vec<String> = Vec::new();
-    let mut run: Option<(u32, u32)> = None;
-    for uid in sorted {
-        run = match run {
-            Some((from, to)) if uid == to + 1 => Some((from, uid)),
-            Some((from, to)) => {
-                parts.push(range(from, to));
-                Some((uid, uid))
-            }
-            None => Some((uid, uid)),
-        };
-    }
-    parts.extend(run.map(|(from, to)| range(from, to)));
-    parts.join(",")
+    UidSet::of(uids).to_string()
 }
 
-fn range(from: u32, to: u32) -> String {
-    if from == to {
-        from.to_string()
-    } else {
-        format!("{from}:{to}")
-    }
-}
-
-/// How many messages a `FETCH` asks about at once.
-const BATCH: usize = 200;
+/// How many messages one `FETCH` command asks about at most, so that a command
+/// on thousands of them is not more than a server takes: a limit of the
+/// command, not of a sync round.
+const FETCH_BATCH: usize = 200;
 
 /// The role a folder has, by what the server says of it (and then it is
 /// declared), or else by its name.
@@ -610,7 +590,7 @@ async fn fetch(live: &mut Live, uids: &[u32], what: &str, whole: bool) -> Res<Ve
     let mut found = Vec::with_capacity(uids.len());
     // In batches: a command for thousands of messages is more than some
     // servers take.
-    for batch in uids.chunks(BATCH) {
+    for batch in uids.chunks(FETCH_BATCH) {
         let fetches: Vec<Fetch> = live
             .session
             .uid_fetch(set(batch.iter().copied()), what)

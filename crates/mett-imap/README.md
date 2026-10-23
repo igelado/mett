@@ -36,8 +36,10 @@ one of a folder the server made anew is gone.
 implements `sync_folder`, so `mett-sqlite`'s cache works in front of it as it
 does in front of Graph and EWS (`can_sync` is true once connected). A folder's
 sync state holds its `UIDVALIDITY`, the next `UID`, the highest modification
-sequence and the `UID`s it had: new messages are those from the next `UID`,
-changed flags those `CHANGEDSINCE` the sequence, and the messages that went
+sequence and the `UID`s it had: changed messages are those `CHANGEDSINCE` the
+sequence, and the new ones are among them (those from the next `UID`: a new
+message's sequence is above all others, RFC 7162; a folder whose sequence
+didn't move is asked with `UID SEARCH` instead), and the messages that went
 are those missing from the `UID`s the folder has now (asked for only when
 its message count doesn't add up). A sync of many messages is made 100 at a
 time. A folder made anew, or a state that isn't understood, is `StaleSync`: the cache

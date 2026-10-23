@@ -45,7 +45,7 @@ pub struct Composed {
 pub fn compose(draft: &Draft, from: &Address, threading: &Threading) -> Result<Composed> {
     let from = draft.from.as_ref().unwrap_or(from);
     // One message, so that its boundary and date are the same in both.
-    let kept = build(draft, from, threading, true)?;
+    let kept = build(draft, from, threading)?;
     let message_id = kept
         .headers()
         .get_raw("Message-ID")
@@ -68,9 +68,9 @@ pub fn compose(draft: &Draft, from: &Address, threading: &Threading) -> Result<C
     })
 }
 
-/// The message, with its `Bcc:` if `keep_bcc`.
-fn build(draft: &Draft, from: &Address, threading: &Threading, keep_bcc: bool) -> Result<Message> {
-    let builder = headers(draft, from, threading, keep_bcc)?.message_id(None);
+/// The message, with its `Bcc:` (`without_bcc` takes it off what is sent).
+fn build(draft: &Draft, from: &Address, threading: &Threading) -> Result<Message> {
+    let builder = headers(draft, from, threading)?.message_id(None);
     finish(builder, draft)
 }
 
@@ -101,12 +101,7 @@ fn without_bcc(message: &[u8]) -> Vec<u8> {
 }
 
 /// The message's headers.
-fn headers(
-    draft: &Draft,
-    from: &Address,
-    threading: &Threading,
-    keep_bcc: bool,
-) -> Result<MessageBuilder> {
+fn headers(draft: &Draft, from: &Address, threading: &Threading) -> Result<MessageBuilder> {
     let mut builder = Message::builder().from(mailbox(from)?);
     for to in &draft.to {
         builder = builder.to(mailbox(to)?);
@@ -117,9 +112,7 @@ fn headers(
     for bcc in &draft.bcc {
         builder = builder.bcc(mailbox(bcc)?);
     }
-    if keep_bcc {
-        builder = builder.keep_bcc();
-    }
+    builder = builder.keep_bcc();
     if !draft.has_recipients() {
         // Lettre won't build a message that goes to no one, though it is
         // only the envelope that says so: this one goes to its sender.

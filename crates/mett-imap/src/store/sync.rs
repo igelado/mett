@@ -11,7 +11,7 @@
 use futures_util::TryStreamExt;
 use mett_core::{Error, FolderChanges, MessageId, SyncState};
 
-use super::{BATCH_SIZE, Fail, Live, Ref, Res, SUMMARY, Selected, fetch, parse, search, select};
+use super::{Fail, Live, Ref, Res, SUMMARY, SYNC_BATCH, Selected, fetch, parse, search, select};
 use crate::parse::Fetched;
 use crate::uidset::UidSet;
 
@@ -123,11 +123,37 @@ async fn advance(
     {
         return Ok((old, Vec::new()));
     }
-    let came: Vec<u32> = search(live, &format!("UID {}:*", old.next))
-        .await?
-        .into_iter()
-        .filter(|uid| *uid >= old.next)
-        .collect();
+    // The messages whose modification sequence passed the state's. A message
+    // that came in has a modification sequence above every other (RFC 7162,
+    // 3.1.1), so these include the new ones and no `SEARCH` is needed to
+    // find them.
+    let moved: Option<Vec<u32>> = if modseq <= old.modseq {
+        None
+    } else if selected.exists > 0 {
+        let flagged: Vec<_> = live
+            .session
+            .uid_fetch("1:*", format!("(UID) (CHANGEDSINCE {})", old.modseq))
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Some(flagged.iter().filter_map(|f| f.uid).collect())
+    } else {
+        Some(Vec::new())
+    };
+    let came: Vec<u32> = match &moved {
+        Some(moved) => moved
+            .iter()
+            .copied()
+            .filter(|uid| *uid >= old.next)
+            .collect(),
+        // A folder that took in a message without moving its modification
+        // sequence on (which it shouldn't) is asked.
+        None => search(live, &format!("UID {}:*", old.next))
+            .await?
+            .into_iter()
+            .filter(|uid| *uid >= old.next)
+            .collect(),
+    };
     let (set, gone, came) = if selected.exists as usize == old.set.len() + came.len() {
         (old.set.with(came.iter().copied()), Vec::new(), came)
     } else {
@@ -139,15 +165,7 @@ async fn advance(
         (all, gone, came)
     };
     let mut changed = came;
-    if modseq > old.modseq && selected.exists > 0 {
-        let flagged: Vec<_> = live
-            .session
-            .uid_fetch("1:*", format!("(UID) (CHANGEDSINCE {})", old.modseq))
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        changed.extend(flagged.iter().filter_map(|f| f.uid));
-    }
+    changed.extend(moved.into_iter().flatten());
     let pending = UidSet::of(changed).without(gone.iter().copied());
     let state = State {
         validity: old.validity,
@@ -169,7 +187,7 @@ async fn batch(
     gone: Vec<u32>,
 ) -> Res<FolderChanges> {
     let first = state.initial;
-    let (uids, rest) = state.pending.split_newest(BATCH_SIZE);
+    let (uids, rest) = state.pending.split_newest(SYNC_BATCH);
     state.pending = rest;
     let by_arrival = super::by_arrival(&live.caps);
     let found: Vec<Fetched> = fetch(live, &uids, SUMMARY, false).await?;
