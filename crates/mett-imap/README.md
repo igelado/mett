@@ -44,7 +44,10 @@ time. A folder made anew, or a state that isn't understood, is `StaleSync`: the 
 starts that folder over. Servers without `CONDSTORE` can't be synced (flags
 changed by other clients couldn't be found), so mett doesn't cache them. On a
 server that can't `SORT`, messages are dated by arrival; the cache orders
-those that arrived in the same second by their ids, not by `UID`.
+those that arrived in the same second by their ids, not by `UID`. A sync of
+more than 250 new messages takes them in newest first, so the new-mail check
+(which is limited to 250 unread messages) may report some older ones in
+place of the newest of such a burst.
 
 Limits: IMAP can't say what changed in a folder as Exchange's APIs do (no
 `QRESYNC`, no `IDLE` yet), so the adapter doesn't watch. To find what is new
