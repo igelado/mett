@@ -222,7 +222,9 @@ mod tests {
         );
         let dir = std::env::temp_dir().join(format!("mett-ca-{}", std::process::id()));
         std::fs::write(&dir, b"PEM").unwrap();
-        let c = config(&format!("set ssl_ca_certificate_file={}\n", dir.display()));
+        // In a mettrc `\` is an escape: paths are written with `/`.
+        let written = dir.display().to_string().replace('\\', "/");
+        let c = config(&format!("set ssl_ca_certificate_file={written}\n"));
         assert_eq!(
             imap_settings(&c, &imap).unwrap().ca_certificates,
             [b"PEM".to_vec()]
