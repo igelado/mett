@@ -1577,7 +1577,7 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
         id: &str,
         folders: &[FolderId],
     ) -> Result<Option<(Vec<FolderId>, bool)>> {
-        use crate::stream::{Streamed, read_envelope, take_envelopes};
+        use crate::stream::{Streamed, check_pending, read_envelope, take_envelopes};
 
         let body = format!(
             "<m:GetStreamingEvents><m:SubscriptionIds><t:SubscriptionId>{}</t:SubscriptionId>\
@@ -1621,12 +1621,7 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                 Err(e) => return Err(Error::Network(e.to_string())),
             };
             buffer.extend_from_slice(&chunk);
-            let envelopes = match take_envelopes(&mut buffer, &mut scanned) {
-                Ok(envelopes) => envelopes,
-                Err(_) if !changed.is_empty() => return Ok(Some((changed, true))),
-                Err(e) => return Err(e),
-            };
-            for envelope in envelopes {
+            for envelope in take_envelopes(&mut buffer, &mut scanned) {
                 told = true;
                 // What changed was told already: an error after it, or
                 // the subscription's end, doesn't lose it.
@@ -1651,6 +1646,12 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                     Streamed::Unsubscribed if changed.is_empty() => return Ok(None),
                     Streamed::Unsubscribed => return Ok(Some((changed, false))),
                 }
+            }
+            // What came complete was used: a rest that is too large ends it.
+            match check_pending(&buffer) {
+                Ok(()) => {}
+                Err(_) if !changed.is_empty() => return Ok(Some((changed, true))),
+                Err(e) => return Err(e),
             }
             self.unreported.lock().expect("lock").partly = if unread(&buffer) {
                 folders.to_vec()
@@ -2515,13 +2516,19 @@ fn decode_base64(text: &str) -> Result<Vec<u8>> {
     let mut decoded = Vec::with_capacity(text.len() / 4 * 3);
     let mut block = [0u8; BLOCK];
     let mut filled = 0;
+    // Padding ends the data: it may be in the last block only.
+    let mut padded = false;
     for c in text.chars().filter(|c| !c.is_whitespace()) {
+        if padded {
+            return Err(invalid(&"data after padding"));
+        }
         block[filled] = u8::try_from(c).map_err(|_| invalid(&"not base64"))?;
         filled += 1;
         if filled == BLOCK {
             engine
                 .decode_vec(&block[..], &mut decoded)
                 .map_err(|e| invalid(&e))?;
+            padded = block.contains(&b'=');
             filled = 0;
         }
     }
@@ -2720,6 +2727,10 @@ mod tests {
         assert_eq!(decode_base64("").unwrap(), b"");
         assert_eq!(decode_base64(" TW\nE= ").unwrap(), b"Ma");
         assert!(decode_base64("TW=E").is_err());
+        // Padding ends the data, wherever the blocks fall.
+        let padded = format!("{}AA==", "AAAA".repeat(1023));
+        assert_eq!(decode_base64(&padded).unwrap().len(), 3070);
+        assert!(decode_base64(&format!("{padded}AAAA")).is_err());
         assert!(decode_base64("TWFu\u{e9}").is_err());
     }
 
