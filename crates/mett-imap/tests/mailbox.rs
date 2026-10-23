@@ -1673,3 +1673,25 @@ async fn a_message_without_an_id_is_found_where_it_went_whatever_the_status_says
         "anonymous"
     );
 }
+
+#[tokio::test]
+async fn the_newest_unread_are_kept_when_there_are_more_than_are_told_and_dates_tie() {
+    let (server, store) = plain().await;
+    // All with the same date, to the second.
+    for n in 0..300 {
+        deliver(&server, "INBOX", &simple(&format!("message {n}")), &[]);
+    }
+    let unread = store
+        .recent_unread(&FolderId::new("INBOX"), None)
+        .await
+        .unwrap();
+    assert_eq!(unread.len(), mett_core::RECENT_UNREAD);
+    // The newest 250 UIDs: 51 to 300.
+    let mut uids: Vec<u32> = unread
+        .iter()
+        .map(|(id, _)| id.as_str().split('.').nth(1).unwrap().parse().unwrap())
+        .collect();
+    uids.sort_unstable();
+    assert_eq!(uids.first(), Some(&51));
+    assert_eq!(uids.last(), Some(&300));
+}

@@ -883,7 +883,12 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
                 selected.floor(),
                 floor,
             );
-            let mut out: Vec<(MessageId, DateTime<Utc>)> = found
+            // The newest first, by the date and, where dates tie (they are to
+            // the second), by UID: what is cut off is the oldest.
+            let mut found: Vec<(u32, DateTime<Utc>)> = found.into_iter().collect();
+            found.sort_by_key(|(uid, at)| std::cmp::Reverse((*at, *uid)));
+            found.truncate(RECENT_UNREAD);
+            Ok(found
                 .into_iter()
                 .map(|(uid, at)| {
                     let id = Ref {
@@ -894,10 +899,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
                     .id();
                     (id, at)
                 })
-                .collect();
-            out.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
-            out.truncate(RECENT_UNREAD);
-            Ok(out)
+                .collect())
         })
         .await;
         g.done(r)
