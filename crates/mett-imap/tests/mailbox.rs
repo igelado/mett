@@ -1904,3 +1904,245 @@ async fn a_folder_name_with_a_line_break_sends_no_command() {
     assert_eq!(commands(&server, "LOGOUT"), 0);
     assert_eq!(commands(&server, "x"), 0);
 }
+
+async fn first_message(server: &Server, store: &ImapMailStore, folder: &str) -> MessageId {
+    deliver(server, folder, &simple("travelling"), &[]);
+    store
+        .list_messages(&FolderId::new(folder), Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone()
+}
+
+/// The commands sent from now on, as written.
+fn sent_since(server: &Server) -> Vec<String> {
+    server.state.lock().unwrap().take_commands()
+}
+
+fn only(commands: &[String], verb: &str) -> usize {
+    commands
+        .iter()
+        .filter(|c| c.to_uppercase().starts_with(verb))
+        .count()
+}
+
+#[tokio::test]
+async fn a_message_moved_is_found_where_the_server_says_it_went() {
+    let (server, store) = plain().await;
+    let id = first_message(&server, &store, "INBOX").await;
+    // Something else is in the way: the new UID is not the first.
+    deliver(&server, "Trash", &simple("other"), &[]);
+    sent_since(&server);
+    let moved = store
+        .move_message(&id, &FolderId::new("Trash"))
+        .await
+        .unwrap();
+    let sent = sent_since(&server);
+    // The message-id and the folder's next UID in one round trip, and then
+    // the move: nothing is looked for afterwards.
+    assert_eq!(only(&sent, "UID FETCH"), 1, "{sent:?}");
+    assert_eq!(only(&sent, "STATUS"), 1);
+    assert_eq!(only(&sent, "UID MOVE"), 1);
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(sent[0].contains("HEADER.FIELDS (MESSAGE-ID)"));
+    assert!(!sent.iter().any(|c| c.contains("BODYSTRUCTURE")));
+    assert_eq!(
+        store.fetch_message(&moved).await.unwrap().summary.subject,
+        "travelling"
+    );
+}
+
+#[tokio::test]
+async fn a_message_copied_is_found_where_the_server_says_it_went() {
+    let (server, store) = plain().await;
+    let id = first_message(&server, &store, "INBOX").await;
+    deliver(&server, "Archive", &simple("other"), &[]);
+    sent_since(&server);
+    let copy = store
+        .copy_message(&id, &FolderId::new("Archive"))
+        .await
+        .unwrap();
+    let sent = sent_since(&server);
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(only(&sent, "UID COPY"), 1);
+    assert_eq!(
+        store.fetch_message(&copy).await.unwrap().summary.subject,
+        "travelling"
+    );
+}
+
+#[tokio::test]
+async fn a_message_moved_by_copying_is_found_where_the_server_says_it_went() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_move = true;
+    let id = first_message(&server, &store, "INBOX").await;
+    sent_since(&server);
+    let moved = store
+        .move_message(&id, &FolderId::new("Trash"))
+        .await
+        .unwrap();
+    let sent = sent_since(&server);
+    assert_eq!(only(&sent, "UID SEARCH"), 0, "{sent:?}");
+    assert_eq!(only(&sent, "UID COPY"), 1);
+    assert_eq!(
+        store.fetch_message(&moved).await.unwrap().summary.subject,
+        "travelling"
+    );
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .folder("INBOX")
+            .messages
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_message_is_looked_for_if_the_server_does_not_say_where_it_went() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_placement = true;
+    let id = first_message(&server, &store, "INBOX").await;
+    deliver(&server, "Trash", &simple("other"), &[]);
+    sent_since(&server);
+    let moved = store
+        .move_message(&id, &FolderId::new("Trash"))
+        .await
+        .unwrap();
+    let sent = sent_since(&server);
+    assert_eq!(only(&sent, "UID SEARCH"), 1, "{sent:?}");
+    // Only the `Message-ID:` of the candidates is fetched: the first fetch
+    // is of the message, and the second of what the search found.
+    let fetches: Vec<&String> = sent.iter().filter(|c| c.starts_with("UID FETCH")).collect();
+    assert_eq!(fetches.len(), 2, "{sent:?}");
+    assert!(
+        fetches
+            .iter()
+            .all(|c| c.contains("HEADER.FIELDS (MESSAGE-ID)"))
+    );
+    assert_eq!(
+        store.fetch_message(&moved).await.unwrap().summary.subject,
+        "travelling"
+    );
+}
+
+#[tokio::test]
+async fn a_message_without_an_id_is_found_by_its_header() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_placement = true;
+    let raw = mail(
+        "no id",
+        "Alice <alice@example.org>",
+        "me@example.com",
+        "",
+        "Hello\n",
+    );
+    deliver(&server, "INBOX", &raw, &[]);
+    deliver(&server, "Trash", &raw, &[]);
+    let id = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    let moved = store
+        .move_message(&id, &FolderId::new("Trash"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch_message(&moved).await.unwrap().summary.subject,
+        "no id"
+    );
+    // Not the one that was there already.
+    assert!(moved.as_str().starts_with("1000.2."), "{moved:?}");
+}
+
+#[tokio::test]
+async fn a_saved_draft_is_found_where_the_server_says_it_went() {
+    let (server, store) = plain().await;
+    deliver(&server, "Drafts", &simple("other"), &[]);
+    let draft = Draft {
+        to: vec![Address::new("alice@example.org")],
+        subject: "Later".into(),
+        body: "First try\n".into(),
+        ..Draft::default()
+    };
+    sent_since(&server);
+    let id = store.save_draft(&draft).await.unwrap();
+    let sent = sent_since(&server);
+    assert_eq!(only(&sent, "APPEND"), 1, "{sent:?}");
+    assert_eq!(only(&sent, "UID SEARCH"), 0, "{sent:?}");
+    assert_eq!(only(&sent, "STATUS"), 0, "{sent:?}");
+    assert_eq!(
+        store.fetch_message(&id).await.unwrap().summary.subject,
+        "Later"
+    );
+    // Without the server saying, it is looked for.
+    server.state.lock().unwrap().no_placement = true;
+    let again = store.save_draft(&draft).await.unwrap();
+    assert_ne!(again, id);
+    assert_eq!(
+        store.fetch_message(&again).await.unwrap().summary.subject,
+        "Later"
+    );
+    // And a server without `UIDPLUS` is asked for the next UID, too.
+    server.state.lock().unwrap().no_uidplus = true;
+    let other = ImapMailStore::new(settings(&server, Security::None), login(), Address::new(ME));
+    sent_since(&server);
+    let third = other.save_draft(&draft).await.unwrap();
+    assert!(sent_since(&server).iter().any(|c| c.starts_with("STATUS")));
+    assert_eq!(
+        other.fetch_message(&third).await.unwrap().summary.subject,
+        "Later"
+    );
+}
+
+#[tokio::test]
+async fn flags_to_set_or_clear_go_in_one_command_each() {
+    let (server, store) = plain().await;
+    let id = first_message(&server, &store, "INBOX").await;
+    sent_since(&server);
+    store
+        .update_flags(
+            &id,
+            FlagsUpdate {
+                read: Some(true),
+                flagged: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(only(&sent_since(&server), "UID STORE"), 1);
+    store
+        .update_flags(
+            &id,
+            FlagsUpdate {
+                read: Some(false),
+                flagged: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(only(&sent_since(&server), "UID STORE"), 1);
+    store
+        .update_flags(
+            &id,
+            FlagsUpdate {
+                read: Some(true),
+                flagged: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(only(&sent_since(&server), "UID STORE"), 2);
+    let m = &store
+        .list_messages(&FolderId::new("INBOX"), Page::first(1))
+        .await
+        .unwrap()
+        .messages[0];
+    assert!(m.flags.read && !m.flags.flagged);
+}

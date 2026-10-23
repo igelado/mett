@@ -86,6 +86,9 @@ pub struct State {
     /// Says it can do `LIST-STATUS` even if it is left out (and then
     /// refuses it): a server that says more than it does.
     pub advertise_list_status: bool,
+    /// Says nothing of where `COPY`, `MOVE` and `APPEND` put a message
+    /// (`COPYUID`, `APPENDUID`), `UIDPLUS` or not.
+    pub no_placement: bool,
     /// Every command the clients sent, as written after its tag, in order.
     pub commands: Vec<String>,
     /// How many commands came before the answer to the one before them.
@@ -535,6 +538,7 @@ impl Session {
                 .and_then(|(_, f)| f.split_once(')'))
                 .map(|(f, _)| f.split_whitespace().map(str::to_owned).collect())
                 .unwrap_or_default();
+            let placing = !(state.no_uidplus || state.no_placement);
             let Some(folder) = state.folders.iter_mut().find(|f| f.name == name) else {
                 out.push_str(&format!("{tag} NO [TRYCREATE] no such folder\r\n"));
                 return;
@@ -549,10 +553,14 @@ impl Session {
                 internal: "21-Oct-2026 09:00:00 +0000".into(),
                 raw: literal.unwrap_or_default(),
             });
-            out.push_str(&format!(
-                "{tag} OK [APPENDUID {} {uid}] done\r\n",
-                folder.validity
-            ));
+            if placing {
+                out.push_str(&format!(
+                    "{tag} OK [APPENDUID {} {uid}] done\r\n",
+                    folder.validity
+                ));
+            } else {
+                out.push_str(&format!("{tag} OK done\r\n"));
+            }
         } else if upper == "EXPUNGE" || upper.starts_with("UID EXPUNGE ") {
             if upper.starts_with("UID") && state.no_uidplus {
                 out.push_str(&format!("{tag} BAD not supported\r\n"));
@@ -659,7 +667,22 @@ impl Session {
                     line.push_str(&format!(" BODYSTRUCTURE {}", structure(&m.raw)));
                 }
                 let mut bytes = line.into_bytes();
-                if items.contains("BODY.PEEK[HEADER]") {
+                if items.contains("BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]") {
+                    let mut header: Vec<u8> = header_of(&m.raw)
+                        .split(|b| *b == b'\n')
+                        .filter(|l| l.len() > 11 && l[..11].eq_ignore_ascii_case(b"message-id:"))
+                        .flat_map(|l| [l, b"\n"].concat())
+                        .collect();
+                    header.extend(b"\r\n");
+                    let header = String::from_utf8_lossy(&header);
+                    bytes.extend(
+                        format!(
+                            " BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}\r\n{header}",
+                            header.len()
+                        )
+                        .into_bytes(),
+                    );
+                } else if items.contains("BODY.PEEK[HEADER]") {
                     let header = header_of(&m.raw);
                     bytes.extend(format!(" BODY[HEADER] {{{}}}\r\n", header.len()).into_bytes());
                     bytes.extend(header);
@@ -726,18 +749,39 @@ impl Session {
             if moving {
                 source.messages.retain(|m| !chosen.contains(&m.uid));
             }
+            let placing = !(state.no_uidplus || state.no_placement);
             let Some(target) = state.folders.iter_mut().find(|f| f.name == dest) else {
                 out.push_str(&format!("{tag} NO [TRYCREATE] no such folder\r\n"));
                 return;
             };
+            let (mut from, mut to) = (Vec::new(), Vec::new());
             for mut m in taken {
+                from.push(m.uid.to_string());
                 m.uid = target.next_uid;
+                to.push(m.uid.to_string());
                 target.next_uid += 1;
                 target.modseq += 1;
                 m.modseq = target.modseq;
                 target.messages.push(m);
             }
-            out.push_str(&format!("{tag} OK done\r\n"));
+            // With `UIDPLUS`, where they went: with `MOVE` in an untagged
+            // answer, with `COPY` in the tagged one.
+            let code = if !placing || from.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "[COPYUID {} {} {}] ",
+                    target.validity,
+                    from.join(","),
+                    to.join(",")
+                )
+            };
+            if moving && !code.is_empty() {
+                out.push_str(&format!("* OK {code}moved\r\n"));
+                out.push_str(&format!("{tag} OK done\r\n"));
+            } else {
+                out.push_str(&format!("{tag} OK {code}done\r\n"));
+            }
         } else {
             out.push_str(&format!("{tag} BAD unknown UID command\r\n"));
         }

@@ -71,6 +71,13 @@ attachments) doesn't select its folder again if it is selected. Listings and
 syncs always select, for the counts and `UIDNEXT` they need new, and a command
 that failed makes the next select again.
 
+A moved, copied or saved message is a new one, with a new `UID`. With `UIDPLUS`
+the server says which (`COPYUID`, `APPENDUID`), and that is all it takes: a move
+is the `FETCH` of its `Message-ID:` and the `STATUS` of the target (sent together,
+in case the server says nothing) and the `MOVE`. Where it doesn't say, the message
+is found again in the target by its `Message-ID:` (only that header is fetched of the
+candidates). The flags to set go in one `STORE`, and those to clear in another.
+
 The configuration (`imaps://` URLs, `imap_user`, `imap_pass`, `smtp_url`,
 `ssl_*`) is described in [docs/MUTTRC.md](../../docs/MUTTRC.md) §4.13.
 

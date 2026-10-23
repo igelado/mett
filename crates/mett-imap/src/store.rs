@@ -4,7 +4,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_imap::Session;
-use async_imap::imap_proto::{MailboxDatum, NameAttribute, Response, Status, StatusAttribute};
+use async_imap::imap_proto::rfc4315::UidSetMember;
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, MessageSection, NameAttribute, RequestId, Response, ResponseCode,
+    SectionPath, Status, StatusAttribute,
+};
 use async_imap::types::{Fetch, Flag};
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
@@ -56,6 +60,9 @@ fn by_arrival(caps: &Caps) -> bool {
 /// How many messages a sync takes in at a time (the summaries of a round of
 /// `sync_folder`), whatever the number of `FETCH` commands that takes.
 const SYNC_BATCH: usize = 100;
+
+/// What to ask of a message to know its `Message-ID:`.
+const IDS: &str = "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])";
 
 /// The whole message.
 const WHOLE: &str = "(UID FLAGS INTERNALDATE BODY.PEEK[])";
@@ -445,6 +452,10 @@ struct Batch {
     listed: Vec<Listed>,
     /// What `STATUS` said (also in the listing, with `LIST-STATUS`).
     counts: Counts,
+    /// The `UIDNEXT` that `STATUS` said of folders.
+    next: HashMap<String, u32>,
+    /// The headers that `FETCH` said of messages, by `UID`.
+    headers: HashMap<u32, Vec<u8>>,
     /// How each command ended, in the order they were sent.
     ended: Vec<Res<()>>,
 }
@@ -475,6 +486,8 @@ async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
     let mut got = Batch {
         listed: Vec::new(),
         counts: Counts::new(),
+        next: HashMap::new(),
+        headers: HashMap::new(),
         ended: Vec::new(),
     };
     let mut ended: Vec<Option<Res<()>>> = commands.iter().map(|_| None).collect();
@@ -495,15 +508,36 @@ async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
             )),
             Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
                 let (mut unseen, mut total) = (0, 0);
+                let name = decode_utf7_imap(mailbox.to_string());
                 for attribute in status {
                     match attribute {
                         StatusAttribute::Unseen(n) => unseen = *n,
                         StatusAttribute::Messages(n) => total = *n,
+                        StatusAttribute::UidNext(n) => {
+                            got.next.insert(name.clone(), *n);
+                        }
                         _ => {}
                     }
                 }
-                got.counts
-                    .insert(decode_utf7_imap(mailbox.to_string()), (unseen, total));
+                got.counts.insert(name, (unseen, total));
+            }
+            Response::Fetch(_, attributes) => {
+                let mut uid = None;
+                let mut header = None;
+                for attribute in attributes {
+                    match attribute {
+                        AttributeValue::Uid(n) => uid = Some(*n),
+                        AttributeValue::BodySection {
+                            section: Some(SectionPath::Full(MessageSection::Header)),
+                            data: Some(data),
+                            ..
+                        } => header = Some(data.to_vec()),
+                        _ => {}
+                    }
+                }
+                if let (Some(uid), Some(header)) = (uid, header) {
+                    got.headers.insert(uid, header);
+                }
             }
             Response::Done {
                 tag,
@@ -1294,9 +1328,16 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let r = bounded(t, async {
             let live = g.live();
             select_ref(live, &at).await?;
-            for (name, on) in [("\\Seen", update.read), ("\\Flagged", update.flagged)] {
-                if let Some(on) = on {
-                    flag(live, &at, if on { '+' } else { '-' }, name).await?;
+            // One command for the flags to set and one for those to clear.
+            let wanted = [("\\Seen", update.read), ("\\Flagged", update.flagged)];
+            for (sign, on) in [('+', true), ('-', false)] {
+                let names: Vec<&str> = wanted
+                    .iter()
+                    .filter(|(_, want)| *want == Some(on))
+                    .map(|(name, _)| *name)
+                    .collect();
+                if !names.is_empty() {
+                    flag(live, &at, sign, &names).await?;
                 }
             }
             Ok(())
@@ -1329,10 +1370,10 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
         let (draft, threading) = self.prepared(draft).await?;
         let composed = mett_smtp::compose(&draft, &self.from, &threading)?;
-        let drafts = self.well_known_folder(WellKnownFolder::Drafts).await?;
+        let drafts = self.well_known_id(WellKnownFolder::Drafts).await?;
         let id = self
             .store(
-                &drafts.id,
+                &drafts,
                 &composed.kept,
                 "(\\Draft \\Seen)",
                 &composed.message_id,
@@ -1349,6 +1390,22 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
 }
 
 impl<A: Authenticator> ImapMailStore<A> {
+    /// The folder that has the role `which`, without asking the server how
+    /// many messages it holds (which is not what is wanted of it).
+    async fn well_known_id(&self, which: WellKnownFolder) -> Result<FolderId> {
+        let mut g = self.lock().await?;
+        let t = g.timeout;
+        let r = bounded(t, async {
+            let all = all_folders(g.live(), false).await?;
+            all.iter()
+                .find(|l| l.role == Some(which))
+                .map(|l| FolderId::new(&l.name))
+                .ok_or_else(|| Fail::Core(Error::not_found("folder", which)))
+        })
+        .await;
+        g.done(r)
+    }
+
     /// A message as the server has it.
     async fn raw(&self, id: &MessageId) -> Result<Vec<u8>> {
         let at = Ref::parse(id)?;
@@ -1376,33 +1433,64 @@ impl<A: Authenticator> ImapMailStore<A> {
         let r = bounded(t, async {
             let live = g.live();
             select_ref(live, &at).await?;
-            // Its `Message-ID:` finds it again where it goes: the server
-            // gives it a new UID, and says which only to some clients.
-            let header = fetch(live, &[at.uid], SUMMARY, false).await?;
-            let Some(header) = header.first() else {
+            // Its `Message-ID:` finds it again where it goes, if the server
+            // doesn't say where it went (`UIDPLUS` does): it gets a new UID.
+            // What is needed of the server before is asked together.
+            let uids = at.uid.to_string();
+            let target = quoted(&wire(to.as_str()))?;
+            let mut got = batch(
+                live,
+                &[
+                    format!("UID FETCH {uids} {IDS}"),
+                    format!("STATUS {target} (UIDNEXT)"),
+                ],
+            )
+            .await?;
+            let mut ended = got.ended.into_iter();
+            ended.next().expect("one end for each command")?;
+            let Some(ids) = got.headers.remove(&at.uid) else {
                 return Err(Error::not_found("message", id).into());
             };
-            let wanted = parse::threading(&header.data)?.0;
-            let before = live
-                .session
-                .status(wire(to.as_str()), "(UIDNEXT)")
-                .await?
-                .uid_next;
-            let uids = at.uid.to_string();
-            if moving && live.caps.moves {
-                live.session.uid_mv(&uids, wire(to.as_str())).await?;
+            ended.next().expect("one end for each command")?;
+            let before = got.next.into_values().next();
+            let wanted = if ids.trim_ascii().is_empty() {
+                None
+            } else {
+                parse::threading(&ids)?.0
+            };
+            // Without a `Message-ID:` it is found by its whole header.
+            let header = if wanted.is_some() {
+                Vec::new()
+            } else {
+                let found = fetch(live, &[at.uid], SUMMARY, false).await?;
+                let Some(found) = found.into_iter().next() else {
+                    return Err(Error::not_found("message", id).into());
+                };
+                found.data
+            };
+            let landed = if moving && live.caps.moves {
+                run(live, &format!("UID MOVE {uids} {target}")).await?
             } else {
                 if moving {
                     // Before the copy: a message that is copied and can't
                     // be deleted is in two folders.
                     expungeable(live)?;
                 }
-                live.session.uid_copy(&uids, wire(to.as_str())).await?;
+                let landed = run(live, &format!("UID COPY {uids} {target}")).await?;
                 if moving {
                     expunge(live, &at).await?;
                 }
+                landed
+            };
+            if let Some((validity, uid)) = landed.and_then(|l| l.of(Some(at.uid))) {
+                return Ok(Ref {
+                    folder: to.as_str().to_owned(),
+                    validity,
+                    uid,
+                }
+                .id());
             }
-            locate(live, to.as_str(), wanted.as_deref(), before, &header.data).await
+            locate(live, to.as_str(), wanted.as_deref(), before, &header).await
         })
         .await;
         g.done(r)
@@ -1420,14 +1508,24 @@ impl<A: Authenticator> ImapMailStore<A> {
         let t = g.timeout;
         let r = bounded(t, async {
             let live = g.live();
-            let before = live
-                .session
-                .status(wire(folder.as_str()), "(UIDNEXT)")
-                .await?
-                .uid_next;
-            live.session
-                .append(wire(folder.as_str()), Some(flags), None, message)
-                .await?;
+            // Where the server says it went (`UIDPLUS`), else what was next.
+            let before = if live.caps.uidplus {
+                None
+            } else {
+                live.session
+                    .status(wire(folder.as_str()), "(UIDNEXT)")
+                    .await?
+                    .uid_next
+            };
+            let landed = append(live, folder.as_str(), flags, message).await?;
+            if let Some((validity, uid)) = landed.and_then(|l| l.of(None)) {
+                return Ok(Ref {
+                    folder: folder.as_str().to_owned(),
+                    validity,
+                    uid,
+                }
+                .id());
+            }
             locate(live, folder.as_str(), Some(message_id), before, &[]).await
         })
         .await;
@@ -1480,12 +1578,16 @@ fn expungeable(live: &Live) -> Res<()> {
     .into())
 }
 
-/// Changes the flags of the message `at` in the selected folder: `sign` is
-/// `+` or `-`. A message that is no longer there is [`Error::NotFound`].
-async fn flag(live: &mut Live, at: &Ref, sign: char, flag: &str) -> Res<()> {
+/// Changes the flags of the message `at` in the selected folder, with a
+/// command for all of them: `sign` is `+` or `-`. A message that is no longer
+/// there is [`Error::NotFound`].
+async fn flag(live: &mut Live, at: &Ref, sign: char, flags: &[&str]) -> Res<()> {
     let changed: Vec<Fetch> = live
         .session
-        .uid_store(at.uid.to_string(), format!("{sign}FLAGS ({flag})"))
+        .uid_store(
+            at.uid.to_string(),
+            format!("{sign}FLAGS ({})", flags.join(" ")),
+        )
         .await?
         .try_collect()
         .await?;
@@ -1498,7 +1600,7 @@ async fn flag(live: &mut Live, at: &Ref, sign: char, flag: &str) -> Res<()> {
 /// Deletes the message `at` from the selected folder.
 async fn expunge(live: &mut Live, at: &Ref) -> Res<()> {
     expungeable(live)?;
-    flag(live, at, '+', "\\Deleted").await?;
+    flag(live, at, '+', &["\\Deleted"]).await?;
     let _: Vec<u32> = live
         .session
         .uid_expunge(at.uid.to_string())
@@ -1506,6 +1608,168 @@ async fn expunge(live: &mut Live, at: &Ref) -> Res<()> {
         .try_collect()
         .await?;
     Ok(())
+}
+
+/// Where a server says messages it copied, moved or appended went
+/// (`COPYUID`, `APPENDUID` of `UIDPLUS`).
+struct Landed {
+    /// The `UIDVALIDITY` of the folder they are in.
+    validity: u32,
+    /// The `UID`s they had, for a copy or a move.
+    from: Vec<u32>,
+    /// The `UID`s they have.
+    to: Vec<u32>,
+}
+
+impl Landed {
+    /// The `UIDVALIDITY` and `UID` of the message that was `from` (for a copy
+    /// or a move) or, for an append, the one that was appended.
+    fn of(&self, from: Option<u32>) -> Option<(u32, u32)> {
+        let uid = match from {
+            Some(from) => self.to.get(self.from.iter().position(|uid| *uid == from)?),
+            None if self.from.is_empty() && self.to.len() == 1 => self.to.first(),
+            None => None,
+        };
+        Some((self.validity, *uid?))
+    }
+}
+
+/// The `UID`s of a set a server says, unless there are too many.
+fn members(set: &[UidSetMember]) -> Option<Vec<u32>> {
+    let mut uids = Vec::new();
+    for member in set {
+        match member {
+            UidSetMember::Uid(uid) => uids.push(*uid),
+            UidSetMember::UidRange(range) => uids.extend(range.clone().take(10_000)),
+        }
+        if uids.len() > 10_000 {
+            return None;
+        }
+    }
+    Some(uids)
+}
+
+/// Where a response code says messages went, if it does.
+fn landed(code: &ResponseCode<'_>) -> Option<Landed> {
+    match code {
+        ResponseCode::CopyUid(validity, from, to) => Some(Landed {
+            validity: *validity,
+            from: members(from)?,
+            to: members(to)?,
+        }),
+        ResponseCode::AppendUid(validity, to) => Some(Landed {
+            validity: *validity,
+            from: Vec::new(),
+            to: members(to)?,
+        }),
+        _ => None,
+    }
+}
+
+/// The next response, within the time the server is given (a macro, as the
+/// library's type of one can't be named).
+macro_rules! next_response {
+    ($live:expr) => {{
+        let live: &mut Live = $live;
+        let response = within(live.timeout, live.session.read_response())
+            .await
+            .map_err(Fail::Core)?
+            .map_err(async_imap::error::Error::Io)?;
+        match response {
+            Some(response) => response,
+            None => return Err(async_imap::error::Error::ConnectionLost.into()),
+        }
+    }};
+}
+
+/// Reads the answers to the command `id` and says where they went, if the
+/// server does (a `MOVE` says it before the end, a `COPY` or an `APPEND` at
+/// the end).
+async fn finished(live: &mut Live, id: &RequestId) -> Res<Option<Landed>> {
+    let mut found = None;
+    loop {
+        let response = next_response!(live);
+        match response.parsed() {
+            Response::Data { outcome, .. } => {
+                found = outcome.code.as_ref().and_then(landed).or(found);
+            }
+            Response::Done {
+                tag,
+                status,
+                outcome,
+            } if tag.0 == id.0 => {
+                let why = outcome
+                    .information
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_owned();
+                return match status {
+                    Status::Ok => Ok(outcome.code.as_ref().and_then(landed).or(found)),
+                    Status::No => Err(async_imap::error::Error::No(why).into()),
+                    _ => Err(async_imap::error::Error::Bad(why).into()),
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Runs `command` (a `COPY` or a `MOVE`) and says where the message went,
+/// if the server does.
+async fn run(live: &mut Live, command: &str) -> Res<Option<Landed>> {
+    let id = within(live.timeout, live.session.run_command(command))
+        .await
+        .map_err(Fail::Core)??;
+    finished(live, &id).await
+}
+
+/// Appends `message` to `folder`, and says where it went, if the server
+/// does (`UIDPLUS`).
+async fn append(live: &mut Live, folder: &str, flags: &str, message: &[u8]) -> Res<Option<Landed>> {
+    // The library doesn't tell what the server says at the end of an
+    // `APPEND`, so it is sent here (as text: that is what it sends).
+    let (true, Ok(text)) = (live.caps.uidplus, std::str::from_utf8(message)) else {
+        live.session
+            .append(wire(folder), Some(flags), None, message)
+            .await?;
+        return Ok(None);
+    };
+    let command = format!(
+        "APPEND {} {flags} {{{}}}",
+        quoted(&wire(folder))?,
+        message.len()
+    );
+    let id = within(live.timeout, live.session.run_command(command))
+        .await
+        .map_err(Fail::Core)??;
+    // The server says to go on, or why it won't.
+    loop {
+        let response = next_response!(live);
+        match response.parsed() {
+            Response::Continue { .. } => break,
+            Response::Done {
+                tag,
+                status,
+                outcome,
+            } if tag.0 == id.0 => {
+                let why = outcome
+                    .information
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_owned();
+                return Err(match status {
+                    Status::Bad => async_imap::error::Error::Bad(why),
+                    _ => async_imap::error::Error::No(why),
+                }
+                .into());
+            }
+            _ => {}
+        }
+    }
+    within(live.timeout, live.session.run_command_untagged(text))
+        .await
+        .map_err(Fail::Core)??;
+    finished(live, &id).await
 }
 
 /// What the message that went into `folder` is called there: the newest
@@ -1536,7 +1800,9 @@ async fn locate(
     let mut candidates: Vec<u32> = search(live, &query).await?;
     candidates.retain(|uid| before.is_none_or(|before| *uid >= before));
     candidates.truncate(LOOKED_AT);
-    let headers = fetch(live, &candidates, SUMMARY, false).await?;
+    // Their `Message-ID:` is all that is looked at, where there is one.
+    let what = if wanted.is_some() { IDS } else { SUMMARY };
+    let headers = fetch(live, &candidates, what, false).await?;
     let found = headers
         .iter()
         .filter(|f| match wanted {
@@ -1576,9 +1842,9 @@ impl<A: Authenticator> MailSender for ImapMailStore<A> {
         // a draft that can't be deleted is the user's to tidy up. A copy
         // that can't be kept is said, as a sent message, not a failed one.
         let copied = if draft.save_copy {
-            match self.well_known_folder(WellKnownFolder::SentItems).await {
+            match self.well_known_id(WellKnownFolder::SentItems).await {
                 Ok(sent) => self
-                    .store(&sent.id, &kept, "(\\Seen)", &message_id)
+                    .store(&sent, &kept, "(\\Seen)", &message_id)
                     .await
                     .map(drop),
                 Err(e) => Err(e),
