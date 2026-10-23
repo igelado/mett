@@ -34,6 +34,10 @@ pub struct Composed {
 /// Writes `draft` as a message from `from` (unless the draft says
 /// another sender), threaded as `threading` says.
 ///
+/// The attachments are `draft.attachments`: the caller puts in those a
+/// forward or a recalled draft takes from the message it comes from (less
+/// the draft's `drop_attachments`), which it can fetch and this can't.
+///
 /// Fails with [`Error::NotSent`] if an address isn't one, or there is
 /// no recipient.
 pub fn compose(draft: &Draft, from: &Address, threading: &Threading) -> Result<Composed> {

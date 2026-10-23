@@ -249,8 +249,8 @@ fn not_sent(e: Error) -> Error {
 ///
 /// A server's answer (4xx or 5xx) tells that the message wasn't taken:
 /// it is a [`Error::Backend`] or, for refused logins, an [`Error::Auth`].
-/// A failure to set up TLS, or of the client's own, comes before anything
-/// is sent. Anything else
+/// A failure to set up TLS (including a certificate not trusted), or of the
+/// client's own, comes before anything is sent. Anything else
 /// (a lost connection, a timeout) may have come after the server took the
 /// message, so it is an [`Error::Network`], which the user is told may have
 /// gone out.
@@ -271,8 +271,24 @@ fn failure(e: &smtp::Error, host: &str) -> Error {
     }
     // A failure of the client's own (the server has no STARTTLS or no login
     // we can use) comes before anything is sent.
-    if e.is_tls() || e.is_client() {
+    if e.is_tls() || e.is_client() || handshake_failed(e) {
         return Error::NotSent(format!("{host}: {e}"));
     }
     Error::Network(format!("{host}: {e}"))
+}
+
+/// Whether `e` is a TLS handshake that failed (say, on a certificate we
+/// don't trust), which lettre reports as a connection error like a
+/// refused connection: the I/O error under it is the handshake's.
+fn handshake_failed(e: &smtp::Error) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::InvalidData
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }

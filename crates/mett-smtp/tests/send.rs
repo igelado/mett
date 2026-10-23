@@ -277,7 +277,7 @@ async fn refuses_a_certificate_it_does_not_trust() {
         .send(&draft(), &Threading::default())
         .await
         .unwrap_err();
-    assert!(!matches!(error, Error::Backend(_)), "{error}");
+    assert!(matches!(error, Error::NotSent(_)), "{error}");
     assert!(server.seen.lock().unwrap().is_empty());
 }
 
