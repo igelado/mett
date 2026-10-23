@@ -137,7 +137,7 @@ impl Live {
             total: app.total_messages(),
             flagged,
             deleted: app.deleted_count(),
-            limited: app.limit.as_ref().map(|_| app.shown_count()),
+            limited: app.index.limit.as_ref().map(|_| app.shown_count()),
         }
     }
 }
@@ -425,7 +425,10 @@ mod tests {
     /// Opens the selected message, `words` words long.
     fn read(app: &mut App, words: usize) {
         let fetch = first_request(&act(app, crate::action::Action::DisplayMessage));
-        let id = app.messages[app.selected].id.as_str().to_owned();
+        let id = app.index.messages[app.index.selected]
+            .id
+            .as_str()
+            .to_owned();
         let mut message = mock::message(&id, "in", "Subject", chrono::DateTime::UNIX_EPOCH);
         message.body.content = "word ".repeat(words);
         respond(app, fetch, Event::MessageFetched(Ok(message)));

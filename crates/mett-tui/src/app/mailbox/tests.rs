@@ -71,7 +71,7 @@ fn marks_and_purges_deleted_messages() {
     let mut app = app(settings());
     act(&mut app, Action::DeleteMessage);
     assert!(app.is_deleted(&"m0".into()));
-    assert_eq!(app.selected, 1, "moved on");
+    assert_eq!(app.index.selected, 1, "moved on");
     act(&mut app, Action::DeleteMessage);
     act(&mut app, Action::PreviousEntry);
     act(&mut app, Action::UndeleteMessage);
@@ -98,7 +98,7 @@ fn marks_and_purges_deleted_messages() {
     assert_eq!(ids(&app), ["m1", "m2"]);
     assert_eq!(app.status, "1 message purged.");
     // `u` moved on to m2, which stays selected.
-    assert_eq!(ids(&app)[app.selected], "m2");
+    assert_eq!(ids(&app)[app.index.selected], "m2");
 }
 
 #[test]
@@ -147,16 +147,16 @@ fn flags_and_toggles_new() {
         request,
         Request::UpdateFlags(_, update) if update == FlagsUpdate::flagged(true)
     ));
-    assert!(app.messages[0].flags.flagged);
+    assert!(app.index.messages[0].flags.flagged);
     respond(&mut app, id, Event::FlagsUpdated(Err(offline())));
-    assert!(!app.messages[0].flags.flagged, "undone");
+    assert!(!app.index.messages[0].flags.flagged, "undone");
 
     let (_, request) = sent(&act(&mut app, Action::ToggleNew));
     assert!(matches!(
         request,
         Request::UpdateFlags(_, update) if update == FlagsUpdate::read(true)
     ));
-    assert!(app.messages[0].flags.read);
+    assert!(app.index.messages[0].flags.read);
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn changes_folder() {
         ))),
     );
     assert!(matches!(sent(&effects).1, Request::ListMessages { .. }));
-    assert!(app.messages.is_empty());
+    assert!(app.index.messages.is_empty());
     assert_eq!(app.folder.as_ref().unwrap().name, "Sent Items");
 
     // A folder that isn't there leaves the user where they were.
@@ -319,7 +319,7 @@ fn flag_changes_to_a_message_go_out_one_at_a_time() {
     let (first, _) = sent(&act(&mut app, Action::FlagMessage));
     // Toggled back before the first change is saved: it waits.
     assert!(act(&mut app, Action::FlagMessage).is_empty());
-    assert!(!app.messages[0].flags.flagged);
+    assert!(!app.index.messages[0].flags.flagged);
     let effects = respond(&mut app, first, Event::FlagsUpdated(Ok(())));
     let (second, request) = sent(&effects);
     assert!(matches!(
@@ -338,7 +338,7 @@ fn flag_changes_to_a_message_go_out_one_at_a_time() {
     act(&mut app, Action::FlagMessage);
     let effects = respond(&mut app, second, Event::FlagsUpdated(Err(offline())));
     assert!(effects.is_empty(), "{effects:?}");
-    assert!(app.messages[0].flags.flagged);
+    assert!(app.index.messages[0].flags.flagged);
     assert!(!app.saving());
 
     // Toggled three times while the first is on its way, and the
@@ -653,9 +653,9 @@ fn resolve_waits_for_the_next_page() {
     let effects = listed(&mut app, first, vec![message("m0", 9)], Some("c"));
     let (second, _) = sent(&effects);
     act(&mut app, Action::DeleteMessage);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     listed(&mut app, second, vec![message("m1", 8)], None);
-    assert_eq!(app.selected, 1, "moved on once it arrived");
+    assert_eq!(app.index.selected, 1, "moved on once it arrived");
 }
 
 #[test]
@@ -785,7 +785,7 @@ fn a_message_being_copied_is_not_moved() {
     );
     // Flags can change while it is only copied (once it is).
     assert!(act(&mut app, Action::FlagMessage).is_empty());
-    assert!(app.messages[0].flags.flagged);
+    assert!(app.index.messages[0].flags.flagged);
 }
 
 #[test]
@@ -934,7 +934,7 @@ fn a_save_question_keeps_its_message() {
     let mut app = app(settings());
     act(&mut app, Action::SaveMessage);
     // The index moves on meanwhile (say, a relist).
-    app.selected = 2;
+    app.index.selected = 2;
     let (_, request) = sent(&answer(&mut app, "=Archive"));
     assert!(matches!(request, Request::Transfer { ref ids, .. } if ids == &[MessageId::new("m0")]));
 }
@@ -947,9 +947,12 @@ fn a_relist_keeps_flag_changes_on_their_way() {
     // unflagged.
     let (list, _) = sent(&app.relist());
     listed(&mut app, list, vec![m0().summary], None);
-    assert!(app.messages[0].flags.flagged, "still the user's choice");
+    assert!(
+        app.index.messages[0].flags.flagged,
+        "still the user's choice"
+    );
     respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
-    assert!(app.messages[0].flags.flagged);
+    assert!(app.index.messages[0].flags.flagged);
 }
 
 #[test]
@@ -960,11 +963,11 @@ fn a_listing_older_than_a_saved_flag_keeps_it() {
     // Saved before the listing, which was taken earlier, comes back.
     respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
     listed(&mut app, list, vec![m0().summary], None);
-    assert!(app.messages[0].flags.flagged);
+    assert!(app.index.messages[0].flags.flagged);
     // The next listing is newer: it is taken as it is.
     let (list, _) = sent(&app.relist());
     listed(&mut app, list, vec![m0().summary], None);
-    assert!(!app.messages[0].flags.flagged);
+    assert!(!app.index.messages[0].flags.flagged);
 }
 
 #[test]
@@ -1046,7 +1049,7 @@ fn a_purged_message_has_nothing_left_to_save() {
     let mut app = yes();
     let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
     respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::DeleteMessage);
     let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
     purged(&mut app, purge, "m0");
@@ -1098,7 +1101,7 @@ fn no_replies_to_a_message_being_moved() {
     let mut app = app(settings());
     act(&mut app, Action::SaveMessage);
     sent(&answer(&mut app, "=Archive"));
-    app.selected = 0;
+    app.index.selected = 0;
     for action in [Action::Reply, Action::GroupReply, Action::Forward] {
         assert!(act(&mut app, action).is_empty());
         assert_eq!(
@@ -1115,7 +1118,7 @@ fn a_save_that_works_the_second_time_is_not_a_failure() {
     let (id, _) = sent(&answer(&mut app, "=Archive"));
     transferred(&mut app, id, "archive", "m0", Err(offline()));
     assert!(!app.save_failures().is_empty());
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::SaveMessage);
     let (id, _) = sent(&answer(&mut app, "=Archive"));
     transferred(&mut app, id, "archive", "m0", Ok("a0"));
@@ -1128,7 +1131,7 @@ fn a_message_moved_into_the_open_folder_leaves_its_old_id() {
     act(&mut app, Action::SaveMessage);
     let (id, _) = sent(&answer(&mut app, "=@inbox"));
     let effects = transferred(&mut app, id, "in", "m0", Ok("n0"));
-    assert!(!app.messages.iter().any(|m| m.id.as_str() == "m0"));
+    assert!(!app.index.messages.iter().any(|m| m.id.as_str() == "m0"));
     assert!(
         matches!(sent(&effects).1, Request::ListMessages { .. }),
         "listed again"
@@ -1216,7 +1219,7 @@ fn a_partly_undone_change_keeps_only_what_still_failed() {
 fn a_listing_older_than_a_purge_does_not_bring_it_back() {
     let mut app = yes();
     act(&mut app, Action::DeleteMessage);
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::CopyMessage);
     let (copy, _) = sent(&answer(&mut app, "=@inbox"));
     assert!(
@@ -1231,7 +1234,7 @@ fn a_listing_older_than_a_purge_does_not_bring_it_back() {
     purged(&mut app, purge, "m0");
     let messages = plain(&["m0", "c0", "m1"]);
     listed(&mut app, list, messages, None);
-    assert!(!app.messages.iter().any(|m| m.id.as_str() == "m0"));
+    assert!(!app.index.messages.iter().any(|m| m.id.as_str() == "m0"));
 }
 
 fn lists_folders(effects: &[Effect]) -> bool {
@@ -1247,7 +1250,7 @@ fn an_off_screen_flag_retry_goes_out_once() {
     signed_out(&mut app);
     respond(&mut app, flag, Event::FlagsUpdated(Err(expired())));
     // Its folder isn't open any more.
-    app.messages.clear();
+    app.index.messages.clear();
     let first = app.retry();
     assert!(matches!(sent(&first).1, Request::UpdateFlags(..)));
     assert!(
@@ -1289,7 +1292,7 @@ fn an_answered_question_forgets_its_browser() {
 
 fn purge_failed_for_sign_in(app: &mut App) {
     act(app, Action::DeleteMessage);
-    app.selected = 0;
+    app.index.selected = 0;
     let (purge, _) = sent(&act(app, Action::SyncMailbox));
     signed_out(app);
     respond(app, purge, Event::Purged(Err(expired())));
@@ -1314,7 +1317,7 @@ fn declining_a_purge_gives_up_its_retry() {
 fn moving_a_message_away_ends_its_purge_failure() {
     let mut app = yes();
     purge_failed_for_sign_in(&mut app);
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::SaveMessage);
     let (id, _) = sent(&answer(&mut app, "=Archive"));
     transferred(&mut app, id, "archive", "m0", Ok("a0"));
@@ -1359,16 +1362,16 @@ fn flag_failed(app: &mut App) {
 fn an_off_screen_retry_leaves_other_flags_alone() {
     let mut app = app(settings());
     flag_failed(&mut app);
-    let listed = app.messages.clone();
-    app.messages.clear();
+    let listed = app.index.messages.clone();
+    app.index.messages.clear();
     let (retry, _) = sent(&app.retry());
     // Back in the folder before the retry is done; m0 is read there.
-    app.messages = listed;
-    app.messages[0].flags.read = true;
-    app.messages[0].flags.flagged = false;
+    app.index.messages = listed;
+    app.index.messages[0].flags.read = true;
+    app.index.messages[0].flags.flagged = false;
     respond(&mut app, retry, Event::FlagsUpdated(Ok(())));
-    assert!(app.messages[0].flags.flagged);
-    assert!(app.messages[0].flags.read, "untouched");
+    assert!(app.index.messages[0].flags.flagged);
+    assert!(app.index.messages[0].flags.read, "untouched");
     assert!(app.save_failures().is_empty());
 }
 
@@ -1377,7 +1380,7 @@ fn a_listing_showing_a_failed_change_made_settles_it() {
     let mut app = app(settings());
     flag_failed(&mut app);
     // The mailbox had it after all, as a new listing shows.
-    app.messages[0].flags.flagged = true;
+    app.index.messages[0].flags.flagged = true;
     let effects = app.retry();
     assert!(
         !effects
@@ -1393,7 +1396,7 @@ fn a_save_before_a_failure_survives_an_older_listing() {
     let mut app = app(settings());
     let list = request_for(&app.relist(), |r| matches!(r, Request::ListMessages { .. }))
         .expect("listed again");
-    app.messages = plain(&["m0", "m1", "m2"]);
+    app.index.messages = plain(&["m0", "m1", "m2"]);
     let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
     act(&mut app, Action::ToggleNew);
     let effects = respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
@@ -1401,9 +1404,9 @@ fn a_save_before_a_failure_survives_an_older_listing() {
     respond(&mut app, read, Event::FlagsUpdated(Err(offline())));
     // The listing taken before both changes arrives now, into an
     // index it fills afresh.
-    app.messages.clear();
+    app.index.messages.clear();
     listed(&mut app, list, vec![m0().summary], None);
-    assert!(app.messages[0].flags.flagged, "the saved flag stays");
+    assert!(app.index.messages[0].flags.flagged, "the saved flag stays");
     assert!(
         !app.save_failures().is_empty(),
         "the read change still failed"
@@ -1474,19 +1477,19 @@ fn mailbox_shortcuts_name_folders() {
 fn a_change_during_an_off_screen_retry_keeps_the_retry() {
     let mut app = app(settings());
     flag_failed(&mut app);
-    let listed = app.messages.clone();
-    app.messages.clear();
+    let listed = app.index.messages.clone();
+    app.index.messages.clear();
     let (retry, _) = sent(&app.retry());
     // Back in the folder, which still shows m0 unflagged; the user
     // marks it read meanwhile.
-    app.messages = listed;
-    app.messages[0].flags.flagged = false;
-    app.messages[0].flags.read = false;
+    app.index.messages = listed;
+    app.index.messages[0].flags.flagged = false;
+    app.index.messages[0].flags.read = false;
     assert!(
         act(&mut app, Action::ToggleNew).is_empty(),
         "waits its turn"
     );
-    assert!(app.messages[0].flags.flagged, "the retry shows");
+    assert!(app.index.messages[0].flags.flagged, "the retry shows");
     let effects = respond(&mut app, retry, Event::FlagsUpdated(Ok(())));
     let (_, request) = sent(&effects);
     let Request::UpdateFlags(_, update) = request else {
@@ -1502,7 +1505,7 @@ fn a_copy_elsewhere_doesnt_make_up_for_a_failed_one() {
     act(&mut app, Action::CopyMessage);
     let (id, _) = sent(&answer(&mut app, "=Archive"));
     transferred(&mut app, id, "archive", "m0", Err(offline()));
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::CopyMessage);
     let (id, _) = sent(&answer(&mut app, "=Projects"));
     transferred(&mut app, id, "projects", "m0", Ok("p0"));
@@ -1512,7 +1515,7 @@ fn a_copy_elsewhere_doesnt_make_up_for_a_failed_one() {
         "the copy to Archive still failed"
     );
     // Copying to Archive again settles it.
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::CopyMessage);
     let (id, _) = sent(&answer(&mut app, "=Archive"));
     transferred(&mut app, id, "archive", "m0", Ok("c0"));
@@ -1522,14 +1525,14 @@ fn a_copy_elsewhere_doesnt_make_up_for_a_failed_one() {
 #[test]
 fn a_copy_into_the_open_folder_keeps_the_selection() {
     let mut app = app(settings());
-    app.selected = 1;
+    app.index.selected = 1;
     act(&mut app, Action::CopyMessage);
     let (copy, _) = sent(&answer(&mut app, "=@inbox"));
     let effects = transferred(&mut app, copy, "in", "m1", Ok("c1"));
     let (list, _) = sent(&effects);
     let messages = plain(&["c1", "m0", "m1", "m2"]);
     listed(&mut app, list, messages, None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "m1");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "m1");
 }
 
 #[test]
@@ -1545,7 +1548,7 @@ fn a_failed_copy_into_the_open_folder_lists_nothing() {
 fn an_off_screen_retry_survives_an_older_listing() {
     let mut app = app(settings());
     flag_failed(&mut app);
-    app.messages.clear();
+    app.index.messages.clear();
     let (retry, _) = sent(&app.retry());
     // The folder is listed again before the retry is done.
     let list = request_for(&app.relist(), |r| matches!(r, Request::ListMessages { .. }))
@@ -1554,8 +1557,8 @@ fn an_off_screen_retry_survives_an_older_listing() {
     let mut m0 = m0().summary;
     m0.flags.read = true;
     listed(&mut app, list, vec![m0], None);
-    assert!(app.messages[0].flags.flagged, "the retry's flag");
-    assert!(app.messages[0].flags.read, "the rest as listed");
+    assert!(app.index.messages[0].flags.flagged, "the retry's flag");
+    assert!(app.index.messages[0].flags.read, "the rest as listed");
 }
 
 #[test]
@@ -1579,10 +1582,10 @@ fn a_browser_opened_by_hand_replaces_the_one_to_retry() {
 fn a_mark_made_during_a_purge_is_purged_before_quitting() {
     let mut app = yes();
     act(&mut app, Action::DeleteMessage);
-    app.selected = 0;
+    app.index.selected = 0;
     let (purge, _) = sent(&act(&mut app, Action::SyncMailbox));
     // m1 is marked while m0 is purged, then the user quits.
-    app.selected = 1;
+    app.index.selected = 1;
     act(&mut app, Action::DeleteMessage);
     act(&mut app, Action::Quit);
     let effects = purged(&mut app, purge, "m0");
@@ -1596,13 +1599,13 @@ fn a_mark_made_during_a_purge_is_purged_before_quitting() {
 #[test]
 fn unread_chosen_while_loading_stays_unread() {
     let mut app = app(settings());
-    app.messages[0].flags.read = true;
+    app.index.messages[0].flags.read = true;
     let (fetch, _) = sent(&act(&mut app, Action::DisplayMessage));
     let (toggle, _) = sent(&act(&mut app, Action::ToggleNew));
     let effects = respond(&mut app, fetch, Event::MessageFetched(Ok(m0())));
     assert!(effects.is_empty(), "not marked read again: {effects:?}");
     respond(&mut app, toggle, Event::FlagsUpdated(Ok(())));
-    assert!(!app.messages[0].flags.read);
+    assert!(!app.index.messages[0].flags.read);
 }
 
 #[test]
@@ -1612,7 +1615,7 @@ fn a_copy_to_the_same_folder_by_another_name_makes_up_for_a_failed_one() {
     let (id, _) = sent(&answer(&mut app, "=Archive"));
     transferred(&mut app, id, "arc", "m0", Err(offline()));
     assert!(!app.save_failures().is_empty());
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::CopyMessage);
     let (id, _) = sent(&answer(&mut app, "=@archive"));
     transferred(&mut app, id, "arc", "m0", Ok("c0"));
@@ -1628,7 +1631,7 @@ fn a_copy_to_the_same_folder_replaces_its_retry() {
     // The folder was found, but copying needed a sign-in.
     transferred(&mut app, id, "arc", "m0", Err(expired()));
     app.sign_in = None;
-    app.selected = 0;
+    app.index.selected = 0;
     act(&mut app, Action::CopyMessage);
     let (id, _) = sent(&answer(&mut app, "=@archive"));
     transferred(&mut app, id, "arc", "m0", Ok("c0"));
@@ -1645,7 +1648,7 @@ fn copies_to_one_folder_by_two_names_are_retried_once() {
     signed_out(&mut app);
     for name in ["=Archive", "=@archive"] {
         app.sign_in = None;
-        app.selected = 0;
+        app.index.selected = 0;
         act(&mut app, Action::CopyMessage);
         let (id, _) = sent(&answer(&mut app, name));
         transferred(&mut app, id, "arc", "m0", Err(expired()));
@@ -1670,7 +1673,7 @@ fn the_pager_s_message_is_the_one_acted_on() {
     });
     show_m0(&mut app);
     // A background listing moves the index's selection meanwhile.
-    app.selected = 1;
+    app.index.selected = 1;
     act(&mut app, Action::DeleteMessage);
     assert!(app.is_deleted(&"m0".into()));
     assert!(!app.is_deleted(&"m1".into()));
@@ -1681,7 +1684,7 @@ fn marking_in_the_pager_goes_on_from_its_message() {
     let mut app = app(settings());
     show_m0(&mut app);
     // A background listing moves the index's selection meanwhile.
-    app.selected = 2;
+    app.index.selected = 2;
     let (_, request) = sent(&act(&mut app, Action::DeleteMessage));
     assert_eq!(
         request,

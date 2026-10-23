@@ -513,13 +513,13 @@ fn tab_gives_the_sidebar_the_keys() {
     assert_eq!(app.menu(), Menu::Sidebar);
     assert!(app.sidebar_focused());
     // The index's keys move the sidebar's cursor instead.
-    let selected = app.selected;
+    let selected = app.index.selected;
     key(&mut app, KeyCode::Char('j'));
     key(&mut app, KeyCode::Down);
     assert_eq!(shown(&app), ["Inbox", "Work", "*Lists"]);
     key(&mut app, KeyCode::Char('k'));
     assert_eq!(shown(&app), ["Inbox", "*Work", "Lists"]);
-    assert_eq!(app.selected, selected);
+    assert_eq!(app.index.selected, selected);
     // Tab, or Esc, gives the keys back.
     key(&mut app, KeyCode::Tab);
     assert_eq!(app.menu(), Menu::Index);

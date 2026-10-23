@@ -696,15 +696,15 @@ fn sending_from_sent_items_lists_it_again() {
     // And again when the timer goes off.
     let effects = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
     assert!(matches!(request(&effects).1, Request::ListMessages { .. }));
-    assert!(app.messages.is_empty());
+    assert!(app.index.messages.is_empty());
 }
 
 #[test]
 fn the_later_sent_items_relist_keeps_the_selection() {
     let mut app = app(settings());
     in_sent_items(&mut app);
-    app.messages = sent_items(&["a", "b", "c"]);
-    app.selected = 1;
+    app.index.messages = sent_items(&["a", "b", "c"]);
+    app.index.selected = 1;
     let relisted = |app: &mut App, ids: &[&str]| {
         let effects = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
         let (id, _) = request(&effects);
@@ -712,30 +712,30 @@ fn the_later_sent_items_relist_keeps_the_selection() {
     };
     // The new copy comes first: still on b.
     relisted(&mut app, &["new", "a", "b", "c"]);
-    assert_eq!(app.messages[app.selected].id.as_str(), "b");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b");
     // A second refresh before the first is listed keeps the place.
     let first = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
     assert!(!first.is_empty());
     relisted(&mut app, &["new", "a", "b", "c"]);
-    assert_eq!(app.messages[app.selected].id.as_str(), "b");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b");
     // b is gone: the message now where it was.
     relisted(&mut app, &["new", "a", "c"]);
-    assert_eq!(app.messages[app.selected].id.as_str(), "c");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "c");
 }
 
 #[test]
 fn sending_from_sent_items_keeps_the_selection() {
     let mut app = app(settings());
     in_sent_items(&mut app);
-    app.messages = sent_items(&["a", "b", "c"]);
-    app.selected = 1;
+    app.index.messages = sent_items(&["a", "b", "c"]);
+    app.index.selected = 1;
     written(&mut app, "text");
     let (id, _) = request(&act(&mut app, Action::SendMessage));
     let effects = respond(&mut app, id, Event::Sent(Ok(()), false));
     let list =
         request_for(&effects, |r| matches!(r, Request::ListMessages { .. })).expect("listed again");
     listed(&mut app, list, sent_items(&["new", "a", "b", "c"]), None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "b");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b");
 }
 
 #[test]
@@ -765,7 +765,7 @@ fn sent_items_is_listed_again_once_the_pager_closes() {
         matches!(effects.as_slice(), [Effect::Later(..)]),
         "no listing under the pager: {effects:?}"
     );
-    assert_eq!(app.messages.len(), 1);
+    assert_eq!(app.index.messages.len(), 1);
     let effects = act(&mut app, Action::Exit);
     assert!(matches!(request(&effects).1, Request::ListMessages { .. }));
 }
@@ -786,7 +786,7 @@ fn a_reply_retried_after_the_index_moved_is_not_to_another_message() {
     let (fetch, _) = request(&act(&mut app, Action::Reply));
     // A background listing puts another message where m1 was.
     let other = mock::message("m0", "in", "Newer", DateTime::UNIX_EPOCH);
-    app.messages.insert(0, other.summary);
+    app.index.messages.insert(0, other.summary);
     signed_out(&mut app);
     respond(&mut app, fetch, Event::MessageFetched(Err(expired())));
     let effects = act(&mut app, Action::Retry);
@@ -862,7 +862,7 @@ fn sending_without_a_copy_leaves_sent_items_alone() {
     let (id, _) = request(&act(&mut app, Action::SendMessage));
     let effects = respond(&mut app, id, Event::Sent(Ok(()), false));
     assert!(effects.is_empty());
-    assert_eq!(app.messages.len(), 1);
+    assert_eq!(app.index.messages.len(), 1);
 }
 
 #[test]
@@ -1045,12 +1045,12 @@ fn a_reply_given_up_with_its_sign_in_is_not_restarted_later() {
 fn writing_during_a_sent_items_refresh_keeps_the_selection() {
     let mut app = app(settings());
     in_sent_items(&mut app);
-    app.messages = sent_items(&["a", "b", "c"]);
-    app.selected = 1;
+    app.index.messages = sent_items(&["a", "b", "c"]);
+    app.index.selected = 1;
     let effects = app.update(Msg::Timer(crate::app::Timer::RelistSentItems));
     let (list, _) = request(&effects);
     // The user starts a new message before the listing is back.
     act(&mut app, Action::Mail);
     listed(&mut app, list, sent_items(&["new", "a", "b", "c"]), None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "b");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "b");
 }

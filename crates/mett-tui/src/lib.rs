@@ -1106,7 +1106,7 @@ mod tests {
             let shown = app.tabs.as_ref().map(|t| t.tabs[t.active].label.clone());
             self.drawn.lock().unwrap().push((
                 shown,
-                app.messages.len(),
+                app.index.messages.len(),
                 app.status.text().to_owned(),
                 app.input.is_some(),
             ));

@@ -8,6 +8,7 @@
 mod attachments;
 mod composing;
 mod flags;
+mod index;
 mod invite;
 mod keys;
 mod mailbox;
@@ -35,6 +36,7 @@ use ratatui::crossterm::event::KeyEvent;
 pub use self::attachments::{AttachMenu, FileOp, FileOutcome, TextView};
 use self::composing::Composing;
 pub use self::composing::{Compose, Input};
+use self::index::IndexState;
 pub use self::keys::{Help, Reconfigured};
 pub use self::mailbox::Browser;
 use self::mailbox::{AfterPurge, Transfer, Write};
@@ -335,10 +337,8 @@ pub struct App {
     pub screens: Vec<Screen>,
     /// The open folder, once known.
     pub folder: Option<Folder>,
-    /// The index, newest first.
-    pub messages: Vec<MessageSummary>,
-    /// The selected index entry.
-    pub selected: usize,
+    /// The open folder's index.
+    pub(crate) index: IndexState,
     /// The message line at the bottom of the screen.
     pub status: Status,
     /// Set when the user quits.
@@ -440,50 +440,15 @@ pub struct App {
     /// reported on exit like changes that couldn't be saved; with the
     /// message, if deleting it again after a sign-in may work.
     left_drafts: Vec<(String, Option<mett_core::Draft>)>,
-    /// The pattern the index is limited to (`l`), if any.
-    pub limit: Option<Limit>,
-    /// The messages that the limit hides, newest first.
-    hidden: Vec<MessageSummary>,
-    /// The messages folded into collapsed threads.
-    folded: Vec<MessageSummary>,
     /// How the index is ordered.
     pub ordering: Ordering,
-    /// Where each message is in its thread, when the index shows threads.
-    threads: HashMap<MessageId, Threaded>,
-    /// How many messages the threads were last built from: while a large
-    /// folder is listed, they are built again only as it doubles.
-    threaded_count: usize,
-    /// Whether building the threads again would give what they were last
-    /// built as (see [`crate::sort::Arranged::settled`]).
-    settled: bool,
-    /// The threads (by key) the user collapsed (`true`) or opened
-    /// (`false`) themselves. The others are open, or with `collapse_all`
-    /// collapsed unless they hold unread mail (as mutt's
-    /// `collapse_unread=no`).
-    chosen: HashMap<std::sync::Arc<str>, bool>,
-    /// `Esc V` collapsed every thread, including those listed since.
-    collapse_all: bool,
-    /// Whether the limit showed each message it was applied to, kept
-    /// across listings so that they show the same messages.
-    limited: HashMap<MessageId, bool>,
-    /// Where each message was in the folder's listing, to restore the
-    /// order when the limit is lifted.
-    positions: HashMap<MessageId, usize>,
-    /// A message was listed twice since the index was last empty: it may
-    /// show it twice.
-    listed_twice: bool,
     /// The last search (`/`), which `n` repeats.
     last_search: Option<String>,
     /// The last search in the pager, which `n` there repeats.
     last_pager_search: Option<String>,
-    /// A search that found nothing yet, waiting for more of the folder,
-    /// and its pattern.
-    pending_search: Option<(String, crate::pattern::Pattern)>,
     /// The search began with nothing in the index: it starts at the
     /// first message, not after the selected one.
     search_from_top: bool,
-    /// Messages marked for deletion, purged by `$` or when leaving.
-    deleted: HashSet<MessageId>,
     /// Changes to the mailbox waiting to be made, in order. They are
     /// made one at a time, as mutt does: one may depend on another (a
     /// move gives a message a new ID; a purge mustn't overtake a copy).
@@ -527,20 +492,10 @@ pub struct App {
     terminal_width: usize,
     /// Rows available for the index or pager body.
     pub body_height: usize,
-    /// The request whose messages the index is waiting for, if any.
-    listing: Option<RequestId>,
-    /// The page that `listing` asked for.
-    listing_page: Option<Page>,
-    /// A page that failed to load, so the index is incomplete. Loading it
-    /// is retried when the user reaches the end of the index.
-    unlisted: Option<Page>,
     /// Changes that failed to save, by message, kept apart from the status
     /// line so that later messages can't hide them. A later successful save
     /// of the same message clears its entry.
     save_failures: HashMap<MessageId, (String, FlagsUpdate)>,
-    /// Where the user asked to move while more messages were loading; the
-    /// selection moves there once they arrive.
-    pending: Option<Target>,
     /// The mailbox's flags, as far as mett knows, for messages whose flag
     /// changes are on their way, so a failure can be undone in the index.
     mailbox_flags: HashMap<MessageId, mett_core::Flags>,
@@ -688,8 +643,7 @@ impl App {
         let mut app = Self {
             screens: vec![Screen::Index],
             folder: None,
-            messages: Vec::new(),
-            selected: 0,
+            index: IndexState::default(),
             status: Status::new("Opening folder..."),
             quit: false,
             sign_in: None,
@@ -727,23 +681,10 @@ impl App {
             addresses_request: None,
             awaiting_addresses: None,
             left_drafts: Vec::new(),
-            limit: None,
-            hidden: Vec::new(),
-            folded: Vec::new(),
             ordering: settings.ordering,
-            threads: HashMap::new(),
-            threaded_count: 0,
-            settled: false,
-            chosen: HashMap::new(),
-            collapse_all: false,
-            limited: HashMap::new(),
-            positions: HashMap::new(),
-            listed_twice: false,
             last_search: None,
             last_pager_search: None,
-            pending_search: None,
             search_from_top: false,
-            deleted: HashSet::new(),
             writes: VecDeque::new(),
             writing: None,
             retries: Retries::default(),
@@ -763,11 +704,7 @@ impl App {
             width: usize::from(width),
             terminal_width: usize::from(width),
             body_height: body_height(height),
-            listing: None,
-            listing_page: None,
-            unlisted: None,
             save_failures: HashMap::new(),
-            pending: None,
             mailbox_flags: HashMap::new(),
             wanted_flags: HashMap::new(),
             saved_flags: HashMap::new(),
@@ -872,7 +809,7 @@ impl App {
         let mut effects = self.handle(msg);
         // A search given up on (the user moved on, or left the message it
         // waited for) stops saying it is searching.
-        let searching = self.pending_search.is_some()
+        let searching = self.index.pending_search.is_some()
             || self
                 .screens
                 .iter()
@@ -1002,7 +939,7 @@ impl App {
         // perhaps to another message, or to help. The sign-in window's
         // keys don't move anywhere, so leave them.
         if menu != Menu::SignIn {
-            self.pending = None;
+            self.index.pending = None;
             // Moving through the index, or opening a message, replaces
             // going back to the message a background refresh left (other
             // actions leave it be).
@@ -1022,7 +959,7 @@ impl App {
             if moving && matches!(self.menu(), Menu::Index | Menu::Pager) {
                 self.reselect = None;
             }
-            if self.pending_search.take().is_some() && self.status.is(StatusKind::Searching) {
+            if self.index.pending_search.take().is_some() && self.status.is(StatusKind::Searching) {
                 self.status.clear();
             }
             self.compose_fetch = None;
@@ -1216,7 +1153,7 @@ impl App {
         };
         self.opening
             .into_iter()
-            .chain(self.listing)
+            .chain(self.index.listing)
             .chain(fetching)
             .chain(self.writing.as_ref().map(|(id, _)| *id))
             .chain(self.delivery_request())
@@ -1239,8 +1176,9 @@ impl App {
         };
         // Only before its first page comes: the sync comes before it, and
         // the pages tell how far they have got themselves.
-        let first_page = self.listing.is_some()
+        let first_page = self.index.listing.is_some()
             && self
+                .index
                 .listing_page
                 .as_ref()
                 .is_some_and(|page| page.cursor().is_none());
@@ -1300,19 +1238,19 @@ impl App {
         if let Some(effects) = self.on_message_action(action) {
             return effects;
         }
-        let last = self.messages.len().saturating_sub(1);
+        let last = self.index.messages.len().saturating_sub(1);
         let page = self.body_height.max(1);
         match action {
-            Action::NextEntry if self.selected < last => self.selected += 1,
+            Action::NextEntry if self.index.selected < last => self.index.selected += 1,
             Action::NextEntry if self.more_to_list() => {
                 return self.wait_for(self.next_entry());
             }
             Action::NextEntry => self.fail("You are on the last message."),
-            Action::PreviousEntry if self.selected > 0 => self.selected -= 1,
+            Action::PreviousEntry if self.index.selected > 0 => self.index.selected -= 1,
             Action::PreviousEntry => self.fail("You are on the first message."),
-            Action::FirstEntry => self.selected = 0,
+            Action::FirstEntry => self.index.selected = 0,
             Action::LastEntry => {
-                self.selected = last;
+                self.index.selected = last;
                 if self.more_to_list() {
                     return self.wait_for(Target::Last);
                 }
@@ -1320,9 +1258,13 @@ impl App {
             Action::NextPage => {
                 // A page on from where it started: pages to come may put
                 // messages before the last one listed.
-                let start = self.messages.get(self.selected).map(|m| m.id.clone());
-                let target = self.selected + page;
-                self.selected = target.min(last);
+                let start = self
+                    .index
+                    .messages
+                    .get(self.index.selected)
+                    .map(|m| m.id.clone());
+                let target = self.index.selected + page;
+                self.index.selected = target.min(last);
                 if target > last && self.more_to_list() {
                     let target = match start {
                         Some(start) => Target::After(start, page),
@@ -1331,7 +1273,7 @@ impl App {
                     return self.wait_for(target);
                 }
             }
-            Action::PreviousPage => self.selected = self.selected.saturating_sub(page),
+            Action::PreviousPage => self.index.selected = self.index.selected.saturating_sub(page),
             // Opening the folder failed: try again. (While it is still
             // opening, there is nothing to display yet.)
             Action::DisplayMessage if self.folder.is_none() && self.opening.is_none() => {
@@ -1362,20 +1304,20 @@ impl App {
             }
             // As in mutt, j and k in the pager show the next or previous
             // message.
-            Action::NextEntry if self.selected + 1 >= self.messages.len() => {
+            Action::NextEntry if self.index.selected + 1 >= self.index.messages.len() => {
                 if self.more_to_list() {
                     return self.wait_for(self.next_entry());
                 }
                 self.fail("You are on the last message.");
             }
-            Action::PreviousEntry if self.selected == 0 => {
+            Action::PreviousEntry if self.index.selected == 0 => {
                 self.fail("You are on the first message.");
             }
             Action::NextEntry | Action::PreviousEntry => {
                 if action == Action::NextEntry {
-                    self.selected += 1;
+                    self.index.selected += 1;
                 } else {
-                    self.selected -= 1;
+                    self.index.selected -= 1;
                 }
                 self.screens.pop();
                 return self.open_selected();
@@ -1412,7 +1354,7 @@ impl App {
     pub(super) fn pager_height(&self) -> usize {
         let index = self
             .display
-            .mini_index_rows(self.messages.len(), self.body_height);
+            .mini_index_rows(self.index.messages.len(), self.body_height);
         self.body_height - index
     }
 
@@ -1452,7 +1394,7 @@ impl App {
 
     /// Opens the pager on the selected message.
     fn open_selected(&mut self) -> Vec<Effect> {
-        let Some(summary) = self.messages.get(self.selected) else {
+        let Some(summary) = self.index.messages.get(self.index.selected) else {
             self.fail("No messages.");
             return Vec::new();
         };
@@ -1548,7 +1490,7 @@ impl App {
                 return effects;
             }
             Event::Watched(result) => return self.on_watched(id, result),
-            Event::MessagesListed(result) if self.listing == Some(id) => match result {
+            Event::MessagesListed(result) if self.index.listing == Some(id) => match result {
                 Ok(page) => {
                     self.poll_paused = false;
                     let mut messages = page.messages;
@@ -1575,8 +1517,8 @@ impl App {
                         }
                         effects = self.list(Page::after(cursor, self.page_size));
                     } else {
-                        self.listing = None;
-                        self.listing_page = None;
+                        self.index.listing = None;
+                        self.index.listing_page = None;
                         self.saved_flags.clear();
                         self.removed_while_listing.clear();
                         self.forget_missing_marks();
@@ -1596,11 +1538,11 @@ impl App {
                     return effects;
                 }
                 Err(e) => {
-                    self.pending = None;
+                    self.index.pending = None;
                     self.reselect = None;
-                    self.listing = None;
+                    self.index.listing = None;
                     self.known_before_refresh = None;
-                    self.unlisted = self.listing_page.take();
+                    self.index.unlisted = self.index.listing_page.take();
                     // What was listed is threaded, while the rest waits.
                     self.thread_listed();
                     // Pages asked for again come after the saves.
@@ -1784,7 +1726,12 @@ impl App {
     /// limit.
     fn summary(&self, id: &MessageId) -> Option<&MessageSummary> {
         // Most often the selected one (IDs are unique).
-        if let Some(selected) = self.messages.get(self.selected).filter(|s| &s.id == id) {
+        if let Some(selected) = self
+            .index
+            .messages
+            .get(self.index.selected)
+            .filter(|s| &s.id == id)
+        {
             return Some(selected);
         }
         self.folder_messages().find(|s| &s.id == id)
@@ -1793,22 +1740,28 @@ impl App {
     /// The summary of a message in the folder, to change.
     fn summary_mut(&mut self, id: &MessageId) -> Option<&mut MessageSummary> {
         if self
+            .index
             .messages
-            .get(self.selected)
+            .get(self.index.selected)
             .is_some_and(|s| &s.id == id)
         {
-            return self.messages.get_mut(self.selected);
+            return self.index.messages.get_mut(self.index.selected);
         }
-        self.messages
+        self.index
+            .messages
             .iter_mut()
-            .chain(&mut self.hidden)
-            .chain(&mut self.folded)
+            .chain(&mut self.index.hidden)
+            .chain(&mut self.index.folded)
             .find(|s| &s.id == id)
     }
 
     /// Every message of the folder listed so far, shown or not.
     pub fn folder_messages(&self) -> impl Iterator<Item = &MessageSummary> {
-        self.messages.iter().chain(&self.hidden).chain(&self.folded)
+        self.index
+            .messages
+            .iter()
+            .chain(&self.index.hidden)
+            .chain(&self.index.folded)
     }
 
     /// How many of the whole folder's messages are unread, and how many
@@ -1833,7 +1786,7 @@ impl App {
     /// Whether part of the folder could not be listed. The index then
     /// shows only the messages loaded so far.
     pub fn incomplete(&self) -> bool {
-        self.unlisted.is_some()
+        self.index.unlisted.is_some()
     }
 
     /// Counts the addresses the mailbox reported as the user's own.
@@ -1888,26 +1841,19 @@ impl App {
         self.reselect = None;
         // As in mutt, the limit's choice of messages stays: only new ones
         // are matched against it.
-        if self.limit.is_some() {
+        if self.index.limit.is_some() {
             let shown = self
+                .index
                 .messages
                 .iter()
-                .chain(&self.folded)
+                .chain(&self.index.folded)
                 .map(|m| (m.id.clone(), true));
-            let hidden = self.hidden.iter().map(|m| (m.id.clone(), false));
-            self.limited.extend(shown.chain(hidden));
+            let hidden = self.index.hidden.iter().map(|m| (m.id.clone(), false));
+            self.index.limited.extend(shown.chain(hidden));
         }
-        self.messages.clear();
+        self.index.forget_listing();
         self.saved_flags.clear();
         self.removed_while_listing.clear();
-        self.hidden.clear();
-        self.folded.clear();
-        self.threads.clear();
-        self.threaded_count = 0;
-        self.positions.clear();
-        self.selected = 0;
-        self.pending = None;
-        self.unlisted = None;
         self.list(Page::first(self.page_size))
     }
 
@@ -1917,9 +1863,10 @@ impl App {
         // A refresh still on its way (the user hasn't moved since, or it
         // would be forgotten) knows better than the index it cleared.
         let selected = self.reselect.clone().or_else(|| {
-            self.messages
-                .get(self.selected)
-                .map(|m| (m.id.clone(), self.selected))
+            self.index
+                .messages
+                .get(self.index.selected)
+                .map(|m| (m.id.clone(), self.index.selected))
         });
         let effects = self.relist();
         self.reselect = selected;
@@ -1935,11 +1882,11 @@ impl App {
         };
         // Shown, or folded into a collapsed thread that is (once listed:
         // looking through the index for it at every page would be slow).
-        let listed = self.positions.contains_key(id);
+        let listed = self.index.positions.contains_key(id);
         if let Some(found) = listed.then(|| self.entry_of(id)).flatten() {
-            self.selected = found;
+            self.index.selected = found;
         } else if done {
-            self.selected = (*at).min(self.messages.len().saturating_sub(1));
+            self.index.selected = (*at).min(self.index.messages.len().saturating_sub(1));
         } else {
             return;
         }
@@ -1958,20 +1905,20 @@ impl App {
         if page.cursor().is_none() {
             self.listing_started();
         }
-        self.listing = Some(effect_id(&list));
-        self.listing_page = Some(page);
+        self.index.listing = Some(effect_id(&list));
+        self.index.listing_page = Some(page);
         vec![list]
     }
 
     /// Whether more messages are loading or could be loaded.
     fn more_to_list(&self) -> bool {
-        self.listing.is_some() || self.unlisted.is_some()
+        self.index.listing.is_some() || self.index.unlisted.is_some()
     }
 
     /// The entry after the selected one, or the first if the index shows
     /// none yet (a limit may hide all the messages loaded so far).
     fn next_entry(&self) -> Target {
-        match self.messages.get(self.selected) {
+        match self.index.messages.get(self.index.selected) {
             Some(message) => Target::After(message.id.clone(), 1),
             None => Target::Entry(0),
         }
@@ -1980,7 +1927,7 @@ impl App {
     /// Remembers that the user asked for the next message, and makes sure
     /// more messages are on their way.
     fn wait_for(&mut self, target: Target) -> Vec<Effect> {
-        self.pending = Some(target);
+        self.index.pending = Some(target);
         self.status
             .say("Loading more messages...", StatusKind::Loading);
         self.retry_listing()
@@ -1991,10 +1938,10 @@ impl App {
     /// message once the folder is fully loaded; the last-message target
     /// follows the end of the index until loading finishes.
     fn apply_pending(&mut self) -> Vec<Effect> {
-        let Some(target) = self.pending.clone() else {
+        let Some(target) = self.index.pending.clone() else {
             return Vec::new();
         };
-        let loading = self.listing.is_some();
+        let loading = self.index.listing.is_some();
         // The next thread needs the threads of what was listed, once it
         // all is (threading at every page would be slow).
         if matches!(target, Target::NextThread | Target::PreviousThread) {
@@ -2003,7 +1950,7 @@ impl App {
             }
             self.thread_listed();
         }
-        let last = self.messages.len().saturating_sub(1);
+        let last = self.index.messages.len().saturating_sub(1);
         let selected = match target {
             // A later page may bring a thread that goes in between.
             Target::NextThread | Target::PreviousThread if loading => return Vec::new(),
@@ -2011,7 +1958,7 @@ impl App {
                 match self.thread_root_toward(matches!(target, Target::NextThread)) {
                     Ok(at) => at,
                     Err(reason) => {
-                        self.pending = None;
+                        self.index.pending = None;
                         self.fail(reason);
                         return Vec::new();
                     }
@@ -2031,29 +1978,29 @@ impl App {
                 // Folded into a collapsed thread since: from the thread.
                 let from = self.entry_of(&message);
                 match from.map(|from| from + steps) {
-                    Some(entry) if entry < self.messages.len() => entry,
+                    Some(entry) if entry < self.index.messages.len() => entry,
                     _ if loading => return Vec::new(),
                     _ => last,
                 }
             }
             // Loaded (the index may still be empty, with a limit hiding
             // all the messages loaded so far).
-            Target::Entry(entry) if entry < self.messages.len() => entry,
+            Target::Entry(entry) if entry < self.index.messages.len() => entry,
             Target::Entry(_) | Target::Last if !loading => last,
             Target::Last => {
-                self.selected = last;
+                self.index.selected = last;
                 return Vec::new();
             }
             Target::Entry(_) => return Vec::new(),
         };
-        self.pending = None;
+        self.index.pending = None;
         if self.status.is(StatusKind::Loading) {
             self.status.clear();
         }
-        if selected == self.selected {
+        if selected == self.index.selected {
             return Vec::new();
         }
-        self.selected = selected;
+        self.index.selected = selected;
         // The screen, not the menu: the sign-in window may be over it.
         match self.screen() {
             Screen::Index
@@ -2100,10 +2047,10 @@ impl App {
 
     /// Retries loading the rest of an incomplete folder.
     fn retry_listing(&mut self) -> Vec<Effect> {
-        if self.listing.is_some() {
+        if self.index.listing.is_some() {
             return Vec::new();
         }
-        let Some(page) = self.unlisted.take() else {
+        let Some(page) = self.index.unlisted.take() else {
             return Vec::new();
         };
         self.status
@@ -2143,7 +2090,7 @@ impl App {
     /// otherwise, the keys play anyway.
     fn load_failed(&mut self, e: Error) {
         if !matches!(e, Error::Auth(_)) {
-            self.pending_search = None;
+            self.index.pending_search = None;
             self.loaded();
         }
         self.report(e);

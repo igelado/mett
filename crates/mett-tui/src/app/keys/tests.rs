@@ -33,7 +33,7 @@ fn play(app: &mut App) {
 fn keys_run_their_functions() {
     let mut app = app();
     press(&mut app, Key::char('j'));
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
     press(&mut app, Key::char('#'));
     assert_eq!(app.status, "Key is not bound.  Press '?' for help.");
     // The next key clears the message.
@@ -55,7 +55,7 @@ fn macros_play_their_keys_and_functions() {
     press(&mut app, Key::char('X'));
     play(&mut app);
     // To the last message, up one, then a search that finds the next.
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
     assert_eq!(app.input, None, "the search question was answered");
 }
 
@@ -64,7 +64,7 @@ fn push_queues_keys_to_play() {
     let mut app = app();
     app.push_keys("jj").unwrap();
     play(&mut app);
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
     assert!(app.push_keys("<frobnicate>").is_err());
 }
 
@@ -118,7 +118,7 @@ fn commands_typed_at_the_prompt_reconfigure_the_app() {
     assert_eq!(app.status, "");
     assert!(!app.resolve);
     play(&mut app);
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
 
     app.update(Msg::Configured(Reconfigured {
         outcome: Err("timeout: expected a number".into()),
@@ -164,7 +164,7 @@ fn startup_keys_wait_for_the_folder() {
     let list = folder_opened(&mut app, open, mock::folder("in", "Inbox", None));
     listed(&mut app, list, three(), None);
     play(&mut app);
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn keys_pushed_by_a_macro_play_before_its_rest() {
     app.strokes.push_back(Stroke::Key(Key::char('k')));
     app.push_keys("<last-entry>").unwrap();
     play(&mut app);
-    assert_eq!(app.selected, 1, "last entry, then up one");
+    assert_eq!(app.index.selected, 1, "last entry, then up one");
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn pushed_sequences_play_in_order() {
         pushed: vec!["<last-entry>".into(), "<previous-entry>".into()],
     }));
     play(&mut app);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
 }
 
 #[test]
@@ -303,7 +303,7 @@ fn sign_in_macros_play_in_the_window() {
     press(&mut app, Key::char('x'));
     assert!(app.next_sign_in_stroke().is_some());
     assert!(app.next_sign_in_stroke().is_none());
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
 }
 
 #[test]
@@ -339,7 +339,7 @@ fn ctrl_j_is_enter_unless_bound() {
         })
         .unwrap();
     press(&mut app, Key::ctrl('j'));
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
     assert_eq!(app.screen(), &Screen::Index, "Enter is left alone");
     press(&mut app, Key::new(KeyCode::Enter));
     assert!(matches!(app.screen(), Screen::Pager(_)));
@@ -407,7 +407,7 @@ fn typing_between_macro_keys_that_wait_for_nothing_keeps_them() {
     app.push_keys("<next-entry><next-entry>").unwrap();
     app.typed();
     play(&mut app);
-    assert_eq!(app.selected, 2);
+    assert_eq!(app.index.selected, 2);
 }
 
 #[test]

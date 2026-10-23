@@ -71,7 +71,8 @@ impl App {
     /// so that a page of collapsed threads looks through the folded mail
     /// only once.
     pub fn roots_with_folded_unread(&self) -> HashSet<&MessageId> {
-        self.folded
+        self.index
+            .folded
             .iter()
             .filter(|m| !m.flags.read)
             .filter_map(|m| self.thread_of(&m.id))
@@ -82,23 +83,27 @@ impl App {
 
     /// How many messages the index shows, folded ones too.
     pub fn shown_count(&self) -> usize {
-        self.messages.len() + self.folded.len()
+        self.index.messages.len() + self.index.folded.len()
     }
 
     /// Where a message is in its thread, if the index shows threads.
     pub fn thread_of(&self, id: &MessageId) -> Option<&Threaded> {
-        self.threads.get(id)
+        self.index.threads.get(id)
     }
 
     /// Puts the index in order again, folding collapsed threads, and stays
     /// on the selected message (or the thread it was folded into).
     pub(super) fn arrange(&mut self) {
-        let selected = self.messages.get(self.selected).map(|m| m.id.clone());
-        let mut all = std::mem::take(&mut self.messages);
-        all.append(&mut self.folded);
+        let selected = self
+            .index
+            .messages
+            .get(self.index.selected)
+            .map(|m| m.id.clone());
+        let mut all = std::mem::take(&mut self.index.messages);
+        all.append(&mut self.index.folded);
         let arranged = {
             let refs: Vec<&MessageSummary> = all.iter().collect();
-            let positions = &self.positions;
+            let positions = &self.index.positions;
             sort::arrange(
                 &refs,
                 self.ordering.sort,
@@ -120,10 +125,10 @@ impl App {
         } else {
             HashSet::new()
         };
-        self.threaded_count = all.len();
-        self.settled = arranged.settled;
+        self.index.threaded_count = all.len();
+        self.index.settled = arranged.settled;
         let mut slots: Vec<Option<MessageSummary>> = all.into_iter().map(Some).collect();
-        self.threads.clear();
+        self.index.threads.clear();
         // The thread being taken in: its first message, its key, whether
         // it is collapsed, and how many messages are folded under it. A
         // thread's messages come together, its first message first.
@@ -131,7 +136,7 @@ impl App {
         for node in arranged.nodes {
             let message = slots[node.index].take().expect("each message once");
             if !threaded {
-                self.messages.push(message);
+                self.index.messages.push(message);
                 continue;
             }
             if node.index == node.root {
@@ -142,7 +147,7 @@ impl App {
                 thread = Some((root, key, collapsed, 0));
             }
             let (root, key, collapsed, folded) = thread.as_mut().expect("the root comes first");
-            self.threads.insert(
+            self.index.threads.insert(
                 message.id.clone(),
                 Threaded {
                     tree: node.tree,
@@ -154,20 +159,23 @@ impl App {
             );
             if *collapsed && node.depth > 0 {
                 *folded += 1;
-                self.folded.push(message);
+                self.index.folded.push(message);
             } else {
-                self.messages.push(message);
+                self.index.messages.push(message);
             }
         }
         self.fold_count(thread);
         // (Collapsed threads hidden by a limit stay collapsed; the folder's
         // are forgotten when it is left or listed again.)
         let Some(selected) = selected else {
-            self.selected = self.selected.min(self.messages.len().saturating_sub(1));
+            self.index.selected = self
+                .index
+                .selected
+                .min(self.index.messages.len().saturating_sub(1));
             return;
         };
         if let Some(at) = self.entry_of(&selected) {
-            self.selected = at;
+            self.index.selected = at;
         }
     }
 
@@ -177,7 +185,7 @@ impl App {
     fn fold_count(&mut self, thread: Option<(MessageId, Arc<str>, bool, usize)>) {
         if let Some((root, _, _, folded)) = thread
             && folded > 0
-            && let Some(threaded) = self.threads.get_mut(&root)
+            && let Some(threaded) = self.index.threads.get_mut(&root)
         {
             threaded.folded = folded;
         }
@@ -186,7 +194,7 @@ impl App {
     /// Where the index shows `id`: its entry, or that of the collapsed
     /// thread it is folded into.
     pub(super) fn entry_of(&self, id: &MessageId) -> Option<usize> {
-        let shown = |id: &MessageId| self.messages.iter().position(|m| &m.id == id);
+        let shown = |id: &MessageId| self.index.messages.iter().position(|m| &m.id == id);
         shown(id).or_else(|| shown(&self.thread_of(id)?.root))
     }
 
@@ -198,17 +206,17 @@ impl App {
     /// threaded again at every page.
     pub(super) fn arrange_listed(&mut self, listed: Vec<MessageSummary>, last: bool) {
         if self.threaded() {
-            self.messages.extend(listed);
+            self.index.messages.extend(listed);
             let count = self.shown_count();
             // Collapsed threads fold their replies as they come.
-            let folding = self.collapse_all || self.chosen.values().any(|&c| c);
-            if last || folding || count >= self.threaded_count.saturating_mul(2) {
+            let folding = self.index.collapse_all || self.index.chosen.values().any(|&c| c);
+            if last || folding || count >= self.index.threaded_count.saturating_mul(2) {
                 self.arrange();
             }
             return;
         }
         let (sort, aux) = (self.ordering.sort, self.ordering.aux);
-        let positions = &self.positions;
+        let positions = &self.index.positions;
         let key = |m: &MessageSummary| {
             let at = positions.get(&m.id).copied().unwrap_or(usize::MAX);
             sort::Key::new(m, sort, aux, at)
@@ -224,47 +232,52 @@ impl App {
         let mut places = Vec::with_capacity(listed.len());
         let mut from = 0;
         for (listed, _) in &listed {
-            from += self.messages[from..].partition_point(|m| !compare(listed, &key(m)).is_lt());
+            from +=
+                self.index.messages[from..].partition_point(|m| !compare(listed, &key(m)).is_lt());
             places.push(from);
         }
-        let selected = self.selected;
+        let selected = self.index.selected;
         // A message listed twice may be shown twice: the selection goes to
         // the first, as when it is looked for.
-        let twice = self.listed_twice
+        let twice = self.index.listed_twice
             || self
+                .index
                 .messages
                 .get(selected)
                 .is_some_and(|s| listed.iter().any(|(_, m)| m.id == s.id));
         let selected_id = self
+            .index
             .messages
             .get(selected)
             .filter(|_| twice)
             .map(|m| m.id.clone());
-        if selected < self.messages.len() {
-            self.selected += places.partition_point(|&place| place <= selected);
+        if selected < self.index.messages.len() {
+            self.index.selected += places.partition_point(|&place| place <= selected);
         }
         // Room at the end for the listed messages (copies of the first, for
         // now). From the last listed, the messages after where each goes
         // move down past the room left, which moves up, and it takes the
         // room's last place: each message moves once.
-        let mut end = self.messages.len();
+        let mut end = self.index.messages.len();
         if let Some((_, first)) = listed.first() {
             let room = std::iter::repeat_n(first.clone(), listed.len());
-            self.messages.extend(room);
+            self.index.messages.extend(room);
         }
         for (k, (&place, (_, message))) in places.iter().zip(listed).enumerate().rev() {
             // The room is end..end + k + 1.
             let room = k + 1;
             while end > place {
                 let step = room.min(end - place);
-                let (before, after) = self.messages.split_at_mut(end);
+                let (before, after) = self.index.messages.split_at_mut(end);
                 before[end - step..].swap_with_slice(&mut after[room - step..room]);
                 end -= step;
             }
-            self.messages[place + k] = message;
+            self.index.messages[place + k] = message;
         }
-        if let Some(at) = selected_id.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
-            self.selected = at;
+        if let Some(at) =
+            selected_id.and_then(|id| self.index.messages.iter().position(|m| m.id == id))
+        {
+            self.index.selected = at;
         }
     }
 
@@ -273,11 +286,17 @@ impl App {
     pub(super) fn in_order(&self) -> bool {
         let (sort, aux) = (self.ordering.sort, self.ordering.aux);
         let key = |m: &MessageSummary| {
-            let at = self.positions.get(&m.id).copied().unwrap_or(usize::MAX);
+            let at = self
+                .index
+                .positions
+                .get(&m.id)
+                .copied()
+                .unwrap_or(usize::MAX);
             sort::Key::new(m, sort, aux, at)
         };
         self.threaded()
             || self
+                .index
                 .messages
                 .windows(2)
                 .all(|pair| sort::compare(&key(&pair[0]), &key(&pair[1]), sort, aux).is_le())
@@ -285,7 +304,7 @@ impl App {
 
     /// Threads the messages listed so far, if some aren't yet.
     pub(super) fn thread_listed(&mut self) {
-        if self.threaded() && self.shown_count() != self.threaded_count {
+        if self.threaded() && self.shown_count() != self.index.threaded_count {
             self.arrange();
         }
     }
@@ -294,23 +313,32 @@ impl App {
     /// collapsed: as the user chose, or as every thread is (but one with
     /// unread mail, kept open).
     fn is_collapsed(&self, key: &str, unread: bool) -> bool {
-        self.chosen
+        self.index
+            .chosen
             .get(key)
             .copied()
-            .unwrap_or(self.collapse_all && !unread)
+            .unwrap_or(self.index.collapse_all && !unread)
     }
 
     /// Collapses or opens the thread `key`, as the user chose.
     fn set_collapsed(&mut self, key: Arc<str>, collapsed: bool) {
-        self.chosen.insert(key, collapsed);
+        self.index.chosen.insert(key, collapsed);
     }
 
     /// Whether the thread `root` starts holds unread mail.
     fn thread_unread(&self, root: &MessageId) -> bool {
-        self.messages
+        self.index
+            .messages
             .iter()
-            .chain(&self.folded)
-            .any(|m| !m.flags.read && self.threads.get(&m.id).is_some_and(|t| &t.root == root))
+            .chain(&self.index.folded)
+            .any(|m| {
+                !m.flags.read
+                    && self
+                        .index
+                        .threads
+                        .get(&m.id)
+                        .is_some_and(|t| &t.root == root)
+            })
     }
 
     /// Mail arrived in the threads of `arrived`: those that would be
@@ -325,9 +353,14 @@ impl App {
         for message in arrived.into_iter().filter(|m| !m.flags.read) {
             if let Some(thread) = &message.thread {
                 let key: Arc<str> = format!("conversation {}", thread.conversation).into();
-                let collapsed = self.chosen.get(&key).copied().unwrap_or(self.collapse_all);
+                let collapsed = self
+                    .index
+                    .chosen
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(self.index.collapse_all);
                 if collapsed {
-                    self.chosen.insert(key, false);
+                    self.index.chosen.insert(key, false);
                     opened = true;
                 }
             }
@@ -340,8 +373,9 @@ impl App {
     pub(super) fn open_at_folded_unread(&mut self) {
         // (Its first message unread is its first unread message.)
         let Some(root) = self
+            .index
             .messages
-            .get(self.selected)
+            .get(self.index.selected)
             .filter(|m| m.flags.read)
             .map(|m| m.id.clone())
         else {
@@ -351,6 +385,7 @@ impl App {
             return;
         }
         let first = self
+            .index
             .folded
             .iter()
             .find(|m| !m.flags.read && self.thread_of(&m.id).is_some_and(|t| t.root == root))
@@ -364,14 +399,15 @@ impl App {
     /// folded into it and shows as unread (its first message, or mail
     /// folded into it): `<toggle-new>` marks them all read.
     pub(super) fn folded_thread_unread(&self) -> Option<Vec<MessageId>> {
-        let root = &self.messages.get(self.selected)?.id;
+        let root = &self.index.messages.get(self.index.selected)?.id;
         if self.thread_of(root).is_none_or(|t| t.folded == 0) || !self.thread_unread(root) {
             return None;
         }
         Some(
-            self.messages
+            self.index
+                .messages
                 .iter()
-                .chain(&self.folded)
+                .chain(&self.index.folded)
                 .filter(|m| !m.flags.read && self.thread_of(&m.id).is_some_and(|t| &t.root == root))
                 .map(|m| m.id.clone())
                 .collect(),
@@ -383,8 +419,8 @@ impl App {
         if self.ordering != ordering {
             self.ordering = ordering;
             if !self.threaded() {
-                self.chosen.clear();
-                self.collapse_all = false;
+                self.index.chosen.clear();
+                self.index.collapse_all = false;
             }
             self.arrange();
         }
@@ -393,19 +429,20 @@ impl App {
     /// Opens the collapsed thread `message` is folded into, and selects it.
     pub(super) fn uncollapse_to(&mut self, message: &MessageId) {
         let thread = self
+            .index
             .threads
             .get(message)
             .map(|t| (t.key.clone(), t.root.clone()));
         let opened = thread.is_some_and(|(key, root)| {
             self.set_collapsed(key, false);
-            let start = self.messages.iter().position(|m| m.id == root);
+            let start = self.index.messages.iter().position(|m| m.id == root);
             start.is_some_and(|start| self.refold(start))
         });
         if !opened {
             self.arrange();
         }
-        if let Some(at) = self.messages.iter().position(|m| &m.id == message) {
-            self.selected = at;
+        if let Some(at) = self.index.messages.iter().position(|m| &m.id == message) {
+            self.index.selected = at;
         }
     }
 
@@ -416,45 +453,52 @@ impl App {
     /// index is threaded as arranging it again would thread it (see
     /// [`crate::sort::Arranged::settled`]), with nothing listed since.
     fn refold(&mut self, start: usize) -> bool {
-        if !self.settled || self.shown_count() != self.threaded_count {
+        if !self.index.settled || self.shown_count() != self.index.threaded_count {
             return false;
         }
-        let root = &self.messages[start].id;
-        let Some(thread) = self.threads.get(root).filter(|t| &t.root == root) else {
+        let root = &self.index.messages[start].id;
+        let Some(thread) = self.index.threads.get(root).filter(|t| &t.root == root) else {
             return false;
         };
         let collapsed = self.is_collapsed(&thread.key, self.thread_unread(root));
         // The messages folded into collapsed threads go in the threads'
         // order: those of the threads before this one come first. They are
         // counted on the shorter side.
-        let folded = |m: &MessageSummary| self.threads.get(&m.id).map_or(0, |t| t.folded);
-        let at = if start <= self.messages.len() / 2 {
-            self.messages[..start].iter().map(folded).sum()
+        let folded = |m: &MessageSummary| self.index.threads.get(&m.id).map_or(0, |t| t.folded);
+        let at = if start <= self.index.messages.len() / 2 {
+            self.index.messages[..start].iter().map(folded).sum()
         } else {
-            let after: usize = self.messages[start + 1..].iter().map(folded).sum();
-            self.folded.len() - after - thread.folded
+            let after: usize = self.index.messages[start + 1..].iter().map(folded).sum();
+            self.index.folded.len() - after - thread.folded
         };
         let moved = if collapsed {
             // Its replies follow it.
-            let replies = self.messages[start + 1..]
+            let replies = self.index.messages[start + 1..]
                 .iter()
-                .take_while(|m| self.threads.get(&m.id).is_some_and(|t| &t.root == root))
+                .take_while(|m| {
+                    self.index
+                        .threads
+                        .get(&m.id)
+                        .is_some_and(|t| &t.root == root)
+                })
                 .count();
             let replies: Vec<MessageSummary> = self
+                .index
                 .messages
                 .drain(start + 1..start + 1 + replies)
                 .collect();
             let count = replies.len();
-            self.folded.splice(at..at, replies);
+            self.index.folded.splice(at..at, replies);
             count
         } else {
-            let replies: Vec<MessageSummary> = self.folded.drain(at..at + thread.folded).collect();
+            let replies: Vec<MessageSummary> =
+                self.index.folded.drain(at..at + thread.folded).collect();
             let count = replies.len();
-            self.messages.splice(start + 1..start + 1, replies);
+            self.index.messages.splice(start + 1..start + 1, replies);
             count
         };
-        let root = self.messages[start].id.clone();
-        if let Some(thread) = self.threads.get_mut(&root) {
+        let root = self.index.messages[start].id.clone();
+        if let Some(thread) = self.index.threads.get_mut(&root) {
             thread.folded = if collapsed { thread.folded + moved } else { 0 };
         }
         true
@@ -462,16 +506,17 @@ impl App {
 
     /// Whether the entry `at` starts a thread.
     fn is_root(&self, at: usize) -> bool {
-        let id = &self.messages[at].id;
-        self.threads.get(id).is_none_or(|t| &t.root == id)
+        let id = &self.index.messages[at].id;
+        self.index.threads.get(id).is_none_or(|t| &t.root == id)
     }
 
     /// Where the thread of `id`, the selected message, starts.
     fn thread_start(&self, id: &MessageId) -> usize {
-        self.threads
+        self.index
+            .threads
             .get(id)
-            .and_then(|t| self.messages.iter().position(|m| m.id == t.root))
-            .unwrap_or(self.selected)
+            .and_then(|t| self.index.messages.iter().position(|m| m.id == t.root))
+            .unwrap_or(self.index.selected)
     }
 
     /// Where the thread after the selected message (if it is listed), or
@@ -479,12 +524,13 @@ impl App {
     /// why there is none.
     pub(super) fn thread_root_toward(&self, next: bool) -> Result<usize, &'static str> {
         if next {
-            (self.selected + 1..self.messages.len())
+            (self.index.selected + 1..self.index.messages.len())
                 .find(|&i| self.is_root(i))
                 .ok_or("You are on the last thread.")
         } else {
-            self.messages
-                .get(self.selected)
+            self.index
+                .messages
+                .get(self.index.selected)
                 .and_then(|m| {
                     (0..self.thread_start(&m.id))
                         .rev()
@@ -515,14 +561,18 @@ impl App {
         // Folded into a collapsed thread since, from the thread.
         if let Some(Screen::Pager(pager)) = self.screens.last() {
             match self.entry_of(&pager.id) {
-                Some(at) => self.selected = at,
+                Some(at) => self.index.selected = at,
                 None => {
                     self.fail("The folder is being listed again; wait a moment.");
                     return Some(Vec::new());
                 }
             }
         }
-        let selected = self.messages.get(self.selected).map(|m| m.id.clone());
+        let selected = self
+            .index
+            .messages
+            .get(self.index.selected)
+            .map(|m| m.id.clone());
         let Some(selected) = selected else {
             self.fail("No messages.");
             return Some(Vec::new());
@@ -544,7 +594,7 @@ impl App {
                     }));
                 }
                 match self.thread_root_toward(next) {
-                    Ok(at) => self.selected = at,
+                    Ok(at) => self.index.selected = at,
                     Err(reason) => {
                         self.fail(reason);
                         return Some(Vec::new());
@@ -552,17 +602,18 @@ impl App {
                 }
             }
             Action::CollapseThread => {
-                let root = &self.messages[start].id;
+                let root = &self.index.messages[start].id;
                 let key = self
+                    .index
                     .threads
                     .get(root)
                     .map_or_else(|| format!("message {root}").into(), |t| t.key.clone());
                 // As it shows now: collapsed if mail is folded into it;
                 // with none (yet), as chosen.
-                let collapsed = self.threads.get(root).is_some_and(|t| t.folded > 0)
+                let collapsed = self.index.threads.get(root).is_some_and(|t| t.folded > 0)
                     || self.is_collapsed(&key, self.thread_unread(root));
                 self.set_collapsed(key, !collapsed);
-                self.selected = start;
+                self.index.selected = start;
                 if !self.refold(start) {
                     self.arrange();
                 }
@@ -571,6 +622,7 @@ impl App {
             _ => {
                 // Collapses every thread, or if they all are, opens them.
                 let mut replies = self
+                    .index
                     .threads
                     .iter()
                     .filter(|(id, t)| *id != &t.root)
@@ -580,18 +632,19 @@ impl App {
                 // (One collapsing every thread leaves open, with unread
                 // mail, counts as collapsed: Esc V again opens them all.)
                 let all_collapsed = if replies.peek().is_none() {
-                    self.collapse_all
+                    self.index.collapse_all
                 } else {
                     replies.all(|(_, t)| {
-                        self.threads
+                        self.index
+                            .threads
                             .get(&t.root)
                             .is_some_and(|root| root.folded > 0)
-                            || (self.collapse_all && !self.chosen.contains_key(&t.key))
+                            || (self.index.collapse_all && !self.index.chosen.contains_key(&t.key))
                     })
                 };
-                self.chosen.clear();
-                self.collapse_all = !all_collapsed;
-                self.selected = start;
+                self.index.chosen.clear();
+                self.index.collapse_all = !all_collapsed;
+                self.index.selected = start;
                 self.arrange();
                 return Some(Vec::new());
             }

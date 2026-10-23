@@ -184,6 +184,11 @@ run `$EDITOR`. The main loop carries them out.
 - **Mitigation:** split `Msg` and `update` per screen, with a top-level
   dispatcher. Render only the visible rows of large lists.
 
+**Grouped state.** State that belongs to the open folder lives in a
+sub-struct of `App` that owns its `Default` and a `reset()`, so that opening
+another folder resets it with one call and a new field can't be forgotten:
+`IndexState` (the messages and how they are threaded, limited and listed).
+
 **Frontends.** The main loop is the same for the terminal and for
 `mett-gui`'s window: it reads crossterm events from a channel, and draws on
 a `Frontend`, which gives the screen's size, draws the `App`, copies to the

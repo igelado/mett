@@ -59,21 +59,21 @@ fn searches_the_index_and_wraps() {
     let mut app = app();
     act(&mut app, Action::Search);
     answer(&mut app, "~f bob");
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
     act(&mut app, Action::SearchNext);
     act(&mut app, Action::SearchNext);
-    assert_eq!(app.selected, 5);
+    assert_eq!(app.index.selected, 5);
     act(&mut app, Action::SearchNext);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
     assert_eq!(app.status, "Search wrapped to top.");
     // Plain text searches the sender and the subject.
     act(&mut app, Action::Search);
     answer(&mut app, "lunch 4");
-    assert_eq!(app.selected, 4);
+    assert_eq!(app.index.selected, 4);
     act(&mut app, Action::Search);
     answer(&mut app, "nobody");
     assert_eq!(app.status, "Not found.");
-    assert_eq!(app.selected, 4);
+    assert_eq!(app.index.selected, 4);
     act(&mut app, Action::Search);
     answer(&mut app, "~q");
     assert!(app.status.contains("not supported"), "{}", app.status);
@@ -86,14 +86,14 @@ fn limits_the_index_and_lifts_the_limit() {
     act(&mut app, Action::Limit);
     answer(&mut app, "~f bob");
     assert_eq!(ids(&app), ["m1", "m3", "m5"]);
-    assert_eq!(app.selected, 0, "still on m1");
+    assert_eq!(app.index.selected, 0, "still on m1");
     assert_eq!(app.total_messages(), 6);
-    assert_eq!(app.limit.as_ref().unwrap().text, "~f bob");
+    assert_eq!(app.index.limit.as_ref().unwrap().text, "~f bob");
 
     act(&mut app, Action::Limit);
     answer(&mut app, "~N");
     assert_eq!(ids(&app), ["m0", "m1"]);
-    assert_eq!(app.selected, 1, "still on m1");
+    assert_eq!(app.index.selected, 1, "still on m1");
 
     // A bad pattern changes nothing.
     act(&mut app, Action::Limit);
@@ -103,11 +103,11 @@ fn limits_the_index_and_lifts_the_limit() {
     act(&mut app, Action::Limit);
     answer(&mut app, "all");
     assert_eq!(ids(&app), ["m0", "m1", "m2", "m3", "m4", "m5"]);
-    assert!(app.limit.is_none());
+    assert!(app.index.limit.is_none());
 
     act(&mut app, Action::Limit);
     answer(&mut app, "~F");
-    assert!(app.messages.is_empty());
+    assert!(app.index.messages.is_empty());
     assert_eq!(app.status, "No messages matched the criteria.");
 }
 
@@ -153,14 +153,17 @@ fn a_failed_flag_change_is_undone_for_a_hidden_message() {
     respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
     act(&mut app, Action::Limit);
     answer(&mut app, "all");
-    assert!(!app.messages[0].flags.flagged, "back as in the mailbox");
+    assert!(
+        !app.index.messages[0].flags.flagged,
+        "back as in the mailbox"
+    );
 }
 
 #[test]
 fn lifting_a_limit_keeps_the_listing_order() {
     let mut app = app();
     // Same dates: the order comes from the listing, not the date.
-    for m in &mut app.messages {
+    for m in &mut app.index.messages {
         m.received = DateTime::UNIX_EPOCH;
     }
     act(&mut app, Action::Limit);
@@ -220,7 +223,7 @@ fn index_and_pager_searches_are_kept_apart() {
     assert_eq!(app.status, "Not found.");
     act(&mut app, Action::Search);
     answer(&mut app, "~f bob");
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
     assert_eq!(app.status, "", "the earlier Not found. is gone");
 
     let fetch = first_request(&act(&mut app, Action::DisplayMessage));
@@ -306,7 +309,7 @@ fn a_search_goes_on_as_pages_arrive() {
     answer(&mut app, "~f bob");
     assert_eq!(app.status, "Searching...");
     listed(&mut app, next, vec![bob()], None);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
     assert_eq!(app.status, "");
 }
 
@@ -360,11 +363,11 @@ fn a_search_reads_the_whole_folder_before_wrapping() {
     act(&mut app, Action::Search);
     answer(&mut app, "~f alice|~f bob");
     assert_eq!(app.status, "Searching...");
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     listed(&mut app, next, vec![bob()], None);
-    assert_eq!(app.selected, 1, "the next match, not the wrap");
+    assert_eq!(app.index.selected, 1, "the next match, not the wrap");
     act(&mut app, Action::SearchNext);
-    assert_eq!(app.selected, 0);
+    assert_eq!(app.index.selected, 0);
     assert_eq!(app.status, "Search wrapped to top.");
 }
 
@@ -430,7 +433,7 @@ fn a_search_waits_for_the_folder_to_open() {
     let mut alice = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
     alice.from = Some(Address::new("alice@contoso.com"));
     listed(&mut app, list, vec![alice, bob()], None);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
 }
 
 #[test]
@@ -442,7 +445,7 @@ fn a_search_loads_a_page_that_failed() {
     let again = first_request(&effects);
     assert_eq!(app.status, "Searching...");
     listed(&mut app, again, vec![bob()], None);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
 }
 
 #[test]
@@ -465,7 +468,7 @@ fn a_search_stays_with_its_folder() {
     let mut other = mock::message("m9", "ar", "Old", DateTime::UNIX_EPOCH).summary;
     other.from = Some(Address::new("carol@contoso.com"));
     listed(&mut app, list, vec![other, bob()], None);
-    assert_eq!(app.selected, 0, "the old search doesn't run here");
+    assert_eq!(app.index.selected, 0, "the old search doesn't run here");
 }
 
 #[test]
@@ -606,7 +609,7 @@ fn a_search_before_any_message_includes_the_first() {
     let mut other = bob();
     other.id = "m2".into();
     listed(&mut app, list, vec![bob(), other], None);
-    assert_eq!(app.selected, 0, "the first match");
+    assert_eq!(app.index.selected, 0, "the first match");
     assert_eq!(app.status, "");
 }
 
@@ -633,7 +636,7 @@ fn a_search_waits_for_a_page_through_a_sign_in() {
     let again = request_for(&effects, |r| matches!(r, Request::ListMessages { .. }))
         .expect("the page again");
     listed(&mut app, again, vec![bob()], None);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
 }
 
 #[test]
@@ -661,12 +664,12 @@ fn next_in_an_empty_limited_index_takes_the_first_match() {
     let (mut app, next) = loading();
     act(&mut app, Action::Limit);
     answer(&mut app, "~f bob");
-    assert!(app.messages.is_empty(), "alice is hidden");
+    assert!(app.index.messages.is_empty(), "alice is hidden");
     act(&mut app, Action::NextEntry);
     let mut second = bob();
     second.id = "m2".into();
     listed(&mut app, next, vec![bob(), second], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "m1");
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "m1");
 }
 
 #[test]
@@ -726,7 +729,7 @@ fn a_search_waits_for_the_folder_through_a_sign_in() {
     let mut alice = mock::message("m0", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
     alice.from = Some(Address::new("alice@contoso.com"));
     listed(&mut app, list, vec![alice, bob()], None);
-    assert_eq!(app.selected, 1);
+    assert_eq!(app.index.selected, 1);
 }
 
 #[test]
@@ -739,11 +742,11 @@ fn next_in_an_empty_limited_index_keeps_waiting_through_empty_pages() {
     let mut alice = mock::message("m5", "in", "Lunch", DateTime::UNIX_EPOCH).summary;
     alice.from = Some(Address::new("alice@contoso.com"));
     let effects = listed(&mut app, next, vec![alice], Some("d"));
-    assert!(app.pending.is_some(), "still waiting");
+    assert!(app.index.pending.is_some(), "still waiting");
     let last = first_request(&effects);
     listed(&mut app, last, vec![bob()], None);
-    assert_eq!(app.messages[app.selected].id.as_str(), "m1");
-    assert!(app.pending.is_none());
+    assert_eq!(app.index.messages[app.index.selected].id.as_str(), "m1");
+    assert!(app.index.pending.is_none());
 }
 
 #[test]

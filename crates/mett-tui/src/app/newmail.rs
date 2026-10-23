@@ -129,10 +129,11 @@ impl App {
         };
         let seen = self.seen.entry(open.id.clone()).or_default();
         let unread = self
+            .index
             .messages
             .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
+            .chain(&self.index.hidden)
+            .chain(&self.index.folded)
             .filter(|m| !m.flags.read);
         for message in unread {
             seen.until = seen.until.max(message.modified);
@@ -397,7 +398,7 @@ impl App {
         let Some(folder) = &self.folder else {
             return Vec::new();
         };
-        if self.listing.is_some()
+        if self.index.listing.is_some()
             || self.polling.is_some()
             || self.opening.is_some()
             || self.switching.is_some()
@@ -407,7 +408,7 @@ impl App {
         // Part of it failed to list: that is tried again instead (what a
         // check adds, that listing would add again), so a passing error
         // doesn't stop new mail reaching the index.
-        if let Some(page) = self.unlisted.take() {
+        if let Some(page) = self.index.unlisted.take() {
             return self.list(page);
         }
         let folder = folder.id.clone();
@@ -487,7 +488,7 @@ impl App {
     /// listed again for new mail. Changes made meanwhile may not show in
     /// what arrives.
     pub(super) fn fetching_index(&self) -> bool {
-        self.listing.is_some() || self.polling.is_some()
+        self.index.listing.is_some() || self.polling.is_some()
     }
 
     /// Takes in what a check of the open folder found: adds the messages
@@ -509,7 +510,7 @@ impl App {
         let still_open = self.folder.as_ref().is_some_and(|f| f.id == folder);
         let page = match result {
             // The folder changed meanwhile, or is being listed again.
-            _ if !still_open || self.listing.is_some() => {
+            _ if !still_open || self.index.listing.is_some() => {
                 self.forget_index_changes();
                 return Vec::new();
             }
@@ -651,7 +652,11 @@ impl App {
             .collect();
         self.remove_messages(&gone);
         // The selected message, or the one that took its place.
-        let selected = self.messages.get(self.selected).map(|m| m.id.clone());
+        let selected = self
+            .index
+            .messages
+            .get(self.index.selected)
+            .map(|m| m.id.clone());
         // The others may have changed elsewhere (read in Outlook, say).
         // When both have a message, it comes as it was last changed.
         let mut updates: HashMap<&MessageId, &MessageSummary> = HashMap::new();
@@ -665,10 +670,11 @@ impl App {
             }
         }
         for summary in self
+            .index
             .messages
             .iter_mut()
-            .chain(&mut self.hidden)
-            .chain(&mut self.folded)
+            .chain(&mut self.index.hidden)
+            .chain(&mut self.index.folded)
         {
             if let Some(update) = updates.get(&summary.id) {
                 // Read or flagged, it stays where it is; otherwise the
@@ -697,8 +703,10 @@ impl App {
             self.arrange();
         }
         // Stay on the same message.
-        if let Some(at) = selected.and_then(|id| self.messages.iter().position(|m| m.id == id)) {
-            self.selected = at;
+        if let Some(at) =
+            selected.and_then(|id| self.index.messages.iter().position(|m| m.id == id))
+        {
+            self.index.selected = at;
         }
         if complete {
             self.forget_missing_marks();
@@ -740,7 +748,7 @@ impl App {
     fn placing(&self) -> Placing {
         let at: Vec<Option<usize>> = self
             .folder_messages()
-            .map(|m| self.positions.get(&m.id).copied())
+            .map(|m| self.index.positions.get(&m.id).copied())
             .collect();
         let mut order: Vec<(Option<usize>, bool, DateTime<Utc>)> = self
             .folder_messages()
@@ -748,11 +756,11 @@ impl App {
             .map(|(m, at)| (*at, m.draft, m.received))
             .collect();
         order.sort_by_key(|(at, _, _)| at.unwrap_or(usize::MAX));
-        let (shown, rest) = at.split_at(self.messages.len());
+        let (shown, rest) = at.split_at(self.index.messages.len());
         Placing {
             order,
             shown: shown.to_vec(),
-            hidden: rest[..self.hidden.len()].to_vec(),
+            hidden: rest[..self.index.hidden.len()].to_vec(),
         }
     }
 
@@ -784,24 +792,29 @@ impl App {
         let at = match at {
             Some(at) => {
                 // Those after it move down one.
-                for later in self.positions.values_mut().filter(|p| **p >= at) {
+                for later in self.index.positions.values_mut().filter(|p| **p >= at) {
                     *later += 1;
                 }
                 placing.shift(at);
                 at
             }
-            None => self.positions.values().max().map_or(0, |last| last + 1),
+            None => self
+                .index
+                .positions
+                .values()
+                .max()
+                .map_or(0, |last| last + 1),
         };
-        self.positions.insert(message.id.clone(), at);
+        self.index.positions.insert(message.id.clone(), at);
         let entry = (Some(at), message.draft, message.received);
         let index = placing
             .order
             .partition_point(|(listed, _, _)| position(listed) < at);
         placing.order.insert(index, entry);
         let (list, positions) = if self.limit_shows(&message) {
-            (&mut self.messages, &mut placing.shown)
+            (&mut self.index.messages, &mut placing.shown)
         } else {
-            (&mut self.hidden, &mut placing.hidden)
+            (&mut self.index.hidden, &mut placing.hidden)
         };
         let index = positions
             .iter()

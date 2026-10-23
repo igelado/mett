@@ -112,7 +112,10 @@ pub(super) enum Choose {
 impl App {
     /// The selected message, if any.
     fn selected_id(&self) -> Option<MessageId> {
-        self.messages.get(self.selected).map(|s| s.id.clone())
+        self.index
+            .messages
+            .get(self.index.selected)
+            .map(|s| s.id.clone())
     }
 
     /// The message mailbox actions act on: the one the pager shows, or the
@@ -127,12 +130,12 @@ impl App {
 
     /// Whether the message is marked for deletion.
     pub fn is_deleted(&self, id: &MessageId) -> bool {
-        self.deleted.contains(id)
+        self.index.deleted.contains(id)
     }
 
     /// How many messages are marked for deletion.
     pub fn deleted_count(&self) -> usize {
-        self.deleted.len()
+        self.index.deleted.len()
     }
 
     /// Handles the mailbox actions of the index and the pager. Returns
@@ -194,10 +197,10 @@ impl App {
                     return Some(Vec::new());
                 };
                 if action == Action::DeleteMessage {
-                    self.deleted.insert(id);
+                    self.index.deleted.insert(id);
                 } else {
                     self.forget_failed_purge(&id);
-                    self.deleted.remove(&id);
+                    self.index.deleted.remove(&id);
                 }
                 if self.resolve {
                     self.next_message()
@@ -241,7 +244,7 @@ impl App {
             }
             Action::SyncMailbox => self.purge(None),
             Action::SaveMessage | Action::CopyMessage => {
-                if self.messages.is_empty() {
+                if self.index.messages.is_empty() {
                     self.fail("No messages.");
                     return Some(Vec::new());
                 }
@@ -279,11 +282,11 @@ impl App {
         // index has selected.
         if let Some(at) = self
             .acted_on()
-            .and_then(|id| self.messages.iter().position(|m| m.id == id))
+            .and_then(|id| self.index.messages.iter().position(|m| m.id == id))
         {
-            self.selected = at;
+            self.index.selected = at;
         }
-        if self.selected + 1 >= self.messages.len() {
+        if self.index.selected + 1 >= self.index.messages.len() {
             // The next message may still be loading: move there once it
             // arrives, as `j` does.
             if self.more_to_list() {
@@ -291,7 +294,7 @@ impl App {
             }
             return Vec::new();
         }
-        self.selected += 1;
+        self.index.selected += 1;
         if matches!(self.screen(), Screen::Pager(_)) {
             self.screens.pop();
             return self.open_selected();
@@ -380,7 +383,7 @@ impl App {
     /// Quits or opens another folder, purging this one's deleted messages
     /// first if the user wants to.
     pub(super) fn leave_folder(&mut self, then: AfterPurge) -> Vec<Effect> {
-        if self.deleted.is_empty() {
+        if self.index.deleted.is_empty() {
             return self.after_purge(then);
         }
         self.purge(Some(then))
@@ -397,14 +400,17 @@ impl App {
             self.fail("Deleted messages are already being purged.");
             return Vec::new();
         }
-        if self.deleted.is_empty() {
+        if self.index.deleted.is_empty() {
             if then.is_none() {
                 self.status.info("Mailbox is unchanged.");
             }
             return then.map_or_else(Vec::new, |then| self.after_purge(then));
         }
         self.then = then;
-        let prompt = format!("Purge {}?", messages(self.deleted.len(), "deleted message"));
+        let prompt = format!(
+            "Purge {}?",
+            messages(self.index.deleted.len(), "deleted message")
+        );
         match self.delete {
             Quad::Yes => self.answer_purge(true),
             Quad::No => self.answer_purge(false),
@@ -432,7 +438,7 @@ impl App {
             self.then = None;
             return Vec::new();
         };
-        let mut ids: Vec<MessageId> = self.deleted.iter().cloned().collect();
+        let mut ids: Vec<MessageId> = self.index.deleted.iter().cloned().collect();
         ids.sort();
         // The worker finds the trash, and deletes for good in the trash
         // itself, as mutt does. Marked messages that earlier moves take
@@ -445,7 +451,7 @@ impl App {
         };
         self.status.info(format!(
             "Purging {}...",
-            messages(self.deleted.len(), "message")
+            messages(self.index.deleted.len(), "message")
         ));
         self.write(Write::Transfer(Transfer::Purge, request))
     }
@@ -681,30 +687,14 @@ impl App {
 
     /// Forgets the open folder's index. Moves, copies and saves that are
     /// on their way or failed are kept: they don't depend on it.
-    fn reset_folder(&mut self) {
+    pub(super) fn reset_folder(&mut self) {
         self.screens.truncate(1);
         self.polling = None;
         self.known_before_refresh = None;
         self.tie_check = None;
         self.reselect = None;
         self.folder = None;
-        self.messages.clear();
-        self.hidden.clear();
-        self.folded.clear();
-        self.threads.clear();
-        self.threaded_count = 0;
-        self.chosen.clear();
-        self.collapse_all = false;
-        self.positions.clear();
-        self.limit = None;
-        self.limited.clear();
-        self.pending_search = None;
-        self.selected = 0;
-        self.deleted.clear();
-        self.listing = None;
-        self.listing_page = None;
-        self.unlisted = None;
-        self.pending = None;
+        self.index.reset();
         self.retries.forget(RetryKind::Open);
         self.relist_on_return = false;
         self.saved_flags.clear();
@@ -949,7 +939,7 @@ impl App {
         }
         match self.then.take() {
             // Messages marked while it ran are purged too, before leaving.
-            Some(then) if !self.deleted.is_empty() => self.purge(Some(then)),
+            Some(then) if !self.index.deleted.is_empty() => self.purge(Some(then)),
             Some(then) => self.after_purge(then),
             None => Vec::new(),
         }
@@ -960,13 +950,14 @@ impl App {
     /// doesn't keep trying them.
     pub(super) fn forget_missing_marks(&mut self) {
         let listed: HashSet<&MessageId> = self
+            .index
             .messages
             .iter()
-            .chain(&self.hidden)
-            .chain(&self.folded)
+            .chain(&self.index.hidden)
+            .chain(&self.index.folded)
             .map(|m| &m.id)
             .collect();
-        self.deleted.retain(|id| listed.contains(id));
+        self.index.deleted.retain(|id| listed.contains(id));
     }
 
     /// Takes messages that are no longer in the folder out of the index,
@@ -982,19 +973,19 @@ impl App {
         }
         self.screens
             .retain(|screen| !matches!(screen, Screen::Pager(pager) if gone.contains(&pager.id)));
-        let before = self.messages[..self.selected.min(self.messages.len())]
+        let before = self.index.messages[..self.index.selected.min(self.index.messages.len())]
             .iter()
             .filter(|m| gone.contains(&m.id))
             .count();
         // A pending move from a message that goes counts from the message
         // before it (or the top), not from the end it can no longer find.
-        if let Some(Target::After(anchor, steps)) = &self.pending
+        if let Some(Target::After(anchor, steps)) = &self.index.pending
             && gone.contains(anchor)
             && let Some(at) = self.entry_of(anchor)
         {
             let steps = *steps;
-            self.pending = Some(
-                match self.messages[..=at]
+            self.index.pending = Some(
+                match self.index.messages[..=at]
                     .iter()
                     .rev()
                     .find(|m| !gone.contains(&m.id))
@@ -1010,7 +1001,8 @@ impl App {
             .as_ref()
             .filter(|id| gone.contains(*id))
             .and_then(|id| {
-                self.folded
+                self.index
+                    .folded
                     .iter()
                     .find(|m| {
                         !gone.contains(&m.id)
@@ -1018,18 +1010,18 @@ impl App {
                     })
                     .map(|m| m.id.clone())
             });
-        self.messages.retain(|m| !gone.contains(&m.id));
-        self.hidden.retain(|m| !gone.contains(&m.id));
-        self.folded.retain(|m| !gone.contains(&m.id));
+        self.index.messages.retain(|m| !gone.contains(&m.id));
+        self.index.hidden.retain(|m| !gone.contains(&m.id));
+        self.index.folded.retain(|m| !gone.contains(&m.id));
         for id in gone {
-            self.deleted.remove(id);
+            self.index.deleted.remove(id);
         }
         // Stay on the same message, or the one that took its place.
-        self.selected = match selected {
-            Some(id) if !gone.contains(&id) => self.selected - before,
-            _ => self.selected.saturating_sub(before),
+        self.index.selected = match selected {
+            Some(id) if !gone.contains(&id) => self.index.selected - before,
+            _ => self.index.selected.saturating_sub(before),
         }
-        .min(self.messages.len().saturating_sub(1));
+        .min(self.index.messages.len().saturating_sub(1));
         // Their threads change. Without threads, what is left is still in
         // order.
         if self.threaded() {
@@ -1039,8 +1031,8 @@ impl App {
         }
         if let Some(member) = left_of_thread {
             let root = self.thread_of(&member).map_or(member, |t| t.root.clone());
-            if let Some(at) = self.messages.iter().position(|m| m.id == root) {
-                self.selected = at;
+            if let Some(at) = self.index.messages.iter().position(|m| m.id == root) {
+                self.index.selected = at;
             }
         }
     }

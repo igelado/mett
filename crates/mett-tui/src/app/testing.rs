@@ -134,7 +134,7 @@ pub(crate) fn requests(effects: &[Effect]) -> Vec<(RequestId, Request)> {
 }
 
 pub(crate) fn ids(app: &App) -> Vec<&str> {
-    app.messages.iter().map(|m| m.id.as_str()).collect()
+    app.index.messages.iter().map(|m| m.id.as_str()).collect()
 }
 
 pub(crate) fn pager(app: &App) -> &Pager {
