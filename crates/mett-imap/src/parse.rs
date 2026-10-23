@@ -95,7 +95,17 @@ fn utc(date: &mail_parser::DateTime) -> Option<DateTime<Utc>> {
 }
 
 /// The index line of a message from its header.
-pub(crate) fn summary(folder: &str, validity: u32, fetched: &Fetched) -> Result<MessageSummary> {
+///
+/// A message is dated by when it says it was sent, which is the order a
+/// server that sorts lists them in; where the server doesn't (`by_arrival`),
+/// they come by `UID`, which is the order of arrival, so they are dated by
+/// when they came in.
+pub(crate) fn summary(
+    folder: &str,
+    validity: u32,
+    fetched: &Fetched,
+    by_arrival: bool,
+) -> Result<MessageSummary> {
     let message = parse(&fetched.data)?;
     let at = Ref {
         folder: folder.to_owned(),
@@ -132,7 +142,12 @@ pub(crate) fn summary(folder: &str, validity: u32, fetched: &Fetched) -> Result<
         from: addresses(message.from()).into_iter().next(),
         to: addresses(message.to()),
         // A message that says no date is dated when it came in.
-        received: sent.or(fetched.internal).unwrap_or(DateTime::UNIX_EPOCH),
+        received: if by_arrival {
+            fetched.internal.or(sent)
+        } else {
+            sent.or(fetched.internal)
+        }
+        .unwrap_or(DateTime::UNIX_EPOCH),
         flags: fetched.flags,
         has_attachments: fetched.attachments.unwrap_or(multipart_mixed),
         draft: fetched.draft,
@@ -145,8 +160,13 @@ pub(crate) fn summary(folder: &str, validity: u32, fetched: &Fetched) -> Result<
 }
 
 /// A whole message.
-pub(crate) fn message(folder: &str, validity: u32, fetched: &Fetched) -> Result<Message> {
-    let mut summary = summary(folder, validity, fetched)?;
+pub(crate) fn message(
+    folder: &str,
+    validity: u32,
+    fetched: &Fetched,
+    by_arrival: bool,
+) -> Result<Message> {
+    let mut summary = summary(folder, validity, fetched, by_arrival)?;
     let parsed = parse(&fetched.data)?;
     summary.has_attachments = parsed.attachment_count() > 0;
     let text: Vec<_> = (0..parsed.text_body_count())

@@ -1600,3 +1600,19 @@ async fn a_check_thrown_away_after_the_changes_were_read_loses_nothing() {
         .unwrap();
     assert_eq!(asked_again.messages[0].subject, "copied in");
 }
+
+#[tokio::test]
+async fn asking_about_one_folder_after_another_lists_the_folders_once() {
+    let (server, store) = plain().await;
+    for name in ["INBOX", "Sent", "Archive", "Trash", "Drafts"] {
+        store.folder(&FolderId::new(name)).await.unwrap();
+    }
+    store
+        .well_known_folder(WellKnownFolder::SentItems)
+        .await
+        .unwrap();
+    assert_eq!(server.state.lock().unwrap().full_lists, 1);
+    // Browsing the folders looks again.
+    store.list_folders().await.unwrap();
+    assert_eq!(server.state.lock().unwrap().full_lists, 2);
+}

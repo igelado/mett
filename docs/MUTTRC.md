@@ -456,7 +456,7 @@ set realname  = "Alice Example"
   seconds rather than being told when mail arrives (flags that another client
   changes are noticed that way only where the server has `CONDSTORE`). The
   index is in the order of the messages' dates where the server has `SORT`,
-  and of their arrival (UID) where it hasn't. Threads are those of
+  and of their arrival (UID, and they are dated by it) where it hasn't. Threads are those of
   `References:`. Meeting invitations aren't shown as such (their `text/calendar`
   part is an attachment) and can't be answered.
 

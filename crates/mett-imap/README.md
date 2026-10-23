@@ -8,7 +8,7 @@ implements `mett-core`'s ports against any IMAP server:
 - **`ImapMailStore`** implements `MailStore`: folders (their roles from the
   server's `SPECIAL-USE` attributes, or their usual names; counts from
   `STATUS`), messages (newest first by their dates where the server has
-  `SORT`, by `UID` where it hasn't; a page at a time; threaded by
+  `SORT`, by `UID` (and so by arrival) where it hasn't; a page at a time; threaded by
   `References:`), message bodies (HTML-only mail as HTML) and attachments,
   read and flagged state, move (`MOVE`, else copy and delete), copy and delete
   (`UID EXPUNGE`: a server without `UIDPLUS` can't delete one message without

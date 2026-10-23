@@ -72,6 +72,8 @@ pub struct State {
     pub no_condstore: bool,
     /// Offers STARTTLS and then refuses it.
     pub refuse_starttls: bool,
+    /// How many times every folder was listed.
+    pub full_lists: u32,
 }
 
 impl State {
@@ -403,6 +405,9 @@ impl Session {
         if upper.starts_with("LIST ") {
             // LIST "" "pattern"
             let pattern = unquote(rest[5..].trim().split_once(' ').map_or("", |(_, p)| p));
+            if pattern == "*" {
+                state.full_lists += 1;
+            }
             for folder in &state.folders {
                 if pattern == "*" || pattern == folder.name {
                     let attributes = folder.attributes.join(" ");

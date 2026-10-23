@@ -23,6 +23,12 @@ use crate::marks::{Floor, Marks, Watch};
 use crate::parse::{self, Fetched};
 use crate::settings::{ImapSettings, Login, NoTokens};
 
+/// How long a listing of the folders is taken for what they are, where the
+/// listing is not what was asked for (a folder's counts, or the folder that
+/// is the Sent one): a poll asks about every mailbox, and each would list
+/// them all again.
+const LISTING_TTL: Duration = Duration::from_secs(30);
+
 /// What a connection that sat idle this long is asked before it is used:
 /// servers drop idle ones, and the first command on a dropped one would
 /// fail.
@@ -74,6 +80,8 @@ struct Live {
     session: Session<Conn>,
     caps: Caps,
     used: Instant,
+    /// The folders as last listed, and when.
+    listing: Option<(Instant, Vec<Listed>)>,
 }
 
 /// A mailbox on an IMAP server.
@@ -158,6 +166,7 @@ impl<A: Authenticator> ImapMailStore<A> {
                 condstore: caps.has_str("CONDSTORE") || caps.has_str("QRESYNC"),
             },
             used: Instant::now(),
+            listing: None,
         })
     }
 
@@ -365,6 +374,7 @@ fn role(
 }
 
 /// A folder from a listing, without counts.
+#[derive(Clone)]
 struct Listed {
     name: String,
     delimiter: Option<String>,
@@ -394,6 +404,19 @@ fn listed(name: &Name) -> Listed {
 fn parent_name<'a>(name: &'a str, delimiter: Option<&str>) -> Option<&'a str> {
     let delimiter = delimiter?;
     name.rsplit_once(delimiter).map(|(parent, _)| parent)
+}
+
+/// The folders, listed again if `fresh` or if the listing before is old.
+async fn all_folders(live: &mut Live, fresh: bool) -> Res<Vec<Listed>> {
+    if !fresh
+        && let Some((at, listing)) = &live.listing
+        && at.elapsed() < LISTING_TTL
+    {
+        return Ok(listing.clone());
+    }
+    let listing = list(live, "*").await?;
+    live.listing = Some((Instant::now(), listing.clone()));
+    Ok(listing)
 }
 
 async fn list(live: &mut Live, pattern: &str) -> Res<Vec<Listed>> {
@@ -456,7 +479,7 @@ async fn folders(
     under: Option<Option<&FolderId>>,
     timeout: Duration,
 ) -> Res<Vec<Folder>> {
-    let all = bounded(timeout, list(live, "*")).await?;
+    let all = bounded(timeout, all_folders(live, true)).await?;
     let names: HashSet<String> = all.iter().map(|l| l.name.clone()).collect();
     let mut out = Vec::with_capacity(all.len());
     for item in &all {
@@ -475,7 +498,7 @@ async fn folders(
 
 async fn folder(live: &mut Live, id: &FolderId) -> Res<Folder> {
     // The whole listing, which says what roles the others have.
-    let all = list(live, "*").await?;
+    let all = all_folders(live, false).await?;
     let item = all
         .iter()
         .find(|l| l.name == id.as_str())
@@ -560,11 +583,12 @@ async fn summaries(
     uids: &[u32],
 ) -> Res<Vec<MessageSummary>> {
     let found = fetch(live, uids, SUMMARY, false).await?;
+    let by_arrival = !live.caps.sort;
     let by_uid: HashMap<u32, &Fetched> = found.iter().map(|f| (f.uid, f)).collect();
     // A message that is gone by now is left out.
     uids.iter()
         .filter_map(|uid| by_uid.get(uid))
-        .map(|f| Ok(parse::summary(folder, validity, f)?))
+        .map(|f| Ok(parse::summary(folder, validity, f, by_arrival)?))
         .collect()
 }
 
@@ -861,7 +885,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let mut g = self.lock().await?;
         let t = g.timeout;
         let r = bounded(t, async {
-            let all = list(g.live(), "*").await?;
+            let all = all_folders(g.live(), false).await?;
             // The server's own say (an attribute) outranks a name that
             // looks right: the first one found goes by the order listed.
             let item = all
@@ -960,7 +984,12 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             let found = found
                 .first()
                 .ok_or_else(|| Error::not_found("message", id))?;
-            Ok(parse::message(&at.folder, at.validity, found)?)
+            Ok(parse::message(
+                &at.folder,
+                at.validity,
+                found,
+                !live.caps.sort,
+            )?)
         })
         .await;
         g.done(r)
