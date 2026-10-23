@@ -11,7 +11,8 @@ implements `mett-core`'s ports against any IMAP server:
   `SORT`, by `UID` where it hasn't; a page at a time; threaded by
   `References:`), message bodies (HTML-only mail as HTML) and attachments,
   read and flagged state, move (`MOVE`, else copy and delete), copy and delete
-  (`UID EXPUNGE` when the server has `UIDPLUS`), new-mail checks, and drafts
+  (`UID EXPUNGE`: a server without `UIDPLUS` can't delete one message without
+  deleting every one marked deleted, so mett refuses), new-mail checks, and drafts
   (appended to the Drafts folder, with `\Draft`).
 - With **`with_smtp(SmtpSender)`** it also implements `MailSender`: it sends
   through `mett-smtp`, threads replies from the original's `Message-ID:` and

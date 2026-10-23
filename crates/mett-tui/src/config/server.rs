@@ -18,19 +18,44 @@ pub struct ServerUrl {
     pub path: String,
 }
 
+/// `url` with the password in it, if any, hidden: for messages, which are
+/// shown and may be logged.
+pub fn redact(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+    let authority = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => match userinfo.split_once(':') {
+            Some((user, _)) => format!("{user}:***@{host}"),
+            None => authority.to_owned(),
+        },
+        None => authority.to_owned(),
+    };
+    match path {
+        Some(path) => format!("{scheme}://{authority}/{path}"),
+        None => format!("{scheme}://{authority}"),
+    }
+}
+
 impl ServerUrl {
     /// Parses `url`, whose scheme is `plain` (`imap`) or `secure`
     /// (`imaps`).
     pub fn parse(url: &str, plain: &str, secure: &str) -> Result<Self, String> {
+        // The URL may hold a password: messages show it without.
+        let shown = redact(url);
         let (scheme, rest) = url
             .split_once("://")
-            .ok_or_else(|| format!("{url}: not a {plain}:// or {secure}:// URL"))?;
+            .ok_or_else(|| format!("{shown}: not a {plain}:// or {secure}:// URL"))?;
         let tls = if scheme.eq_ignore_ascii_case(secure) {
             true
         } else if scheme.eq_ignore_ascii_case(plain) {
             false
         } else {
-            return Err(format!("{url}: expected {plain}:// or {secure}://"));
+            return Err(format!("{shown}: expected {plain}:// or {secure}://"));
         };
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         let (userinfo, hostport) = match authority.rsplit_once('@') {
@@ -42,7 +67,7 @@ impl ServerUrl {
             Some(v6) => match v6.split_once(']') {
                 Some((host, "")) => (host, None),
                 Some((host, port)) => (host, port.strip_prefix(':')),
-                None => return Err(format!("{url}: unclosed [ in the host")),
+                None => return Err(format!("{shown}: unclosed [ in the host")),
             },
             None => match hostport.rsplit_once(':') {
                 Some((host, port)) => (host, Some(port)),
@@ -50,12 +75,12 @@ impl ServerUrl {
             },
         };
         if host.is_empty() {
-            return Err(format!("{url}: no host"));
+            return Err(format!("{shown}: no host"));
         }
         let port = port
             .map(|p| {
                 p.parse::<u16>()
-                    .map_err(|_| format!("{url}: {p:?} is not a port"))
+                    .map_err(|_| format!("{shown}: {p:?} is not a port"))
             })
             .transpose()?;
         let (user, password) = match userinfo {
@@ -86,7 +111,7 @@ pub fn decode(text: &str) -> Result<String, String> {
             let hex = text
                 .get(i + 1..i + 3)
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
-                .ok_or_else(|| format!("{text}: bad % escape"))?;
+                .ok_or("a bad % escape in a user name or password")?;
             out.push(hex);
             i += 3;
         } else {
@@ -94,7 +119,7 @@ pub fn decode(text: &str) -> Result<String, String> {
             i += 1;
         }
     }
-    String::from_utf8(out).map_err(|_| format!("{text}: not UTF-8 once unescaped"))
+    String::from_utf8(out).map_err(|_| "not UTF-8 once unescaped".to_owned())
 }
 
 /// `text` with what a URL's user name can't hold escaped.
@@ -156,6 +181,7 @@ mod tests {
             "imap://host:port/",
             "imap://host:99999/",
             "imap://a%zz@host/",
+            "imap://me:pw@host:port/",
             "host",
         ] {
             assert!(imap(bad).is_err(), "{bad}");
@@ -167,5 +193,25 @@ mod tests {
         for text in ["me@example.com", "p:ss/w%rd", "ünï"] {
             assert_eq!(decode(&encode(text)).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn errors_do_not_show_passwords() {
+        for bad in [
+            "imap://me:hunter2@host:port/",
+            "imap://me:hunter2@:993/",
+            "imapx://me:hunter2@host/",
+            "imap://me:hunter2@[::1/",
+            "imap://me:h%zzter2@host/",
+        ] {
+            let error = imap(bad).unwrap_err();
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+        assert_eq!(
+            redact("imaps://me:hunter2@host/INBOX"),
+            "imaps://me:***@host/INBOX"
+        );
+        assert_eq!(redact("imaps://me@host/INBOX"), "imaps://me@host/INBOX");
+        assert_eq!(redact("INBOX"), "INBOX");
     }
 }

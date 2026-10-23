@@ -735,92 +735,52 @@ async fn a_draft_without_recipients_can_be_postponed() {
 }
 
 #[tokio::test]
-async fn deletes_one_message_without_uidplus_only_if_no_other_is_marked() {
+async fn will_not_delete_one_message_without_uidplus() {
     let (server, store) = plain().await;
     server.state.lock().unwrap().no_uidplus = true;
     let ours = deliver(&server, "INBOX", &simple("ours"), &[]);
+    let theirs = deliver(&server, "INBOX", &simple("theirs"), &["\\Deleted"]);
     let inbox = FolderId::new("INBOX");
     let id = store
-        .list_messages(&inbox, Page::first(1))
+        .list_messages(&inbox, Page::first(5))
         .await
         .unwrap()
-        .messages[0]
+        .messages[1]
         .id
         .clone();
-    // Another client marked a message deleted and hasn't expunged yet.
-    let theirs = deliver(&server, "INBOX", &simple("theirs"), &["\\Deleted"]);
+    // Expunging would take the other client's message as well.
     let error = store.delete_message(&id).await.unwrap_err();
     assert!(error.to_string().contains("UIDPLUS"), "{error}");
-    {
-        let mut state = server.state.lock().unwrap();
-        let kept: Vec<u32> = state
-            .folder("INBOX")
-            .messages
-            .iter()
-            .map(|m| m.uid)
-            .collect();
-        assert_eq!(kept, [ours, theirs]);
-        // Ours wasn't left marked.
-        assert!(
-            !state.folder("INBOX").messages[0]
-                .flags
-                .contains("\\Deleted")
-        );
-        // Without the other one, it is safe.
-        state.folder("INBOX").messages.retain(|m| m.uid == ours);
-    }
-    store.delete_message(&id).await.unwrap();
+    let mut state = server.state.lock().unwrap();
+    let kept: Vec<u32> = state
+        .folder("INBOX")
+        .messages
+        .iter()
+        .map(|m| m.uid)
+        .collect();
+    assert_eq!(kept, [ours, theirs]);
     assert!(
-        server
-            .state
-            .lock()
-            .unwrap()
-            .folder("INBOX")
-            .messages
-            .is_empty()
+        !state.folder("INBOX").messages[0]
+            .flags
+            .contains("\\Deleted")
     );
 }
 
 #[tokio::test]
-async fn moves_without_move_or_uidplus_by_copying_when_it_can_delete_safely() {
+async fn moves_without_move_or_uidplus_fail_before_copying() {
     let (server, store) = plain().await;
     {
         let mut state = server.state.lock().unwrap();
         state.no_uidplus = true;
         state.no_move = true;
     }
-    deliver(&server, "INBOX", &simple("travelling"), &[]);
+    deliver(&server, "INBOX", &simple("stays"), &[]);
     let inbox = FolderId::new("INBOX");
     let id = store
         .list_messages(&inbox, Page::first(1))
         .await
         .unwrap()
         .messages[0]
-        .id
-        .clone();
-    let moved = store
-        .move_message(&id, &FolderId::new("Archive"))
-        .await
-        .unwrap();
-    assert!(moved.as_str().ends_with(".Archive"));
-    assert!(
-        server
-            .state
-            .lock()
-            .unwrap()
-            .folder("INBOX")
-            .messages
-            .is_empty()
-    );
-
-    // With another message marked, it doesn't copy at all.
-    deliver(&server, "INBOX", &simple("stays"), &[]);
-    deliver(&server, "INBOX", &simple("theirs"), &["\\Deleted"]);
-    let id = store
-        .list_messages(&inbox, Page::first(5))
-        .await
-        .unwrap()
-        .messages[1]
         .id
         .clone();
     assert!(
@@ -838,6 +798,56 @@ async fn moves_without_move_or_uidplus_by_copying_when_it_can_delete_safely() {
             .messages
             .is_empty()
     );
+    // A copy leaves the original, so it works.
+    store
+        .copy_message(&id, &FolderId::new("Trash"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_message_without_a_message_id_is_found_where_it_was_moved() {
+    let (server, store) = plain().await;
+    let raw = "From: a@example.org\nTo: me@example.com\nSubject: anonymous\nDate: Tue, 20 Oct 2026 09:00:00 +0000\n\nbody\n";
+    deliver(&server, "INBOX", raw, &[]);
+    // Something else is already in the destination.
+    deliver(&server, "Archive", &simple("resident"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    let copy = store
+        .copy_message(&id, &FolderId::new("Archive"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch_message(&copy).await.unwrap().summary.subject,
+        "anonymous"
+    );
+}
+
+#[tokio::test]
+async fn all_mail_is_not_the_archive() {
+    let server = server(
+        Mode::Plain,
+        password(),
+        vec![
+            Folder::new("INBOX", &[]),
+            Folder::new("All Mail", &["\\All"]),
+            Folder::new("Filed", &["\\Archive"]),
+        ],
+    )
+    .await;
+    let store = ImapMailStore::new(settings(&server, Security::None), login(), Address::new(ME));
+    let archive = store
+        .well_known_folder(WellKnownFolder::Archive)
+        .await
+        .unwrap();
+    assert_eq!(archive.id.as_str(), "Filed");
 }
 
 #[tokio::test]

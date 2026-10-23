@@ -303,7 +303,7 @@ fn role(
             NameAttribute::Drafts => WellKnownFolder::Drafts,
             NameAttribute::Trash => WellKnownFolder::DeletedItems,
             NameAttribute::Junk => WellKnownFolder::JunkEmail,
-            NameAttribute::Archive | NameAttribute::All => WellKnownFolder::Archive,
+            NameAttribute::Archive => WellKnownFolder::Archive,
             _ => continue,
         };
         return Some((declared, true));
@@ -1019,14 +1019,14 @@ impl<A: Authenticator> ImapMailStore<A> {
                 if moving {
                     // Before the copy: a message that is copied and can't
                     // be deleted is in two folders.
-                    expungeable(live, at.uid).await?;
+                    expungeable(live)?;
                 }
                 live.session.uid_copy(&uids, wire(to.as_str())).await?;
                 if moving {
                     expunge(live, &at).await?;
                 }
             }
-            locate(live, to.as_str(), wanted.as_deref(), before).await
+            locate(live, to.as_str(), wanted.as_deref(), before, &header.data).await
         })
         .await;
         g.done(r)
@@ -1052,7 +1052,7 @@ impl<A: Authenticator> ImapMailStore<A> {
             live.session
                 .append(wire(folder.as_str()), Some(flags), None, message)
                 .await?;
-            locate(live, folder.as_str(), Some(message_id), before).await
+            locate(live, folder.as_str(), Some(message_id), before, &[]).await
         })
         .await;
         g.done(r)
@@ -1091,20 +1091,17 @@ impl<A: Authenticator> ImapMailStore<A> {
     }
 }
 
-/// Whether the message `uid` of the selected folder can be deleted without
-/// deleting others: without `UIDPLUS`, expunging takes every message marked
-/// deleted, so it is only safe if none other is.
-async fn expungeable(live: &mut Live, uid: u32) -> Res<()> {
+/// Fails unless the server can delete one message of a folder: without
+/// `UIDPLUS`, expunging takes every message marked deleted, including those
+/// another client marked since, which no check beforehand can make safe.
+fn expungeable(live: &Live) -> Res<()> {
     if live.caps.uidplus {
         return Ok(());
     }
-    if search(live, "DELETED").await?.iter().any(|u| *u != uid) {
-        return Err(Error::Backend(
-            "the folder has other messages marked deleted, and this server can't delete just one (it has no UIDPLUS)".into(),
-        )
-        .into());
-    }
-    Ok(())
+    Err(Error::Backend(
+        "this server can't delete just one message (it has no UIDPLUS): nothing was deleted".into(),
+    )
+    .into())
 }
 
 /// Changes the flags of the message `at` in the selected folder: `sign` is
@@ -1124,39 +1121,50 @@ async fn flag(live: &mut Live, at: &Ref, sign: char, flag: &str) -> Res<()> {
 
 /// Deletes the message `at` from the selected folder.
 async fn expunge(live: &mut Live, at: &Ref) -> Res<()> {
-    expungeable(live, at.uid).await?;
+    expungeable(live)?;
     flag(live, at, '+', "\\Deleted").await?;
-    if live.caps.uidplus {
-        let _: Vec<u32> = live
-            .session
-            .uid_expunge(at.uid.to_string())
-            .await?
-            .try_collect()
-            .await?;
-    } else {
-        let _: Vec<u32> = live.session.expunge().await?.try_collect().await?;
-    }
+    let _: Vec<u32> = live
+        .session
+        .uid_expunge(at.uid.to_string())
+        .await?
+        .try_collect()
+        .await?;
     Ok(())
 }
 
 /// What the message that went into `folder` is called there: the newest
-/// with the `Message-ID:` `wanted`, or, without one, the one that would
-/// have `before` (the folder's `UIDNEXT` then).
+/// with the `Message-ID:` `wanted`; or, without one, the newest from
+/// `before` on (the folder's `UIDNEXT` before it went in) whose header is
+/// `header`, which another client's mail that came in meanwhile doesn't have.
 async fn locate(
     live: &mut Live,
     folder: &str,
     wanted: Option<&str>,
     before: Option<u32>,
+    header: &[u8],
 ) -> Res<MessageId> {
     let validity = select(live, folder).await?.validity;
-    let found = match wanted {
-        Some(id) => {
+    let found = match (wanted, before) {
+        (Some(id), _) => {
             let query = format!("HEADER Message-ID \"{}\"", id.replace(['\\', '"'], ""));
             search(live, &query).await?.first().copied()
         }
-        None => None,
+        (None, Some(before)) => {
+            let candidates: Vec<u32> = search(live, &format!("UID {before}:*"))
+                .await?
+                .into_iter()
+                .filter(|uid| *uid >= before)
+                .collect();
+            let headers = fetch(live, &candidates, SUMMARY, false).await?;
+            headers
+                .iter()
+                .filter(|f| f.data == header)
+                .map(|f| f.uid)
+                .max()
+        }
+        (None, None) => None,
     };
-    let uid = found.or(before).ok_or_else(|| {
+    let uid = found.ok_or_else(|| {
         Error::Backend(format!(
             "{folder}: the message went there, but where it is isn't known"
         ))

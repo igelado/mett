@@ -123,7 +123,7 @@ impl MailboxUrl {
         };
         Ok(Self {
             account,
-            folder: folder_path_of(url, &segments)?,
+            folder: folder_path_of(&server::redact(url), &segments)?,
             server: Server::Imap(server),
         })
     }
@@ -217,10 +217,10 @@ impl fmt::Display for MailboxUrl {
         let encoded = |name: &str| match self.server {
             Server::Office365 => name.to_owned(),
             Server::Imap(_) => name
-                .bytes()
-                .map(|b| match b {
-                    b'%' | b'/' | b' ' | b'#' | b'?' => format!("%{b:02X}"),
-                    _ => (b as char).to_string(),
+                .chars()
+                .map(|c| match c {
+                    '%' | '/' | ' ' | '#' | '?' => format!("%{:02X}", c as u32),
+                    _ => c.to_string(),
                 })
                 .collect::<String>(),
         };
@@ -277,7 +277,8 @@ pub fn folder_path(
         let url = MailboxUrl::parse(&expanded)?;
         if !url.is_of(account, folder) {
             return Err(MailboxError(format!(
-                "{expanded}: mett can only use folders of {account}"
+                "{}: mett can only use folders of {account}",
+                server::redact(&expanded)
             )));
         }
         url
@@ -556,5 +557,21 @@ mod tests {
         assert_eq!(path("=Trash"), Ok(FolderPath::Named(vec!["Trash".into()])));
         assert!(path("imaps://mail.example.org/Trash").is_ok());
         assert!(path("imaps://other.example.org/Trash").is_err());
+    }
+
+    #[test]
+    fn non_ascii_folder_names_round_trip_in_imap_urls() {
+        for url in [
+            "imaps://me@mail.example.com/%C3%89quipe",
+            "imaps://me@mail.example.com/Équipe/Entwürfe",
+            "imaps://me@mail.example.com/Reports%2F2026",
+        ] {
+            let parsed = MailboxUrl::parse(url).unwrap();
+            let again = MailboxUrl::parse(&parsed.to_string()).unwrap();
+            assert_eq!(parsed, again, "{url}");
+        }
+        let url = MailboxUrl::parse("imaps://me@mail.example.com/%C3%89quipe").unwrap();
+        assert_eq!(url.folder, FolderPath::Named(vec!["Équipe".into()]));
+        assert_eq!(url.to_string(), "imaps://me@mail.example.com/Équipe");
     }
 }
