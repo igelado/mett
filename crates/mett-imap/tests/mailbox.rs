@@ -1327,3 +1327,32 @@ async fn what_comes_in_between_listing_a_folder_and_the_first_poll_is_new() {
     assert_eq!(changed.messages.len(), 1);
     assert_eq!(changed.messages[0].subject, "copied in too");
 }
+
+#[tokio::test]
+async fn a_quoted_message_id_is_found_where_it_was_copied() {
+    let (server, store) = plain().await;
+    let raw = mail(
+        "quoted",
+        "a@example.org",
+        "me@example.com",
+        "Message-ID: <\"abc\"@example.org>\n",
+        "body",
+    );
+    deliver(&server, "INBOX", &raw, &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    let copy = store
+        .copy_message(&id, &FolderId::new("Archive"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.fetch_message(&copy).await.unwrap().summary.subject,
+        "quoted"
+    );
+}

@@ -153,7 +153,21 @@ impl MailboxUrl {
         {
             return false;
         }
-        if self.account.as_str().eq_ignore_ascii_case(account.as_str()) {
+        let same_account = match self.server {
+            // An Office365 account is a mail address, which ignores case; an
+            // IMAP user name may not: `Alice` and `alice` can be two users.
+            Server::Office365 => self.account.as_str().eq_ignore_ascii_case(account.as_str()),
+            Server::Imap(_) => match (
+                self.account.as_str().rsplit_once('@'),
+                account.as_str().rsplit_once('@'),
+            ) {
+                (Some((user, host)), Some((other, other_host))) => {
+                    user == other && host.eq_ignore_ascii_case(other_host)
+                }
+                _ => self.account == *account,
+            },
+        };
+        if same_account {
             return true;
         }
         // An IMAP URL that names no user is of whoever logs in at its
@@ -593,5 +607,24 @@ mod tests {
                 parsed.server
             );
         }
+    }
+
+    #[test]
+    fn imap_user_names_keep_their_case() {
+        let account = AccountId::new("Alice@mail.example.com");
+        let folder = "imaps://Alice@mail.example.com/";
+        let path = |text| folder_path(text, folder, &account);
+        assert!(path("imaps://Alice@MAIL.example.com/INBOX").is_ok());
+        assert!(path("imaps://alice@mail.example.com/INBOX").is_err());
+        // Office365 addresses don't.
+        let account = AccountId::new("Alice@contoso.com");
+        assert!(
+            folder_path(
+                "msgraph://alice@contoso.com/@inbox",
+                "msgraph://Alice@contoso.com/",
+                &account
+            )
+            .is_ok()
+        );
     }
 }

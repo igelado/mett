@@ -1169,7 +1169,10 @@ async fn locate(
     let validity = select(live, folder).await?.validity;
     let found = match (wanted, before) {
         (Some(id), _) => {
-            let query = format!("HEADER Message-ID \"{}\"", id.replace(['\\', '"'], ""));
+            let query = format!(
+                "HEADER Message-ID \"{}\"",
+                id.replace('\\', "\\\\").replace('"', "\\\"")
+            );
             search(live, &query).await?.first().copied()
         }
         (None, Some(before)) => {

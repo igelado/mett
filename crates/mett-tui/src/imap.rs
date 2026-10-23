@@ -95,30 +95,29 @@ pub fn smtp_sender(
     }
     settings.verify = config.flag("ssl_verify_host");
     settings.ca_certificates = certificates(config)?;
-    // The user is the one of the mailbox unless the URL says another, and
-    // the password the URL's or `smtp_pass`, or the mailbox's if the user
-    // is the same.
-    let mailbox_login = imap_login(config, url).ok();
-    let user = server.user.clone().or_else(|| match &mailbox_login {
-        Some(Login::Password { user, .. }) => Some(user.clone()),
-        _ => None,
-    });
-    let login = match user {
+    // Like mutt, mett logs in only as the user the URL names; the password
+    // is the URL's, or `smtp_pass`, or the mailbox's if the user is the same.
+    // A URL with no user is a relay that takes mail without a login.
+    let login = match &server.user {
         None => SmtpLogin::None,
         Some(user) => {
+            let same_user = imap_login(config, url).ok().and_then(|login| match login {
+                Login::Password {
+                    user: same,
+                    password,
+                } if same == *user => Some(password),
+                _ => None,
+            });
             let password = server
                 .password
                 .clone()
                 .or_else(|| Some(config.string("smtp_pass").to_owned()).filter(|p| !p.is_empty()))
-                .or_else(|| match &mailbox_login {
-                    Some(Login::Password {
-                        user: same,
-                        password,
-                    }) if *same == user => Some(password.clone()),
-                    _ => None,
-                })
+                .or(same_user)
                 .ok_or("smtp_pass is not set")?;
-            SmtpLogin::Password { user, password }
+            SmtpLogin::Password {
+                user: user.clone(),
+                password,
+            }
         }
     };
     Ok(Some(SmtpSender::new(settings, login)))
@@ -263,9 +262,15 @@ mod tests {
         let imap = url("imaps://me@mail.example.com/");
         assert!(smtp_sender(&config(""), &imap, &me).unwrap().is_none());
 
-        // No user in `smtp_url`: the mailbox's, with its password.
+        // No user in `smtp_url`: a relay that takes mail without a login.
         let c = config("set imap_pass=secret smtp_url=smtps://smtp.example.com\n");
-        assert!(smtp_sender(&c, &imap, &me).unwrap().is_some());
+        let relay = smtp_sender(&c, &imap, &me).unwrap().unwrap();
+        assert!(format!("{relay:?}").contains("login: None"), "{relay:?}");
+
+        // The mailbox's user logs in with the mailbox's password.
+        let c = config("set imap_pass=secret smtp_url=smtps://me@smtp.example.com\n");
+        let same = smtp_sender(&c, &imap, &me).unwrap().unwrap();
+        assert!(format!("{same:?}").contains("Password"), "{same:?}");
 
         // Another user needs a password of its own.
         let c = config("set imap_pass=secret smtp_url=smtp://other@smtp.example.com:2525\n");

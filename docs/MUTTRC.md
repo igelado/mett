@@ -434,9 +434,11 @@ set realname  = "Alice Example"
   use `ssl_force_tls` unless the network is yours. The server's certificate
   is checked against the system's authorities (and
   `ssl_ca_certificate_file`) unless `ssl_verify_host` is off.
-- **SMTP.** `smtp_url` names the server and, if it needs one, a user (by
-  default `imap_user`). Its password is in the URL, or `smtp_pass`, or the
-  IMAP one if the user is the same. Without `smtp_url`, mail can't be sent.
+- **SMTP.** `smtp_url` names the server and, if it needs a login, the user
+  (`smtps://alice@smtp.example.com`; as in mutt, a URL without a user is a
+  relay that takes mail without one). Its password is in the URL, or
+  `smtp_pass`, or the IMAP one if the user is the same. Without `smtp_url`,
+  mail can't be sent.
   mett saves the copy of what it sends (`copy`) in the folder the server
   calls Sent, and postponed messages in Drafts, whatever `record` and
   `postponed` say (as with Office365). Replies keep the original's
