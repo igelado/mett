@@ -678,6 +678,12 @@ impl Config {
                     Ok(())
                 }),
                 "exec" => Err("exec: expected a function".to_owned()),
+                // The accounts are opened when mett starts: one made at the
+                // prompt (which has no file) would open nothing.
+                "account" if origin.file.as_os_str().is_empty() => Err(
+                    "account: can only be used in a mettrc, which is read when mett starts"
+                        .to_owned(),
+                ),
                 "account" => match args {
                     [label, path] => self.expand(label).and_then(|label| {
                         let path = self.expand(path)?;
@@ -1889,6 +1895,14 @@ mod tests {
         assert!(config.take_pushed().is_empty());
         assert_eq!(config.take_key_commands().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn accounts_cannot_be_made_at_the_prompt() {
+        let mut config = Config::new(None);
+        let error = config.run_line("account Work /tmp/work").unwrap_err();
+        assert!(error.contains("only be used in a mettrc"), "{error}");
+        assert!(config.accounts().is_empty());
     }
 
     #[test]
