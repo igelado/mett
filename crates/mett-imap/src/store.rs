@@ -121,6 +121,45 @@ struct Live {
     /// `SELECT` left it: what works on a message by its `UID` needs not
     /// select it again. Not known (`None`) after a command failed.
     open: Option<(String, u32)>,
+    /// The message last read whole, which its attachments are read from:
+    /// the list of them and then each (a body doesn't change) take one
+    /// fetch, not one each.
+    raw: Option<Cached>,
+}
+
+/// A message, as the server has it, kept for a while.
+struct Cached {
+    at: Ref,
+    data: Vec<u8>,
+    /// When it was fetched.
+    since: Instant,
+}
+
+/// How long a message that was read whole is kept: no longer than a user
+/// takes to save its attachments, so that one deleted by another client is
+/// not kept for long.
+const KEPT: Duration = Duration::from_secs(60);
+
+/// The largest message that is kept.
+const KEPT_UP_TO: usize = 32 << 20;
+
+impl Live {
+    /// Keeps the message `at`, as the server has it, for the next read of it.
+    fn keep(&mut self, at: &Ref, data: &[u8]) {
+        self.raw = (data.len() <= KEPT_UP_TO).then(|| Cached {
+            at: at.clone(),
+            data: data.to_vec(),
+            since: Instant::now(),
+        });
+    }
+
+    /// The message `at` as it was kept, if it is.
+    fn kept(&self, at: &Ref) -> Option<&[u8]> {
+        self.raw
+            .as_ref()
+            .filter(|c| c.at == *at && c.since.elapsed() < KEPT)
+            .map(|c| c.data.as_slice())
+    }
 }
 
 /// A mailbox on an IMAP server.
@@ -219,6 +258,7 @@ impl<A: Authenticator> ImapMailStore<A> {
             used: Instant::now(),
             listing: None,
             open: None,
+            raw: None,
         })
     }
 
@@ -457,6 +497,8 @@ struct Batch {
     next: HashMap<String, u32>,
     /// The headers that `FETCH` said of messages, by `UID`.
     headers: HashMap<u32, Vec<u8>>,
+    /// What `SEARCH` found, for each answer, in the order they came.
+    searches: Vec<Vec<u32>>,
     /// How each command ended, in the order they were sent.
     ended: Vec<Res<()>>,
 }
@@ -489,6 +531,7 @@ async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
         counts: Counts::new(),
         next: HashMap::new(),
         headers: HashMap::new(),
+        searches: Vec::new(),
         ended: Vec::new(),
     };
     let mut ended: Vec<Option<Res<()>>> = commands.iter().map(|_| None).collect();
@@ -522,6 +565,7 @@ async fn batch(live: &mut Live, commands: &[String]) -> Res<Batch> {
                 }
                 got.counts.insert(name, (unseen, total));
             }
+            Response::MailboxData(MailboxDatum::Search(uids)) => got.searches.push(uids.clone()),
             Response::Fetch(_, attributes) => {
                 let mut uid = None;
                 let mut header = None;
@@ -999,7 +1043,18 @@ async fn arrived_since(
     } else {
         format!("SINCE {day}")
     };
-    let mut uids: Vec<u32> = search(live, &query).await?;
+    let uids = search(live, &query).await?;
+    dated(live, uids, since, unseen).await
+}
+
+/// Of `uids` (newest first), those that came in at or after `since`, with
+/// when (see `arrived_since`).
+async fn dated(
+    live: &mut Live,
+    mut uids: Vec<u32>,
+    since: DateTime<Utc>,
+    unseen: bool,
+) -> Res<HashMap<u32, DateTime<Utc>>> {
     if unseen {
         uids.truncate(RECENT_UNREAD * 4);
     }
@@ -1009,6 +1064,44 @@ async fn arrived_since(
         .filter_map(|f| Some((f.uid, f.internal?)))
         .filter(|(_, at)| *at >= since)
         .collect())
+}
+
+/// The unread messages of the selected folder, and, if `since` is told, those
+/// that came in about then (see `arrived_since`; newest first). The second
+/// is part of the first, but only the server can tell by what date: both
+/// searches are sent together, one round trip for them.
+async fn unread_and_recent(
+    live: &mut Live,
+    since: Option<DateTime<Utc>>,
+) -> Res<(BTreeSet<u32>, Vec<u32>)> {
+    let Some(since) = since else {
+        return Ok((
+            search(live, "UNSEEN").await?.into_iter().collect(),
+            Vec::new(),
+        ));
+    };
+    let query = format!("UNSEEN SINCE {}", day(since - chrono::TimeDelta::days(1)));
+    let mut got = batch(
+        live,
+        &[
+            "UID SEARCH UNSEEN".to_owned(),
+            format!("UID SEARCH {query}"),
+        ],
+    )
+    .await?;
+    for ended in got.ended {
+        ended?;
+    }
+    // The answers come in the order of the commands: a server that leaves
+    // one out (it is to say, even if it found nothing) is asked one at a time.
+    if got.searches.len() != 2 {
+        let unseen = search(live, "UNSEEN").await?.into_iter().collect();
+        return Ok((unseen, search(live, &query).await?));
+    }
+    let mut recent = got.searches.pop().unwrap_or_default();
+    recent.sort_unstable_by(|a, b| b.cmp(a));
+    let unseen = got.searches.pop().unwrap_or_default().into_iter().collect();
+    Ok((unseen, recent))
 }
 
 /// What is new in the selected folder since `floor`: the messages from its
@@ -1114,9 +1207,9 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             // last time this asked, whatever its date says (it may have
             // been copied in, or marked unread by another client).
             let mut found: HashMap<u32, DateTime<Utc>> = HashMap::new();
-            let unseen: BTreeSet<u32> = search(live, "UNSEEN").await?.into_iter().collect();
+            let (unseen, recent) = unread_and_recent(live, since).await?;
             if let Some(since) = since {
-                found.extend(arrived_since(live, since, true).await?);
+                found.extend(dated(live, recent, since, true).await?);
             } else {
                 // The newest are enough: no more than that are told.
                 let newest: Vec<u32> = unseen
@@ -1279,6 +1372,8 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             let found = found
                 .first()
                 .ok_or_else(|| Error::not_found("message", id))?;
+            // Its attachments are likely to be read next.
+            live.keep(&at, &found.data);
             Ok(parse::message(
                 &at.folder,
                 at.validity,
@@ -1362,6 +1457,8 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let r = bounded(t, async {
             let live = g.live();
             select_ref(live, &at).await?;
+            // What is gone is not kept.
+            live.raw = None;
             expunge(live, &at).await
         })
         .await;
@@ -1414,13 +1511,18 @@ impl<A: Authenticator> ImapMailStore<A> {
         let t = g.timeout;
         let r = bounded(t, async {
             let live = g.live();
+            if let Some(data) = live.kept(&at) {
+                return Ok(data.to_vec());
+            }
             select_ref(live, &at).await?;
             let found = fetch(live, &[at.uid], WHOLE, true).await?;
-            found
+            let data = found
                 .into_iter()
                 .next()
                 .map(|f| f.data)
-                .ok_or_else(|| Fail::Core(Error::not_found("message", id)))
+                .ok_or_else(|| Fail::Core(Error::not_found("message", id)))?;
+            live.keep(&at, &data);
+            Ok(data)
         })
         .await;
         g.done(r)
@@ -1437,6 +1539,10 @@ impl<A: Authenticator> ImapMailStore<A> {
             // Its `Message-ID:` finds it again where it goes, if the server
             // doesn't say where it went (`UIDPLUS` does): it gets a new UID.
             // What is needed of the server before is asked together.
+            if moving {
+                // What is gone is not kept.
+                live.raw = None;
+            }
             let uids = at.uid.to_string();
             let target = quoted(&wire(to.as_str()))?;
             let mut got = batch(

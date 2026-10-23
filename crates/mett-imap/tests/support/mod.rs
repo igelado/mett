@@ -333,7 +333,9 @@ impl Session {
                 // the answer, which a client that waits does) is not left
                 // to the timing of the packets: the answers to these wait
                 // a little for the next.
-                if (upper.starts_with("STATUS ") || upper.starts_with("LIST "))
+                if (upper.starts_with("STATUS ")
+                    || upper.starts_with("LIST ")
+                    || upper.starts_with("UID SEARCH UNSEEN"))
                     && stream.buffer().is_empty()
                 {
                     let wait = std::time::Duration::from_millis(100);

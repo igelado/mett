@@ -2146,3 +2146,77 @@ async fn flags_to_set_or_clear_go_in_one_command_each() {
         .messages[0];
     assert!(m.flags.read && !m.flags.flagged);
 }
+
+fn with_attachment(subject: &str) -> String {
+    format!(
+        "From: Alice <alice@example.org>\nTo: me@example.com\nSubject: {subject}\nDate: Tue, 20 Oct 2026 09:00:00 +0000\nMessage-ID: <att-{subject}@example.org>\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=\"b\"\n\n--b\nContent-Type: text/plain\n\nSee attached.\n--b\nContent-Type: application/octet-stream; name=\"a.bin\"\nContent-Disposition: attachment; filename=\"a.bin\"\nContent-Transfer-Encoding: base64\n\naGVsbG8=\n--b--\n"
+    )
+}
+
+fn whole_fetches(server: &Server) -> usize {
+    let state = server.state.lock().unwrap();
+    state
+        .commands
+        .iter()
+        .filter(|c| c.starts_with("UID FETCH") && c.contains("BODY.PEEK[]"))
+        .count()
+}
+
+#[tokio::test]
+async fn the_attachments_of_a_message_take_one_fetch() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &with_attachment("one"), &[]);
+    deliver(&server, "INBOX", &with_attachment("two"), &[]);
+    let page = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(10))
+        .await
+        .unwrap();
+    let (two, one) = (page.messages[0].id.clone(), page.messages[1].id.clone());
+
+    // Reading it is the one fetch, and what it has is read from that.
+    let message = store.fetch_message(&one).await.unwrap();
+    assert_eq!(whole_fetches(&server), 1);
+    let attachments = store.list_attachments(&one).await.unwrap();
+    assert_eq!(attachments.len(), 1);
+    for _ in 0..2 {
+        let data = store
+            .fetch_attachment(&one, &attachments[0].id)
+            .await
+            .unwrap();
+        assert_eq!(data, b"hello");
+    }
+    assert_eq!(whole_fetches(&server), 1);
+    assert_eq!(message.summary.subject, "one");
+
+    // Another message is another fetch, and replaces the one kept.
+    store.list_attachments(&two).await.unwrap();
+    assert_eq!(whole_fetches(&server), 2);
+    store.list_attachments(&two).await.unwrap();
+    assert_eq!(whole_fetches(&server), 2);
+    store.list_attachments(&one).await.unwrap();
+    assert_eq!(whole_fetches(&server), 3);
+
+    // A message that is deleted is not kept.
+    store.delete_message(&one).await.unwrap();
+    assert!(matches!(
+        store.list_attachments(&one).await,
+        Err(Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn unread_mail_since_a_date_takes_both_searches_in_one_round_trip() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    deliver(&server, "INBOX", &simple("two"), &["\\Seen"]);
+    let inbox = FolderId::new("INBOX");
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    sent_since(&server);
+    let unread = store.recent_unread(&inbox, Some(since)).await.unwrap();
+    assert_eq!(unread.len(), 1);
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.count("UID SEARCH UNSEEN"), 2);
+    assert!(state.pipelined >= 1);
+}

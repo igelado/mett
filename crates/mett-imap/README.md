@@ -78,6 +78,12 @@ in case the server says nothing) and the `MOVE`. Where it doesn't say, the messa
 is found again in the target by its `Message-ID:` (only that header is fetched of the
 candidates). The flags to set go in one `STORE`, and those to clear in another.
 
+The message last read whole is kept for a minute (up to 32 MiB), so that its
+list of attachments and each of them take one fetch in all; deleting or moving a
+message drops it, and so does losing the connection. A check for unread mail since a
+date sends its two searches (`UNSEEN` and `UNSEEN SINCE`) together, and takes the
+answers in the order they were sent.
+
 The configuration (`imaps://` URLs, `imap_user`, `imap_pass`, `smtp_url`,
 `ssl_*`) is described in [docs/MUTTRC.md](../../docs/MUTTRC.md) §4.13.
 
