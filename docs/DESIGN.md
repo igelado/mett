@@ -55,7 +55,8 @@ I/O and talks to the UI over channels.
 │  MailStore, Authenticator, MailSender, …       │
 ├───────────────┬──────────────┬─────────────────┤
 │ mett-msgraph, │ mett-sqlite  │ mock (tests)    │
-│ mett-ews      │              │                 │
+│ mett-ews,     │              │                 │
+│ mett-smtp     │              │                 │
 └───────────────┴──────────────┴─────────────────┘
 ```
 
@@ -70,6 +71,7 @@ a crate may only depend on crates below it in the diagram.
 | `mett-core`    | Domain model (messages, folders, threads, drafts) and port traits. | none (no I/O crates)           |
 | `mett-msgraph` | Microsoft Graph adapter: HTTP, OAuth2, paging, throttling, delta.  | `mett-core`                    |
 | `mett-ews`     | Exchange Web Services adapter: SOAP, paging, throttling.           | `mett-core`                    |
+| `mett-smtp`    | SMTP adapter (wraps `lettre`): sends mail, writes drafts as MIME.  | `mett-core`                    |
 | `mett-sqlite`  | Local cache and sync state, in SQLite.                             | `mett-core`                    |
 | `mett-tui`     | The binary: TUI, key bindings, configuration, worker wiring.       | `mett-core`, adapters          |
 
@@ -100,6 +102,13 @@ takes any `Authenticator`, and `mett-tui` gives it `mett-msgraph`'s, asking
 for an Exchange Online token. `mett-tui` picks the adapter at startup
 (`use_ews`); an enum of the two implements the ports by delegating, so the
 worker stays generic over a single type.
+
+`mett-smtp` implements `MailSender` over SMTP (plain, STARTTLS or TLS; a
+password or an OAuth2 token for the login), wrapping the `lettre` crate. It
+also writes a `Draft` as the MIME message (`compose`), which a mailbox that
+keeps its own Sent and Drafts folders (IMAP) stores. Replies are threaded
+by the `Message-ID:` and `References:` of the original, which the caller
+looks up and gives as `Threading`.
 
 - **Pros:**
   - The core and UI can be tested without network access.
