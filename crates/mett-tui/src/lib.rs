@@ -880,16 +880,28 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
     // Whether the screen may differ from what was drawn last: it is drawn
     // only before waiting, once everything ready has been taken in.
     let mut stale = true;
+    // The accounts that have said they are done (quit), and those asked
+    // about their deleted messages first.
+    let mut done = vec![false; slots.len()];
+    let mut asked = vec![false; slots.len()];
     'run: loop {
-        if slots[active].app.quit {
+        // Quitting in any account quits mett, as it would in one alone: it
+        // may be one that isn't shown (a `push <quit>`, or a purge that was
+        // being done when the user went to another tab).
+        for (at, slot) in slots.iter_mut().enumerate() {
+            if std::mem::take(&mut slot.app.quit) {
+                done[at] = true;
+            }
+        }
+        if done.iter().any(|done| *done) {
             // Messages marked deleted in another account are the user's to
             // decide on, as they would be quitting it alone: it is shown,
-            // and asked.
-            match slots
-                .iter()
-                .position(|s| !s.app.quit && s.app.has_deleted())
-            {
+            // and asked, once.
+            let to_ask = (0..slots.len())
+                .find(|at| !done[*at] && !asked[*at] && slots[*at].app.has_deleted());
+            match to_ask {
                 Some(other) => {
+                    asked[other] = true;
                     active = other;
                     stale = true;
                     // An account that needs a sign-in first has its window
@@ -899,7 +911,12 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                         slots[other].absorb(effects);
                     }
                 }
-                None => break 'run,
+                // Nothing is left to ask: mett quits. (An account asked and
+                // not answered keeps it going: the user may have said no.)
+                None if (0..slots.len()).all(|at| done[at] || !slots[at].app.has_deleted()) => {
+                    break 'run;
+                }
+                None => {}
             }
         }
         for at in 0..slots.len() {
@@ -978,7 +995,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 });
             }
         }
-        if slots[active].app.quit {
+        if slots.iter().any(|slot| slot.app.quit) {
             continue 'run;
         }
         // The keys a `push` in an account's own file queued play there even
@@ -990,9 +1007,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 slot.absorb(effects);
                 stale = true;
                 // A `push <quit>` there quits mett, as it would in any
-                // account: it is the one shown, and the rest is asked.
+                // account (see above).
                 if slots[at].app.quit {
-                    active = at;
                     continue 'run;
                 }
             }
@@ -2663,6 +2679,44 @@ mod tests {
                 .await;
                 assert!(drawn.lock().unwrap().len() > before);
                 input.send(key('n', false)).unwrap();
+                let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                    .await
+                    .expect("quits")
+                    .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_quit_that_finishes_after_going_to_another_account_still_quits() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drawn = Arc::default();
+                let screen = Recording {
+                    drawn: Arc::clone(&drawn),
+                };
+                let (input, events) = mpsc::unbounded_channel();
+                let accounts = Accounts {
+                    list: vec![demo_account("Work"), demo_account("Home")],
+                    position: app::TabPosition::Top,
+                };
+                let running = tokio::task::spawn_local(run(screen, events, accounts));
+                input.send(key('2', true)).unwrap();
+                drawn_until(&drawn, |(tab, messages, ..)| {
+                    tab.as_deref() == Some("Home") && *messages > 0
+                })
+                .await;
+                // In Home: a message deleted, then quit, purge, and straight
+                // to Work, before the purge is done.
+                for stroke in [
+                    key('d', false),
+                    key('q', false),
+                    key('y', false),
+                    key('1', true),
+                ] {
+                    input.send(stroke).unwrap();
+                }
                 let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
                     .await
                     .expect("quits")
