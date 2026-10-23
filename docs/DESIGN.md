@@ -199,7 +199,9 @@ clipboard and runs the user's own editor.
 - **The window** (`mett-gui`, the `gui` feature): winit's window, drawn by
   ratatui-wgpu. winit needs the main thread, so the app runs on a thread of
   its own. It draws each screen into cells (a ratatui backend that keeps
-  them) and sends them to the window's thread. That thread shows them, and
+  them) and leaves the latest in a slot the window's thread reads, waking
+  it (a window that draws slower than the app skips screens, rather than
+  queueing them). That thread shows them, and
   sends keys back as the crossterm events a terminal would give. There is
   no terminal for `$EDITOR`, so messages are written in the built-in
   editor (`editor/builtin.rs`, on edtui).
@@ -250,6 +252,12 @@ channel and receives `Event`s on another. Every request carries a
 Commands typed at the `:` prompt, which may `source` files or run
 backticks, likewise run on a thread of their own, one at a time, and
 report back to the main loop.
+
+Requests are served concurrently, but reads (listing, fetching, checking)
+only six calls at a time (a throttled call gives its turn up while it waits), the rest waiting their turn; writes (flags, moves,
+sends, drafts) and the lookups the UI may give up on never wait behind them.
+A read the UI no longer wants still runs once its turn comes (cancelling
+stale fetches is not done yet).
 
 A request that takes many Graph requests (moving many messages, checking
 the `mailboxes`) makes a few at a time, keeping the order of its results.

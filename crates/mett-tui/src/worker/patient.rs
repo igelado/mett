@@ -31,6 +31,10 @@ fn back_off(attempt: u32) -> Duration {
 pub(super) struct Patient<'a, S> {
     pub(super) store: &'a S,
     pub(super) notify: &'a (dyn Fn(Duration, u32) + Sync),
+    /// Limits how many calls are made at once (those of reads): a call
+    /// holds one only while it is made, not while it waits to be tried
+    /// again, so throttled calls don't keep healthy ones from starting.
+    pub(super) turns: Option<&'a tokio::sync::Semaphore>,
 }
 
 impl<S> Patient<'_, S> {
@@ -38,7 +42,14 @@ impl<S> Patient<'_, S> {
     async fn patiently<T, F: Future<Output = Result<T>>>(&self, call: impl Fn() -> F) -> Result<T> {
         let mut attempt = 0;
         loop {
-            match call().await {
+            let outcome = {
+                let _turn = match self.turns {
+                    Some(turns) => turns.acquire().await.ok(),
+                    None => None,
+                };
+                call().await
+            };
+            match outcome {
                 Err(Error::Throttled { retry_after }) if attempt < THROTTLED_RETRIES => {
                     attempt += 1;
                     let wait = retry_after
@@ -203,6 +214,7 @@ mod tests {
         let patient = Patient {
             store: &(),
             notify: &notify,
+            turns: None,
         };
         let start = tokio::time::Instant::now();
         let outcome = patient
@@ -244,14 +256,48 @@ mod tests {
             let patient = Patient {
                 store: &cached,
                 notify: &notify,
+                turns: None,
             };
             assert_eq!(patient.capabilities(), expected);
             let outer = Patient {
                 store: &patient,
                 notify: &notify,
+                turns: None,
             };
             assert_eq!(outer.capabilities(), expected);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_call_gives_its_turn_up_while_it_waits() {
+        let turns = tokio::sync::Semaphore::new(1);
+        let notify = |_, _| {};
+        let patient = Patient {
+            store: &(),
+            notify: &notify,
+            turns: Some(&turns),
+        };
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let throttled = patient.patiently(|| async {
+            match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Err(Error::Throttled {
+                    retry_after: Some(Duration::from_secs(60)),
+                }),
+                n => Ok(n),
+            }
+        });
+        // Another call gets the only turn while the first one waits.
+        let other = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let start = tokio::time::Instant::now();
+            let outcome = patient.patiently(|| async { Ok(7) }).await;
+            (outcome, start.elapsed())
+        };
+        let (first, (second, took)) = tokio::join!(throttled, other);
+        assert_eq!(first.unwrap(), 1);
+        assert_eq!(second.unwrap(), 7);
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(turns.available_permits(), 1);
     }
 
     #[tokio::test(start_paused = true)]

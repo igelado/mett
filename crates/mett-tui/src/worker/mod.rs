@@ -227,8 +227,37 @@ pub struct Response {
     pub event: Event,
 }
 
+/// How many read requests are served at once. A burst of them (the user
+/// paging through a folder holding a key down, a check of many mailboxes)
+/// waits for its turn, instead of opening as many connections to the
+/// server. Writes are not counted: they never wait behind reads.
+const READS_AT_ONCE: usize = 6;
+
+/// Whether `request` only reads from the mailbox, and is short: it counts
+/// against [`READS_AT_ONCE`]. Not the lookups and watches the UI may give
+/// up on (they can wait long, and mustn't hold the others), nor anything
+/// that changes the mailbox.
+fn is_read(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::OpenFolder(_)
+            | Request::ListMessages { .. }
+            | Request::PollFolder { .. }
+            | Request::FetchMessage(_)
+            | Request::ListAttachments(_)
+            | Request::FetchAttachment(..)
+            | Request::ListFolders
+            | Request::OwnAddresses
+            | Request::CheckMailboxes(_)
+            | Request::StillThere { .. }
+    )
+}
+
 /// Serves requests until the request channel closes. Each request runs as
-/// its own task, so a slow fetch doesn't hold up the others.
+/// its own task, so a slow fetch doesn't hold up the others; reads are
+/// limited to [`READS_AT_ONCE`] store calls at a time, and the rest wait
+/// their turn (in the order they came). A call throttled by the server
+/// gives its turn up while it waits to be tried again.
 pub async fn run<S: MailStore + MailSender + 'static>(
     store: Arc<S>,
     mut requests: mpsc::UnboundedReceiver<(RequestId, Request)>,
@@ -238,6 +267,7 @@ pub async fn run<S: MailStore + MailSender + 'static>(
     let queries: Arc<
         std::sync::Mutex<std::collections::HashMap<RequestId, tokio::task::AbortHandle>>,
     > = Arc::default();
+    let reads = Arc::new(tokio::sync::Semaphore::new(READS_AT_ONCE));
     while let Some((id, request)) = requests.recv().await {
         if let Request::Cancel(query) = request {
             if let Some(task) = crate::platform::lock(&queries).remove(&query) {
@@ -250,6 +280,7 @@ pub async fn run<S: MailStore + MailSender + 'static>(
         let store = Arc::clone(&store);
         let responses = responses.clone();
         let running = Arc::clone(&queries);
+        let read = is_read(&request).then(|| Arc::clone(&reads));
         // Held until the query is registered: it can't take itself out
         // before then.
         let mut registered = crate::platform::lock(&queries);
@@ -264,6 +295,7 @@ pub async fn run<S: MailStore + MailSender + 'static>(
             let patient = Patient {
                 store: &*store,
                 notify: &notify,
+                turns: read.as_deref(),
             };
             let event = serve(&patient, request).await;
             if query {
@@ -562,6 +594,132 @@ mod tests {
             .with_folder(child("mett", "mett", "proj"))
             .with_folder(child("team", "équipe", "in"))
             .with_folder(mock::folder("arc", "Archive", None))
+    }
+
+    /// A store whose fetches wait until the test lets them go, and which
+    /// counts how many are waiting.
+    struct Gated {
+        inner: MemoryStore,
+        gate: tokio::sync::Semaphore,
+        fetching: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MailStore for Gated {
+        async fn list_folders(&self) -> Result<Vec<Folder>> {
+            self.inner.list_folders().await
+        }
+        async fn folder(&self, id: &FolderId) -> Result<Folder> {
+            self.inner.folder(id).await
+        }
+        async fn recent_unread(
+            &self,
+            folder: &FolderId,
+            since: Option<DateTime<Utc>>,
+        ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
+            self.inner.recent_unread(folder, since).await
+        }
+        async fn well_known_folder(&self, which: WellKnownFolder) -> Result<Folder> {
+            self.inner.well_known_folder(which).await
+        }
+        async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
+            self.inner.list_messages(folder, page).await
+        }
+        async fn changed_messages(
+            &self,
+            folder: &FolderId,
+            since: DateTime<Utc>,
+            page: Page,
+        ) -> Result<MessagePage> {
+            self.inner.changed_messages(folder, since, page).await
+        }
+        async fn fetch_message(&self, id: &MessageId) -> Result<Message> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.fetching.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            self.gate.acquire().await.expect("open").forget();
+            self.fetching.fetch_sub(1, SeqCst);
+            self.inner.fetch_message(id).await
+        }
+        async fn list_attachments(&self, message: &MessageId) -> Result<Vec<Attachment>> {
+            self.inner.list_attachments(message).await
+        }
+        async fn fetch_attachment(
+            &self,
+            message: &MessageId,
+            attachment: &AttachmentId,
+        ) -> Result<Vec<u8>> {
+            self.inner.fetch_attachment(message, attachment).await
+        }
+        async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
+            self.inner.update_flags(id, update).await
+        }
+        async fn move_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
+            self.inner.move_message(id, to).await
+        }
+        async fn copy_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
+            self.inner.copy_message(id, to).await
+        }
+        async fn delete_message(&self, id: &MessageId) -> Result<()> {
+            self.inner.delete_message(id).await
+        }
+        async fn save_draft(&self, draft: &Draft) -> Result<MessageId> {
+            self.inner.save_draft(draft).await
+        }
+    }
+
+    impl MailSender for Gated {
+        async fn send(&self, draft: &Draft) -> Result<()> {
+            self.inner.send(draft).await
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_wait_their_turn_but_writes_do_not() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let reads = READS_AT_ONCE * 2;
+        let store = Arc::new(Gated {
+            inner: MemoryStore::new()
+                .with_folder(mock::folder("in", "Inbox", None))
+                .with_message(mock::message("m1", "in", "Hi", DateTime::UNIX_EPOCH)),
+            gate: tokio::sync::Semaphore::new(0),
+            fetching: 0.into(),
+            peak: 0.into(),
+        });
+        let (request, requests) = mpsc::unbounded_channel();
+        let (respond, mut responses) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(run(Arc::clone(&store), requests, respond));
+        for i in 0..reads {
+            let id = RequestId(i as u64);
+            request
+                .send((id, Request::FetchMessage(MessageId::new("m1"))))
+                .unwrap();
+        }
+        // A write, behind every read.
+        let write = RequestId(1000);
+        let update = FlagsUpdate::default();
+        request
+            .send((write, Request::UpdateFlags(MessageId::new("m1"), update)))
+            .unwrap();
+        // The write is answered while the reads are all still held up.
+        let first = tokio::time::timeout(Duration::from_secs(10), responses.recv())
+            .await
+            .expect("the write is not held up")
+            .expect("a response");
+        assert_eq!(first.id, write);
+        assert_eq!(store.fetching.load(SeqCst), READS_AT_ONCE);
+        // Letting reads go lets the next ones start, never above the cap.
+        store.gate.add_permits(reads);
+        for _ in 0..reads {
+            let response = tokio::time::timeout(Duration::from_secs(10), responses.recv())
+                .await
+                .expect("the reads finish")
+                .expect("a response");
+            assert!(matches!(response.event, Event::MessageFetched(Ok(_))));
+        }
+        assert_eq!(store.peak.load(SeqCst), READS_AT_ONCE);
+        drop(request);
+        worker.await.unwrap();
     }
 
     #[tokio::test]
