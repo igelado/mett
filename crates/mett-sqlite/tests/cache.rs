@@ -873,7 +873,11 @@ async fn a_busy_cache_is_not_a_broken_one() {
     );
     other.execute_batch("ROLLBACK").unwrap();
     let syncs = store.inner().syncs();
+    // It is left alone for a while, not asked again for every call.
     later().await;
+    assert_eq!(listing(&store, 10).await, ["m1", "m0"]);
+    assert_eq!(store.inner().syncs(), syncs);
+    tokio::time::advance(Duration::from_secs(10)).await;
     assert_eq!(listing(&store, 10).await, ["m1", "m0"]);
     assert!(store.inner().syncs() > syncs, "the cache is used again");
     // Windows can't remove files that are open.

@@ -29,8 +29,8 @@ of each folder listed, and each message read, in a database file: mutt's
 - **Failures:** if the cache fails (a full disk, a corrupt file, say), mett
   leaves it alone for the rest of the session and asks the server for
   everything. A cache that is only busy (another mett is writing to it)
-  isn't given up on: the server answers that call, and the cache serves
-  the next.
+  isn't given up on: the server answers for ten seconds (SQLite already
+  waited five), and then the cache serves again.
 - **Storage:** a message's row keeps what is sorted, filtered or changed
   alone (dates, read, flagged) in columns, with indexes that page by date
   and by change (and one for unread mail), and the rest of its summary as

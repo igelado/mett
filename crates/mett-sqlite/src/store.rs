@@ -26,6 +26,9 @@ const FRESH: Duration = Duration::from_secs(2);
 /// took in changes first.
 const LOST_RACES: u32 = 3;
 
+/// How long a cache that stayed busy is left alone: it waited long enough.
+const BUSY_COOLDOWN: Duration = Duration::from_secs(10);
+
 /// Why the cache could not be opened.
 #[derive(Debug, thiserror::Error)]
 #[error("cache {path}: {source}")]
@@ -49,6 +52,10 @@ pub struct CachedStore<S> {
     /// Set when the cache fails (a full disk, say): from then on,
     /// everything goes to `S`.
     broken: AtomicBool,
+    /// Until when the cache is left alone, after it was busy for as long as
+    /// SQLite waited (another mett holds it): each call would wait that
+    /// long again.
+    busy_until: Mutex<Option<Instant>>,
     /// How many changes mett made, which a sync brings in (with the dates
     /// the server gives them) or elsewhere (a copy, a draft), where the
     /// folder isn't known: any folder synced before one is synced again.
@@ -119,6 +126,7 @@ impl<S: MailStore> CachedStore<S> {
                 Mutex::new(db)
             }),
             broken: AtomicBool::new(false),
+            busy_until: Mutex::new(None),
             writes: AtomicU64::new(0),
             folder_writes: Mutex::default(),
             synced: Mutex::new(HashMap::new()),
@@ -234,7 +242,15 @@ impl<S: MailStore> CachedStore<S> {
     /// Whether folders are cached: there is a cache, it works, and the
     /// backend can keep it up to date.
     fn caching(&self) -> bool {
-        self.db.is_some() && !self.broken() && self.inner.can_sync()
+        self.db.is_some() && !self.broken() && !self.busy() && self.inner.can_sync()
+    }
+
+    /// Whether the cache was busy lately, and is left alone for a while.
+    fn busy(&self) -> bool {
+        self.busy_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() < until)
     }
 
     /// Whether the cache failed, and is no longer used.
@@ -253,8 +269,13 @@ impl<S: MailStore> CachedStore<S> {
             .ok_or_else(|| Error::Backend("cache: not caching".into()))?;
         let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
         let done = f(&mut db);
-        if done.as_ref().is_err_and(|e| !is_busy(e)) {
-            self.broken.store(true, Ordering::SeqCst);
+        match &done {
+            Err(e) if is_busy(e) => {
+                *self.busy_until.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Instant::now() + BUSY_COOLDOWN);
+            }
+            Err(_) => self.broken.store(true, Ordering::SeqCst),
+            Ok(_) => {}
         }
         done
     }
@@ -288,9 +309,10 @@ impl<S: MailStore> CachedStore<S> {
     }
 
     /// Whether a failure is to go to the server for this call alone: the
-    /// cache failed (and isn't used any more), or was only busy.
+    /// cache failed (and isn't used any more), was only busy (and is left
+    /// alone for a while), or was left alone meanwhile.
     fn skips_cache(&self, e: &Error) -> bool {
-        self.broken() || is_busy(e)
+        self.broken() || is_busy(e) || !self.caching()
     }
 
     /// Brings `folder`'s cache up to date, unless it just was. Each batch
