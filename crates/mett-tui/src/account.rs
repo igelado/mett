@@ -759,8 +759,13 @@ mod tests {
     fn an_imap_cache_is_named_by_the_user_and_the_server() {
         let name = |text: &str| {
             let url = MailboxUrl::parse(text).unwrap();
-            cache_path(&config(""), &url, Some("/xdg".into()), None)
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            cache_path(
+                &config(""),
+                &url,
+                Some(std::env::temp_dir().into_os_string()),
+                None,
+            )
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         };
         // The same address at two servers is two accounts, with two caches.
         assert_eq!(
