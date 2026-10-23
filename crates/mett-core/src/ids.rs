@@ -3,20 +3,22 @@
 //! Each kind of identifier is a distinct newtype so that, for example, a
 //! folder ID can never be passed where a message ID is expected. The values
 //! are opaque: they are whatever the backend uses (for Microsoft Graph,
-//! base64-like strings).
+//! base64-like strings). They are shared (`Arc<str>`), so cloning one, which
+//! the clients do constantly, is a reference count and not a copy.
 
 use std::fmt;
+use std::sync::Arc;
 
 macro_rules! string_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(String);
+        pub struct $name(Arc<str>);
 
         impl $name {
             /// Wraps a backend identifier.
             pub fn new(id: impl Into<String>) -> Self {
-                Self(id.into())
+                Self(Arc::from(id.into()))
             }
 
             /// Returns the identifier as a string slice.
@@ -39,7 +41,7 @@ macro_rules! string_id {
 
         impl From<String> for $name {
             fn from(id: String) -> Self {
-                Self(id)
+                Self(Arc::from(id))
             }
         }
     };
