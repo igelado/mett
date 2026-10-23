@@ -8,10 +8,12 @@
 //! gone now are those missing). A sync of many messages is made in batches:
 //! the state then also holds the messages not yet taken in.
 
-use futures_util::TryStreamExt;
 use mett_core::{Error, FolderChanges, MessageId, SyncState};
 
-use super::{Fail, Live, Ref, Res, SUMMARY, SYNC_BATCH, Selected, fetch, parse, search, select};
+use super::{
+    Fail, Live, Ref, Res, SUMMARY, SYNC_BATCH, Selected, fetch, from_uid, moved_since, parse,
+    search, select,
+};
 use crate::parse::Fetched;
 use crate::uidset::UidSet;
 
@@ -130,13 +132,7 @@ async fn advance(
     let moved: Option<Vec<u32>> = if modseq <= old.modseq {
         None
     } else if selected.exists > 0 {
-        let flagged: Vec<_> = live
-            .session
-            .uid_fetch("1:*", format!("(UID) (CHANGEDSINCE {})", old.modseq))
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        Some(flagged.iter().filter_map(|f| f.uid).collect())
+        Some(moved_since(live, old.modseq).await?)
     } else {
         Some(Vec::new())
     };
@@ -148,11 +144,7 @@ async fn advance(
             .collect(),
         // A folder that took in a message without moving its modification
         // sequence on (which it shouldn't) is asked.
-        None => search(live, &format!("UID {}:*", old.next))
-            .await?
-            .into_iter()
-            .filter(|uid| *uid >= old.next)
-            .collect(),
+        None => from_uid(live, old.next).await?,
     };
     let (set, gone, came) = if selected.exists as usize == old.set.len() + came.len() {
         (old.set.with(came.iter().copied()), Vec::new(), came)

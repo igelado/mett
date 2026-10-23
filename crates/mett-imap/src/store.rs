@@ -1116,21 +1116,34 @@ async fn changed_since(live: &mut Live, selected: &Selected, floor: Floor) -> Re
     let mut changed = BTreeSet::new();
     match floor.modseq.filter(|_| live.caps.condstore) {
         Some(modseq) if selected.exists > 0 => {
-            let fetches: Vec<Fetch> = live
-                .session
-                .uid_fetch("1:*", format!("(UID FLAGS) (CHANGEDSINCE {modseq})"))
-                .await?
-                .try_collect()
-                .await?;
-            changed.extend(fetches.iter().filter_map(|f| f.uid));
+            changed.extend(moved_since(live, modseq).await?);
         }
         Some(_) => {}
-        None => {
-            let fresh = search(live, &format!("UID {}:*", floor.next)).await?;
-            changed.extend(fresh.into_iter().filter(|uid| *uid >= floor.next));
-        }
+        None => changed.extend(from_uid(live, floor.next).await?),
     }
     Ok(changed)
+}
+
+/// The messages of the selected folder (which is not empty) whose
+/// modification sequence passed `modseq` (`CONDSTORE`): those that changed
+/// and those that came in, which have one above every other (RFC 7162,
+/// 3.1.1). The one place that asks, for the new-mail checks and the sync.
+async fn moved_since(live: &mut Live, modseq: u64) -> Res<Vec<u32>> {
+    let fetches: Vec<Fetch> = live
+        .session
+        .uid_fetch("1:*", format!("(UID) (CHANGEDSINCE {modseq})"))
+        .await?
+        .try_collect()
+        .await?;
+    Ok(fetches.iter().filter_map(|f| f.uid).collect())
+}
+
+/// The messages of the selected folder from `UID` `next` on. A search for
+/// `next:*` always finds the newest message, even if its `UID` is below
+/// `next`: that one is dropped.
+async fn from_uid(live: &mut Live, next: u32) -> Res<Vec<u32>> {
+    let found = search(live, &format!("UID {next}:*")).await?;
+    Ok(found.into_iter().filter(|uid| *uid >= next).collect())
 }
 
 /// `IMAP`'s date for a search: the day, which is as exact as it gets.
