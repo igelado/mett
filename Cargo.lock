@@ -2554,6 +2554,7 @@ name = "mett-ews"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "mett-core",
  "reqwest",

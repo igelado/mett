@@ -285,6 +285,35 @@ async fn folder_listings_follow_every_page() {
 }
 
 #[tokio::test]
+async fn listing_the_folders_below_one_reuses_the_roles_of_the_last_full_listing() {
+    let server = MockServer::start().await;
+    ews("<m:GetFolder>")
+        .respond_with(roles())
+        .mount(&server)
+        .await;
+    ews("<m:FindFolder")
+        .respond_with(success(
+            "FindFolder",
+            "<m:RootFolder IncludesLastItemInRange=\"true\"><t:Folders/></m:RootFolder>",
+        ))
+        .mount(&server)
+        .await;
+    let store = store(&server);
+    store.child_folders(None).await.unwrap();
+    store.list_folders().await.unwrap();
+    store.child_folders(None).await.unwrap();
+    store.child_folders(None).await.unwrap();
+    let lookups = requests(&server)
+        .await
+        .iter()
+        .filter(|r| r.contains("<m:GetFolder>"))
+        .count();
+    // The first listing found none cached; the full listing looks them up
+    // again; the others use them.
+    assert_eq!(lookups, 2);
+}
+
+#[tokio::test]
 async fn the_archive_folder_has_no_distinguished_name() {
     let server = MockServer::start().await;
     let e = store(&server)

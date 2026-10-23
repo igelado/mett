@@ -6,8 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
     AccessToken, AccountId, Address, Answer, Attachment, AttachmentId, AttachmentKind,
@@ -38,6 +39,10 @@ const BYTES_PER_SECOND: usize = 64 * 1024;
 /// Upper bound on a request whose response may be large (an attachment's
 /// content), which its own size doesn't tell.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How long the roles a folder listing looked up serve other calls, which
+/// would otherwise look them up each time.
+const ROLES_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// The most items or folders EWS returns per request.
 const MAX_PAGE_SIZE: u32 = 1000;
@@ -114,8 +119,8 @@ const STALE_KEPT: usize = 8;
 /// Folders below one are listed in name order.
 pub struct EwsMailStore<A> {
     conn: Connection<A>,
-    /// The mailbox's folder roles, once looked up.
-    roles: Mutex<Option<Arc<Roles>>>,
+    /// The mailbox's folder roles, once looked up, and when.
+    roles: Mutex<Option<(Arc<Roles>, Instant)>>,
     /// Server drafts kept after a send or update whose outcome is unknown,
     /// by what they answer and the composed message they hold
     /// ([`Draft::attempt`]): sending or postponing that message again
@@ -376,7 +381,7 @@ impl<A: Authenticator> Connection<A> {
         before: fn(Error) -> Error,
         download: Duration,
     ) -> Result<String> {
-        let xml = envelope(body);
+        let xml = Bytes::from(envelope(body));
         let timeout = timeout_for(xml.len(), download);
         let response = self.send_soap(&xml, before, timeout).await?;
         checked(response, about).await
@@ -387,7 +392,7 @@ impl<A: Authenticator> Connection<A> {
     /// request is made go through `before`.
     async fn send_soap(
         &self,
-        xml: &str,
+        xml: &Bytes,
         before: fn(Error) -> Error,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
@@ -413,7 +418,7 @@ impl<A: Authenticator> Connection<A> {
 
     async fn attempt(
         &self,
-        xml: &str,
+        xml: &Bytes,
         token: &AccessToken,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
@@ -424,7 +429,7 @@ impl<A: Authenticator> Connection<A> {
             // Exchange Online routes the request to the mailbox's server.
             .header("X-AnchorMailbox", self.account.as_str())
             .timeout(timeout)
-            .body(xml.to_owned())
+            .body(xml.clone())
             .send()
             .await
             .map_err(|e| Error::Network(e.to_string()))
@@ -469,8 +474,9 @@ async fn checked(response: reqwest::Response, about: About<'_>) -> Result<String
 impl<A: Authenticator + 'static> EwsMailStore<A> {
     /// The mailbox's folder roles, looked up with one `GetFolder` for the
     /// root and every well-known folder EWS can name. Looked up afresh on
-    /// every call (once per folder listing), so a well-known folder created
-    /// since is recognised; the result is cached for [`Self::cached_roles`].
+    /// every call, so a well-known folder created since is recognised: a
+    /// listing of every folder does so, and other calls use what it found
+    /// ([`Self::cached_roles`]). The result is cached.
     async fn roles(&self) -> Result<Arc<Roles>> {
         let names: Vec<&str> = std::iter::once(ROOT)
             .chain(nameable().map(|(_, name)| name))
@@ -513,13 +519,21 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
             }
         }
         let roles = Arc::new(roles);
-        *self.roles.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&roles));
+        *self.roles.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Arc::clone(&roles), Instant::now()));
         Ok(roles)
     }
 
-    /// The roles, as last looked up, or looked up now.
+    /// The roles, as last looked up if that was less than [`ROLES_TTL`]
+    /// ago, otherwise looked up now.
     async fn cached_roles(&self) -> Result<Arc<Roles>> {
-        let cached = self.roles.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cached = self
+            .roles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < ROLES_TTL)
+            .map(|(roles, _)| Arc::clone(roles));
         match cached {
             Some(roles) => Ok(roles),
             None => self.roles().await,
@@ -898,12 +912,7 @@ fn tree_order(folders: Vec<EwsFolder>, parent: Option<&str>) -> Vec<EwsFolder> {
 /// Sorts folders by name, ignoring case (then by ID, so the order is
 /// always the same).
 fn sort_by_name(folders: &mut [EwsFolder]) {
-    folders.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    folders.sort_by_cached_key(|f| (f.name.to_lowercase(), f.id.clone()));
 }
 
 /// The mail folders among `folders`, and none below a folder of another
@@ -1011,8 +1020,10 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
     }
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
-        // The roles label the folders as in a listing of them all.
-        let (roles, listing) = first_then(self.roles(), self.find_folders(parent, false)).await?;
+        // The roles label the folders as in a listing of them all: those
+        // the last such listing found, if recent, otherwise looked up.
+        let (roles, listing) =
+            first_then(self.cached_roles(), self.find_folders(parent, false)).await?;
         let mut folders = mail_folders(listing?);
         sort_by_name(&mut folders);
         Ok(folders.into_iter().map(|f| roles.folder(f)).collect())
@@ -1190,12 +1201,13 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
         {
             return Err(Error::not_found("attachment", attachment));
         }
+        // Decoded from the text in the document, without copies of it.
         let content = match found.tag_name().name() {
-            "FileAttachment" => child_text(found, "Content"),
+            "FileAttachment" => child(found, "Content"),
             "ItemAttachment" => found
                 .children()
                 .filter(Node::is_element)
-                .find_map(|item| child_text(item, "MimeContent")),
+                .find_map(|item| child(item, "MimeContent")),
             _ => {
                 return Err(Error::Backend(format!(
                     "{} is a link, with no content of its own",
@@ -1203,7 +1215,7 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
                 )));
             }
         };
-        decode_base64(&content.unwrap_or_default())
+        decode_base64(content.and_then(|n| n.text()).unwrap_or_default())
     }
 
     async fn update_flags(&self, id: &MessageId, update: FlagsUpdate) -> Result<()> {
@@ -1348,14 +1360,17 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
         }
         let summaries = self.summaries(&touched, about).await?;
         // Those gone (or moved away) since are gone.
+        let here: HashSet<&str> = summaries
+            .iter()
+            .filter(|s| &s.folder == folder)
+            .map(|s| s.id.as_str())
+            .collect();
         for id in &touched {
-            if !summaries
-                .iter()
-                .any(|s| s.id.as_str() == id && &s.folder == folder)
-            {
+            if !here.contains(id.as_str()) {
                 removed.push(MessageId::new(id.as_str()));
             }
         }
+        drop(here);
         Ok(FolderChanges {
             changed: summaries
                 .into_iter()
@@ -1570,7 +1585,7 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
              </m:GetStreamingEvents>",
             escape(id)
         );
-        let xml = envelope(&body);
+        let xml = Bytes::from(envelope(&body));
         // The response stays open as long as asked, and a little more.
         let timeout = Duration::from_secs(WATCH_MINUTES * 60 + 60);
         let mut response = self.conn.send_soap(&xml, |e| e, timeout).await?;
@@ -1580,6 +1595,7 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                 .map(|_| Some((Vec::new(), false)));
         }
         let mut buffer = Vec::new();
+        let mut scanned = 0;
         let mut changed: Vec<FolderId> = Vec::new();
         // Once something changed, what follows at once (the rest of a
         // burst) is read too, for a moment: events sent are not sent again.
@@ -1605,7 +1621,12 @@ impl<A: Authenticator + 'static> EwsMailStore<A> {
                 Err(e) => return Err(Error::Network(e.to_string())),
             };
             buffer.extend_from_slice(&chunk);
-            for envelope in take_envelopes(&mut buffer) {
+            let envelopes = match take_envelopes(&mut buffer, &mut scanned) {
+                Ok(envelopes) => envelopes,
+                Err(_) if !changed.is_empty() => return Ok(Some((changed, true))),
+                Err(e) => return Err(e),
+            };
+            for envelope in envelopes {
                 told = true;
                 // What changed was told already: an error after it, or
                 // the subscription's end, doesn't lose it.
@@ -2484,10 +2505,30 @@ fn attachment(node: Node<'_, '_>) -> Option<Attachment> {
 fn decode_base64(text: &str) -> Result<Vec<u8>> {
     use base64::Engine;
 
-    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(compact)
-        .map_err(|e| Error::Backend(format!("invalid attachment content from EWS: {e}")))
+    /// Characters decoded at a time (a multiple of 4).
+    const BLOCK: usize = 4096;
+
+    let invalid = |e: &dyn std::fmt::Display| {
+        Error::Backend(format!("invalid attachment content from EWS: {e}"))
+    };
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut decoded = Vec::with_capacity(text.len() / 4 * 3);
+    let mut block = [0u8; BLOCK];
+    let mut filled = 0;
+    for c in text.chars().filter(|c| !c.is_whitespace()) {
+        block[filled] = u8::try_from(c).map_err(|_| invalid(&"not base64"))?;
+        filled += 1;
+        if filled == BLOCK {
+            engine
+                .decode_vec(&block[..], &mut decoded)
+                .map_err(|e| invalid(&e))?;
+            filled = 0;
+        }
+    }
+    engine
+        .decode_vec(&block[..filled], &mut decoded)
+        .map_err(|e| invalid(&e))?;
+    Ok(decoded)
 }
 
 /// The addresses of a recipients element (such as `ToRecipients`) of
@@ -2662,6 +2703,41 @@ mod tests {
             REQUEST_TIMEOUT + Duration::from_secs(10)
         );
         assert_eq!(timeout_for(100, DOWNLOAD_TIMEOUT), DOWNLOAD_TIMEOUT);
+    }
+
+    #[test]
+    fn decodes_base64_wrapped_in_white_space() {
+        use base64::Engine;
+
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        let wrapped: String = encoded
+            .as_bytes()
+            .chunks(76)
+            .flat_map(|line| [std::str::from_utf8(line).unwrap(), "\r\n"])
+            .collect();
+        assert_eq!(decode_base64(&wrapped).unwrap(), data);
+        assert_eq!(decode_base64("").unwrap(), b"");
+        assert_eq!(decode_base64(" TW\nE= ").unwrap(), b"Ma");
+        assert!(decode_base64("TW=E").is_err());
+        assert!(decode_base64("TWFu\u{e9}").is_err());
+    }
+
+    #[test]
+    fn folders_sort_by_name_without_regard_to_case() {
+        let folder = |name: &str, id: &str| EwsFolder {
+            name: name.into(),
+            id: id.into(),
+            parent: None,
+            element: "Folder".into(),
+            class: None,
+            unread: 0,
+            total: 0,
+        };
+        let mut folders = vec![folder("b", "2"), folder("B", "1"), folder("A", "3")];
+        sort_by_name(&mut folders);
+        let ids: Vec<&str> = folders.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["3", "1", "2"]);
     }
 
     #[test]

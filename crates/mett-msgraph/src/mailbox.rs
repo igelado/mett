@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use mett_core::{
@@ -28,8 +28,23 @@ use crate::invitation::{
 };
 use crate::settings::{AuthSettings, Cloud, with_segments};
 
-/// Upper bound on each Graph request.
+/// Upper bound on each Graph request, unless it moves a lot of data (an
+/// attachment's content: see [`DOWNLOAD_TIMEOUT`] and [`upload_timeout`]).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The slowest upload a request with a large body is given time for.
+const BYTES_PER_SECOND: usize = 64 * 1024;
+
+/// Upper bound on a request whose response may be large (an attachment's
+/// content), which its own size doesn't tell.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How long a request that uploads `size` bytes may take: the usual
+/// [`REQUEST_TIMEOUT`], and a second more for each [`BYTES_PER_SECOND`].
+fn upload_timeout(size: usize) -> Duration {
+    let seconds = u64::try_from(size / BYTES_PER_SECOND).unwrap_or(u64::MAX);
+    REQUEST_TIMEOUT + Duration::from_secs(seconds)
+}
 
 /// The message fields the index needs.
 const SUMMARY_FIELDS: &str = "id,parentFolderId,subject,from,toRecipients,sentDateTime,createdDateTime,isDraft,isRead,flag,hasAttachments,lastModifiedDateTime,receivedDateTime,conversationId,conversationIndex";
@@ -50,8 +65,8 @@ pub struct GraphMailStore<A> {
     canonical: Url,
     cloud: Cloud,
     auth: Arc<A>,
-    /// The mailbox's folder roles, once looked up.
-    roles: Mutex<Option<Arc<Roles>>>,
+    /// The mailbox's folder roles, once looked up, and when.
+    roles: Mutex<Option<(Arc<Roles>, Instant)>>,
     /// The hidden root folder's ID, once looked up on its own.
     root: Mutex<Option<Option<FolderId>>>,
     /// Server drafts kept after a send or update
@@ -204,7 +219,7 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// Sends `request` for `about` (the object it concerns, named in a
     /// "not found" error).
     async fn send(&self, request: RequestBuilder, about: About<'_>) -> Result<reqwest::Response> {
-        self.send_with(request, about, |e| e)
+        self.send_with(request, about, |e| e, REQUEST_TIMEOUT)
             .await
             .map(|(response, _)| response)
     }
@@ -214,22 +229,26 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// unsent, which [`Error::NotSent`] says; only a lost response to the
     /// request itself leaves it in doubt.
     async fn hand_over(&self, request: RequestBuilder, about: About<'_>) -> Result<()> {
-        self.send_with(request, about, unsent).await.map(drop)
+        self.send_with(request, about, unsent, REQUEST_TIMEOUT)
+            .await
+            .map(drop)
     }
 
     /// Like [`Self::send`], also returning the token the response was
     /// obtained with, and passing errors from before the request is made
-    /// (or after Graph refused it) through `before`.
+    /// (or after Graph refused it) through `before`. Each attempt, response
+    /// body included, may take `timeout`.
     async fn send_with(
         &self,
         request: RequestBuilder,
         about: About<'_>,
         before: fn(Error) -> Error,
+        timeout: Duration,
     ) -> Result<(reqwest::Response, AccessToken)> {
         let token = self.auth.access_token().await.map_err(before)?;
         // Kept for a retry; JSON bodies can always be cloned.
         let retry = request.try_clone();
-        let response = Self::attempt(request, &token).await?;
+        let response = Self::attempt(request, &token, timeout).await?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok((Self::checked(response, about).await?, token));
         }
@@ -239,7 +258,7 @@ impl<A: Authenticator> GraphMailStore<A> {
         let fresh = self.auth.access_token().await.map_err(before)?;
         match retry {
             Some(retry) if fresh != token => {
-                let response = Self::attempt(retry, &fresh).await?;
+                let response = Self::attempt(retry, &fresh, timeout).await?;
                 if response.status() == StatusCode::UNAUTHORIZED {
                     // Rejected too: don't let the next request reuse it.
                     self.auth.token_rejected(&fresh).await;
@@ -250,10 +269,14 @@ impl<A: Authenticator> GraphMailStore<A> {
         }
     }
 
-    async fn attempt(request: RequestBuilder, token: &AccessToken) -> Result<reqwest::Response> {
+    async fn attempt(
+        request: RequestBuilder,
+        token: &AccessToken,
+        timeout: Duration,
+    ) -> Result<reqwest::Response> {
         request
             .bearer_auth(token.secret())
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|e| Error::Network(e.to_string()))
@@ -288,7 +311,12 @@ impl<A: Authenticator> GraphMailStore<A> {
         about: About<'_>,
         before: fn(Error) -> Error,
     ) -> Result<T> {
-        decode(self.send_with(request, about, before).await?.0).await
+        decode(
+            self.send_with(request, about, before, REQUEST_TIMEOUT)
+                .await?
+                .0,
+        )
+        .await
     }
 
     fn request(&self, method: Method, url: Url) -> RequestBuilder {
@@ -298,7 +326,7 @@ impl<A: Authenticator> GraphMailStore<A> {
     /// The hidden root folder's ID: from the roles if they are known,
     /// otherwise looked up on its own (and cached).
     async fn root(&self) -> Result<Option<FolderId>> {
-        if let Some(roles) = self
+        if let Some((roles, _)) = self
             .roles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -317,10 +345,20 @@ impl<A: Authenticator> GraphMailStore<A> {
         Ok(root)
     }
 
+    /// The roles looked up less than [`ROLES_TTL`] ago, if any.
+    fn known_roles(&self) -> Option<Arc<Roles>> {
+        let cached = self.roles.lock().unwrap_or_else(|e| e.into_inner());
+        cached
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < ROLES_TTL)
+            .map(|(roles, _)| Arc::clone(roles))
+    }
+
     /// The mailbox's folder roles, looked up with a single `$batch` request
     /// for the root and every well-known folder. Looked up afresh on every
-    /// call (once per folder listing), so a well-known folder created since
-    /// is recognised; the result is cached for [`Self::root`].
+    /// call, so a well-known folder created since is recognised: a listing
+    /// of every folder does so, and a listing of the folders below one
+    /// uses what that found ([`Self::known_roles`]). The result is cached.
     async fn roles(&self) -> Result<Arc<Roles>> {
         let names: Vec<&str> = std::iter::once(ROOT)
             .chain(WellKnownFolder::ALL.iter().map(|w| w.as_str()))
@@ -397,7 +435,8 @@ impl<A: Authenticator> GraphMailStore<A> {
             }
         }
         let roles = Arc::new(roles);
-        *self.roles.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&roles));
+        *self.roles.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Arc::clone(&roles), Instant::now()));
         Ok(roles)
     }
 }
@@ -408,10 +447,16 @@ impl<A: Authenticator> GraphMailStore<A> {
         let request = self
             .request(Method::POST, self.url(&["$batch"]))
             .json(&json!({ "requests": requests }));
-        let (response, token) = self.send_with(request, About::MAILBOX, |e| e).await?;
+        let (response, token) = self
+            .send_with(request, About::MAILBOX, |e| e, REQUEST_TIMEOUT)
+            .await?;
         Ok((decode(response).await?, token))
     }
 }
+
+/// How long the roles a folder listing looked up serve the listings of the
+/// folders below one, which would otherwise look them up each time.
+const ROLES_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Graph's well-known name for the hidden root of the folder tree.
 const ROOT: &str = "msgfolderroot";
@@ -690,9 +735,13 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
     }
 
     async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
-        // The roles label the folders as in a listing of them all.
-        let (roles, listing) =
-            first_then(self.roles(), self.subfolders(parent.map(FolderId::as_str))).await?;
+        // The roles label the folders as in a listing of them all: those
+        // the last such listing found, if recent, otherwise looked up.
+        let id = parent.map(FolderId::as_str);
+        let (roles, listing) = match self.known_roles() {
+            Some(roles) => (roles, self.subfolders(id).await),
+            None => first_then(self.roles(), self.subfolders(id)).await?,
+        };
         Ok(listing?.into_iter().map(|f| roles.folder(f)).collect())
     }
 
@@ -702,7 +751,7 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
         // folder.
         let cached = self.roles.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let roles = match cached {
-            Some(roles) => roles,
+            Some((roles, _)) => roles,
             None => Arc::new(Roles {
                 root: self.root().await?,
                 ..Default::default()
@@ -947,18 +996,27 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             state: SyncState::new(String::new()),
             more: page.next_link.is_some(),
         };
-        // A message may come more than once: its last entry tells.
-        for mut entry in page.value {
+        // A message may come more than once: its last entry tells. Each
+        // message's outcome (its summary, or none if removed) is kept by ID, with the position of the entry
+        // that decided it (a repeated removal keeps the first), and
+        // handed out in that order.
+        let mut outcomes: HashMap<MessageId, (usize, Option<MessageSummary>)> = HashMap::new();
+        for (position, mut entry) in page.value.into_iter().enumerate() {
             if entry.get("@removed").is_some() {
                 let id = entry
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| Error::Backend("delta entry without an id".into()))?;
                 let id = MessageId::new(id);
-                changes.changed.retain(|m| m.id != id);
-                if !changes.removed.contains(&id) {
-                    changes.removed.push(id);
-                }
+                outcomes
+                    .entry(id)
+                    .and_modify(|(at, outcome)| {
+                        if outcome.is_some() {
+                            *at = position;
+                            *outcome = None;
+                        }
+                    })
+                    .or_insert((position, None));
                 continue;
             }
             // Delta entries are in the folder synced, whether or not they
@@ -971,9 +1029,15 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             let message: GraphMessage = serde_json::from_value(entry)
                 .map_err(|e| Error::Backend(format!("unexpected delta entry from Graph: {e}")))?;
             let summary = message.into_summary()?;
-            changes.removed.retain(|id| *id != summary.id);
-            changes.changed.retain(|m| m.id != summary.id);
-            changes.changed.push(summary);
+            outcomes.insert(summary.id.clone(), (position, Some(summary)));
+        }
+        let mut outcomes: Vec<_> = outcomes.into_iter().collect();
+        outcomes.sort_unstable_by_key(|(_, (position, _))| *position);
+        for (id, (_, outcome)) in outcomes {
+            match outcome {
+                Some(summary) => changes.changed.push(summary),
+                None => changes.removed.push(id),
+            }
         }
         let link = page
             .next_link
@@ -1037,10 +1101,13 @@ impl<A: Authenticator> MailStore for GraphMailStore<A> {
             attachment.as_str(),
             "$value",
         ]);
-        let response = self
-            .send(
+        // The content may be large, and how long it takes isn't known.
+        let (response, _) = self
+            .send_with(
                 self.request(Method::GET, url),
                 About::message(message.as_str()),
+                |e| e,
+                DOWNLOAD_TIMEOUT,
             )
             .await?;
         response
@@ -1551,7 +1618,7 @@ impl<A: Authenticator> GraphMailStore<A> {
             let response = self
                 .http
                 .put(upload.clone())
-                .timeout(REQUEST_TIMEOUT)
+                .timeout(upload_timeout(chunk.len()))
                 .header("Content-Range", format!("bytes {start}-{end}/{total}"))
                 // Graph requires it of every piece.
                 .header("Content-Type", "application/octet-stream")
@@ -2350,6 +2417,18 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn large_uploads_are_given_time_to_finish() {
+        assert_eq!(upload_timeout(0), REQUEST_TIMEOUT);
+        assert_eq!(
+            upload_timeout(10 * BYTES_PER_SECOND),
+            REQUEST_TIMEOUT + Duration::from_secs(10)
+        );
+        // A chunk of a large attachment, at the slowest speed allowed for.
+        assert!(upload_timeout(UPLOAD_CHUNK) > Duration::from_secs(UPLOAD_CHUNK as u64 / 65536));
+        assert!(DOWNLOAD_TIMEOUT > REQUEST_TIMEOUT);
+    }
 
     /// Drafts of every shape the size of a request depends on.
     fn drafts() -> Vec<Draft> {

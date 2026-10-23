@@ -660,13 +660,15 @@ async fn lists_the_folders_below_one_as_the_whole_tree_does() {
         let below = store.child_folders(parent.as_ref()).await.unwrap();
         let expected: Vec<_> = all.iter().filter(|f| f.parent == parent).cloned().collect();
         assert_eq!(below, expected, "below {parent:?}");
-        // One listing (with its pages), and the roles.
+        // One listing (with its pages); the roles are those of the listing
+        // of every folder, not looked up again.
         let requests = server.received_requests().await.unwrap();
         let listings: Vec<_> = requests
             .iter()
             .filter(|r| r.method.as_str() == "GET")
             .map(|r| r.url.path().to_owned())
             .collect();
+        assert!(requests.iter().all(|r| r.method.as_str() != "POST"));
         let at = match &parent {
             None => "/v1.0/me/mailFolders".to_owned(),
             Some(id) => format!("/v1.0/me/mailFolders/{id}/childFolders"),
@@ -696,7 +698,9 @@ async fn lists_the_folders_below_one_as_the_whole_tree_does() {
     let top = store.child_folders(None).await.unwrap();
     assert!(top.iter().all(|f| f.parent.is_none()));
 
-    // Failing, the roles are the answer.
+    // With no roles known (none looked up yet), failing, they are the
+    // answer.
+    let store = self::store(&server);
     server.reset().await;
     mount_roles_with(&server, 503).await;
     mount_tree(&server).await;
@@ -710,6 +714,19 @@ async fn lists_the_folders_below_one_as_the_whole_tree_does() {
         store.child_folders(Some(&FolderId::new("nope"))).await,
         Err(Error::NotFound { kind: "folder", id }) if id == "nope"
     ));
+    // The listing of every folder looks the roles up afresh.
+    server.reset().await;
+    mount_roles(&server).await;
+    mount_tree(&server).await;
+    store.list_folders().await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -2906,6 +2923,12 @@ async fn syncs_a_folder_with_delta_links() {
                     "subject": "Partial",
                     "sentDateTime": "2026-10-14T12:00:00Z",
                 },
+                // Removed twice: where it was first.
+                { "id": "m5", "@removed": { "reason": "deleted" } },
+                { "id": "m6", "@removed": { "reason": "deleted" } },
+                { "id": "m5", "@removed": { "reason": "deleted" } },
+                // Changed again: where it last was.
+                message("m2", "2026-10-14T11:30:00Z"),
             ],
             "@odata.deltaLink": format!("{base}/v1.0/me/mailFolders/inbox-id/messages/delta?$deltatoken=d1"),
         })))
@@ -2919,9 +2942,10 @@ async fn syncs_a_folder_with_delta_links() {
     assert!(first.more);
     let second = store.sync_folder(&inbox, Some(&first.state)).await.unwrap();
     let changed: Vec<&str> = second.changed.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(changed, ["m2", "m4", "m3"]);
-    assert_eq!(second.changed[2].folder, inbox, "m3 left out its folder");
-    assert_eq!(second.removed, [MessageId::new("m0")]);
+    assert_eq!(changed, ["m4", "m3", "m2"]);
+    assert_eq!(second.changed[1].folder, inbox, "m3 left out its folder");
+    let removed: Vec<&str> = second.removed.iter().map(|m| m.as_str()).collect();
+    assert_eq!(removed, ["m0", "m5", "m6"]);
     assert!(!second.more);
     assert!(second.state.as_str().ends_with("$deltatoken=d1"));
     // A link of another endpoint is never followed.
