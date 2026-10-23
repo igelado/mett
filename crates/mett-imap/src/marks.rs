@@ -6,6 +6,12 @@
 //! and each asker, the `UID` the next message would have (everything from
 //! there on is new) and, where the server has `CONDSTORE`, the folder's
 //! highest modification sequence (everything changed after it is changed).
+//!
+//! The cache's sync (`store/sync.rs`) tracks the same facts, but is not built
+//! on this, nor this on it: a sync state needs `CONDSTORE` and a `SEARCH ALL`
+//! of the folder's `UID`s (these marks work without both), and has no
+//! per-asker marks, lag or rollback. The queries they share
+//! (`moved_since`, `from_uid`) are one function each in `store.rs`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
