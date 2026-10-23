@@ -154,16 +154,21 @@ impl<S: MailStore> MailStore for Patient<'_, S> {
         self.patiently(|| self.store.save_draft(draft)).await
     }
 
-    fn folder_names_ignore_case(&self) -> bool {
-        self.store.folder_names_ignore_case()
-    }
-
-    fn can_watch(&self) -> bool {
-        self.store.can_watch()
+    fn capabilities(&self) -> mett_core::Capabilities {
+        self.store.capabilities()
     }
 
     async fn watch(&self, folders: &[FolderId]) -> Result<Vec<FolderId>> {
         self.patiently(|| self.store.watch(folders)).await
+    }
+
+    async fn sync_folder(
+        &self,
+        folder: &FolderId,
+        state: Option<&mett_core::SyncState>,
+    ) -> Result<mett_core::FolderChanges> {
+        self.patiently(|| self.store.sync_folder(folder, state))
+            .await
     }
 }
 
@@ -212,6 +217,41 @@ mod tests {
             .await;
         let waits = waits.into_inner().unwrap();
         (outcome, waits, start.elapsed())
+    }
+
+    #[test]
+    fn a_stack_of_wrappers_reports_the_capabilities_of_the_store_inside() {
+        use mett_core::Capabilities;
+        use mett_core::mock::MemoryStore;
+        use mett_sqlite::{Cache, CachedStore};
+
+        let notify = |_, _| {};
+        for (inner, expected) in [
+            (MemoryStore::new(), Capabilities::default()),
+            (
+                MemoryStore::new().with_sync().with_exact_names(),
+                Capabilities {
+                    can_sync: true,
+                    folder_names_ignore_case: false,
+                    ..Capabilities::default()
+                },
+            ),
+        ] {
+            let cached = CachedStore::new(
+                inner,
+                Some(Cache::in_memory(&mett_core::AccountId::new("alice@contoso.com")).unwrap()),
+            );
+            let patient = Patient {
+                store: &cached,
+                notify: &notify,
+            };
+            assert_eq!(patient.capabilities(), expected);
+            let outer = Patient {
+                store: &patient,
+                notify: &notify,
+            };
+            assert_eq!(outer.capabilities(), expected);
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -363,7 +363,7 @@ async fn serve<S: MailStore + MailSender>(store: &S, request: Request) -> Event 
             }
             Event::StillThere(Ok(gone))
         }
-        Request::Watch(folders) => Event::Watched(match store.can_watch() {
+        Request::Watch(folders) => Event::Watched(match store.capabilities().can_watch {
             true => Some(store.watch(&folders).await),
             false => None,
         }),
@@ -441,7 +441,7 @@ async fn transfer<S: MailStore>(
 /// names apart, but for the `INBOX` at the top of the mailbox (`root`).
 fn names_match<S: MailStore>(store: &S, a: &str, b: &str, root: bool) -> bool {
     a == b
-        || if store.folder_names_ignore_case() {
+        || if store.capabilities().folder_names_ignore_case {
             crate::config::mailbox::same_name(a, b)
         } else {
             root && a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX")

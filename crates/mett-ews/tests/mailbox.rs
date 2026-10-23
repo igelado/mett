@@ -1074,7 +1074,7 @@ async fn a_first_sync_tells_of_every_message() {
         .mount(&server)
         .await;
     let store = store(&server);
-    assert!(store.can_sync());
+    assert!(store.capabilities().can_sync);
     let changes = store
         .sync_folder(&FolderId::new("inbox-id"), None)
         .await
@@ -1361,7 +1361,7 @@ async fn watches_folders_by_streaming_notifications() {
         .mount(&server)
         .await;
     let store = store(&server);
-    assert!(store.can_watch());
+    assert!(store.capabilities().can_watch);
     let inbox = [FolderId::new("inbox-id")];
     assert_eq!(store.watch(&inbox).await.unwrap(), inbox);
     // Watched again, the subscription goes on.

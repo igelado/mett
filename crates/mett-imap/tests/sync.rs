@@ -86,14 +86,14 @@ async fn syncs_only_where_the_server_tells_what_changed() {
     let store = store_for(&server);
     // Before it has connected, it doesn't know, and an earlier run's cache
     // can be read.
-    assert!(store.can_sync());
+    assert!(store.capabilities().can_sync);
     store.list_folders().await.unwrap();
-    assert!(store.can_sync());
+    assert!(store.capabilities().can_sync);
 
     let server = server_without_condstore().await;
     let store = store_for(&server);
     store.list_folders().await.unwrap();
-    assert!(!store.can_sync());
+    assert!(!store.capabilities().can_sync);
 }
 
 async fn server_without_condstore() -> Server {

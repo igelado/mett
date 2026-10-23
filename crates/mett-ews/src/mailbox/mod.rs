@@ -849,8 +849,12 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
         Ok(())
     }
 
-    fn can_sync(&self) -> bool {
-        true
+    fn capabilities(&self) -> mett_core::Capabilities {
+        mett_core::Capabilities {
+            can_sync: true,
+            can_watch: true,
+            ..mett_core::Capabilities::default()
+        }
     }
 
     async fn sync_folder(
@@ -933,10 +937,6 @@ impl<A: Authenticator + 'static> MailStore for EwsMailStore<A> {
             state: SyncState::new(new_state),
             more: !last,
         })
-    }
-
-    fn can_watch(&self) -> bool {
-        true
     }
 
     /// With a streaming subscription to `folders` (made once, and again if

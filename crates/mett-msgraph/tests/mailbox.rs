@@ -2888,7 +2888,7 @@ async fn syncs_a_folder_with_delta_links() {
         .mount(&server)
         .await;
     let store = store(&server);
-    assert!(store.can_sync());
+    assert!(store.capabilities().can_sync);
     let inbox = FolderId::new("inbox-id");
     let first = store.sync_folder(&inbox, None).await.unwrap();
     assert_eq!(first.changed[0].id, MessageId::new("m1"));

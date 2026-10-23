@@ -620,8 +620,11 @@ impl MailStore for Flaky {
         self.up()?;
         self.inner.save_draft(draft).await
     }
-    fn can_sync(&self) -> bool {
-        true
+    fn capabilities(&self) -> mett_core::Capabilities {
+        mett_core::Capabilities {
+            can_sync: true,
+            ..mett_core::Capabilities::default()
+        }
     }
     async fn sync_folder(
         &self,

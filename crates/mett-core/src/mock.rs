@@ -102,7 +102,7 @@ impl MemoryStore {
     }
 
     /// Makes folder names exact, as on most IMAP servers: `Archive` is not
-    /// `archive` ([`MailStore::folder_names_ignore_case`]).
+    /// `archive` ([`Capabilities::folder_names_ignore_case`](crate::Capabilities)).
     pub fn with_exact_names(self) -> Self {
         self.state().exact_names = true;
         self
@@ -551,12 +551,13 @@ impl MailStore for MemoryStore {
         Ok(())
     }
 
-    fn folder_names_ignore_case(&self) -> bool {
-        !self.state().exact_names
-    }
-
-    fn can_sync(&self) -> bool {
-        self.state().sync
+    fn capabilities(&self) -> crate::Capabilities {
+        let state = self.state();
+        crate::Capabilities {
+            folder_names_ignore_case: !state.exact_names,
+            can_sync: state.sync,
+            ..crate::Capabilities::default()
+        }
     }
 
     /// The state is a snapshot of the folder: its epoch, then each
