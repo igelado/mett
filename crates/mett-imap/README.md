@@ -7,7 +7,7 @@ implements `mett-core`'s ports against any IMAP server:
 
 - **`ImapMailStore`** implements `MailStore`: folders (their roles from the
   server's `SPECIAL-USE` attributes, or their usual names; counts from
-  `STATUS`), messages (newest first by their dates where the server has
+  `LIST-STATUS` or `STATUS`), messages (newest first by their dates where the server has
   `SORT`, by `UID` (and so by arrival) where it hasn't; a page at a time; threaded by
   `References:`), message bodies (HTML-only mail as HTML) and attachments,
   read and flagged state, move (`MOVE`, else copy and delete), copy and delete
@@ -61,8 +61,15 @@ the `UID` the next message would have and, with `CONDSTORE`, the modification
 sequence: mail copied in with an old date and flags that another client
 changed are found that way; without `CONDSTORE`, a flag another client
 changed is seen when the folder is opened again. Meeting invitations are
-attachments, not answered; the folder listing counts messages with a
-`STATUS` for each folder.
+attachments, not answered. The folder listing counts messages with the
+listing itself where the server has `LIST-STATUS`, and else with a `STATUS` for
+each folder, sent together without waiting for each answer (in rounds of 50).
+
+The connection remembers which folder is selected (and its `UIDVALIDITY`):
+what is done to one message (fetching it, its flags, deleting it, its
+attachments) doesn't select its folder again if it is selected. Listings and
+syncs always select, for the counts and `UIDNEXT` they need new, and a command
+that failed makes the next select again.
 
 The configuration (`imaps://` URLs, `imap_user`, `imap_pass`, `smtp_url`,
 `ssl_*`) is described in [docs/MUTTRC.md](../../docs/MUTTRC.md) §4.13.

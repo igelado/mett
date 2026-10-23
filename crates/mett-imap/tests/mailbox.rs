@@ -386,6 +386,13 @@ async fn a_message_of_a_folder_made_anew_is_gone() {
         .id
         .clone();
     server.state.lock().unwrap().folder("INBOX").validity += 1;
+    // A server doesn't make a folder anew while it is selected: it is
+    // selected again here, as it is when the connection has gone to
+    // another folder in the meantime.
+    store
+        .list_messages(&FolderId::new("Sent"), Page::first(1))
+        .await
+        .unwrap();
     assert!(matches!(
         store.fetch_message(&id).await,
         Err(Error::NotFound { .. })
@@ -1720,4 +1727,180 @@ async fn a_sent_message_whose_copy_cannot_be_kept_is_said_to_be_sent() {
     assert!(matches!(error, Error::SentNotKept(_)), "{error}");
     // It went out, once.
     assert_eq!(out.taken.lock().unwrap().len(), 1);
+}
+
+fn commands(server: &Server, verb: &str) -> usize {
+    server.state.lock().unwrap().count(verb)
+}
+
+#[tokio::test]
+async fn counts_come_with_the_listing_where_the_server_says_so() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    deliver(&server, "INBOX", &simple("two"), &["\\Seen"]);
+    let folders = store.list_folders().await.unwrap();
+    let inbox = folders.iter().find(|f| f.id.as_str() == "INBOX").unwrap();
+    assert_eq!((inbox.total_count, inbox.unread_count), (2, 1));
+    // One command for the listing and the counts of all folders.
+    assert_eq!(commands(&server, "LIST"), 1);
+    assert_eq!(commands(&server, "STATUS"), 0);
+}
+
+#[tokio::test]
+async fn counts_are_asked_together_where_the_listing_has_none() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_list_status = true;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    deliver(&server, "INBOX", &simple("two"), &["\\Seen"]);
+    let folders = store.list_folders().await.unwrap();
+    let inbox = folders.iter().find(|f| f.id.as_str() == "INBOX").unwrap();
+    assert_eq!((inbox.total_count, inbox.unread_count), (2, 1));
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.count("STATUS"), folders.len());
+    assert_eq!(state.count("LIST"), 1);
+    // All but the first of them went out before the answer to the one
+    // before: the connection waits for the server once, not for each.
+    assert!(state.pipelined >= folders.len() as u32 - 1);
+}
+
+#[tokio::test]
+async fn a_listing_that_is_refused_with_counts_is_asked_without() {
+    let (server, store) = plain().await;
+    // Says it can, and can't.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.no_list_status = true;
+        state.advertise_list_status = true;
+    }
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    let folders = store.list_folders().await.unwrap();
+    let inbox = folders.iter().find(|f| f.id.as_str() == "INBOX").unwrap();
+    assert_eq!((inbox.total_count, inbox.unread_count), (1, 1));
+}
+
+#[tokio::test]
+async fn a_folder_polled_after_the_listing_went_old_takes_one_round_trip() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    // The first asks the folders (and the folder) and keeps the listing.
+    let id = FolderId::new("INBOX");
+    assert_eq!(store.folder(&id).await.unwrap().unread_count, 1);
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.count("LIST"), 1);
+        assert_eq!(state.count("STATUS"), 1);
+        // Listing and counts were written together.
+        assert_eq!(state.pipelined, 1);
+    }
+    // While the listing is kept, only the folder is asked of.
+    deliver(&server, "INBOX", &simple("two"), &[]);
+    assert_eq!(store.folder(&id).await.unwrap().unread_count, 2);
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.count("LIST"), 1);
+    assert_eq!(state.count("STATUS"), 2);
+}
+
+#[tokio::test]
+async fn a_folder_that_is_selected_is_not_selected_again_for_a_message() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    deliver(&server, "INBOX", &simple("two"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let page = store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    let (first, second) = (page.messages[0].id.clone(), page.messages[1].id.clone());
+    assert_eq!(commands(&server, "SELECT"), 1);
+
+    store.fetch_message(&first).await.unwrap();
+    store.fetch_message(&second).await.unwrap();
+    store
+        .update_flags(&first, FlagsUpdate::read(true))
+        .await
+        .unwrap();
+    store.list_attachments(&first).await.unwrap();
+    store.message_folder(&first).await.unwrap();
+    store.delete_message(&second).await.unwrap();
+    assert_eq!(commands(&server, "SELECT"), 1);
+
+    // What lists the folder selects it, for the counts it says anew.
+    store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    assert_eq!(commands(&server, "SELECT"), 2);
+
+    // Another folder is selected for what is done in it, and then the
+    // first is selected again.
+    store
+        .well_known_folder(WellKnownFolder::Drafts)
+        .await
+        .unwrap();
+    store
+        .list_messages(&FolderId::new("Sent"), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(commands(&server, "SELECT"), 3);
+    store.fetch_message(&first).await.unwrap();
+    assert_eq!(commands(&server, "SELECT"), 4);
+}
+
+#[tokio::test]
+async fn a_message_that_is_gone_is_not_found_in_a_folder_that_is_selected() {
+    let (server, store) = plain().await;
+    let id = {
+        deliver(&server, "INBOX", &simple("one"), &[]);
+        let page = store
+            .list_messages(&FolderId::new("INBOX"), Page::first(10))
+            .await
+            .unwrap();
+        page.messages[0].id.clone()
+    };
+    // Another client deletes it.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .clear();
+    assert!(matches!(
+        store.fetch_message(&id).await,
+        Err(Error::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.update_flags(&id, FlagsUpdate::read(true)).await,
+        Err(Error::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_failed_command_makes_the_next_select_the_folder_again() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("one"), &[]);
+    let id = store
+        .list_messages(&FolderId::new("INBOX"), Page::first(10))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    assert_eq!(commands(&server, "SELECT"), 1);
+    // Another client deletes it: the fetch finds nothing, and what the
+    // server says of the folder is not taken for granted after that.
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .clear();
+    assert!(store.fetch_message(&id).await.is_err());
+    assert_eq!(commands(&server, "SELECT"), 1);
+    assert!(store.fetch_message(&id).await.is_err());
+    assert_eq!(commands(&server, "SELECT"), 2);
+}
+
+#[tokio::test]
+async fn a_folder_name_with_a_line_break_sends_no_command() {
+    let (server, store) = plain().await;
+    let result = store.folder(&FolderId::new("INBOX\r\nx LOGOUT")).await;
+    assert!(result.is_err());
+    assert_eq!(commands(&server, "LOGOUT"), 0);
+    assert_eq!(commands(&server, "x"), 0);
 }

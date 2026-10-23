@@ -81,9 +81,31 @@ pub struct State {
     /// Says which folders are Sent, Drafts and so on only when asked to
     /// (`RETURN (SPECIAL-USE)`), as the servers allowed to do.
     pub special_use_only_on_request: bool,
+    /// Leaves `LIST-STATUS` out of what it can do.
+    pub no_list_status: bool,
+    /// Says it can do `LIST-STATUS` even if it is left out (and then
+    /// refuses it): a server that says more than it does.
+    pub advertise_list_status: bool,
+    /// Every command the clients sent, as written after its tag, in order.
+    pub commands: Vec<String>,
+    /// How many commands came before the answer to the one before them.
+    pub pipelined: u32,
 }
 
 impl State {
+    /// How many commands begin with `verb` (like `UID FETCH`).
+    pub fn count(&self, verb: &str) -> usize {
+        self.commands
+            .iter()
+            .filter(|c| c.to_uppercase().starts_with(verb))
+            .count()
+    }
+
+    /// The commands sent since the last call, as written, and forget them.
+    pub fn take_commands(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.commands)
+    }
+
     /// Another client changes the flags of a message.
     pub fn set_flags(&mut self, name: &str, uid: u32, flags: &[&str]) {
         let folder = self.folder(name);
@@ -287,11 +309,34 @@ impl Session {
             if greet {
                 let _ = stream.write_all(b"* OK IMAP4rev1 ready\r\n").await;
             }
-            while let Some((line, literal)) = command(&mut stream).await {
+            let mut ahead = false;
+            loop {
+                // A command that came before the answer to the one before
+                // it was sent without waiting for that answer.
+                let queued = ahead || !stream.buffer().is_empty();
+                let Some((line, literal)) = command(&mut stream).await else {
+                    break;
+                };
                 let mut words = line.splitn(2, ' ');
                 let tag = words.next().unwrap_or("*").to_owned();
                 let rest = words.next().unwrap_or("").to_owned();
                 let upper = rest.to_uppercase();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.commands.push(rest.clone());
+                    state.pipelined += u32::from(queued);
+                }
+                // Whether the next is already on its way (or sent after
+                // the answer, which a client that waits does) is not left
+                // to the timing of the packets: the answers to these wait
+                // a little for the next.
+                if (upper.starts_with("STATUS ") || upper.starts_with("LIST "))
+                    && stream.buffer().is_empty()
+                {
+                    let wait = std::time::Duration::from_millis(100);
+                    let _ = tokio::time::timeout(wait, stream.fill_buf()).await;
+                }
+                ahead = !stream.buffer().is_empty();
                 let mut out = String::new();
                 let ok =
                     |out: &mut String, text: &str| out.push_str(&format!("{tag} OK {text}\r\n"));
@@ -303,17 +348,22 @@ impl Session {
                     } else {
                         ""
                     };
-                    let (uidplus, moves, sort, condstore) = {
+                    let (uidplus, moves, sort, condstore, list_status) = {
                         let state = self.state.lock().unwrap();
                         (
                             if state.no_uidplus { "" } else { " UIDPLUS" },
                             if state.no_move { "" } else { " MOVE" },
                             if state.no_sort { "" } else { " SORT" },
                             if state.no_condstore { "" } else { " CONDSTORE" },
+                            if state.no_list_status && !state.advertise_list_status {
+                                ""
+                            } else {
+                                " LIST-STATUS"
+                            },
                         )
                     };
                     out.push_str(&format!(
-                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2 SPECIAL-USE LIST-EXTENDED{uidplus}{moves}{sort}{condstore}\r\n"
+                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2 SPECIAL-USE LIST-EXTENDED{list_status}{uidplus}{moves}{sort}{condstore}\r\n"
                     ));
                     ok(&mut out, "done");
                 } else if upper == "STARTTLS" {
@@ -410,9 +460,16 @@ impl Session {
         let shared = self.state.clone();
         let mut state = shared.lock().unwrap();
         if upper.starts_with("LIST ") {
-            // LIST "" "pattern" [RETURN (SPECIAL-USE)]
+            // LIST "" "pattern" [RETURN (SPECIAL-USE STATUS (items))]
             let args = rest[5..].trim().split_once(' ').map_or("", |(_, p)| p);
-            let asked = args.to_uppercase().contains("RETURN (SPECIAL-USE)");
+            let returns = args.to_uppercase();
+            let returns = returns.split_once(" RETURN ").map_or("", |(_, r)| r);
+            let asked = returns.contains("SPECIAL-USE");
+            let counted = returns.contains("STATUS");
+            if counted && state.no_list_status {
+                out.push_str(&format!("{tag} BAD LIST-STATUS is not supported\r\n"));
+                return;
+            }
             let pattern = unquote(args.split(" RETURN").next().unwrap_or(""));
             if pattern == "*" {
                 state.full_lists += 1;
@@ -428,6 +485,9 @@ impl Session {
                         "* LIST ({attributes}) \"/\" \"{}\"\r\n",
                         folder.name
                     ));
+                    if counted && !folder.attributes.iter().any(|a| a == "\\Noselect") {
+                        out.push_str(&status_line(folder));
+                    }
                 }
             }
             out.push_str(&format!("{tag} OK done\r\n"));
@@ -435,17 +495,8 @@ impl Session {
             let name = unquote(rest[7..].split(" (").next().unwrap_or(""));
             match state.folders.iter().find(|f| f.name == name) {
                 Some(f) => {
-                    let unseen = f
-                        .messages
-                        .iter()
-                        .filter(|m| !m.flags.contains("\\Seen"))
-                        .count();
-                    out.push_str(&format!(
-                        "* STATUS \"{name}\" (MESSAGES {} UNSEEN {unseen} UIDNEXT {} UIDVALIDITY {})\r\n{tag} OK done\r\n",
-                        f.messages.len(),
-                        f.next_uid,
-                        f.validity
-                    ));
+                    out.push_str(&status_line(f));
+                    out.push_str(&format!("{tag} OK done\r\n"));
                 }
                 None => out.push_str(&format!("{tag} NO [NONEXISTENT] no such folder\r\n")),
             }
@@ -691,6 +742,22 @@ impl Session {
             out.push_str(&format!("{tag} BAD unknown UID command\r\n"));
         }
     }
+}
+
+/// The `STATUS` line of a folder.
+fn status_line(f: &Folder) -> String {
+    let unseen = f
+        .messages
+        .iter()
+        .filter(|m| !m.flags.contains("\\Seen"))
+        .count();
+    format!(
+        "* STATUS \"{}\" (MESSAGES {} UNSEEN {unseen} UIDNEXT {} UIDVALIDITY {})\r\n",
+        f.name,
+        f.messages.len(),
+        f.next_uid,
+        f.validity
+    )
 }
 
 /// What the server says of the parts of a message (`BODYSTRUCTURE`).
