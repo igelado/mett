@@ -430,7 +430,7 @@ fn failures_follow_messages_moved_on_again() {
         failure("z", Transfer::Save, &archive),
     ]);
     let unsaved = ("offline".to_owned(), FlagsUpdate::read(true));
-    app.save_failures.insert("a".into(), unsaved.clone());
+    app.flag_sync.failures.insert("a".into(), unsaved.clone());
     // a became b, and b (another message) became c: what failed for
     // a goes along to c, as what failed for b does.
     app.follow_moves(&[("a".into(), "b".into()), ("b".into(), "c".into())]);
@@ -448,7 +448,7 @@ fn failures_follow_messages_moved_on_again() {
     .map(|((id, transfer, to), e)| format!("{id:?} {transfer:?} {to:?}: {e}"));
     assert_eq!(failures, expected);
     assert_eq!(
-        app.save_failures,
+        app.flag_sync.failures,
         HashMap::from([(MessageId::new("c"), unsaved)])
     );
 }
@@ -464,8 +464,8 @@ fn a_failed_flag_change_follows_the_move() {
     transferred(&mut app, moving, "archive", "m0", Ok("a0"));
     assert!(!app.saving());
     // Trying again changes the moved message.
-    assert!(app.save_failures.contains_key(&MessageId::new("a0")));
-    assert!(!app.save_failures.contains_key(&MessageId::new("m0")));
+    assert!(app.flag_sync.failures.contains_key(&MessageId::new("a0")));
+    assert!(!app.flag_sync.failures.contains_key(&MessageId::new("m0")));
 }
 
 #[test]
@@ -977,7 +977,7 @@ fn failed_flag_changes_are_kept_together() {
     respond(&mut app, flag, Event::FlagsUpdated(Err(offline())));
     let (read, _) = sent(&act(&mut app, Action::ToggleNew));
     respond(&mut app, read, Event::FlagsUpdated(Err(offline())));
-    let (_, failed) = &app.save_failures[&MessageId::new("m0")];
+    let (_, failed) = &app.flag_sync.failures[&MessageId::new("m0")];
     assert_eq!(
         *failed,
         FlagsUpdate {
@@ -988,7 +988,7 @@ fn failed_flag_changes_are_kept_together() {
     // Saving one of them leaves the other to try again.
     let (flag, _) = sent(&act(&mut app, Action::FlagMessage));
     respond(&mut app, flag, Event::FlagsUpdated(Ok(())));
-    let (_, failed) = &app.save_failures[&MessageId::new("m0")];
+    let (_, failed) = &app.flag_sync.failures[&MessageId::new("m0")];
     assert_eq!(*failed, FlagsUpdate::read(true));
 }
 

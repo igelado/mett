@@ -37,6 +37,7 @@ use ratatui::crossterm::event::KeyEvent;
 pub use self::attachments::{AttachMenu, FileOp, FileOutcome, TextView};
 use self::composing::Composing;
 pub use self::composing::{Compose, Input};
+use self::flags::FlagSync;
 use self::index::IndexState;
 pub use self::keys::{Help, Reconfigured};
 pub use self::mailbox::Browser;
@@ -494,20 +495,6 @@ pub struct App {
     terminal_width: usize,
     /// Rows available for the index or pager body.
     pub body_height: usize,
-    /// Changes that failed to save, by message, kept apart from the status
-    /// line so that later messages can't hide them. A later successful save
-    /// of the same message clears its entry.
-    save_failures: HashMap<MessageId, (String, FlagsUpdate)>,
-    /// The mailbox's flags, as far as mett knows, for messages whose flag
-    /// changes are on their way, so a failure can be undone in the index.
-    mailbox_flags: HashMap<MessageId, mett_core::Flags>,
-    /// The flags the user last asked for, for messages whose updates are
-    /// on their way.
-    wanted_flags: HashMap<MessageId, mett_core::Flags>,
-    /// Flags saved while the folder was being listed, as far as known:
-    /// pages asked for before may still have the old ones. Forgotten once
-    /// the listing is done.
-    saved_flags: HashMap<MessageId, FlagsUpdate>,
     /// Messages moved or purged away while the folder was being listed:
     /// pages asked for before may still have them. Forgotten once the
     /// listing is done.
@@ -560,6 +547,8 @@ pub struct App {
     mailbox_state: HashMap<FolderPath, newmail::MailboxState>,
     /// See [`Settings::sync_interval`].
     sync_interval: Option<std::time::Duration>,
+    /// How the user's flag changes stand with the mailbox.
+    flag_sync: FlagSync,
     /// The checks for new mail, and watching for changes.
     poll: Poll,
     /// The unread mail the user has seen, by folder.
@@ -661,10 +650,6 @@ impl App {
             width: usize::from(width),
             terminal_width: usize::from(width),
             body_height: body_height(height),
-            save_failures: HashMap::new(),
-            mailbox_flags: HashMap::new(),
-            wanted_flags: HashMap::new(),
-            saved_flags: HashMap::new(),
             removed_while_listing: HashSet::new(),
             transfer_failures: HashMap::new(),
             folder_ids: HashMap::new(),
@@ -687,6 +672,7 @@ impl App {
             mailboxes: settings.mailboxes,
             mailbox_state: HashMap::new(),
             sync_interval: settings.sync_interval,
+            flag_sync: FlagSync::default(),
             poll: Poll::default(),
             seen: HashMap::new(),
             sidebar: Sidebar::default(),
@@ -1457,7 +1443,7 @@ impl App {
                     } else {
                         self.index.listing = None;
                         self.index.listing_page = None;
-                        self.saved_flags.clear();
+                        self.flag_sync.forget_listing();
                         self.removed_while_listing.clear();
                         self.forget_missing_marks();
                         self.loaded();
@@ -1484,7 +1470,7 @@ impl App {
                     // What was listed is threaded, while the rest waits.
                     self.thread_listed();
                     // Pages asked for again come after the saves.
-                    self.saved_flags.clear();
+                    self.flag_sync.forget_listing();
                     self.removed_while_listing.clear();
                     self.load_failed(e);
                 }
@@ -1790,7 +1776,7 @@ impl App {
             self.index.limited.extend(shown.chain(hidden));
         }
         self.index.forget_listing();
-        self.saved_flags.clear();
+        self.flag_sync.forget_listing();
         self.removed_while_listing.clear();
         self.list(Page::first(self.page_size))
     }
@@ -1973,7 +1959,8 @@ impl App {
     /// Changes that could not be saved, one per message.
     pub fn save_failures(&self) -> Vec<String> {
         let mut failures: Vec<_> = self
-            .save_failures
+            .flag_sync
+            .failures
             .values()
             .map(|(error, _)| error.clone())
             .chain(self.transfer_failures.values().cloned())

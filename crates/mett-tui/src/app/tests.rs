@@ -1085,3 +1085,46 @@ fn resetting_the_folder_restores_a_fresh_poll_of_the_folder() {
     assert!(app.poll.armed);
     assert_eq!(app.poll.epoch, 3);
 }
+
+#[test]
+fn resetting_the_folder_forgets_only_the_flags_saved_while_listing() {
+    let (mut app, _) = opened(Settings::default(), 24, plain(&["a"]), None);
+    let id = MessageId::new("a");
+    app.flag_sync
+        .saved
+        .insert(id.clone(), FlagsUpdate::read(true));
+    app.flag_sync
+        .mailbox
+        .insert(id.clone(), mett_core::Flags::default());
+    app.flag_sync
+        .failures
+        .insert(id.clone(), ("offline".into(), FlagsUpdate::read(true)));
+    app.reset_folder();
+    assert!(app.flag_sync.saved.is_empty());
+    // Changes on their way and failed ones don't depend on the folder.
+    assert!(app.flag_sync.mailbox.contains_key(&id));
+    assert!(app.flag_sync.failures.contains_key(&id));
+}
+
+#[test]
+fn flag_updates_merge_and_clear_by_field() {
+    use super::flags::FlagsUpdateExt;
+    let read = FlagsUpdate::read(true);
+    let flagged = FlagsUpdate {
+        read: None,
+        flagged: Some(true),
+    };
+    let both = read.merged(flagged);
+    assert_eq!((both.read, both.flagged), (Some(true), Some(true)));
+    assert_eq!(both.merged(FlagsUpdate::read(false)).read, Some(false));
+    assert_eq!(both.without(read), flagged);
+    assert!(both.without(both).is_empty());
+    // Only what is changed to something else is undone.
+    assert_eq!(both.undone_by(FlagsUpdate::read(true)), both);
+    assert_eq!(both.undone_by(FlagsUpdate::read(false)), flagged);
+    let all = FlagsUpdate::whole(mett_core::Flags {
+        read: false,
+        flagged: true,
+    });
+    assert_eq!((all.read, all.flagged), (Some(false), Some(true)));
+}
