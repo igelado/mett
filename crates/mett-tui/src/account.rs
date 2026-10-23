@@ -261,7 +261,7 @@ pub fn cache_path(
             };
             let name = format!(
                 "imap~{}~{}~{port}",
-                part(url.account.as_str()),
+                part(&imap_user(url, server)),
                 part(&server.host.to_lowercase())
             );
             format!("{name}.sqlite")
@@ -298,6 +298,16 @@ pub fn default_cache_path(config: &Config, url: &MailboxUrl) -> Option<PathBuf> 
     )
 }
 
+/// Who logs in at the IMAP `server` of `url`: its user, else the account
+/// (which, for a user who is no address, is the user at the server as it is
+/// spelt, and so not the same for two spellings of the server).
+fn imap_user(url: &MailboxUrl, server: &crate::config::server::ServerUrl) -> String {
+    server
+        .user
+        .clone()
+        .unwrap_or_else(|| url.account.to_string())
+}
+
 /// Whose a cache file is: the account, and for IMAP the server too (the
 /// same address may be at another), which a cache file named by hand
 /// doesn't say.
@@ -307,7 +317,7 @@ fn cache_owner(url: &MailboxUrl) -> mett_core::AccountId {
             let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
             mett_core::AccountId::new(format!(
                 "imap://{}@{}:{port}",
-                url.account,
+                imap_user(url, server),
                 server.host.to_lowercase()
             ))
         }
@@ -316,8 +326,12 @@ fn cache_owner(url: &MailboxUrl) -> mett_core::AccountId {
 }
 
 /// `path` as the file it names, so that two spellings of one are told as
-/// one: the folder it is in as the system has it, and its name.
+/// one: as the system has it (or, if there is no such file, the folder it
+/// is in as the system has it, and its name).
 fn identity(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
     match (
         absolute.parent().map(Path::canonicalize),
@@ -764,15 +778,20 @@ mod tests {
             name("imap://alice%40company-mail@example.net/"),
             name("imap://alice%40company@mail-example.net/")
         );
+        // The spelling of the server's name doesn't make another account.
+        assert_eq!(
+            name("imaps://me@MAIL.One.net/"),
+            name("imaps://me@mail.one.net/")
+        );
         // Another port is another server.
         assert_eq!(
             name("imaps://me@mail.one.net:1993/").as_deref(),
-            Some("imap~me@mail.one.net~mail.one.net~1993.sqlite")
+            Some("imap~me~mail.one.net~1993.sqlite")
         );
         // Whatever a file name can't hold is made harmless.
         assert_eq!(
             name("imap://a%2Fb@h/").as_deref(),
-            Some("imap~a%2Fb@h~h~143.sqlite")
+            Some("imap~a%2Fb~h~143.sqlite")
         );
     }
 
