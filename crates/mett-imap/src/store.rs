@@ -46,11 +46,10 @@ const SYNCS_YES: u8 = 1;
 const SYNCS_NO: u8 = 2;
 
 /// Whether messages are dated by when they came in: where the server can't
-/// sort them by the dates they say, and so lists them by arrival. (With
-/// `CONDSTORE`, the server is synced and the cache lists them, in the order
-/// of the dates they say, as the app does.)
+/// sort them by the dates they say, they are listed by arrival, and a cache
+/// lists them in the same order only if it has the same dates.
 fn by_arrival(caps: &Caps) -> bool {
-    !caps.sort && !caps.condstore
+    !caps.sort
 }
 
 /// How many messages a sync takes in at a time.
@@ -1053,7 +1052,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
                 &at.folder,
                 at.validity,
                 found,
-                !live.caps.sort,
+                by_arrival(&live.caps),
             )?)
         })
         .await;
