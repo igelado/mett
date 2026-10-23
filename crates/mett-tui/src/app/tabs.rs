@@ -239,6 +239,20 @@ mod tests {
     }
 
     #[test]
+    fn going_to_another_account_leaves_a_reply_being_fetched_pending() {
+        let message =
+            mett_core::mock::message("m", "in", "Hello", chrono::DateTime::UNIX_EPOCH).summary;
+        let mut app = opened(Settings::default(), 24, vec![message], None).0;
+        app.tabs = Some(tabs(0, 2));
+        // A reply asks for its message first.
+        let effects = act(&mut app, Action::Reply);
+        assert!(!effects.is_empty());
+        assert!(app.compose_fetch.is_some());
+        act(&mut app, Action::NextAccount);
+        assert!(app.compose_fetch.is_some(), "still waiting for it");
+    }
+
+    #[test]
     fn with_one_account_there_is_nothing_to_go_to() {
         let mut app = app();
         assert!(act(&mut app, Action::NextAccount).is_empty());

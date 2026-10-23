@@ -1209,6 +1209,27 @@ impl App {
             self.fail("Not available in a prompt.");
             return Vec::new();
         }
+        // Another account's tab can be gone to from the index and the pager,
+        // and leaves what is pending here to be taken up when it is shown
+        // again.
+        if matches!(menu, Menu::Index | Menu::Pager)
+            && matches!(
+                action,
+                Action::NextAccount
+                    | Action::PreviousAccount
+                    | Action::Account1
+                    | Action::Account2
+                    | Action::Account3
+                    | Action::Account4
+                    | Action::Account5
+                    | Action::Account6
+                    | Action::Account7
+                    | Action::Account8
+                    | Action::Account9
+            )
+        {
+            return self.switch_account(action);
+        }
         // Any new action in a menu replaces a pending move, and a reply or
         // forward still waiting for its message: the user has moved on,
         // perhaps to another message, or to help. The sign-in window's
@@ -1244,23 +1265,6 @@ impl App {
             self.dismissed = false;
         }
         match action {
-            // Another account's tab can be gone to from the index and the
-            // pager.
-            Action::NextAccount
-            | Action::PreviousAccount
-            | Action::Account1
-            | Action::Account2
-            | Action::Account3
-            | Action::Account4
-            | Action::Account5
-            | Action::Account6
-            | Action::Account7
-            | Action::Account8
-            | Action::Account9
-                if matches!(menu, Menu::Index | Menu::Pager) =>
-            {
-                return self.switch_account(action);
-            }
             // Help and commands work in every menu but the sign-in window.
             Action::Help if menu != Menu::SignIn => return self.open_help(),
             // A lookup's answer may bring back the question it came from,

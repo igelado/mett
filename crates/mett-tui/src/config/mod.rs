@@ -323,7 +323,7 @@ impl Config {
         if !self
             .accounts
             .iter()
-            .any(|account| !account.config.was_set("alias_file"))
+            .any(|account| account.config.string("alias_file").is_empty())
         {
             return;
         }
@@ -341,7 +341,8 @@ impl Config {
         }
         for account in &mut self.accounts {
             let config = &mut account.config;
-            if config.was_set("alias_file") {
+            // One that says where (not "": no file) keeps its own.
+            if !config.string("alias_file").is_empty() {
                 continue;
             }
             // Set as it is, not written in a mettrc line: a path may hold
@@ -1990,6 +1991,16 @@ mod tests {
         config.share_aliases_with_accounts();
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         assert_eq!(config.accounts()[0].config.aliases()[0].value, "bob@x.org");
+        // An alias_file set to "" is no file: the shared one is used.
+        let mut empty = Config::new(None);
+        empty.set_user_file(Some(dir.join("mettrc")));
+        fs::write(dir.join("aliases"), "alias bob $my_addr\n").unwrap();
+        empty.load_str(
+            "set my_addr=bob@x.org alias_file=\"\"\naccount One one\n",
+            &dir.join("mettrc"),
+        );
+        empty.share_aliases_with_accounts();
+        assert_eq!(empty.accounts()[0].config.aliases().len(), 1);
         // Without accounts, it isn't read: nothing asked for it.
         fs::write(dir.join("aliases"), "this is not a mettrc\n").unwrap();
         let mut single = Config::new(None);
