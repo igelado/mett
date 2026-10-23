@@ -1215,17 +1215,7 @@ impl App {
         if matches!(menu, Menu::Index | Menu::Pager)
             && matches!(
                 action,
-                Action::NextAccount
-                    | Action::PreviousAccount
-                    | Action::Account1
-                    | Action::Account2
-                    | Action::Account3
-                    | Action::Account4
-                    | Action::Account5
-                    | Action::Account6
-                    | Action::Account7
-                    | Action::Account8
-                    | Action::Account9
+                Action::NextAccount | Action::PreviousAccount | Action::Account(_)
             )
         {
             return self.switch_account(action);
@@ -1463,8 +1453,6 @@ impl App {
             .collect()
     }
 
-    /// Retries once the last of the requests that were pending when the
-    /// user asked to retry has reported back.
     /// The open folder's sync, while it loads, has `taken` of its messages
     /// in the cache: the status line says so, as a large folder's first
     /// sync takes a while.
@@ -1540,6 +1528,8 @@ impl App {
         ])
     }
 
+    /// Retries once the last of the requests that were pending when the
+    /// user asked to retry has reported back.
     fn retry_if_requested(&mut self, id: RequestId) -> Vec<Effect> {
         if self.retry_after.remove(&id) && self.retry_after.is_empty() {
             self.retry()
@@ -2449,8 +2439,6 @@ impl App {
         self.unlisted.is_some()
     }
 
-    /// Takes in the settings after a `:` command changed them. The account
-    /// stays the same.
     /// Counts the addresses the mailbox reported as the user's own.
     fn add_mailbox_addresses(&mut self) {
         for address in &self.mailbox_addresses {
@@ -2460,6 +2448,8 @@ impl App {
         }
     }
 
+    /// Takes in the settings after a `:` command changed them. The account
+    /// stays the same.
     pub(super) fn apply_settings(&mut self, settings: Settings) {
         self.page_size = settings.page_size;
         self.home = settings.home;
@@ -2802,7 +2792,6 @@ impl App {
     }
 }
 
-/// `earlier` with what `later` changes too.
 /// All of `flags`, as an update.
 fn whole(flags: mett_core::Flags) -> FlagsUpdate {
     FlagsUpdate {
@@ -2811,6 +2800,7 @@ fn whole(flags: mett_core::Flags) -> FlagsUpdate {
     }
 }
 
+/// `earlier` with what `later` changes too.
 fn merged(earlier: FlagsUpdate, later: FlagsUpdate) -> FlagsUpdate {
     FlagsUpdate {
         read: later.read.or(earlier.read),

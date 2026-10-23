@@ -5,7 +5,7 @@ Status: **partly implemented.** mett reads mettrc files (§1) with `set`,
 in `spoolfile` (§3, without the Focused Inbox views), signing in with the
 §4.1–4.3 variables (except `office365_oauth_refresh_command`). It sends mail
 through the spoolfile's account and postpones it to that account's Drafts
-(§5.2, without `record` and `postponed`). Folders of that account can be
+(§5.2, without `record`). Folders of that account can be
 opened, browsed, and used to save or copy messages, and purged messages go
 to `trash` (§6). The open folder and the `mailboxes` of that account are
 checked for new mail every `office365_sync_interval` seconds (§4.5). The
@@ -77,7 +77,7 @@ needed to use an Office365 account through Microsoft Graph.
 Plain muttrc already covers multiple accounts (`account-hook`,
 `folder-hook`), caching (`header_cache`, `message_cachedir`), identity
 (`from`, `realname`) and the standard mailbox variables (`spoolfile`,
-`record`, `postponed`, `trash`). mett reuses them.
+`record`, `trash`; `postponed` is accepted but has no effect). mett reuses them.
 
 ## 3. The `msgraph://` mailbox URL scheme
 
@@ -104,7 +104,6 @@ unchanged:
 set folder    = "msgraph://alice@contoso.com/"
 set spoolfile = "=@inbox"
 set record    = "=@sentitems"
-set postponed = "=@drafts"
 set trash     = "=@deleteditems"
 mailboxes     =@inbox =@inbox/@focused "=Inbox/Projects/mett"
 ```
@@ -221,7 +220,7 @@ Graph:
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `office365_focused_inbox` | boolean | `no` | When set, `=@inbox` opens the Focused view, and a status-line indicator lets the user switch to Other. |
+| `office365_focused_inbox` | boolean | `no` | *Accepted but has no effect in mett* (setting it warns). Planned: when set, `=@inbox` opens the Focused view, and a status-line indicator lets the user switch to Other. Open `=@inbox/@focused` and `=@inbox/@other` meanwhile, if the `mailboxes` list them. |
 | `office365_query_directory` | boolean | `yes` | When `query_command` is unset, `<query>` searches the people the user works with (People API, `People.Read`) and the whole organisation directory (`User.ReadBasic.All`). |
 | `office365_page_size` | number | `50` | Number of messages fetched per Graph request. |
 | `office365_sync_interval` | number | `60` | Seconds between checks for new mail; `0` turns them off. This plays the role of `mail_check`, which mett uses only for local mailboxes. *Implemented so far:* each check lists the newest page of the open folder again (taking in what arrived, changed or went among those messages) and the messages changed since the last check (`lastModifiedDateTime`, which also finds mail delivered late or moved in with an old date), and reads the counts of the `mailboxes` and their unread messages that arrived or changed since the user last saw them (by `lastModifiedDateTime`, which a message moved in also gets); a mailbox has new mail when one of those is unread mail the user didn't see when they last had it open, newer than what they saw (before that, when it has unread mail). |
@@ -234,8 +233,8 @@ Like mutt, mett has no `account` command. An account is whatever a mailbox
 URL names, and its settings come from hooks.
 
 - **Discovering accounts:** at startup, mett collects the `<account>` part of
-  every `msgraph://` URL in `folder`, `spoolfile`, `mailboxes`, `record` and
-  `postponed`. The worker signs in to and syncs each of these accounts in the
+  every `msgraph://` URL in `folder`, `spoolfile`, `mailboxes` and
+  `record`. The worker signs in to and syncs each of these accounts in the
   background. mutt does the equivalent when it polls `mailboxes`.
 - **Connection settings (`account-hook`):** for each account, mett applies
   the `account-hook`s whose regex matches its URL to a private copy of the
@@ -244,7 +243,7 @@ URL names, and its settings come from hooks.
   each connection. mett's worker serves several accounts at once, so each
   account needs its own copy. The result is the same as in mutt, but settings
   can't carry over from one account to another.
-- **Identity (`folder-hook`):** `from`, `realname`, `record` and `postponed`
+- **Identity (`folder-hook`):** `from`, `realname` and `record`
   are set by `folder-hook`s when a mailbox is opened, exactly as in mutt.
 
 ### 5.2 Sending
@@ -259,8 +258,8 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
   account's `@sentitems`, mett asks Graph to save the copy
   (`saveToSentItems=true`) instead of uploading a second one. Any other
   `record` value is honoured with an explicit save.
-- **Postponing:** `postponed` pointing at `@drafts` stores drafts as server
-  drafts, so they are visible in Outlook. Recalling one (`R`) lists the
+- **Postponing:** `postponed` is accepted but has no effect (setting it
+  warns). Drafts are always stored as server drafts in `@drafts`, so they are visible in Outlook. Recalling one (`R`) lists the
   drafts there (drafts only); the one chosen is updated in place when it
   is postponed again, and sent as itself (its attachments go with it
   unless taken off with `D`, and Graph keeps a copy in Sent Items). It is
@@ -285,7 +284,7 @@ message. If no `msgraph://` account matches, mett falls back to `smtp_url` or
 
 *Implemented so far:* mail is sent through the account of `spoolfile`, and
 a copy is kept in its Sent Items when `copy` allows. `record` is not used
-yet, and `postponed` only as described above: messages are postponed to,
+yet, and `postponed` is accepted but has no effect: messages are postponed to,
 and recalled from, the account's Drafts folder.
 
 ## 6. New meanings for existing mutt concepts
@@ -312,12 +311,10 @@ set realname = "Alice Example"
 set folder    = "msgraph://alice@contoso.com/"
 set spoolfile = "=@inbox"
 set record    = "=@sentitems"
-set postponed = "=@drafts"
 set trash     = "=@deleteditems"
 
 set office365_client_id     = "00000000-0000-0000-0000-000000000000"
 set office365_tenant        = "contoso.com"
-set office365_focused_inbox = yes
 
 mailboxes =@inbox =@inbox/@other =@archive "=Inbox/Projects/mett"
 ```

@@ -239,34 +239,33 @@ pub fn cache_path(
 ) -> Option<PathBuf> {
     // An IMAP account is named by its user, who may be the same address at
     // another server: the server is in the name too.
-    let file = match &url.server {
-        Server::Imap(server) => {
-            let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
+    let file = match ImapIdentity::of(url) {
+        Some(identity) => {
             // What a file name may not hold, or could be confused with, is
             // written as `%` and its code; the parts are told apart by a `~`
             // (which is one of those), so that two accounts never share a
             // name.
             let part = |text: &str| -> String {
-                text.chars()
-                    .flat_map(|c| {
-                        if c.is_ascii_alphanumeric() || "@.-".contains(c) {
-                            c.to_string()
-                        } else {
-                            c.to_string().bytes().map(|b| format!("%{b:02X}")).collect()
+                let mut out = String::new();
+                for c in text.chars() {
+                    if c.is_ascii_alphanumeric() || "@.-".contains(c) {
+                        out.push(c);
+                    } else {
+                        for b in c.encode_utf8(&mut [0; 4]).bytes() {
+                            out.push_str(&format!("%{b:02X}"));
                         }
-                        .chars()
-                        .collect::<Vec<_>>()
-                    })
-                    .collect()
+                    }
+                }
+                out
             };
-            let name = format!(
-                "imap~{}~{}~{port}",
-                part(&imap_user(url, server)),
-                part(&server.host.to_lowercase())
-            );
-            format!("{name}.sqlite")
+            format!(
+                "imap~{}~{}~{}.sqlite",
+                part(&identity.user),
+                part(&identity.host),
+                identity.port
+            )
         }
-        Server::Office365 => format!("{}.sqlite", url.account),
+        None => format!("{}.sqlite", url.account),
     };
     if !config.was_set("header_cache") {
         // The XDG Base Directory spec says to ignore relative values.
@@ -298,30 +297,47 @@ pub fn default_cache_path(config: &Config, url: &MailboxUrl) -> Option<PathBuf> 
     )
 }
 
-/// Who logs in at the IMAP `server` of `url`: its user, else the account
-/// (which, for a user who is no address, is the user at the server as it is
-/// spelt, and so not the same for two spellings of the server).
-fn imap_user(url: &MailboxUrl, server: &crate::config::server::ServerUrl) -> String {
-    server
-        .user
-        .clone()
-        .unwrap_or_else(|| url.account.to_string())
+/// Who an IMAP account is: whom it logs in as, at which server (the host in
+/// lower case) and port. It names the account's cache file and says whose
+/// that is.
+struct ImapIdentity {
+    /// The user in the URL, else the account (which, for a user who is no
+    /// address, is the user at the server as it is spelt, and so not the
+    /// same for two spellings of the server).
+    user: String,
+    /// The host, in lower case.
+    host: String,
+    /// The port in the URL, else the protocol's.
+    port: u16,
+}
+
+impl ImapIdentity {
+    /// The identity of the account in `url`, if it is an IMAP one.
+    fn of(url: &MailboxUrl) -> Option<Self> {
+        let Server::Imap(server) = &url.server else {
+            return None;
+        };
+        Some(Self {
+            user: server
+                .user
+                .clone()
+                .unwrap_or_else(|| url.account.to_string()),
+            host: server.host.to_lowercase(),
+            port: server.port.unwrap_or(if server.tls { 993 } else { 143 }),
+        })
+    }
 }
 
 /// Whose a cache file is: the account, and for IMAP the server too (the
 /// same address may be at another), which a cache file named by hand
 /// doesn't say.
 fn cache_owner(url: &MailboxUrl) -> mett_core::AccountId {
-    match &url.server {
-        Server::Imap(server) => {
-            let port = server.port.unwrap_or(if server.tls { 993 } else { 143 });
-            mett_core::AccountId::new(format!(
-                "imap://{}@{}:{port}",
-                imap_user(url, server),
-                server.host.to_lowercase()
-            ))
-        }
-        Server::Office365 => url.account.clone(),
+    match ImapIdentity::of(url) {
+        Some(identity) => mett_core::AccountId::new(format!(
+            "imap://{}@{}:{}",
+            identity.user, identity.host, identity.port
+        )),
+        None => url.account.clone(),
     }
 }
 

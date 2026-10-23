@@ -226,6 +226,10 @@ pub const VARS: &[Var] = &[
     var("wrap", Kind::Number, "0"),
 ];
 
+/// Variables mett accepts, so a shared muttrc loads, but never reads:
+/// setting one warns.
+pub const NO_EFFECT: &[&str] = &["office365_focused_inbox", "postponed", "timeout"];
+
 /// Variables mett renamed, by their old names, sorted: the `msgraph_`
 /// settings that Microsoft Graph and Exchange Web Services share are
 /// `office365_` ones now. The old names still work, with a warning.

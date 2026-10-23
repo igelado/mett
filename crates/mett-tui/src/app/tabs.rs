@@ -46,7 +46,8 @@ pub struct Tab {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tabs {
     /// The tabs, in the order of the `account` commands.
-    pub tabs: Vec<Tab>,
+    /// Shared by every account's app, which compare them by identity first.
+    pub tabs: std::sync::Arc<[Tab]>,
     /// The account shown.
     pub active: usize,
     /// Where they are drawn.
@@ -125,15 +126,7 @@ impl App {
         let switch = match action {
             Action::NextAccount => Switch::Next,
             Action::PreviousAccount => Switch::Previous,
-            Action::Account1 => Switch::To(0),
-            Action::Account2 => Switch::To(1),
-            Action::Account3 => Switch::To(2),
-            Action::Account4 => Switch::To(3),
-            Action::Account5 => Switch::To(4),
-            Action::Account6 => Switch::To(5),
-            Action::Account7 => Switch::To(6),
-            Action::Account8 => Switch::To(7),
-            Action::Account9 => Switch::To(8),
+            Action::Account(number) => Switch::To(usize::from(number.saturating_sub(1))),
             _ => return Vec::new(),
         };
         match switch.target(tabs.active, tabs.tabs.len()) {
@@ -209,13 +202,13 @@ mod tests {
             [Effect::Account(Switch::Previous)]
         );
         assert_eq!(
-            act(&mut app, Action::Account3),
+            act(&mut app, Action::Account(3)),
             [Effect::Account(Switch::To(2))]
         );
         // The one shown already: nothing to do.
-        assert!(act(&mut app, Action::Account1).is_empty());
+        assert!(act(&mut app, Action::Account(1)).is_empty());
         // One there isn't.
-        assert!(act(&mut app, Action::Account5).is_empty());
+        assert!(act(&mut app, Action::Account(5)).is_empty());
         assert_eq!(app.status, "There is no account 5.");
     }
 
