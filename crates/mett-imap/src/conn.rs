@@ -132,24 +132,31 @@ pub(crate) async fn connect(
         Security::None => greet(Client::new(Conn::Plain(tcp))).await?,
         Security::StartTls | Security::StartTlsIfOffered => {
             let mut client = greet(Client::new(Conn::Plain(tcp))).await?;
-            // A server that can't says so, and the connection goes on in
-            // plain text only if the settings allow it.
-            let upgraded = within(timeout, client.run_command_and_check_ok("STARTTLS", None))
+            // The password may only go over a connection that is as protected
+            // as the settings say: a server that offers STARTTLS and then
+            // refuses it is not one that can't, and isn't gone on with.
+            let offered = within(timeout, advertises_starttls(&mut client))
                 .await
-                .map_err(other)?;
-            match (upgraded, settings.security) {
-                (Ok(()), _) => {
-                    let Conn::Plain(tcp) = client.into_inner() else {
-                        unreachable!("the connection was plain")
-                    };
-                    Client::new(Conn::Tls(Box::new(tls(tcp).await?)))
-                }
-                (Err(e), Security::StartTls) => {
+                .map_err(other)?
+                .map_err(|e| other(lost(host, &e.to_string())))?;
+            if !offered {
+                if settings.security == Security::StartTls {
                     return Err(other(Error::Backend(format!(
-                        "{host}: the server doesn't do STARTTLS ({e}); to go on in plain text, turn ssl_force_tls off"
+                        "{host}: the server doesn't offer STARTTLS; to go on in plain text, turn ssl_force_tls off"
                     ))));
                 }
-                (Err(_), _) => client,
+                client
+            } else {
+                within(timeout, client.run_command_and_check_ok("STARTTLS", None))
+                    .await
+                    .map_err(other)?
+                    .map_err(|e| {
+                        other(Error::Backend(format!("{host}: STARTTLS was refused: {e}")))
+                    })?;
+                let Conn::Plain(tcp) = client.into_inner() else {
+                    unreachable!("the connection was plain")
+                };
+                Client::new(Conn::Tls(Box::new(tls(tcp).await?)))
             }
         }
     };
@@ -169,6 +176,28 @@ pub(crate) async fn connect(
         }
         e => other(lost(host, &e.to_string())),
     })
+}
+
+/// Whether the server offers STARTTLS, by what it says it can do.
+async fn advertises_starttls(client: &mut Client<Conn>) -> async_imap::error::Result<bool> {
+    use async_imap::imap_proto::{Capability, Response};
+    use async_imap::types::UnsolicitedResponse;
+    // What the server says besides the answer comes to the channel.
+    let (said, hears) = async_channel::unbounded();
+    client
+        .run_command_and_check_ok("CAPABILITY", Some(said))
+        .await?;
+    let mut offered = false;
+    while let Ok(response) = hears.try_recv() {
+        if let UnsolicitedResponse::Other(response) = response
+            && let Response::Capabilities(capabilities) = response.parsed()
+        {
+            offered |= capabilities
+                .iter()
+                .any(|c| matches!(c, Capability::Atom(a) if a.eq_ignore_ascii_case("STARTTLS")));
+        }
+    }
+    Ok(offered)
 }
 
 /// A lost connection.

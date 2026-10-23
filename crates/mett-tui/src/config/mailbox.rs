@@ -83,16 +83,20 @@ impl MailboxUrl {
         if IMAP.iter().any(|s| url.to_ascii_lowercase().starts_with(s)) {
             return Self::parse_imap(url);
         }
-        let rest = url
-            .strip_prefix(SCHEME)
-            .ok_or_else(|| MailboxError(format!("{url}: not a msgraph:// or imap:// mailbox")))?;
+        let rest = url.strip_prefix(SCHEME).ok_or_else(|| {
+            MailboxError(format!(
+                "{}: not a msgraph:// or imap:// mailbox",
+                server::redact(url)
+            ))
+        })?;
         let (account, path) = rest.split_once('/').unwrap_or((rest, ""));
         let valid_upn = account.split_once('@').is_some_and(|(user, domain)| {
             !user.is_empty() && !domain.is_empty() && !domain.contains('@')
         });
         if !valid_upn {
             return Err(MailboxError(format!(
-                "{url}: expected msgraph://<user@domain>/<folder>"
+                "{}: expected msgraph://<user@domain>/<folder>",
+                server::redact(url)
             )));
         }
         let segments: Vec<String> = path
@@ -664,5 +668,18 @@ mod tests {
         );
         // Unescaped, it is still the well-known folder's marker.
         assert!(MailboxUrl::parse("imaps://me@mail.example.com/@Projects").is_err());
+    }
+
+    #[test]
+    fn errors_about_urls_do_not_show_passwords() {
+        for bad in [
+            "imapp://me:hunter2@mail.example.com/INBOX",
+            "msgraph://me:hunter2@/@inbox",
+            "msgraph://me:hunter2@contoso.com@x/@inbox",
+            "imaps://me:hunter2@mail.example.com/@spam",
+        ] {
+            let error = MailboxUrl::parse(bad).unwrap_err().to_string();
+            assert!(!error.contains("hunter2"), "{error}");
+        }
     }
 }

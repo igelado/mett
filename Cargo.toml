@@ -27,6 +27,7 @@ encoding_rs = "0.8.35"
 getrandom = "0.4.3"
 keyring = "4.2.0"
 # IMAP, with its parsing of mail and of mailbox names.
+async-channel = "2"
 async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
 futures-util = { version = "0.3.34", default-features = false }
 mail-parser = { version = "0.11.9", features = ["full_encoding"] }

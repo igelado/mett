@@ -70,6 +70,8 @@ pub struct State {
     pub no_sort: bool,
     /// Leaves `CONDSTORE` out of it.
     pub no_condstore: bool,
+    /// Offers STARTTLS and then refuses it.
+    pub refuse_starttls: bool,
 }
 
 impl State {
@@ -306,7 +308,8 @@ impl Session {
                     ));
                     ok(&mut out, "done");
                 } else if upper == "STARTTLS" {
-                    if !self.starttls || self.encrypted {
+                    let refused = self.state.lock().unwrap().refuse_starttls;
+                    if !self.starttls || self.encrypted || refused {
                         no(&mut out, "no STARTTLS here");
                     } else {
                         let _ = stream

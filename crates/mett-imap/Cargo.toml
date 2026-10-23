@@ -12,6 +12,7 @@ repository.workspace = true
 mett-core.workspace = true
 mett-smtp.workspace = true
 
+async-channel.workspace = true
 async-imap.workspace = true
 base64.workspace = true
 chrono.workspace = true

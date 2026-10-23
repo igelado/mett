@@ -1407,3 +1407,29 @@ async fn summaries_say_when_they_came_in_for_the_new_mail_checks() {
         "2026-10-20T10:00:00+00:00"
     );
 }
+
+#[tokio::test]
+async fn a_folder_made_anew_between_pages_says_to_list_again() {
+    let (server, store) = plain().await;
+    for n in 1..=6 {
+        deliver(&server, "INBOX", &simple(&format!("message {n}")), &[]);
+    }
+    let inbox = FolderId::new("INBOX");
+    let first = store.list_messages(&inbox, Page::first(2)).await.unwrap();
+    // The folder is recreated: new messages take the UIDs the old ones had.
+    server.state.lock().unwrap().folder("INBOX").validity += 1;
+    let error = store
+        .list_messages(&inbox, Page::after(first.next.unwrap(), 2))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("list it again"), "{error}");
+}
+
+#[tokio::test]
+async fn never_sends_the_password_in_plain_text_after_an_offered_starttls_is_refused() {
+    let (server, store) = connected(Mode::StartTls, Security::StartTlsIfOffered).await;
+    server.state.lock().unwrap().refuse_starttls = true;
+    let error = store.list_folders().await.unwrap_err();
+    assert!(error.to_string().contains("STARTTLS"), "{error}");
+    assert!(server.state.lock().unwrap().logins.is_empty());
+}
