@@ -201,6 +201,10 @@ impl MailStore for Mailbox {
         either!(self, s => s.can_sync())
     }
 
+    fn folder_names_ignore_case(&self) -> bool {
+        either!(self, s => s.folder_names_ignore_case())
+    }
+
     fn can_watch(&self) -> bool {
         either!(self, s => s.can_watch())
     }

@@ -417,6 +417,10 @@ impl<S: MailStore> MailStore for Patient<'_, S> {
         self.patiently(|| self.store.save_draft(draft)).await
     }
 
+    fn folder_names_ignore_case(&self) -> bool {
+        self.store.folder_names_ignore_case()
+    }
+
     fn can_watch(&self) -> bool {
         self.store.can_watch()
     }
@@ -1002,8 +1006,9 @@ async fn resolve_with<S: MailStore>(
 }
 
 /// Walks down `names` from `start` (or the top of the mailbox), listing
-/// the folders below each level only. Names match exactly, or else
-/// ignoring case (in any script), as Office365 folder names do.
+/// the folders below each level only. Names match exactly, or else, where
+/// the backend takes names that differ in case as the same (Office365),
+/// ignoring case (in any script).
 async fn descend<S: MailStore>(
     store: &S,
     lookups: &Lookups,
@@ -1018,8 +1023,13 @@ async fn descend<S: MailStore>(
         let found = children()
             .find(|f| &f.name == name)
             .or_else(|| {
+                // The inbox is the one folder IMAP names ignore case for.
+                let ignore = store.folder_names_ignore_case()
+                    || (parent.is_none() && name.eq_ignore_ascii_case("INBOX"));
                 let name = name.to_lowercase();
-                children().find(|f| f.name.to_lowercase() == name)
+                ignore
+                    .then(|| children().find(|f| f.name.to_lowercase() == name))
+                    .flatten()
             })
             .ok_or_else(|| Error::NotFound {
                 kind: "folder",
@@ -1170,6 +1180,21 @@ mod tests {
             Err(Error::NotFound { kind: "folder", .. })
         ));
         assert!(resolve(&store, &FolderPath::Root).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_names_match_exactly_except_for_the_inbox() {
+        let store = tree().with_exact_names();
+        let named = |name: &str| FolderPath::Named(vec![name.into()]);
+        // `archive` is not `Archive` where names are exact.
+        assert!(resolve(&store, &named("archive")).await.is_err());
+        assert_eq!(
+            resolve(&store, &named("Archive")).await.unwrap().id,
+            FolderId::new("arc")
+        );
+        // Below a folder too.
+        let nested = FolderPath::WellKnown(WellKnownFolder::Inbox, vec!["ÉQUIPE".into()]);
+        assert!(resolve(&store, &nested).await.is_err());
     }
 
     #[tokio::test]

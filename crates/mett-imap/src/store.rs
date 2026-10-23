@@ -516,17 +516,18 @@ async fn fetch(live: &mut Live, uids: &[u32], what: &str, whole: bool) -> Res<Ve
     Ok(fetches.iter().filter_map(|f| fetched(f, whole)).collect())
 }
 
-/// The summaries of `uids` in the selected folder, newest UID first.
+/// The summaries of `uids` in the selected folder, in that order.
 async fn summaries(
     live: &mut Live,
     folder: &str,
     validity: u32,
     uids: &[u32],
 ) -> Res<Vec<MessageSummary>> {
-    let mut found = fetch(live, uids, SUMMARY, false).await?;
-    found.sort_by_key(|f| std::cmp::Reverse(f.uid));
-    found
-        .iter()
+    let found = fetch(live, uids, SUMMARY, false).await?;
+    let by_uid: HashMap<u32, &Fetched> = found.iter().map(|f| (f.uid, f)).collect();
+    // A message that is gone by now is left out.
+    uids.iter()
+        .filter_map(|uid| by_uid.get(uid))
         .map(|f| Ok(parse::summary(folder, validity, f)?))
         .collect()
 }
@@ -685,6 +686,10 @@ fn day(at: DateTime<Utc>) -> String {
 }
 
 impl<A: Authenticator> MailStore for ImapMailStore<A> {
+    fn folder_names_ignore_case(&self) -> bool {
+        false
+    }
+
     async fn own_addresses(&self) -> Result<Vec<String>> {
         let mut own = vec![self.from.email.clone()];
         if self.login.user().contains('@') && self.login.user() != self.from.email {
@@ -957,9 +962,11 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
                 &composed.message_id,
             )
             .await?;
-        // A recalled draft that is saved again replaces the one recalled.
+        // A recalled draft that is saved again replaces the one recalled. The
+        // new one is saved by now: if the old one can't be deleted, that is
+        // the user's to tidy up, not a reason to save it all again.
         if let Some(DraftOrigin::Recalled(old)) = &draft.origin {
-            self.delete_message(old).await?;
+            let _ = self.delete_message(old).await;
         }
         Ok(id)
     }

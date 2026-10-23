@@ -1023,6 +1023,10 @@ async fn lists_messages_by_the_dates_they_say_where_the_server_can_sort() {
     assert_eq!(subjects(&second), ["oldest"]);
     assert!(second.next.is_none());
 
+    // The order within a page is the dates', not the UIDs'.
+    let all = store.list_messages(&inbox, Page::first(3)).await.unwrap();
+    assert_eq!(subjects(&all), ["newest", "middle", "oldest"]);
+
     // Where it can't, by UID.
     server.state.lock().unwrap().no_sort = true;
     let (_, unsorted) = {
@@ -1222,4 +1226,40 @@ async fn the_folder_of_a_message_is_known_only_while_it_is_there() {
         store.message_folder(&id).await,
         Err(Error::NotFound { .. })
     ));
+}
+
+#[tokio::test]
+async fn folder_names_are_exact() {
+    let (_server, store) = plain().await;
+    assert!(!store.folder_names_ignore_case());
+}
+
+#[tokio::test]
+async fn a_replaced_draft_is_saved_even_if_the_old_one_cannot_be_deleted() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_uidplus = true;
+    let draft = Draft {
+        to: vec![Address::new("alice@example.org")],
+        subject: "Later".into(),
+        body: "First\n".into(),
+        ..Draft::default()
+    };
+    let id = store.save_draft(&draft).await.unwrap();
+    // Another client marked a draft deleted: the old one can't be expunged alone.
+    deliver(&server, "Drafts", &simple("theirs"), &["\\Deleted"]);
+    let again = Draft {
+        body: "Second\n".into(),
+        origin: Some(DraftOrigin::Recalled(id)),
+        ..draft
+    };
+    let saved = store.save_draft(&again).await.unwrap();
+    assert!(
+        store
+            .fetch_message(&saved)
+            .await
+            .unwrap()
+            .body
+            .content
+            .contains("Second")
+    );
 }

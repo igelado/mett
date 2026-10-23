@@ -228,6 +228,13 @@ pub trait MailStore: Send + Sync {
         )))
     }
 
+    /// Whether the backend takes folder names that differ only in case as
+    /// the same folder, as Office365 does. Where it doesn't (most IMAP
+    /// servers), a name that isn't a folder's exactly names no folder.
+    fn folder_names_ignore_case(&self) -> bool {
+        true
+    }
+
     /// Whether the backend can tell what changed in a folder since a sync
     /// state ([`MailStore::sync_folder`]).
     fn can_sync(&self) -> bool {

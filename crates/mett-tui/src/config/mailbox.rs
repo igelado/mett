@@ -147,21 +147,19 @@ impl MailboxUrl {
     /// the same kind of server and, for IMAP, the same host and port. An
     /// IMAP URL that names no user is of any user at its server.
     pub fn is_of(&self, account: &AccountId, base: &str) -> bool {
-        if let Ok(base) = MailboxUrl::parse(base)
-            && !self.same_server(&base)
+        let base = MailboxUrl::parse(base).ok();
+        if let Some(base) = &base
+            && !self.same_server(base)
         {
             return false;
         }
         if self.account.as_str().eq_ignore_ascii_case(account.as_str()) {
             return true;
         }
-        match &self.server {
-            Server::Imap(server) if server.user.is_none() => account
-                .as_str()
-                .rsplit_once('@')
-                .is_some_and(|(_, host)| host.eq_ignore_ascii_case(&server.host)),
-            _ => false,
-        }
+        // An IMAP URL that names no user is of whoever logs in at its
+        // server: the base says it is the server (without one, any is).
+        matches!(&self.server, Server::Imap(server) if server.user.is_none())
+            && base.is_some_and(|base| matches!(base.server, Server::Imap(_)))
     }
 
     /// Whether both mailboxes are on the same server.
@@ -547,5 +545,16 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn an_email_login_at_another_domain_than_its_server_has_folders_at_that_server() {
+        // alice@example.org logs in at mail.example.org.
+        let account = AccountId::new("alice@example.org");
+        let folder = "imaps://mail.example.org/";
+        let path = |text| folder_path(text, folder, &account);
+        assert_eq!(path("=Trash"), Ok(FolderPath::Named(vec!["Trash".into()])));
+        assert!(path("imaps://mail.example.org/Trash").is_ok());
+        assert!(path("imaps://other.example.org/Trash").is_err());
     }
 }
