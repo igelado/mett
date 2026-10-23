@@ -1336,18 +1336,24 @@ impl<A: Authenticator> MailSender for ImapMailStore<A> {
             e => e,
         })?;
         let (message_id, kept) = smtp.send(&draft, &threading).await?;
-        // Once the message is out, what is left to do can't take that
-        // back: a copy that can't be kept, or a draft that can't be
-        // deleted, is the user's to tidy up.
-        if draft.save_copy
-            && let Ok(sent) = self.well_known_folder(WellKnownFolder::SentItems).await
-        {
-            let _ = self.store(&sent.id, &kept, "(\\Seen)", &message_id).await;
-        }
+        // Once the message is out, what is left to do can't take that back:
+        // a draft that can't be deleted is the user's to tidy up. A copy
+        // that can't be kept is said, as a sent message, not a failed one.
+        let copied = if draft.save_copy {
+            match self.well_known_folder(WellKnownFolder::SentItems).await {
+                Ok(sent) => self
+                    .store(&sent.id, &kept, "(\\Seen)", &message_id)
+                    .await
+                    .map(drop),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(())
+        };
         if let Some(DraftOrigin::Recalled(old)) = &draft.origin {
             let _ = self.delete_message(old).await;
         }
-        Ok(())
+        copied.map_err(|e| Error::SentNotKept(e.to_string()))
     }
 }
 

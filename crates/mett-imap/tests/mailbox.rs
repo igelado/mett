@@ -1695,3 +1695,29 @@ async fn the_newest_unread_are_kept_when_there_are_more_than_are_told_and_dates_
     assert_eq!(uids.first(), Some(&51));
     assert_eq!(uids.last(), Some(&300));
 }
+
+#[tokio::test]
+async fn a_sent_message_whose_copy_cannot_be_kept_is_said_to_be_sent() {
+    // No folder is the Sent one.
+    let server = server(
+        Mode::Plain,
+        password(),
+        vec![
+            Folder::new("INBOX", &[]),
+            Folder::new("Drafts", &["\\Drafts"]),
+        ],
+    )
+    .await;
+    let (store, out) = mailer(&server).await;
+    let draft = Draft {
+        to: vec![Address::new("alice@example.org")],
+        subject: "Hi".into(),
+        body: "Hello\n".into(),
+        save_copy: true,
+        ..Draft::default()
+    };
+    let error = store.send(&draft).await.unwrap_err();
+    assert!(matches!(error, Error::SentNotKept(_)), "{error}");
+    // It went out, once.
+    assert_eq!(out.taken.lock().unwrap().len(), 1);
+}

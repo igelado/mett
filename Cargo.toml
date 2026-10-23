@@ -33,7 +33,7 @@ futures-util = { version = "0.3.34", default-features = false }
 mail-parser = { version = "0.11.9", features = ["full_encoding"] }
 utf7-imap = "0.3.2"
 # SMTP, and the MIME of what is sent.
-lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "aws-lc-rs", "rustls-platform-verifier", "webpki-roots", "hostname"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "aws-lc-rs", "rustls-platform-verifier", "hostname"] }
 open = "5.4.4"
 # The GUI (mett-gui): drawing, windows, the clipboard, fonts.
 arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
@@ -46,6 +46,7 @@ winit = "0.30.13"
 ratatui = "0.30.2"
 regex = "1.13.1"
 rustls = { version = "0.23.46", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
 rustls-platform-verifier = "0.7.1"
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

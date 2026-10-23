@@ -208,12 +208,16 @@ impl<A: Authenticator> SmtpSender<A> {
                 );
             }
             if !settings.verify_host {
-                // Lettre skips the name check only with a store of its own
-                // (its platform verifier is all or nothing): the roots it
-                // bundles, and the extra ones given.
-                tls = tls
-                    .certificate_store(CertificateStore::WebpkiRoots)
-                    .dangerous_accept_invalid_hostnames(true);
+                // Lettre skips the name check only with roots it is given
+                // (its platform verifier is all or nothing): the system's,
+                // which are loaded here, and the extra ones above.
+                tls = tls.certificate_store(CertificateStore::None);
+                for root in rustls_native_certs::load_native_certs().certs {
+                    if let Ok(root) = Certificate::from_der(root.to_vec()) {
+                        tls = tls.add_root_certificate(root);
+                    }
+                }
+                tls = tls.dangerous_accept_invalid_hostnames(true);
             }
             tls.build_rustls()
                 .map_err(|e| Error::NotSent(format!("TLS: {e}")))

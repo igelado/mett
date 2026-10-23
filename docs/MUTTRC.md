@@ -105,7 +105,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `smtp_oauth_refresh_command` | string | As for IMAP. (Not supported yet.) |
 | | `sendmail` | path | Local MTA, used when `smtp_url` is unset. (Not supported: with no `smtp_url`, mail can't be sent.) |
 | | `ssl_starttls`, `ssl_force_tls` | boolean | Upgrade a plain connection with STARTTLS if the server offers it (`yes`); fail if it doesn't (`ssl_force_tls`, `no`). |
-| | `ssl_verify_host` | boolean | Check that the server's certificate is for the server's name (`yes`). The certificate itself is always checked: for a self-signed one, give it in `ssl_ca_certificate_file`. (For `smtp_url` with `ssl_verify_host` off, the authorities are the bundled public ones and those of `ssl_ca_certificate_file`, not the system's.) |
+| | `ssl_verify_host` | boolean | Check that the server's certificate is for the server's name (`yes`). The certificate itself is always checked: for a self-signed one, give it in `ssl_ca_certificate_file`. |
 | | `ssl_ca_certificate_file` | path | More certificate authorities to trust, as PEM, besides the system's. |
 | Caching | `header_cache` | path | Header cache database. |
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
