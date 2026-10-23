@@ -24,7 +24,7 @@ fn folders() -> Vec<Folder> {
 
 fn store_for(server: &Server) -> ImapMailStore {
     let mut settings = ImapSettings::new("127.0.0.1", Security::None);
-    settings.port = server.port;
+    settings.server.port = server.port;
     let login = Login::Password {
         user: "me".into(),
         password: "secret".into(),

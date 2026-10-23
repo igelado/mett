@@ -10,8 +10,8 @@ use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use mett_core::{
     AccountId, Address, Attachment, AttachmentId, Authenticator, Draft, DraftOrigin, Error, Flags,
-    FlagsUpdate, Folder, FolderChanges, FolderId, MailSender, MailStore, Message, MessageId,
-    MessagePage, MessageSummary, Page, PageCursor, RECENT_UNREAD, Result, SyncState,
+    FlagsUpdate, Folder, FolderChanges, FolderId, Login, MailSender, MailStore, Message, MessageId,
+    MessagePage, MessageSummary, NoTokens, Page, PageCursor, RECENT_UNREAD, Result, SyncState,
     WellKnownFolder,
 };
 use mett_smtp::{SmtpSender, Threading};
@@ -22,7 +22,7 @@ use crate::conn::{self, Conn, Credentials, LoginFailure, within};
 use crate::ids::Ref;
 use crate::marks::{Floor, Marks, Watch};
 use crate::parse::{self, Fetched};
-use crate::settings::{ImapSettings, Login, NoTokens};
+use crate::settings::ImapSettings;
 use crate::uidset::UidSet;
 
 /// How long a listing of the folders is taken for what they are, where the
@@ -149,11 +149,11 @@ impl<A: Authenticator> ImapMailStore<A> {
 
     /// The account: the user at the server.
     pub fn account(&self) -> AccountId {
-        account(&self.settings.host, self.login.user())
+        account(&self.settings.server.host, self.login.user())
     }
 
     async fn connect(&self) -> Result<Live> {
-        let host = &self.settings.host;
+        let host = &self.settings.server.host;
         let session = match &self.login {
             Login::Password { user, password } => {
                 conn::connect(&self.settings, Credentials::Password(user, password)).await
@@ -179,7 +179,7 @@ impl<A: Authenticator> ImapMailStore<A> {
         let mut session = session.map_err(|failure| match failure {
             LoginFailure::Refused(e) | LoginFailure::Other(e) => e,
         })?;
-        let caps = within(self.settings.timeout, session.capabilities())
+        let caps = within(self.settings.server.timeout, session.capabilities())
             .await?
             .map_err(|e| conn::lost(host, &e.to_string()))?;
         let condstore = caps.has_str("CONDSTORE") || caps.has_str("QRESYNC");
@@ -208,7 +208,7 @@ impl<A: Authenticator> ImapMailStore<A> {
         if let Some(live) = slot.as_mut()
             && live.used.elapsed() > STALE
         {
-            let alive = within(self.settings.timeout, live.session.noop()).await;
+            let alive = within(self.settings.server.timeout, live.session.noop()).await;
             if !matches!(alive, Ok(Ok(()))) {
                 *slot = None;
             }
@@ -218,8 +218,8 @@ impl<A: Authenticator> ImapMailStore<A> {
         }
         Ok(Guard {
             slot,
-            host: &self.settings.host,
-            timeout: self.settings.timeout,
+            host: &self.settings.server.host,
+            timeout: self.settings.server.timeout,
         })
     }
 }

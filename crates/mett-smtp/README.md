@@ -11,9 +11,18 @@ crate (with rustls):
   refused if the server won't) or `Security::Tls` (TLS from the first
   byte, port 465). The login is a password (`Login::Password`: PLAIN or
   LOGIN) or an OAuth2 token from any `Authenticator` (`Login::OAuth`: SASL
-  XOAUTH2; a token the server turns down is replaced once). The server's
+  XOAUTH2; a token the server turns down is replaced once; `None` logs in
+  to nothing). `Login`, `Security` and `NoTokens` live in `mett-core`, as
+  does `ServerSettings` (host, port, security, `verify_host`,
+  `ca_certificates`, timeout), which `SmtpSettings` and IMAP's
+  `ImapSettings` both embed as `server`. The server's
   certificate is checked against the system's roots and any `ca_certificates`
-  given, and for the name it is made to unless `verify_host` is off.
+  given, and for the name it is made to unless `verify_host` is off. With
+  `verify_host` off lettre can't use the platform verifier, so the chain is
+  checked against the system's roots (read once per process) and the extra
+  ones, without the platform's own policy (revocation and the like); IMAP,
+  which uses the platform verifier throughout, does apply it and ignores
+  only a name mismatch.
 - **`compose`** writes a `Draft` as MIME: plain text UTF-8 and, with
   attachments, `multipart/mixed`. It returns the message as it goes out
   (without `Bcc:`) and as the sender keeps it (with), sharing a `Message-ID:`.

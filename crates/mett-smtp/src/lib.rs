@@ -20,4 +20,5 @@ mod compose;
 mod sender;
 
 pub use compose::{Composed, Threading, compose};
-pub use sender::{Login, NoTokens, Security, SmtpSender, SmtpSettings};
+pub use mett_core::{Login, NoTokens, Security};
+pub use sender::{SmtpSender, SmtpSettings};

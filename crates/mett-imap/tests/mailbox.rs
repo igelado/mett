@@ -9,7 +9,7 @@ use mett_core::{
     MailSender, MailStore, MessageId, OutgoingAttachment, Page, WellKnownFolder,
 };
 use mett_imap::{ImapMailStore, ImapSettings, Login, NoTokens, Security};
-use mett_smtp::{Login as SmtpLogin, Security as SmtpSecurity, SmtpSender, SmtpSettings};
+use mett_smtp::{Security as SmtpSecurity, SmtpSender, SmtpSettings};
 use support::smtp::smtp;
 use support::{Accept, Folder, Mode, Server, server, server_for};
 
@@ -33,8 +33,8 @@ fn password() -> Accept {
 
 fn settings(server: &Server, security: Security) -> ImapSettings {
     let mut settings = ImapSettings::new("127.0.0.1", security);
-    settings.port = server.port;
-    settings.ca_certificates = vec![server.ca.clone()];
+    settings.server.port = server.port;
+    settings.server.ca_certificates = vec![server.ca.clone()];
     settings
 }
 
@@ -481,8 +481,8 @@ async fn saves_a_draft_and_replaces_one_recalled() {
 async fn mailer(server: &Server) -> (ImapMailStore, support::smtp::Smtp) {
     let out = smtp().await;
     let mut settings = SmtpSettings::new("127.0.0.1", SmtpSecurity::None, Address::new(ME));
-    settings.port = out.port;
-    let sender = SmtpSender::new(settings, SmtpLogin::None);
+    settings.server.port = out.port;
+    let sender = SmtpSender::new(settings, None);
     let store = ImapMailStore::new(
         self::settings(server, Security::None),
         login(),
@@ -635,7 +635,7 @@ async fn upgrades_if_offered_and_goes_on_in_plain_text_if_not() {
 async fn does_not_trust_a_certificate_it_is_not_given() {
     let server = server(Mode::Tls, password(), folders()).await;
     let mut settings = settings(&server, Security::Tls);
-    settings.ca_certificates.clear();
+    settings.server.ca_certificates.clear();
     let store = ImapMailStore::new(settings, login(), Address::new(ME));
     assert!(store.list_folders().await.is_err());
     assert!(server.state.lock().unwrap().logins.is_empty());
@@ -650,12 +650,12 @@ async fn takes_a_certificate_for_another_name_only_when_not_checking_names() {
     assert!(server.state.lock().unwrap().logins.is_empty());
 
     let mut lenient = settings(&server, Security::Tls);
-    lenient.verify_host = false;
+    lenient.server.verify_host = false;
     let store = ImapMailStore::new(lenient.clone(), login(), Address::new(ME));
     store.list_folders().await.unwrap();
 
     // The certificate is still checked: one no authority vouches for is not taken.
-    lenient.ca_certificates.clear();
+    lenient.server.ca_certificates.clear();
     let store = ImapMailStore::new(lenient, login(), Address::new(ME));
     assert!(store.list_folders().await.is_err());
     assert_eq!(server.state.lock().unwrap().logins.len(), 1);
