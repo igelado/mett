@@ -19,6 +19,7 @@ mod retry;
 mod search;
 mod sidebar;
 mod signin;
+mod status;
 mod tabs;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -44,6 +45,7 @@ pub use self::recall::PostponedMenu;
 pub use self::search::{Limit, highlighted};
 pub use self::sidebar::{Sidebar, SidebarEntry, SidebarSettings, SidebarSort};
 pub use self::signin::{Row, SignIn};
+pub use self::status::{Status, StatusKind};
 pub use self::tabs::{Switch, Tab, TabPosition, Tabs};
 pub use self::threads::{Ordering, Threaded};
 use crate::action::Action;
@@ -337,7 +339,7 @@ pub struct App {
     /// The selected index entry.
     pub selected: usize,
     /// The message line at the bottom of the screen.
-    pub status: String,
+    pub status: Status,
     /// Set when the user quits.
     pub quit: bool,
     /// The sign-in window, if it is open.
@@ -353,9 +355,6 @@ pub struct App {
     pub arrived: bool,
     /// How the screen is drawn: formats and colors.
     pub display: crate::expando::Display,
-    /// The last error reported on the message line, so that the view can
-    /// tell it from other messages.
-    pub error: Option<String>,
     /// Why a question was asked again (a lookup found nothing, say):
     /// shown in its place until the next key.
     pub input_note: Option<String>,
@@ -710,14 +709,13 @@ impl App {
             folder: None,
             messages: Vec::new(),
             selected: 0,
-            status: "Opening folder...".into(),
+            status: Status::new("Opening folder..."),
             quit: false,
             sign_in: None,
             keymap: Keymap::mutt_defaults(),
             tabs: None,
             arrived: false,
             display: settings.display,
-            error: None,
             input_note: None,
             alternates: compile_alternates(&settings.compose.alternates),
             folder_counts: std::cell::Cell::new(None),
@@ -857,7 +855,7 @@ impl App {
     fn open_folder(&mut self) -> Vec<Effect> {
         let effect = self.request(Request::OpenFolder(self.path.clone()));
         self.opening = Some(effect_id(&effect));
-        self.status = "Opening folder...".into();
+        self.status.info("Opening folder...");
         vec![effect]
     }
 
@@ -905,7 +903,7 @@ impl App {
                 .screens
                 .iter()
                 .any(|s| matches!(s, Screen::Pager(p) if p.pending_search.is_some()));
-        if !searching && self.status == "Searching..." {
+        if !searching && self.status.is(StatusKind::Searching) {
             self.status.clear();
         }
         // The open folder gained messages while another screen was up:
@@ -1050,7 +1048,7 @@ impl App {
             if moving && matches!(self.menu(), Menu::Index | Menu::Pager) {
                 self.reselect = None;
             }
-            if self.pending_search.take().is_some() && self.status == "Searching..." {
+            if self.pending_search.take().is_some() && self.status.is(StatusKind::Searching) {
                 self.status.clear();
             }
             self.compose_fetch = None;
@@ -1120,7 +1118,7 @@ impl App {
                 self.sign_in = None;
                 // Signed in: watching can go on.
                 self.watch_paused = false;
-                if std::mem::take(&mut self.cancelled) && self.status == "Sign-in cancelled." {
+                if std::mem::take(&mut self.cancelled) && self.status.is(StatusKind::Cancelled) {
                     self.status.clear();
                 }
                 Vec::new()
@@ -1175,7 +1173,7 @@ impl App {
                 self.cancelled = true;
                 // Don't let a retry that was waiting start another sign-in.
                 self.retry_after.clear();
-                self.status = "Sign-in cancelled.".into();
+                self.status.say("Sign-in cancelled.", StatusKind::Cancelled);
                 return vec![Effect::CancelSignIn];
             }
             Action::OpenBrowser if failed => {}
@@ -1195,7 +1193,8 @@ impl App {
                 };
                 // The terminal may not allow it, and can't say whether it
                 // did.
-                self.status = "Copied to the clipboard, if your terminal allows it.".into();
+                self.status
+                    .info("Copied to the clipboard, if your terminal allows it.");
                 return vec![Effect::Copy(text)];
             }
             Action::NextLine | Action::PreviousLine => {
@@ -1272,8 +1271,11 @@ impl App {
                 .listing_page
                 .as_ref()
                 .is_some_and(|page| page.cursor().is_none());
-        if first_page && self.status.starts_with("Loading ") {
-            self.status = format!("Loading {}: {taken} messages synced...", open.name);
+        if first_page && self.status.is(StatusKind::Loading) {
+            self.status.say(
+                format!("Loading {}: {taken} messages synced...", open.name),
+                StatusKind::Loading,
+            );
         }
     }
 
@@ -1363,7 +1365,7 @@ impl App {
                 return self.open_folder();
             }
             Action::DisplayMessage if self.folder.is_none() => {
-                self.status = "Opening folder...".into();
+                self.status.info("Opening folder...");
             }
             Action::DisplayMessage => {
                 // A collapsed thread with unread mail folded into it opens
@@ -1546,7 +1548,8 @@ impl App {
             Event::FolderOpened(Ok(folder)) => {
                 self.opening = None;
                 self.poll_paused = false;
-                self.status = format!("Loading {}...", folder.name);
+                self.status
+                    .say(format!("Loading {}...", folder.name), StatusKind::Loading);
                 self.folder = Some(folder);
                 self.visited();
                 let mut effects = self.list(Page::first(self.page_size));
@@ -1587,12 +1590,15 @@ impl App {
                         // Keep loading until the whole folder is listed,
                         // saying how far it has got.
                         if let Some(folder) = &self.folder
-                            && self.status.starts_with("Loading ")
+                            && self.status.is(StatusKind::Loading)
                         {
-                            self.status = format!(
-                                "Loading {}: {} messages...",
-                                folder.name,
-                                self.total_messages()
+                            self.status.say(
+                                format!(
+                                    "Loading {}: {} messages...",
+                                    folder.name,
+                                    self.total_messages()
+                                ),
+                                StatusKind::Loading,
                             );
                         }
                         effects = self.list(Page::after(cursor, self.page_size));
@@ -1608,7 +1614,7 @@ impl App {
                         effects.extend(self.recheck());
                         // Clear the "Loading" message, but not an error that
                         // was reported while the folder was loading.
-                        if self.status.starts_with("Loading ") {
+                        if self.status.is(StatusKind::Loading) {
                             self.status.clear();
                         }
                     }
@@ -2001,7 +2007,8 @@ impl App {
     /// more messages are on their way.
     fn wait_for(&mut self, target: Target) -> Vec<Effect> {
         self.pending = Some(target);
-        self.status = "Loading more messages...".into();
+        self.status
+            .say("Loading more messages...", StatusKind::Loading);
         self.retry_listing()
     }
 
@@ -2066,7 +2073,7 @@ impl App {
             Target::Entry(_) => return Vec::new(),
         };
         self.pending = None;
-        if self.status.starts_with("Loading ") {
+        if self.status.is(StatusKind::Loading) {
             self.status.clear();
         }
         if selected == self.selected {
@@ -2125,7 +2132,8 @@ impl App {
         let Some(page) = self.unlisted.take() else {
             return Vec::new();
         };
-        self.status = "Loading more messages...".into();
+        self.status
+            .say("Loading more messages...", StatusKind::Loading);
         self.list(page)
     }
 
@@ -2170,33 +2178,25 @@ impl App {
     fn report(&mut self, error: Error) {
         // A request the user's cancelled sign-in held up: they know.
         if matches!(&error, Error::Auth(m) if m == "sign-in cancelled") {
-            self.status = "Sign-in cancelled.".into();
+            self.status.say("Sign-in cancelled.", StatusKind::Cancelled);
             return;
         }
         self.fail(error.to_string());
     }
 
     /// Shows an error on the message line, in the `error` color.
-    /// Clears the status if it is one of `statuses`, which no longer hold.
-    pub(super) fn clear_status_if(&mut self, statuses: &[&str]) {
-        if statuses.contains(&self.status.as_str()) {
-            self.status.clear();
-        }
-    }
-
     pub(super) fn fail(&mut self, text: impl Into<String>) {
-        self.status = text.into();
-        self.error = Some(self.status.clone());
+        self.status.say(text, StatusKind::Error);
         // The built-in editor hides the message line: it says it.
         if let Some(editing) = &mut self.editing {
-            editing.get_mut().say(&self.status);
+            editing.get_mut().say(self.status.text());
         }
     }
 
     /// [`Self::fail`], shown over the question being asked too.
     pub(super) fn fail_at_question(&mut self, text: impl Into<String>) {
         self.fail(text);
-        self.input_note = Some(self.status.clone());
+        self.input_note = Some(self.status.text().to_owned());
     }
 
     /// Whether the user sent mail from `address`.

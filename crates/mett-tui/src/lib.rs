@@ -935,7 +935,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
 fn copy_all(screen: &mut impl Frontend, app: &mut App, copies: Vec<String>) {
     for text in copies {
         if let Err(e) = screen.copy(&text) {
-            app.status = format!("Could not copy: {e}");
+            app.status.info(format!("Could not copy: {e}"));
         }
     }
 }
@@ -1014,7 +1014,7 @@ fn dispatch(
             // it nowhere.
             Effect::OpenUrl(url) => {
                 if let Err(e) = open::that_detached(&url) {
-                    app.status = format!("Could not open a browser: {e}");
+                    app.status.info(format!("Could not open a browser: {e}"));
                 }
             }
             Effect::CancelSignIn => {
@@ -1107,7 +1107,7 @@ mod tests {
             self.drawn.lock().unwrap().push((
                 shown,
                 app.messages.len(),
-                app.status.clone(),
+                app.status.text().to_owned(),
                 app.input.is_some(),
             ));
             Ok(())

@@ -106,7 +106,7 @@ pub(crate) async fn finish(
     if waiting(slots) {
         for slot in slots.iter_mut() {
             if slot.app.saving() {
-                slot.app.status = "Saving changes...".into();
+                slot.app.status.info("Saving changes...");
             }
         }
         let mut stale = true;

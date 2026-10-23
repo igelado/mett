@@ -45,7 +45,7 @@ fn loading_says_how_far_it_has_got() {
     app.update(syncing(600));
     assert_eq!(app.status, "Loading Inbox: 3 messages...");
     // Not once loaded.
-    app.status = "Mail sent.".into();
+    app.status.info("Mail sent.");
     app.update(syncing(3));
     assert_eq!(app.status, "Mail sent.");
 }

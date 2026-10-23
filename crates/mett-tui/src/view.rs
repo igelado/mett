@@ -201,7 +201,7 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
         }
         Some(input) => render_input(input, colors.prompt, frame, message),
         None => {
-            let style = if app.error.as_deref() == Some(app.status.as_str()) {
+            let style = if app.status.is_error() {
                 colors.error
             } else {
                 colors.message
@@ -219,7 +219,7 @@ pub fn render(app: &App, frame: &mut Frame) -> Option<Overlay> {
                 Constraint::Length(notice.as_deref().map_or(0, |n| n.width() as u16 + 1)),
             ])
             .areas(message);
-            frame.render_widget(Paragraph::new(app.status.as_str()).style(style), text);
+            frame.render_widget(Paragraph::new(app.status.text()).style(style), text);
             if let Some(notice) = notice {
                 frame.render_widget(
                     Paragraph::new(notice)
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn the_wait_for_a_throttling_server_ends_the_message_line() {
         let mut app = app(3);
-        app.status = "Mail sent.".into();
+        app.status.info("Mail sent.");
         respond(
             &mut app,
             crate::worker::RequestId(90),
@@ -1199,8 +1199,8 @@ mod tests {
         assert_eq!(tiny, "Mail sent.");
         // An error keeps its own color, and its room.
         colored(&mut app, &["color error brightred default"]);
-        app.status = "x".repeat(100);
-        app.error = Some(app.status.clone());
+        app.status
+            .say("x".repeat(100), crate::app::StatusKind::Error);
         let error = styles(&app);
         let row = HEIGHT - 1;
         assert_eq!(error[(0, row)].fg, ratatui::style::Color::LightRed);
@@ -1303,7 +1303,7 @@ mod tests {
         assert_eq!(buffer[(0, 0)].bg, Color::Blue, "the help line too");
         // Errors in their own color.
         colored(&mut app, &["color error brightred default"]);
-        app.status = "Mail sent.".into();
+        app.status.info("Mail sent.");
         assert_eq!(styles(&app)[(0, 7)].fg, Color::Reset, "not an error");
         // As in mutt, this is an error.
         act(&mut app, Action::PreviousEntry);

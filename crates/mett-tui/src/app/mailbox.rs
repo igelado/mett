@@ -2,6 +2,7 @@
 //! purging them, flags, saving and copying messages to other folders,
 //! changing folders, and the folder browser.
 
+use super::StatusKind;
 use std::collections::{HashMap, HashSet};
 
 use mett_core::{Error, FlagsUpdate, Folder, FolderId, MessageId, Page, WellKnownFolder};
@@ -363,7 +364,7 @@ impl App {
                 } else {
                     (Transfer::Save, "Saving message...")
                 };
-                self.status = status.into();
+                self.status.info(status);
                 let request = Request::Transfer {
                     ids: vec![id],
                     to: path,
@@ -397,7 +398,7 @@ impl App {
         }
         if self.deleted.is_empty() {
             if then.is_none() {
-                self.status = "Mailbox is unchanged.".into();
+                self.status.info("Mailbox is unchanged.");
             }
             return then.map_or_else(Vec::new, |then| self.after_purge(then));
         }
@@ -441,7 +442,10 @@ impl App {
             from: folder.id.clone(),
             trash: self.trash.clone(),
         };
-        self.status = format!("Purging {}...", messages(self.deleted.len(), "message"));
+        self.status.info(format!(
+            "Purging {}...",
+            messages(self.deleted.len(), "message")
+        ));
         self.write(Write::Transfer(Transfer::Purge, request))
     }
 
@@ -497,7 +501,7 @@ impl App {
                 }
                 // The marked messages all moved away: nothing to purge.
                 Write::Transfer(Transfer::Purge, request) if transfer_ids(&request).is_empty() => {
-                    self.status = "Mailbox is unchanged.".into();
+                    self.status.info("Mailbox is unchanged.");
                     if let Some(then) = self.then.take() {
                         effects.extend(self.after_purge(then));
                     }
@@ -630,7 +634,7 @@ impl App {
         self.unswitched = None;
         let request = self.request(Request::OpenFolder(path.clone()));
         self.switching = Some((effect_id(&request), path));
-        self.status = "Opening folder...".into();
+        self.status.info("Opening folder...");
         vec![request]
     }
 
@@ -646,7 +650,8 @@ impl App {
                 self.see_index();
                 self.reset_folder();
                 self.previous = Some(std::mem::replace(&mut self.path, path));
-                self.status = format!("Loading {}...", folder.name);
+                self.status
+                    .say(format!("Loading {}...", folder.name), StatusKind::Loading);
                 self.folder = Some(folder);
                 self.visited();
                 let mut effects = self.list(Page::first(self.page_size));
@@ -932,11 +937,11 @@ impl App {
             ));
             return Vec::new();
         }
-        self.status = match transfer {
+        self.status.info(match transfer {
             Transfer::Save => "Message saved.".into(),
             Transfer::Copy => "Message copied.".into(),
             Transfer::Purge => format!("{} purged.", messages(done.len(), "message")),
-        };
+        });
         // Only a purge carries on with what was waiting for it.
         if transfer != Transfer::Purge {
             return Vec::new();

@@ -2,6 +2,7 @@
 //! a message's attachments, and attaching files to a message being written
 //! (`a` and `D` in the compose menu).
 
+use super::StatusKind;
 use std::path::PathBuf;
 
 use mett_core::{Attachment, AttachmentKind, MessageId, OutgoingAttachment};
@@ -270,7 +271,8 @@ impl App {
             attachment,
             to,
         });
-        self.status = "Fetching attachment...".into();
+        self.status
+            .say("Fetching attachment...", StatusKind::Fetching);
         vec![request]
     }
 
@@ -315,7 +317,7 @@ impl App {
                 return Vec::new();
             }
         };
-        self.clear_status_if(&["Fetching attachment..."]);
+        self.status.clear_if(StatusKind::Fetching);
         match to {
             Use::Save(path) => {
                 let op = self.wait_for_file(path.clone());
@@ -354,7 +356,7 @@ impl App {
         }
         match outcome {
             FileOutcome::Done(path) => {
-                self.status = format!("Saved to {}.", path.display());
+                self.status.info(format!("Saved to {}.", path.display()));
             }
             FileOutcome::Exists(path, data) => {
                 self.unsaved = Some((path.clone(), data));
@@ -375,7 +377,7 @@ impl App {
             return Vec::new();
         };
         if !overwrite {
-            self.status = "Not saved.".into();
+            self.status.info("Not saved.");
             return Vec::new();
         }
         let op = self.wait_for_file(path.clone());
@@ -431,7 +433,7 @@ impl App {
             return Vec::new();
         }
         let path = PathBuf::from(expand_home(path, self.home.as_deref()));
-        self.status = "Attaching...".into();
+        self.status.say("Attaching...", StatusKind::Attaching);
         let op = self.wait_for_file(path.clone());
         vec![Effect::ReadFile(op, path)]
     }
@@ -468,7 +470,7 @@ impl App {
         if !self.file_waited(op) {
             return Vec::new();
         }
-        self.clear_status_if(&["Attaching..."]);
+        self.status.clear_if(StatusKind::Attaching);
         let data = match result {
             Ok(data) => data,
             Err(e) => {

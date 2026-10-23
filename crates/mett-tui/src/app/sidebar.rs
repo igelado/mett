@@ -540,7 +540,8 @@ impl App {
             Action::SidebarToggleVisible => return Some(self.toggle_sidebar()),
             Action::SidebarFocus => {
                 if self.sidebar.settings.too_narrow(self.terminal_width) {
-                    self.status = self.narrow_note();
+                    let note = self.narrow_note();
+                    self.status.info(note);
                 } else if !self.sidebar_shown() {
                     self.fail("The sidebar is hidden: set sidebar_visible to show it.");
                 } else {
@@ -559,7 +560,8 @@ impl App {
             | Action::SidebarOpen => {
                 // As in mutt, they do nothing while it is hidden.
                 if self.sidebar.settings.too_narrow(self.terminal_width) {
-                    self.status = self.narrow_note();
+                    let note = self.narrow_note();
+                    self.status.info(note);
                 }
                 if !self.sidebar_shown() || count == 0 {
                     return Some(Vec::new());

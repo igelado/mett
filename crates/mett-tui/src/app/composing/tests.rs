@@ -375,7 +375,7 @@ fn a_message_sent_without_its_copy_kept_is_sent() {
     assert_eq!(app.screen(), &Screen::Index);
     assert!(app.status.starts_with("Mail sent, but no copy was kept"));
     assert!(app.status.contains("no Sent folder"));
-    assert!(app.error.is_some(), "said as a problem");
+    assert!(app.status.is_error(), "said as a problem");
     assert!(!app.saving());
 }
 

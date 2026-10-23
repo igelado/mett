@@ -3,6 +3,7 @@
 //! taken at once), and the one chosen opens in the compose menu. It is
 //! then sent, or postponed again, as itself.
 
+use super::StatusKind;
 use mett_core::{
     Attachment, BodyKind, Draft, DraftOrigin, Error, Folder, FolderId, Message, MessagePage,
     MessageSummary, Page, WellKnownFolder,
@@ -75,7 +76,8 @@ impl App {
         let path = FolderPath::WellKnown(WellKnownFolder::Drafts, Vec::new());
         let request = self.request(Request::OpenFolder(path));
         self.recall = Some(Recall::Opening(effect_id(&request)));
-        self.status = "Looking for postponed messages...".into();
+        self.status
+            .say("Looking for postponed messages...", StatusKind::Recalling);
         vec![request]
     }
 
@@ -180,7 +182,8 @@ impl App {
     fn fetch_postponed(&mut self, message: MessageSummary) -> Vec<Effect> {
         let request = self.request(Request::FetchMessage(message.id));
         self.recall = Some(Recall::Fetching(effect_id(&request)));
-        self.status = "Fetching postponed message...".into();
+        self.status
+            .say("Fetching postponed message...", StatusKind::Recalling);
         vec![request]
     }
 
@@ -279,10 +282,7 @@ impl App {
     }
 
     fn clear_recall_status(&mut self) {
-        self.clear_status_if(&[
-            "Looking for postponed messages...",
-            "Fetching postponed message...",
-        ]);
+        self.status.clear_if(StatusKind::Recalling);
     }
 }
 
