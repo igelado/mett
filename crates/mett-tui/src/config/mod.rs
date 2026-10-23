@@ -1011,6 +1011,13 @@ impl Config {
 
     /// Sets the variable `name` to `value`, as the user did.
     fn store(&mut self, name: &'static str, value: Value) {
+        if vars::NO_EFFECT.contains(&name) {
+            self.warn_once(
+                "variable",
+                name,
+                format!("{name}: accepted but has no effect in mett"),
+            );
+        }
         self.values.insert(name, value);
         self.assigned.insert(name);
     }
@@ -1263,11 +1270,11 @@ mod tests {
 
     #[test]
     fn accepts_spaces_on_either_side_of_equals() {
-        let config = load("set from =a@b.c realname= Alice timeout = 7\n");
+        let config = load("set from =a@b.c realname= Alice mail_check = 7\n");
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         assert_eq!(config.string("from"), "a@b.c");
         assert_eq!(config.string("realname"), "Alice");
-        assert_eq!(config.get("timeout"), Some(&Value::Number(7)));
+        assert_eq!(config.get("mail_check"), Some(&Value::Number(7)));
     }
 
     #[test]
@@ -1278,21 +1285,21 @@ mod tests {
 
     #[test]
     fn crlf_files_continue_lines() {
-        let config = load("set from=a@b.c \\\r\n  realname=Alice\r\nset timeout=7\r\n");
+        let config = load("set from=a@b.c \\\r\n  realname=Alice\r\nset mail_check=7\r\n");
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
         assert_eq!(config.string("realname"), "Alice");
-        assert_eq!(config.get("timeout"), Some(&Value::Number(7)));
+        assert_eq!(config.get("mail_check"), Some(&Value::Number(7)));
     }
 
     #[test]
     fn unsets_and_resets() {
         let config = load(
-            "set office365_cloud=china timeout=5\n\
-             reset office365_cloud\nunset timeout\nset &use_from\n",
+            "set office365_cloud=china mail_check=5\n\
+             reset office365_cloud\nunset mail_check\nset &use_from\n",
         );
         assert_eq!(config.string("office365_cloud"), "global");
-        assert_eq!(config.get("timeout"), Some(&Value::Number(0)));
+        assert_eq!(config.get("mail_check"), Some(&Value::Number(0)));
         assert_eq!(config.get("use_from"), Some(&Value::Bool(true)));
     }
 
@@ -1398,11 +1405,11 @@ mod tests {
     #[test]
     fn runs_commands_typed_at_the_prompt() {
         let mut config = load("");
-        assert_eq!(config.run_line("set timeout=7"), Ok(vec![]));
-        assert_eq!(config.get("timeout"), Some(&Value::Number(7)));
+        assert_eq!(config.run_line("set mail_check=7"), Ok(vec![]));
+        assert_eq!(config.get("mail_check"), Some(&Value::Number(7)));
         assert_eq!(
-            config.run_line("set timeout=soon"),
-            Err("timeout: expected a number, got \"soon\"".into())
+            config.run_line("set mail_check=soon"),
+            Err("mail_check: expected a number, got \"soon\"".into())
         );
         assert!(config.errors.is_empty(), "prompt errors aren't kept");
         assert_eq!(
@@ -1411,8 +1418,8 @@ mod tests {
         );
         // `set ?var` shows the value.
         assert_eq!(
-            config.run_line("set ?timeout"),
-            Ok(vec!["timeout=7".into()])
+            config.run_line("set ?mail_check"),
+            Ok(vec!["mail_check=7".into()])
         );
         assert_eq!(
             config.run_line("set ?resolve"),
@@ -1426,6 +1433,44 @@ mod tests {
         let first = config.run_line("score a b c").unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(config.run_line("score a b c"), Ok(first));
+    }
+
+    #[test]
+    fn variables_without_effect_warn_when_set() {
+        for line in [
+            "set timeout=5",
+            "set timeout=0",
+            "unset timeout",
+            "set postponed=\"=Drafts\"",
+            "set office365_focused_inbox",
+            "toggle office365_focused_inbox",
+            "set msgraph_focused_inbox=yes",
+        ] {
+            let mut config = Config::new(None);
+            let warnings = config.run_line(line).unwrap_or_default();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("accepted but has no effect in mett")),
+                "{line}: {warnings:?}"
+            );
+        }
+        // Each variable is warned about once per file; reading one and
+        // setting others are not.
+        let config = load("set timeout=5\nset timeout=6\nset ?timeout\nset wrap=3\n");
+        let own: Vec<_> = config
+            .warnings
+            .iter()
+            .filter(|w| w.contains("no effect"))
+            .collect();
+        assert_eq!(own.len(), 1, "{:?}", config.warnings);
+        assert!(own[0].starts_with("/conf/mettrc:1:"));
+        let mut config = Config::new(None);
+        assert_eq!(
+            config.run_line("set ?timeout"),
+            Ok(vec!["timeout=600".to_owned()])
+        );
+        assert!(config.run_line("set wrap=3").unwrap().is_empty());
     }
 
     #[test]

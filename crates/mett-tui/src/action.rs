@@ -15,17 +15,31 @@ macro_rules! actions {
                 #[doc = $description]
                 $variant,
             )*
+            /// Go to the tab of the account with this number (1 to 9).
+            Account(u8),
         }
 
         impl Action {
             /// Every action.
-            pub const ALL: &[Action] = &[$(Action::$variant),*];
+            pub const ALL: &[Action] = &[
+                $(Action::$variant,)*
+                Action::Account(1),
+                Action::Account(2),
+                Action::Account(3),
+                Action::Account(4),
+                Action::Account(5),
+                Action::Account(6),
+                Action::Account(7),
+                Action::Account(8),
+                Action::Account(9),
+            ];
 
             /// The mutt-style function name, as used in `bind` (without the
             /// angle brackets).
             pub fn name(self) -> &'static str {
                 match self {
                     $(Action::$variant => $name,)*
+                    Action::Account(number) => account(number).0,
                 }
             }
 
@@ -33,6 +47,7 @@ macro_rules! actions {
             pub fn description(self) -> &'static str {
                 match self {
                     $(Action::$variant => $description,)*
+                    Action::Account(number) => account(number).1,
                 }
             }
 
@@ -42,6 +57,27 @@ macro_rules! actions {
             }
         }
     };
+}
+
+/// The name and description of the action that goes to the tab of account
+/// `number` (1 to 9).
+fn account(number: u8) -> (&'static str, &'static str) {
+    const ACCOUNTS: [(&str, &str); 9] = [
+        ("account-1", "Go to the first account's tab"),
+        ("account-2", "Go to the second account's tab"),
+        ("account-3", "Go to the third account's tab"),
+        ("account-4", "Go to the fourth account's tab"),
+        ("account-5", "Go to the fifth account's tab"),
+        ("account-6", "Go to the sixth account's tab"),
+        ("account-7", "Go to the seventh account's tab"),
+        ("account-8", "Go to the eighth account's tab"),
+        ("account-9", "Go to the ninth account's tab"),
+    ];
+    usize::from(number)
+        .checked_sub(1)
+        .and_then(|index| ACCOUNTS.get(index))
+        .copied()
+        .unwrap_or(("account", "Go to an account's tab"))
 }
 
 actions! {
@@ -98,15 +134,6 @@ actions! {
     DeclineInvite => "decline-invite", "Decline the meeting the message invites to";
     NextAccount => "next-account", "Go to the next account's tab";
     PreviousAccount => "previous-account", "Go to the previous account's tab";
-    Account1 => "account-1", "Go to the first account's tab";
-    Account2 => "account-2", "Go to the second account's tab";
-    Account3 => "account-3", "Go to the third account's tab";
-    Account4 => "account-4", "Go to the fourth account's tab";
-    Account5 => "account-5", "Go to the fifth account's tab";
-    Account6 => "account-6", "Go to the sixth account's tab";
-    Account7 => "account-7", "Go to the seventh account's tab";
-    Account8 => "account-8", "Go to the eighth account's tab";
-    Account9 => "account-9", "Go to the ninth account's tab";
     Search => "search", "Search with a pattern (in the pager, the text)";
     SearchNext => "search-next", "Find the next match of the last search";
     Limit => "limit", "Show only the messages matching a pattern";

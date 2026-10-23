@@ -17,6 +17,7 @@ use mett_core::{
     MailSender, MailStore, Message, MessageId, MessagePage, Page, Result, WellKnownFolder,
     join_bounded, join_bounded_until,
 };
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::config::mailbox::FolderPath;
@@ -232,7 +233,7 @@ pub async fn run<S: MailStore + MailSender + 'static>(
     > = Arc::default();
     while let Some((id, request)) = requests.recv().await {
         if let Request::Cancel(query) = request {
-            if let Some(task) = queries.lock().expect("lock").remove(&query) {
+            if let Some(task) = crate::platform::lock(&queries).remove(&query) {
                 task.abort();
             }
             continue;
@@ -244,7 +245,7 @@ pub async fn run<S: MailStore + MailSender + 'static>(
         let running = Arc::clone(&queries);
         // Held until the query is registered: it can't take itself out
         // before then.
-        let mut registered = queries.lock().expect("lock");
+        let mut registered = crate::platform::lock(&queries);
         let task = tokio::spawn(async move {
             // The UI hears of every wait for the server, with the request.
             let notify = |wait, attempt| {
@@ -674,7 +675,11 @@ impl<K: Clone + Eq + Hash, V: Clone> Memo<K, V> {
         key: &K,
         look_up: impl FnOnce() -> F,
     ) -> Result<V> {
-        let cell = Arc::clone(self.0.lock().expect("lock").entry(key.clone()).or_default());
+        let cell = Arc::clone(
+            crate::platform::lock(&self.0)
+                .entry(key.clone())
+                .or_default(),
+        );
         cell.get_or_try_init(look_up).await.cloned()
     }
 }
@@ -706,6 +711,9 @@ async fn changes<S: MailStore>(
     Ok(changed)
 }
 
+/// How much of a `query_command`'s output is read: 1 MiB.
+const QUERY_OUTPUT_LIMIT: u64 = 1 << 20;
+
 /// Runs `query_command` for `text`, as mutt does: `%s` is the text,
 /// quoted for the shell; the first line of output is a message, and each
 /// line after it an address, a tab, then a name.
@@ -730,18 +738,31 @@ async fn run_query(
     #[cfg(unix)]
     shell.process_group(0);
     let child = shell.spawn().map_err(|e| format!("query_command: {e}"))?;
+    let mut child = child;
     let mut group = KillGroup(child.id());
-    let output = child
-        .wait_with_output()
+    // What the command prints is read up to a limit: a runaway command
+    // doesn't fill the memory (the group is killed when this gives up).
+    let mut stdout = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        out.take(QUERY_OUTPUT_LIMIT + 1)
+            .read_to_end(&mut stdout)
+            .await
+            .map_err(|e| format!("query_command: {e}"))?;
+    }
+    if stdout.len() as u64 > QUERY_OUTPUT_LIMIT {
+        return Err("query_command: output over 1 MiB; ignored".to_owned());
+    }
+    let status = child
+        .wait()
         .await
         .map_err(|e| format!("query_command: {e}"))?;
     group.0 = None;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout);
     let mut lines = stdout.lines();
     let first = lines.next().unwrap_or_default();
-    if !output.status.success() {
+    if !status.success() {
         return Err(if first.is_empty() {
-            format!("query_command failed: {}", output.status)
+            format!("query_command failed: {status}")
         } else {
             first.to_owned()
         });
@@ -789,10 +810,16 @@ impl Drop for KillGroup {
             kill.args(["-TERM", "--", &format!("-{pid}")]);
             kill
         };
-        let _ = kill
+        // Not waited for here, in an async task: a thread reaps it.
+        if let Ok(mut child) = kill
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -1105,6 +1132,22 @@ mod tests {
         let more =
             tokio::time::timeout(std::time::Duration::from_millis(200), response_rx.recv()).await;
         assert!(more.is_err(), "the query answered: {more:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_query_command_printing_too_much_is_given_up() {
+        let flood = run_query("yes x | head -c 3000000; echo", "a").await;
+        assert_eq!(
+            flood,
+            Err("query_command: output over 1 MiB; ignored".into())
+        );
+        // Just under the limit is read.
+        assert!(
+            run_query("echo; head -c 1000000 /dev/zero | tr '\\0' x; echo", "a")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

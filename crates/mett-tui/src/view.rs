@@ -263,28 +263,28 @@ fn render_tabs(app: &App, frame: &mut Frame) -> Rect {
     let colors = &app.display.colors;
     // Too many tabs for the line: those before the one shown go from the
     // left until it fits.
-    let text = |at: usize, tab: &crate::app::Tab| {
-        let marker = if tab.new_mail { "*" } else { "" };
-        format!(" {} {}{marker} ", at + 1, tab.label)
-    };
-    let widths: Vec<usize> = tabs
+    let texts: Vec<String> = tabs
         .tabs
         .iter()
         .enumerate()
-        .map(|(at, tab)| text(at, tab).width())
+        .map(|(at, tab)| {
+            let marker = if tab.new_mail { "*" } else { "" };
+            format!(" {} {}{marker} ", at + 1, tab.label)
+        })
         .collect();
+    let widths: Vec<usize> = texts.iter().map(|text| text.width()).collect();
     let mut first = 0;
     while first < tabs.active
         && widths[first..=tabs.active].iter().sum::<usize>() > usize::from(bar.width)
     {
         first += 1;
     }
-    let spans: Vec<Span> = tabs
-        .tabs
-        .iter()
+    let spans: Vec<Span> = texts
+        .into_iter()
+        .zip(tabs.tabs.iter())
         .enumerate()
         .skip(first)
-        .map(|(at, tab)| {
+        .map(|(at, (text, tab))| {
             let style = if at == tabs.active {
                 colors.indicator
             } else if tab.new_mail {
@@ -296,7 +296,7 @@ fn render_tabs(app: &App, frame: &mut Frame) -> Rect {
             } else {
                 colors.status
             };
-            Span::styled(text(at, tab), style)
+            Span::styled(text, style)
         })
         .collect();
     frame.render_widget(Paragraph::new(Line::from(spans)).style(colors.status), bar);

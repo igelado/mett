@@ -371,7 +371,7 @@ impl Gui {
         let backend = pollster::block_on(builder.build_with_target(window.clone()))
             .map_err(|e| format!("cannot draw in the window: {e}"))?;
         let terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
-        *self.size.lock().expect("not poisoned") = terminal.size().map_err(|e| e.to_string())?;
+        *crate::platform::lock(&self.size) = terminal.size().map_err(|e| e.to_string())?;
         self.terminal = Some(terminal);
         self.window = Some(window.clone());
         if let Some(start) = self.start.take() {
@@ -463,7 +463,7 @@ impl Gui {
         terminal.backend_mut().resize(width, height);
         if let Ok(cells) = terminal.size() {
             let changed = {
-                let mut shared = self.size.lock().expect("not poisoned");
+                let mut shared = crate::platform::lock(&self.size);
                 std::mem::replace(&mut *shared, cells) != cells
             };
             if changed {
@@ -785,7 +785,7 @@ pub(crate) struct WindowScreen {
 
 impl crate::Frontend for WindowScreen {
     fn size(&self) -> std::io::Result<Size> {
-        Ok(*self.size.lock().expect("not poisoned"))
+        Ok(*crate::platform::lock(&self.size))
     }
 
     fn draw(&mut self, app: &App) -> std::io::Result<()> {
@@ -864,7 +864,7 @@ impl Backend for Capture {
     }
 
     fn size(&self) -> std::io::Result<Size> {
-        Ok(*self.size.lock().expect("not poisoned"))
+        Ok(*crate::platform::lock(&self.size))
     }
 
     fn window_size(&mut self) -> std::io::Result<WindowSize> {

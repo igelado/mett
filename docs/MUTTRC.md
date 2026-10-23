@@ -89,7 +89,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | Mailboxes | `folder` | path | Base of the mailbox tree, often an `imaps://` URL. Default `~/Mail`. |
 | | `spoolfile` | path | Incoming mailbox, opened at startup. |
 | | `record` | path | Where copies of sent mail are saved. |
-| | `postponed` | path | Where drafts are saved. |
+| | `postponed` | path | *Accepted but has no effect in mett* (setting it warns): postponed messages always go to the Drafts folder of the account. |
 | | `mbox` | path | Where read mail is moved when `move` is set. |
 | | `trash` | path | Deleted mail is moved here instead of being purged. |
 | | `delete` | quadoption | Whether to purge messages marked for deletion (on `$`, or when leaving the folder). |
@@ -124,7 +124,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `abort_unmodified`, `abort_nosubject`, `postpone` | quadoption | Abort an unedited message or one without subject (asked again when sending without one, as in mutt); postpone when leaving the compose menu. |
 | | `tmpdir` | path | Where the editor's temporary files go. |
 | Behaviour | `mail_check` | number | Seconds between new-mail checks of an IMAP mailbox (`0` turns them off; Office365 has `office365_sync_interval`). |
-| | `timeout` | number | Seconds to wait for input before checking mail. |
+| | `timeout` | number | *Accepted but has no effect in mett* (setting it warns): mett checks mail on `mail_check` (or `office365_sync_interval`), not on input timeouts. |
 | | `sort`, `sort_aux` | sort order | Index sorting. |
 | | `index_format`, `pager_format`, `status_format` | string | Display formats. |
 | | `pager_index_lines` | number | Rows of a mini-index shown above the pager, one of them the index's status bar (default `0`, none). As in mutt, the open message is about a third of the way down it, and it takes only the rows the index needs. On a terminal too small for it and a few rows of the message, it shrinks, or is left out. |
@@ -133,7 +133,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `sidebar_visible`, `sidebar_width`, `sidebar_format` | boolean, number, string | The sidebar (§4.10). |
 | | `tab_position` | `top` or `bottom` | mett's own: where the accounts' tabs are (§4.14). |
 | | `mailcap_path` | string | mailcap files used to view MIME parts. |
-| | `query_command` | path | External address-book query. |
+| | `query_command` | path | External address-book query. At most 1 MiB of its output is read: a command that prints more is stopped, and the query fails. |
 | | `alias_file` | path | Where aliases created with `a` (`<create-alias>`) are saved. Defaults to the user's own mettrc (`~/.config/mett/mettrc` for a user who has none yet). |
 
 ## 4. Commands
@@ -416,7 +416,6 @@ set imap_pass = "`pass show mail/example`"   # or a literal password
 set folder    = "imaps://mail.example.com/"
 set spoolfile = "=INBOX"
 set record    = "=Sent"
-set postponed = "=Drafts"
 set trash     = "=Trash"
 
 set smtp_url  = "smtps://smtp.example.com"   # smtp://host:587 for STARTTLS
@@ -442,8 +441,8 @@ set realname  = "Alice Example"
   `smtp_pass`, or the IMAP one if the user is the same. Without `smtp_url`,
   mail can't be sent.
   mett saves the copy of what it sends (`copy`) in the folder the server
-  calls Sent, and postponed messages in Drafts, whatever `record` and
-  `postponed` say (as with Office365). Replies keep the original's
+  calls Sent, and postponed messages in Drafts, whatever `record` says
+  (`postponed` has no effect; as with Office365). Replies keep the original's
   `Message-ID:` and `References:`.
 - **Folders** are named as on the server, below `folder`: `=INBOX/Work`
   (with `/`, whatever the server's own separator is). `@inbox`, `@sentitems`,
@@ -590,7 +589,6 @@ set imap_user = "alice@contoso.com"
 set folder    = "imaps://outlook.office365.com/"
 set spoolfile = "+INBOX"
 set record    = "+Sent Items"
-set postponed = "+Drafts"
 set trash     = "+Deleted Items"
 
 set imap_authenticators        = "xoauth2"

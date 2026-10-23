@@ -11,6 +11,14 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Locks `mutex`, going on with what it holds if a thread panicked while
+/// holding it (what the mutexes here guard stays valid).
+pub fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Whether mett runs in a window of its own (`mett-gui`) rather than in a
 /// terminal.
 static GUI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -34,9 +42,7 @@ pub fn with_clipboard<T>(
     f: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
 ) -> Result<T, String> {
     static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
-    let mut clipboard = CLIPBOARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut clipboard = lock(&CLIPBOARD);
     if clipboard.is_none() {
         *clipboard = Some(arboard::Clipboard::new().map_err(|e| e.to_string())?);
     }

@@ -427,7 +427,8 @@ fn settings_keeping(
     };
     // How often mail is looked for: mutt's `mail_check` for an IMAP mailbox,
     // Office365's own setting for those.
-    let interval = match account::Api::from_config(config) {
+    let api = account::Api::from_config(config);
+    let interval = match api {
         account::Api::Imap => "mail_check",
         account::Api::Graph | account::Api::Ews => "office365_sync_interval",
     };
@@ -440,8 +441,8 @@ fn settings_keeping(
     };
     // Without the password a URL may hold: the mailboxes, as `mailboxes`
     // keeps them, don't have it either, and are shown relative to this.
-    let folder = config::server::strip_password(config.string("folder"));
-    let folder = folder.as_str();
+    let stripped_folder = config::server::strip_password(config.string("folder"));
+    let folder = stripped_folder.as_str();
     let mailboxes = config
         .mailboxes()
         .iter()
@@ -518,14 +519,14 @@ fn settings_keeping(
         page_size,
         mailboxes,
         sidebar,
-        api: account::Api::from_config(config),
+        api,
         display,
         ordering,
         sync_interval,
         compose,
         account: account.clone(),
         // The mailboxes are shown relative to it: without a password in it.
-        folder: config::server::strip_password(config.string("folder")),
+        folder: stripped_folder,
         trash,
         delete: config.quad("delete"),
         resolve: config.flag("resolve"),
@@ -797,25 +798,41 @@ fn rows(height: u16, tabs: bool) -> u16 {
 }
 
 /// Gives every account's app the tabs, as the account `active` shows them.
+/// Called on every pass of the main loop: an app's tabs are replaced only
+/// when they changed (the active tab, a label or a tab's new-mail mark), and
+/// the apps share one list.
 fn show_tabs(slots: &mut [Slot], active: usize, position: app::TabPosition) {
     if slots.len() < 2 {
         return;
     }
     // What is shown is looked at.
     slots[active].app.arrived = false;
-    let tabs: Vec<app::Tab> = slots
+    let fresh: std::sync::Arc<[app::Tab]> = slots
         .iter()
         .map(|slot| app::Tab {
             label: slot.label.clone(),
             new_mail: slot.app.mailboxes_with_new_mail() > 0 || slot.app.arrived,
         })
         .collect();
+    // The list the apps have, if it is still right.
+    let tabs = match &slots[active].app.tabs {
+        Some(shown) if *shown.tabs == *fresh => std::sync::Arc::clone(&shown.tabs),
+        _ => fresh,
+    };
     for slot in slots.iter_mut() {
-        slot.app.tabs = Some(app::Tabs {
-            tabs: tabs.clone(),
-            active,
-            position,
-        });
+        let current = matches!(
+            &slot.app.tabs,
+            Some(shown) if std::sync::Arc::ptr_eq(&shown.tabs, &tabs)
+                && shown.active == active
+                && shown.position == position
+        );
+        if !current {
+            slot.app.tabs = Some(app::Tabs {
+                tabs: std::sync::Arc::clone(&tabs),
+                active,
+                position,
+            });
+        }
     }
 }
 
@@ -1371,11 +1388,11 @@ async fn finish(
     let failures: Vec<String> = slots
         .iter()
         .flat_map(|slot| {
-            let many = slots_len_label(slot);
+            let prefix = failure_prefix(slot);
             slot.app
                 .save_failures()
                 .into_iter()
-                .map(move |failure| format!("{many}{failure}"))
+                .map(move |failure| format!("{prefix}{failure}"))
         })
         .collect();
     if !failures.is_empty() {
@@ -1389,7 +1406,7 @@ async fn finish(
 
 /// What a saving failure of `slot`'s account starts with: its tab, if it
 /// has one.
-fn slots_len_label(slot: &Slot) -> String {
+fn failure_prefix(slot: &Slot) -> String {
     match &slot.app.tabs {
         Some(_) => format!("{}: ", slot.label),
         None => String::new(),
@@ -1950,9 +1967,7 @@ fn dispatch(
                 // One at a time, each on a line of its own: two words added
                 // at once don't run together.
                 static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-                let _writing = WRITING
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _writing = platform::lock(&WRITING);
                 append_line(&path, &format!("{word}\n"))
                     .err()
                     .map(|e| Msg::Failed(format!("spell_words: {}: {e}", path.display())))
