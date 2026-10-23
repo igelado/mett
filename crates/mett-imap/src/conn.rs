@@ -113,7 +113,8 @@ pub(crate) async fn connect(
     };
     let host = settings.host.as_str();
     let tls = |stream| async move {
-        let config = client_config(settings.verify, &settings.ca_certificates).map_err(other)?;
+        let config =
+            client_config(settings.verify_host, &settings.ca_certificates).map_err(other)?;
         within(timeout, TlsConnector::from(config).connect(name()?, stream))
             .await
             .map_err(other)?

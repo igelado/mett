@@ -105,7 +105,7 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `smtp_oauth_refresh_command` | string | As for IMAP. (Not supported yet.) |
 | | `sendmail` | path | Local MTA, used when `smtp_url` is unset. (Not supported: with no `smtp_url`, mail can't be sent.) |
 | | `ssl_starttls`, `ssl_force_tls` | boolean | Upgrade a plain connection with STARTTLS if the server offers it (`yes`); fail if it doesn't (`ssl_force_tls`, `no`). |
-| | `ssl_verify_host` | boolean | Check the server's certificate and name (`yes`). |
+| | `ssl_verify_host` | boolean | Check that the server's certificate is for the server's name (`yes`). The certificate itself is always checked: for a self-signed one, give it in `ssl_ca_certificate_file`. (With `smtp_url`, `ssl_verify_host` off and `ssl_ca_certificate_file` can't be used together: use a certificate for the server's name.) |
 | | `ssl_ca_certificate_file` | path | More certificate authorities to trust, as PEM, besides the system's. |
 | Caching | `header_cache` | path | Header cache database. |
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
@@ -433,7 +433,8 @@ set realname  = "Alice Example"
   without it if `ssl_force_tls` is set, and go on in plain text otherwise:
   use `ssl_force_tls` unless the network is yours. The server's certificate
   is checked against the system's authorities (and
-  `ssl_ca_certificate_file`) unless `ssl_verify_host` is off.
+  `ssl_ca_certificate_file`; put a self-signed certificate there), and for the
+  server's name unless `ssl_verify_host` is off.
 - **SMTP.** `smtp_url` names the server and, if it needs a login, the user
   (`smtps://alice@smtp.example.com`; as in mutt, a URL without a user is a
   relay that takes mail without one). Its password is in the URL, or

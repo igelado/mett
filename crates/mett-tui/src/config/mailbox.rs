@@ -121,9 +121,21 @@ impl MailboxUrl {
             // Until `imap_user` says (see `with_user`).
             None => AccountId::new(&server.host),
         };
+        // A leading `@` names a well-known folder (`@inbox`), unless it is
+        // escaped (`%40Projects`), which is a folder named so.
+        let escaped = server
+            .path
+            .split('/')
+            .find(|s| !s.is_empty())
+            .is_some_and(|first| first.starts_with("%40"));
+        let folder = if escaped {
+            FolderPath::Named(segments)
+        } else {
+            folder_path_of(&server::redact(url), &segments)?
+        };
         Ok(Self {
             account,
-            folder: folder_path_of(&server::redact(url), &segments)?,
+            folder,
             server: Server::Imap(server),
         })
     }
@@ -232,12 +244,16 @@ impl fmt::Display for MailboxUrl {
                 f.write_str("/")?;
             }
         }
-        let encoded = |name: &str| match self.server {
+        // `first`: the name starts the path, where an `@` would make it a
+        // well-known folder.
+        let encoded = |name: &str, first: bool| match self.server {
             Server::Office365 => name.to_owned(),
             Server::Imap(_) => name
                 .chars()
-                .map(|c| match c {
+                .enumerate()
+                .map(|(at, c)| match c {
                     '%' | '/' | ' ' | '#' | '?' => format!("%{:02X}", c as u32),
+                    '@' if first && at == 0 => "%40".to_owned(),
                     _ => c.to_string(),
                 })
                 .collect::<String>(),
@@ -246,12 +262,14 @@ impl fmt::Display for MailboxUrl {
             FolderPath::Root => Ok(()),
             FolderPath::WellKnown(which, rest) => {
                 write!(f, "@{which}")?;
-                rest.iter().try_for_each(|s| write!(f, "/{}", encoded(s)))
+                rest.iter()
+                    .try_for_each(|s| write!(f, "/{}", encoded(s, false)))
             }
             FolderPath::Named(names) => f.write_str(
                 &names
                     .iter()
-                    .map(|n| encoded(n))
+                    .enumerate()
+                    .map(|(at, n)| encoded(n, at == 0))
                     .collect::<Vec<_>>()
                     .join("/"),
             ),
@@ -626,5 +644,25 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn an_escaped_leading_at_sign_is_a_folder_name_not_a_well_known_folder() {
+        let url = MailboxUrl::parse("imaps://me@mail.example.com/%40Projects/Sub").unwrap();
+        assert_eq!(
+            url.folder,
+            FolderPath::Named(vec!["@Projects".into(), "Sub".into()])
+        );
+        assert_eq!(
+            url.to_string(),
+            "imaps://me@mail.example.com/%40Projects/Sub"
+        );
+        let url = MailboxUrl::parse(&url.to_string()).unwrap();
+        assert_eq!(
+            url.folder,
+            FolderPath::Named(vec!["@Projects".into(), "Sub".into()])
+        );
+        // Unescaped, it is still the well-known folder's marker.
+        assert!(MailboxUrl::parse("imaps://me@mail.example.com/@Projects").is_err());
     }
 }

@@ -142,10 +142,10 @@ pub enum Mode {
     Tls,
 }
 
-fn acceptor() -> (TlsAcceptor, Vec<u8>) {
+fn acceptor(name: &str) -> (TlsAcceptor, Vec<u8>) {
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(Vec::new()).unwrap();
-    params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
+    params.subject_alt_names = vec![SanType::IpAddress(name.parse().unwrap())];
     let cert = params.self_signed(&key).unwrap();
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -158,7 +158,12 @@ fn acceptor() -> (TlsAcceptor, Vec<u8>) {
 }
 
 pub async fn server(mode: Mode, accept: Accept, folders: Vec<Folder>) -> Server {
-    let (acceptor, ca) = acceptor();
+    server_for(mode, accept, folders, "127.0.0.1").await
+}
+
+/// A server whose certificate is for the address `name`.
+pub async fn server_for(mode: Mode, accept: Accept, folders: Vec<Folder>, name: &str) -> Server {
+    let (acceptor, ca) = acceptor(name);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let state = Arc::new(Mutex::new(State {

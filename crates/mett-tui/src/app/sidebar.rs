@@ -18,10 +18,13 @@ use crate::action::Action;
 use crate::config::mailbox::{FolderPath, same_name as same_name_ignoring_case};
 
 /// Whether two folder names are the same, by the rules of the mailbox's
-/// `api`: Office365 ignores case, IMAP doesn't (but for `INBOX`).
-fn same_name(a: &str, b: &str, api: Api) -> bool {
+/// `api`: Office365 ignores case, IMAP doesn't (but for the top-level
+/// `INBOX`, `root`).
+fn same_name(a: &str, b: &str, api: Api, root: bool) -> bool {
     match api {
-        Api::Imap => a == b || (a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX")),
+        Api::Imap => {
+            a == b || (root && a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX"))
+        }
         Api::Graph | Api::Ews => same_name_ignoring_case(a, b),
     }
 }
@@ -655,7 +658,7 @@ impl App {
                     }
                     FolderPath::Named(names) => {
                         open.well_known.is_some()
-                            && matches!(names.as_slice(), [name] if same_name(name, &open.name, self.api))
+                            && matches!(names.as_slice(), [name] if same_name(name, &open.name, self.api, true))
                     }
                     FolderPath::Root => false,
                 };
@@ -677,15 +680,20 @@ impl App {
 /// Whether `a` and `b` are the same path, ignoring case as Office365
 /// does (`api`: IMAP servers tell names apart by case, the inbox's aside).
 fn same_path(a: &FolderPath, b: &FolderPath, api: Api) -> bool {
-    let same_names = |a: &[String], b: &[String]| {
-        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_name(a, b, api))
+    // `root`: whether the names start at the top of the mailbox.
+    let same_names = |a: &[String], b: &[String], root: bool| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .enumerate()
+                .all(|(at, (a, b))| same_name(a, b, api, root && at == 0))
     };
     match (a, b) {
         (FolderPath::Root, FolderPath::Root) => true,
         (FolderPath::WellKnown(a, a_below), FolderPath::WellKnown(b, b_below)) => {
-            a == b && same_names(a_below, b_below)
+            a == b && same_names(a_below, b_below, false)
         }
-        (FolderPath::Named(a), FolderPath::Named(b)) => same_names(a, b),
+        (FolderPath::Named(a), FolderPath::Named(b)) => same_names(a, b, true),
         _ => false,
     }
 }
@@ -1399,5 +1407,9 @@ mod tests {
         assert!(!same_path(&named("Foo"), &named("foo"), Api::Imap));
         assert!(same_path(&named("Foo"), &named("Foo"), Api::Imap));
         assert!(same_path(&named("INBOX"), &named("Inbox"), Api::Imap));
+        // Only the top-level one: `INBOX/Inbox` and `INBOX/INBOX` are two.
+        let below = |name: &str| FolderPath::Named(vec!["INBOX".into(), name.into()]);
+        assert!(!same_path(&below("Inbox"), &below("INBOX"), Api::Imap));
+        assert!(same_path(&below("Inbox"), &below("Inbox"), Api::Imap));
     }
 }

@@ -38,9 +38,11 @@ pub struct SmtpSettings {
     pub port: u16,
     /// How the connection is protected.
     pub security: Security,
-    /// Whether to check the server's certificate (and its name). Turning
-    /// this off leaves the connection open to impersonation.
-    pub verify: bool,
+    /// Whether to check that the server's certificate is for the name the
+    /// connection is made to (mutt's `ssl_verify_host`). The certificate is
+    /// always checked against the authorities; turning this off leaves the
+    /// connection open to anyone with a certificate from one of them.
+    pub verify_host: bool,
     /// Certificate authorities to trust besides the system's, as PEM.
     pub ca_certificates: Vec<Vec<u8>>,
     /// The sender's address, for messages that don't name another.
@@ -63,7 +65,7 @@ impl SmtpSettings {
                 Security::Tls => 465,
             },
             security,
-            verify: true,
+            verify_host: true,
             ca_certificates: Vec::new(),
             from,
             timeout: Duration::from_secs(60),
@@ -205,10 +207,16 @@ impl<A: Authenticator> SmtpSender<A> {
                         .map_err(|e| Error::NotSent(format!("CA certificate: {e}")))?,
                 );
             }
-            if !settings.verify {
-                tls = tls
-                    .dangerous_accept_invalid_certs(true)
-                    .dangerous_accept_invalid_hostnames(true);
+            if !settings.verify_host {
+                // Lettre doesn't skip the name check of a server it trusts
+                // extra certificates for: that is refused, not done wrong.
+                if !settings.ca_certificates.is_empty() {
+                    return Err(Error::NotSent(
+                        "not checking the server's name can't be combined with extra certificate authorities for SMTP: give a certificate for the name used"
+                            .into(),
+                    ));
+                }
+                tls = tls.dangerous_accept_invalid_hostnames(true);
             }
             tls.build_rustls()
                 .map_err(|e| Error::NotSent(format!("TLS: {e}")))

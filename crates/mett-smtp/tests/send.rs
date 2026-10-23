@@ -44,10 +44,10 @@ enum Accept {
     Challenge(&'static str),
 }
 
-fn acceptor() -> (TlsAcceptor, Vec<u8>) {
+fn acceptor(name: &str) -> (TlsAcceptor, Vec<u8>) {
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(Vec::new()).unwrap();
-    params.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().unwrap())];
+    params.subject_alt_names = vec![SanType::IpAddress(name.parse().unwrap())];
     let cert = params.self_signed(&key).unwrap();
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -60,7 +60,12 @@ fn acceptor() -> (TlsAcceptor, Vec<u8>) {
 }
 
 async fn server(wrapper: bool, accept: Accept) -> Server {
-    let (acceptor, ca) = acceptor();
+    server_for(wrapper, accept, "127.0.0.1").await
+}
+
+/// A server whose certificate is for the address `name`.
+async fn server_for(wrapper: bool, accept: Accept, name: &str) -> Server {
+    let (acceptor, ca) = acceptor(name);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -282,14 +287,34 @@ async fn refuses_a_certificate_it_does_not_trust() {
 }
 
 #[tokio::test]
-async fn accepts_any_certificate_when_not_verifying() {
-    let server = server(true, Accept::Everything).await;
+async fn checks_the_name_of_the_certificate_and_the_certificate_itself() {
+    // Its certificate is for 127.0.0.2, the connection is to 127.0.0.1.
+    let server = server_for(true, Accept::Everything, "127.0.0.2").await;
     let mut settings = settings(&server, Security::Tls);
+    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
+    let error = sender
+        .send(&draft(), &Threading::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSent(_)), "{error}");
+
+    // Not checking the name doesn't mean taking any certificate: this one
+    // is from no authority the sender knows.
+    settings.verify_host = false;
     settings.ca_certificates.clear();
-    settings.verify = false;
+    let sender = SmtpSender::<NoTokens>::new(settings.clone(), Login::None);
+    assert!(sender.send(&draft(), &Threading::default()).await.is_err());
+
+    // Nor can it be combined with the extra authorities, which lettre
+    // would check the name with anyway: that is said, not done wrong.
+    settings.ca_certificates = vec![server.ca.clone()];
     let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
-    sender.send(&draft(), &Threading::default()).await.unwrap();
-    assert_eq!(server.seen.lock().unwrap().len(), 1);
+    let error = sender
+        .send(&draft(), &Threading::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("can't be combined"), "{error}");
+    assert!(server.seen.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

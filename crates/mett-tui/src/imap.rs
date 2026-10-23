@@ -55,7 +55,7 @@ pub fn imap_settings(config: &Config, url: &MailboxUrl) -> Result<ImapSettings, 
     if let Some(port) = server.port {
         settings.port = port;
     }
-    settings.verify = config.flag("ssl_verify_host");
+    settings.verify_host = config.flag("ssl_verify_host");
     settings.ca_certificates = certificates(config)?;
     Ok(settings)
 }
@@ -93,8 +93,11 @@ pub fn smtp_sender(
     if let Some(port) = server.port {
         settings.port = port;
     }
-    settings.verify = config.flag("ssl_verify_host");
+    settings.verify_host = config.flag("ssl_verify_host");
     settings.ca_certificates = certificates(config)?;
+    if !settings.verify_host && !settings.ca_certificates.is_empty() {
+        return Err("ssl_verify_host is off and ssl_ca_certificate_file is set: for SMTP, a certificate for the server's name is needed".into());
+    }
     // Like mutt, mett logs in only as the user the URL names; the password
     // is the URL's, or `smtp_pass`, or the mailbox's if the user is the same.
     // A URL with no user is a relay that takes mail without a login.
@@ -208,11 +211,11 @@ mod tests {
     #[test]
     fn verification_and_extra_authorities_follow_the_variables() {
         let imap = url("imaps://me@mail.example.com/");
-        assert!(imap_settings(&config(""), &imap).unwrap().verify);
+        assert!(imap_settings(&config(""), &imap).unwrap().verify_host);
         assert!(
             !imap_settings(&config("set ssl_verify_host=no\n"), &imap)
                 .unwrap()
-                .verify
+                .verify_host
         );
         let missing = config("set ssl_ca_certificate_file=/nonexistent/ca.pem\n");
         assert!(
@@ -288,6 +291,23 @@ mod tests {
                 .unwrap_err()
                 .starts_with("smtp_url:")
         );
+    }
+
+    #[test]
+    fn smtp_cannot_skip_the_name_check_with_extra_authorities() {
+        let ca = std::env::temp_dir().join(format!("mett-ca-smtp-{}", std::process::id()));
+        std::fs::write(&ca, b"PEM").unwrap();
+        let c = config(&format!(
+            "set ssl_verify_host=no ssl_ca_certificate_file={} smtp_url=smtps://smtp.example.com\n",
+            ca.display()
+        ));
+        let me = Address::new("me@example.com");
+        let imap = url("imaps://me@mail.example.com/");
+        let error = smtp_sender(&c, &imap, &me).unwrap_err();
+        assert!(error.contains("ssl_verify_host"), "{error}");
+        // IMAP takes the combination.
+        assert!(imap_settings(&c, &imap).is_ok());
+        let _ = std::fs::remove_file(&ca);
     }
 
     #[test]

@@ -14,9 +14,11 @@ pub struct ImapSettings {
     pub port: u16,
     /// How the connection is protected.
     pub security: Security,
-    /// Whether to check the server's certificate (and its name). Turning
-    /// this off leaves the connection open to impersonation.
-    pub verify: bool,
+    /// Whether to check that the server's certificate is for the name the
+    /// connection is made to (mutt's `ssl_verify_host`). The certificate is
+    /// always checked against the authorities; turning this off leaves the
+    /// connection open to anyone with a certificate from one of them.
+    pub verify_host: bool,
     /// Certificate authorities to trust besides the system's, as PEM.
     pub ca_certificates: Vec<Vec<u8>>,
     /// How long to wait for the server at each step.
@@ -34,7 +36,7 @@ impl ImapSettings {
                 _ => 143,
             },
             security,
-            verify: true,
+            verify_host: true,
             ca_certificates: Vec::new(),
             timeout: Duration::from_secs(60),
         }

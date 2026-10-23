@@ -872,7 +872,14 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             if floor.is_none_or(|f| f.modseq.is_none() || !live.caps.condstore) {
                 uids.extend(arrived_since(live, since, false).await?);
             }
-            let (page, _) = page_of(live, folder.as_str(), Some(uids), &page).await?;
+            let (mut page, _) = page_of(live, folder.as_str(), Some(uids), &page).await?;
+            // What this finds changed now, whatever date it came in with:
+            // the new-mail check reads that to tell a change it hasn't seen
+            // from one the listing had.
+            let now = Utc::now();
+            for message in &mut page.messages {
+                message.modified = Some(now);
+            }
             if first {
                 self.marks.commit(
                     Watch::Changes,

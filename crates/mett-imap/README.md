@@ -21,7 +21,8 @@ implements `mett-core`'s ports against any IMAP server:
 
 The connection is plain, STARTTLS (required, or only if the server offers it)
 or TLS from the first byte (`Security`), checked against the system's
-certificate authorities and any more given. The login is a password (`LOGIN`)
+certificate authorities and any more given, and for the name it is made
+to unless `verify_host` is off. The login is a password (`LOGIN`)
 or an OAuth2 token from any `Authenticator` (`Login::OAuth`, SASL XOAUTH2; a
 token the server turns down is replaced once). It keeps one connection, which
 it makes again if it is lost or has sat idle.
