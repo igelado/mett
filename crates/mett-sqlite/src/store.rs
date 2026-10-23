@@ -15,7 +15,7 @@ use mett_core::{
 };
 use tokio::time::Instant;
 
-use crate::db::{Db, Key, Listing, comes_after, modified_key, received_key};
+use crate::db::{Db, Key, Listing, comes_after, is_busy, modified_key, received_key};
 
 /// A folder synced this recently isn't synced again: the calls of one
 /// request (a check for new mail lists a folder and its changes) share a
@@ -25,6 +25,9 @@ const FRESH: Duration = Duration::from_secs(2);
 /// How many times a sync goes on after another mett sharing the cache
 /// took in changes first.
 const LOST_RACES: u32 = 3;
+
+/// How long a cache that stayed busy is left alone: it waited long enough.
+const BUSY_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// Why the cache could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -49,10 +52,17 @@ pub struct CachedStore<S> {
     /// Set when the cache fails (a full disk, say): from then on,
     /// everything goes to `S`.
     broken: AtomicBool,
+    /// Until when the cache is left alone, after it was busy for as long as
+    /// SQLite waited (another mett holds it): each call would wait that
+    /// long again.
+    busy_until: Mutex<Option<Instant>>,
     /// How many changes mett made, which a sync brings in (with the dates
-    /// the server gives them) or elsewhere (a copy, a draft): any folder
-    /// synced before one is synced again.
+    /// the server gives them) or elsewhere (a copy, a draft), where the
+    /// folder isn't known: any folder synced before one is synced again.
     writes: AtomicU64,
+    /// How many changes mett made in each folder (where it is known): that
+    /// folder, synced before one, is synced again.
+    folder_writes: Mutex<HashMap<FolderId, u64>>,
     /// When each folder was last synced, and how many changes mett had
     /// made then. Its lock also keeps two syncs of one folder from running
     /// at once.
@@ -68,7 +78,10 @@ pub struct CachedStore<S> {
 pub type Progress = Box<dyn Fn(&FolderId, u64) + Send + Sync>;
 
 /// When a folder was last synced, and how many changes mett had made then.
-type LastSync = Option<(Instant, u64)>;
+type LastSync = Option<(Instant, Writes)>;
+
+/// How many changes mett had made: anywhere, and in one folder.
+type Writes = (u64, u64);
 
 /// A cache database, for a [`CachedStore`].
 pub struct Cache(Db);
@@ -113,7 +126,9 @@ impl<S: MailStore> CachedStore<S> {
                 Mutex::new(db)
             }),
             broken: AtomicBool::new(false),
+            busy_until: Mutex::new(None),
             writes: AtomicU64::new(0),
+            folder_writes: Mutex::default(),
             synced: Mutex::new(HashMap::new()),
             progress: None,
             unsyncable: Mutex::default(),
@@ -227,7 +242,15 @@ impl<S: MailStore> CachedStore<S> {
     /// Whether folders are cached: there is a cache, it works, and the
     /// backend can keep it up to date.
     fn caching(&self) -> bool {
-        self.db.is_some() && !self.broken() && self.inner.can_sync()
+        self.db.is_some() && !self.broken() && !self.busy() && self.inner.can_sync()
+    }
+
+    /// Whether the cache was busy lately, and is left alone for a while.
+    fn busy(&self) -> bool {
+        self.busy_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() < until)
     }
 
     /// Whether the cache failed, and is no longer used.
@@ -235,7 +258,9 @@ impl<S: MailStore> CachedStore<S> {
         self.broken.load(Ordering::SeqCst)
     }
 
-    /// Runs `f` on the cache. If it fails, the cache is no longer used.
+    /// Runs `f` on the cache. If it fails, the cache is no longer used,
+    /// unless it was only busy (another mett holds it, say): that is the
+    /// call's failure alone (see [`is_busy`]), and the cache is used again.
     fn with_cache<T>(&self, f: impl FnOnce(&mut Db) -> Result<T>) -> Result<T> {
         let db = self
             .db
@@ -243,9 +268,19 @@ impl<S: MailStore> CachedStore<S> {
             .filter(|_| self.caching())
             .ok_or_else(|| Error::Backend("cache: not caching".into()))?;
         let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+        // Calls that waited for the lock while another one found the cache
+        // busy don't wait on it again.
+        if !self.caching() {
+            return Err(Error::Backend("cache: not caching".into()));
+        }
         let done = f(&mut db);
-        if done.is_err() {
-            self.broken.store(true, Ordering::SeqCst);
+        match &done {
+            Err(e) if is_busy(e) => {
+                *self.busy_until.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Instant::now() + BUSY_COOLDOWN);
+            }
+            Err(_) => self.broken.store(true, Ordering::SeqCst),
+            Ok(_) => {}
         }
         done
     }
@@ -253,6 +288,36 @@ impl<S: MailStore> CachedStore<S> {
     /// Notes a change mett made that a sync may bring in elsewhere.
     fn wrote(&self) {
         self.writes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Notes a change mett made in `folder` alone: only it syncs again.
+    fn wrote_in(&self, folder: &FolderId) {
+        *self
+            .folder_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(folder.clone())
+            .or_default() += 1;
+    }
+
+    /// How many changes mett has made, anywhere and in `folder`.
+    fn writes_in(&self, folder: &FolderId) -> Writes {
+        (
+            self.writes.load(Ordering::SeqCst),
+            self.folder_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(folder)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
+    /// Whether a failure is to go to the server for this call alone: the
+    /// cache failed (and isn't used any more), was only busy (and is left
+    /// alone for a while), or was left alone meanwhile.
+    fn skips_cache(&self, e: &Error) -> bool {
+        self.broken() || is_busy(e) || !self.caching()
     }
 
     /// Brings `folder`'s cache up to date, unless it just was. Each batch
@@ -276,7 +341,7 @@ impl<S: MailStore> CachedStore<S> {
                 .or_default(),
         );
         let mut last = lock.lock().await;
-        let writes = self.writes.load(Ordering::SeqCst);
+        let writes = self.writes_in(folder);
         if last.is_some_and(|(at, then)| at.elapsed() < FRESH && then == writes) {
             return Ok(true);
         }
@@ -290,7 +355,7 @@ impl<S: MailStore> CachedStore<S> {
         let mut lost = 0;
         // How many of the folder's messages are here, once counted, and how
         // many changes mett had made then.
-        let mut here: Option<(u64, u64)> = None;
+        let mut here: Option<(u64, Writes)> = None;
         loop {
             let changes = match self.inner.sync_folder(folder, state.as_ref()).await {
                 // The server forgot where the sync stood: start over,
@@ -352,7 +417,7 @@ impl<S: MailStore> CachedStore<S> {
             if let Some(progress) = &self.progress
                 && (changes.more || here.is_some())
             {
-                let writes = self.writes.load(Ordering::SeqCst);
+                let writes = self.writes_in(folder);
                 let now = match here {
                     Some((here, then)) if then == writes => {
                         Some(here.saturating_add_signed(more_here))
@@ -663,7 +728,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     ) -> Result<Vec<(MessageId, DateTime<Utc>)>> {
         if self.caching() {
             match self.recent_unread_cached(folder, since).await {
-                Err(_) if self.broken() => {}
+                Err(e) if self.skips_cache(&e) => {}
                 found => return found,
             }
         }
@@ -683,9 +748,11 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
-        if self.caching() {
+        // A cursor that isn't the cache's (the server's, or a listing the
+        // cache began, resumed from the server) goes on there.
+        if self.caching() && page.cursor().is_none_or(is_cached) {
             match self.list_cached(folder, &page).await {
-                Err(_) if self.broken() => {}
+                Err(e) if self.skips_cache(&e) => {}
                 listed => return listed,
             }
         }
@@ -706,9 +773,9 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         since: DateTime<Utc>,
         page: Page,
     ) -> Result<MessagePage> {
-        if self.caching() {
+        if self.caching() && page.cursor().is_none_or(is_cached) {
             match self.changed_cached(folder, since, &page).await {
-                Err(_) if self.broken() => {}
+                Err(e) if self.skips_cache(&e) => {}
                 listed => return listed,
             }
         }
@@ -808,7 +875,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
 
     async fn copy_message(&self, id: &MessageId, to: &FolderId) -> Result<MessageId> {
         let copied = self.inner.copy_message(id, to).await;
-        self.wrote();
+        // Only the folder it went to changes.
+        self.wrote_in(to);
         copied
     }
 
@@ -858,6 +926,10 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         self.inner.can_sync()
     }
 
+    fn bodies_change(&self) -> bool {
+        self.inner.bodies_change()
+    }
+
     fn folder_names_ignore_case(&self) -> bool {
         self.inner.folder_names_ignore_case()
     }
@@ -870,8 +942,8 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         let changed = self.inner.watch(folders).await?;
         // Synced just before the change, the folders sync again: they are
         // checked at once.
-        if !changed.is_empty() {
-            self.wrote();
+        for folder in &changed {
+            self.wrote_in(folder);
         }
         Ok(changed)
     }

@@ -815,3 +815,72 @@ async fn quick_syncs_have_nothing_to_tell() {
     // One batch: done at once. (Longer ones are counted in db.rs's tests.)
     assert!(told.lock().unwrap().is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_copy_syncs_only_the_folder_it_went_to() {
+    let store = cached(mailbox(2)).unwrap();
+    let archive = FolderId::new("arc");
+    listing(&store, 10).await;
+    store
+        .list_messages(&archive, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(store.inner().syncs(), 2);
+    store
+        .copy_message(&MessageId::new("m0"), &archive)
+        .await
+        .unwrap();
+    // The Inbox, listed again, is still fresh; the Archive isn't.
+    store
+        .list_messages(&inbox(), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(store.inner().syncs(), 2);
+    let page = store
+        .list_messages(&archive, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(store.inner().syncs(), 3);
+    // A change whose folder isn't known makes every folder sync again.
+    store
+        .update_flags(&MessageId::new("m1"), FlagsUpdate::read(true))
+        .await
+        .unwrap();
+    store
+        .list_messages(&inbox(), Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(store.inner().syncs(), 4);
+}
+
+/// A cache that is only busy (another mett holds it) isn't given up on.
+#[tokio::test(start_paused = true)]
+async fn a_busy_cache_is_not_a_broken_one() {
+    let dir = std::env::temp_dir().join(format!("mett-sqlite-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("cache.sqlite");
+    let store = CachedStore::new(mailbox(2), Some(Cache::open(&path, &alice()).unwrap()));
+    listing(&store, 10).await;
+    // Another mett is writing to the cache.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    later().await;
+    assert_eq!(
+        listing(&store, 10).await,
+        ["m1", "m0"],
+        "from the server meanwhile"
+    );
+    other.execute_batch("ROLLBACK").unwrap();
+    let syncs = store.inner().syncs();
+    // It is left alone for a while, not asked again for every call.
+    later().await;
+    assert_eq!(listing(&store, 10).await, ["m1", "m0"]);
+    assert_eq!(store.inner().syncs(), syncs);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(listing(&store, 10).await, ["m1", "m0"]);
+    assert!(store.inner().syncs() > syncs, "the cache is used again");
+    // Windows can't remove files that are open.
+    drop((store, other));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
