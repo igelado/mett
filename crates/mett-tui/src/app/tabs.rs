@@ -83,17 +83,24 @@ impl App {
         !self.deleted.is_empty()
     }
 
-    /// The keys still to play (a macro, `push`), which go on in the account
-    /// that is shown next when one is gone to.
-    pub fn take_strokes(&mut self) -> std::collections::VecDeque<crate::keymap::Stroke> {
-        std::mem::take(&mut self.strokes)
+    /// The keys still to play (a macro, `push`), and how many have been
+    /// played in a row, which go on in the account that is shown next when
+    /// one is gone to: a macro that goes back and forth between accounts
+    /// stops at the same limit as one that doesn't.
+    pub fn take_strokes(&mut self) -> (std::collections::VecDeque<crate::keymap::Stroke>, usize) {
+        (std::mem::take(&mut self.strokes), self.played)
     }
 
-    /// Plays `strokes` first (see [`App::take_strokes`]).
-    pub fn give_strokes(&mut self, strokes: std::collections::VecDeque<crate::keymap::Stroke>) {
+    /// Plays `strokes` first, counting on from `played` (see
+    /// [`App::take_strokes`]).
+    pub fn give_strokes(
+        &mut self,
+        (strokes, played): (std::collections::VecDeque<crate::keymap::Stroke>, usize),
+    ) {
         for stroke in strokes.into_iter().rev() {
             self.strokes.push_front(stroke);
         }
+        self.played = self.played.max(played);
     }
 
     /// Goes to another account, if there are any.
@@ -207,11 +214,15 @@ mod tests {
             crate::keymap::Stroke::Key(crate::keymap::Key::char('k')),
         ]);
         let mut to = app();
+        from.played = 7;
         let strokes = from.take_strokes();
-        assert_eq!(strokes.len(), 2);
-        assert!(from.take_strokes().is_empty());
+        assert_eq!(strokes.0.len(), 2);
+        assert!(from.take_strokes().0.is_empty());
         to.give_strokes(strokes);
-        assert_eq!(to.take_strokes().len(), 2);
+        // The count goes on, so that a macro going back and forth stops.
+        let (queued, played) = to.take_strokes();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(played, 7);
     }
 
     #[test]
