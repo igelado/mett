@@ -148,10 +148,7 @@ impl<A: Authenticator> SmtpSender<A> {
                 let sent = self
                     .deliver(&envelope, &composed.sent, Some(oauth(user, &token)), true)
                     .await;
-                // A server may turn a token down with a `334` challenge
-                // (Google's and Microsoft's do), which lettre can't answer
-                // and reports as a failure of its own.
-                let (Err(Error::Auth(_)) | Err(Error::NotSent(_))) = &sent else {
+                let Err(Error::Auth(_)) = &sent else {
                     return sent.map(|()| (composed.message_id, composed.kept));
                 };
                 // The server turned down a token that hadn't expired (it
@@ -265,6 +262,12 @@ fn failure(e: &smtp::Error, host: &str) -> Error {
             "530" | "534" | "535" => Error::Auth(format!("{host}: {e}")),
             _ => Error::Backend(format!("{host}: {e}")),
         };
+    }
+    // A server may turn an XOAUTH2 token down with a `334` challenge
+    // (Google's and Microsoft's do), which lettre can't answer: it says so
+    // as a failure of its own, which is the server's refusal all the same.
+    if e.is_client() && e.to_string().contains("does not expect a challenge") {
+        return Error::Auth(format!("{host}: the server refused the token"));
     }
     // A failure of the client's own (the server has no STARTTLS or no login
     // we can use) comes before anything is sent.
