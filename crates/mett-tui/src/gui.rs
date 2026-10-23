@@ -136,6 +136,9 @@ enum Shown {
     Starting,
     /// A screen the app drew: its cells, and the cursor, if shown.
     Screen(Buffer, Option<Position>),
+    /// The app drew a screen into the [`Frames`] slot: take the latest.
+    /// (Only a wake-up: the screens don't queue in the event loop.)
+    Frame,
     /// The app ended, with this exit code, and what it had to say. The
     /// window shows that until the user presses a key or closes it.
     Ended(ExitCode, Vec<String>),
@@ -274,6 +277,7 @@ fn show(shown: Shown, start: Option<(StartApp, Fonts)>) -> ExitCode {
     };
     let mut gui = Gui {
         proxy: event_loop.create_proxy(),
+        frames: Arc::default(),
         start,
         fonts,
         shown,
@@ -303,6 +307,8 @@ type Pixels = AspectPreservingDefaultPostProcessor;
 struct Gui {
     /// For the app's thread to reach the window's.
     proxy: EventLoopProxy<Shown>,
+    /// Where the app's latest screen waits for the window.
+    frames: Arc<Frames>,
     /// Starts the app, once the window is open.
     start: Option<StartApp>,
     fonts: Fonts,
@@ -380,6 +386,7 @@ impl Gui {
             let screen = WindowScreen {
                 size: self.size.clone(),
                 proxy: self.proxy.clone(),
+                frames: self.frames.clone(),
                 capture: Terminal::new(Capture {
                     size: self.size.clone(),
                     cursor: None,
@@ -505,14 +512,19 @@ impl Gui {
         }
         let shown = &self.shown;
         let drawn = terminal.draw(|frame| match shown {
-            Shown::Starting => {}
+            // (A wake-up is turned into a screen before it is shown.)
+            Shown::Starting | Shown::Frame => {}
             Shown::Screen(buffer, cursor) => {
                 let area = frame.area();
                 let target = frame.buffer_mut();
-                // The window may have changed size since the app drew.
-                for y in 0..area.height.min(buffer.area.height) {
-                    for x in 0..area.width.min(buffer.area.width) {
-                        target[(x, y)] = buffer[(x, y)].clone();
+                if buffer.area == target.area {
+                    target.clone_from(buffer);
+                } else {
+                    // The window changed size since the app drew.
+                    for y in 0..area.height.min(buffer.area.height) {
+                        for x in 0..area.width.min(buffer.area.width) {
+                            target[(x, y)] = buffer[(x, y)].clone();
+                        }
                     }
                 }
                 // ratatui-wgpu draws no cursor: it is the cell in reverse,
@@ -559,6 +571,15 @@ impl ApplicationHandler<Shown> for Gui {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, shown: Shown) {
+        let shown = match shown {
+            Shown::Frame => match self.frames.take() {
+                // The app is over: its last words stay.
+                Some(_) if matches!(self.shown, Shown::Ended(..)) => return,
+                Some((buffer, cursor)) => Shown::Screen(buffer, cursor),
+                None => return,
+            },
+            shown => shown,
+        };
         if let Shown::Ended(code, said) = &shown {
             self.code = *code;
             self.input = None;
@@ -773,12 +794,35 @@ fn function_key(key: NamedKey) -> Option<u8> {
         .and_then(|i| u8::try_from(i + 1).ok())
 }
 
+/// The latest screen the app drew, which the window hasn't taken yet. A
+/// newer screen replaces it, so a window that draws slower than the app
+/// doesn't fall behind.
+#[derive(Default)]
+struct Frames(Mutex<Option<(Buffer, Option<Position>)>>);
+
+impl Frames {
+    /// Leaves a screen. Returns whether the window needs waking: not when
+    /// a screen was already waiting, as a wake-up for it is on its way.
+    fn put(&self, buffer: Buffer, cursor: Option<Position>) -> bool {
+        crate::platform::lock(&self.0)
+            .replace((buffer, cursor))
+            .is_none()
+    }
+
+    /// Takes the latest screen, if there is one.
+    fn take(&self) -> Option<(Buffer, Option<Position>)> {
+        crate::platform::lock(&self.0).take()
+    }
+}
+
 /// The window, as the app's thread draws on it.
 pub(crate) struct WindowScreen {
     /// The window's size, in cells.
     size: Arc<Mutex<Size>>,
-    /// Where screens go.
+    /// Wakes the window when a screen is waiting.
     proxy: EventLoopProxy<Shown>,
+    /// Where screens go.
+    frames: Arc<Frames>,
     /// Draws a screen into cells.
     capture: Terminal<Capture>,
 }
@@ -797,9 +841,13 @@ impl crate::Frontend for WindowScreen {
         })?;
         let cursor = self.capture.backend().cursor;
         let cells = cells.expect("drawn");
-        self.proxy
-            .send_event(Shown::Screen(cells, cursor))
-            .map_err(|_| std::io::Error::other("the window closed"))
+        // A window slower than the app only ever sees the latest screen.
+        if self.frames.put(cells, cursor) {
+            self.proxy
+                .send_event(Shown::Frame)
+                .map_err(|_| std::io::Error::other("the window closed"))?;
+        }
+        Ok(())
     }
 
     fn edit(
@@ -882,6 +930,25 @@ impl Backend for Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn frames_keep_only_the_latest_screen() {
+        let frames = Frames::default();
+        assert!(frames.take().is_none());
+        let small = Buffer::empty(Rect::new(0, 0, 2, 1));
+        let big = Buffer::empty(Rect::new(0, 0, 4, 3));
+        // The first screen needs a wake-up; the next ones don't.
+        assert!(frames.put(small, None));
+        assert!(!frames.put(big, Some(Position::new(1, 1))));
+        let (buffer, cursor) = frames.take().expect("a screen");
+        // The latest, at its own size, with its cursor.
+        assert_eq!(buffer.area, Rect::new(0, 0, 4, 3));
+        assert_eq!(cursor, Some(Position::new(1, 1)));
+        assert!(frames.take().is_none());
+        // After a take, the next screen wakes the window again.
+        assert!(frames.put(Buffer::empty(Rect::new(0, 0, 1, 1)), None));
+    }
 
     fn press(
         logical: Key,
