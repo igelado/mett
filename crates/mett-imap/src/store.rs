@@ -725,32 +725,31 @@ async fn page_of(
     Ok((MessagePage { messages, next }, selected))
 }
 
-/// The messages that came in at or after `since` (the server dates them by
-/// the day, in its own zone, so this asks for the day before too, and
-/// keeps those that did by the minute).
-async fn arrived_since(live: &mut Live, since: DateTime<Utc>, unseen: bool) -> Res<BTreeSet<u32>> {
+/// The messages that came in at or after `since`, with when (the server
+/// dates them by the day, in its own zone, so this asks for the day before
+/// too, and keeps those that did by the minute). Of the unread ones
+/// (`unseen`), only the newest `RECENT_UNREAD * 4` are looked at: no more
+/// than `RECENT_UNREAD` are told.
+async fn arrived_since(
+    live: &mut Live,
+    since: DateTime<Utc>,
+    unseen: bool,
+) -> Res<HashMap<u32, DateTime<Utc>>> {
     let day = day(since - chrono::TimeDelta::days(1));
     let query = if unseen {
         format!("UNSEEN SINCE {day}")
     } else {
         format!("SINCE {day}")
     };
-    let uids: Vec<u32> = search(live, &query).await?;
-    let dates: HashMap<u32, Option<DateTime<Utc>>> =
-        fetch(live, &uids, "(UID FLAGS INTERNALDATE)", false)
-            .await?
-            .into_iter()
-            .map(|f| (f.uid, f.internal))
-            .collect();
-    Ok(uids
+    let mut uids: Vec<u32> = search(live, &query).await?;
+    if unseen {
+        uids.truncate(RECENT_UNREAD * 4);
+    }
+    Ok(fetch(live, &uids, "(UID FLAGS INTERNALDATE)", false)
+        .await?
         .into_iter()
-        .filter(|uid| {
-            dates
-                .get(uid)
-                .copied()
-                .flatten()
-                .is_none_or(|at| at >= since)
-        })
+        .filter_map(|f| Some((f.uid, f.internal?)))
+        .filter(|(_, at)| *at >= since)
         .collect())
 }
 
@@ -837,15 +836,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             let mut found: HashMap<u32, DateTime<Utc>> = HashMap::new();
             let unseen: BTreeSet<u32> = search(live, "UNSEEN").await?.into_iter().collect();
             if let Some(since) = since {
-                let dated = arrived_since(live, since, true).await?;
-                let dates = fetch(
-                    live,
-                    &dated.iter().copied().collect::<Vec<_>>(),
-                    "(UID FLAGS INTERNALDATE)",
-                    false,
-                )
-                .await?;
-                found.extend(dates.into_iter().filter_map(|f| Some((f.uid, f.internal?))));
+                found.extend(arrived_since(live, since, true).await?);
             } else {
                 // The newest are enough: no more than that are told.
                 let newest: Vec<u32> = unseen
@@ -967,7 +958,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
             // after `since`, by the dates the server gives.
             let mut uids = uids;
             if floor.is_none_or(|f| f.modseq.is_none() || !live.caps.condstore) {
-                uids.extend(arrived_since(live, since, false).await?);
+                uids.extend(arrived_since(live, since, false).await?.into_keys());
             }
             let (mut page, _) = page_of(live, folder.as_str(), Some(uids), &page).await?;
             // What this finds changed now, whatever date it came in with:
