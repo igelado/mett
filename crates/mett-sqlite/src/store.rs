@@ -268,6 +268,11 @@ impl<S: MailStore> CachedStore<S> {
             .filter(|_| self.caching())
             .ok_or_else(|| Error::Backend("cache: not caching".into()))?;
         let mut db = db.lock().unwrap_or_else(|e| e.into_inner());
+        // Calls that waited for the lock while another one found the cache
+        // busy don't wait on it again.
+        if !self.caching() {
+            return Err(Error::Backend("cache: not caching".into()));
+        }
         let done = f(&mut db);
         match &done {
             Err(e) if is_busy(e) => {
