@@ -249,7 +249,7 @@ backticks, likewise run on a thread of their own, one at a time, and
 report back to the main loop.
 
 Requests are served concurrently, but reads (listing, fetching, checking)
-only six at a time, the rest waiting their turn; writes (flags, moves,
+only six calls at a time (a throttled call gives its turn up while it waits), the rest waiting their turn; writes (flags, moves,
 sends, drafts) and the lookups the UI may give up on never wait behind them.
 A read the UI no longer wants still runs once its turn comes (cancelling
 stale fetches is not done yet).

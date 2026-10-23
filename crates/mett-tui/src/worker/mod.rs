@@ -255,8 +255,9 @@ fn is_read(request: &Request) -> bool {
 
 /// Serves requests until the request channel closes. Each request runs as
 /// its own task, so a slow fetch doesn't hold up the others; reads are
-/// limited to [`READS_AT_ONCE`] at a time, and the rest wait their turn
-/// (in the order they came).
+/// limited to [`READS_AT_ONCE`] store calls at a time, and the rest wait
+/// their turn (in the order they came). A call throttled by the server
+/// gives its turn up while it waits to be tried again.
 pub async fn run<S: MailStore + MailSender + 'static>(
     store: Arc<S>,
     mut requests: mpsc::UnboundedReceiver<(RequestId, Request)>,
@@ -284,11 +285,6 @@ pub async fn run<S: MailStore + MailSender + 'static>(
         // before then.
         let mut registered = crate::platform::lock(&queries);
         let task = tokio::spawn(async move {
-            // Held until the request is served.
-            let _turn = match read {
-                Some(reads) => reads.acquire_owned().await.ok(),
-                None => None,
-            };
             // The UI hears of every wait for the server, with the request.
             let notify = |wait, attempt| {
                 let _ = responses.send(Response {
@@ -299,6 +295,7 @@ pub async fn run<S: MailStore + MailSender + 'static>(
             let patient = Patient {
                 store: &*store,
                 notify: &notify,
+                turns: read.as_deref(),
             };
             let event = serve(&patient, request).await;
             if query {
