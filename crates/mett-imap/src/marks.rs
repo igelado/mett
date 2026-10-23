@@ -36,7 +36,14 @@ struct Mark {
     validity: u32,
     /// How the folder stood when last asked about.
     now: Floor,
-    /// What that was compared with, for the pages of the same scan that
+    /// How it stood the time before: a scan compares with that, so that
+    /// what the last scan found is found again by this one. A check that is
+    /// made of more than one request (the worker lists the newest page as it
+    /// asks for the changes) may fail after this has noted a scan, and its
+    /// result is then thrown away: what it found must not be lost with it.
+    /// What is found twice is taken in once, as the app does.
+    lag: Option<Floor>,
+    /// What that scan was compared with, for the pages of the same scan that
     /// come after the first.
     scanning: Option<Floor>,
 }
@@ -54,16 +61,21 @@ pub(crate) struct Marks {
 type Found = (u32, HashMap<u32, DateTime<Utc>>);
 
 impl Marks {
-    /// What to compare the folder with: how it stood when last asked (the
-    /// first page of a scan), or what the scan under way compares with (the
-    /// pages after it). `None` if it was never asked about.
+    /// What to compare the folder with: how it stood the time before the last
+    /// it was asked about (the first page of a scan), or what the scan under
+    /// way compares with (the pages after it). `None` if it was never asked
+    /// about.
     pub fn floor(&self, watch: Watch, folder: &str, validity: u32, first: bool) -> Option<Floor> {
         let marks = self.marks.lock().expect("no panic holds the marks");
         let mark = marks.get(&(watch, folder.to_owned()))?;
         if mark.validity != validity {
             return None;
         }
-        if first { Some(mark.now) } else { mark.scanning }
+        if first {
+            Some(mark.lag.unwrap_or(mark.now))
+        } else {
+            mark.scanning
+        }
     }
 
     /// The unread mail found new in the folder, with when it was found: what
@@ -106,6 +118,7 @@ impl Marks {
                     Mark {
                         validity,
                         now,
+                        lag: None,
                         scanning: None,
                     },
                 );
@@ -118,9 +131,10 @@ impl Marks {
     pub fn rollback(&self, watch: Watch, folder: &str) {
         let mut marks = self.marks.lock().expect("no panic holds the marks");
         let key = (watch, folder.to_owned());
-        let restored = marks
-            .get_mut(&key)
-            .map(|mark| mark.scanning.inspect(|floor| mark.now = *floor).is_some());
+        let restored = marks.get_mut(&key).map(|mark| {
+            mark.lag = None;
+            mark.scanning.inspect(|floor| mark.now = *floor).is_some()
+        });
         // A scan that began with no mark leaves none.
         if restored == Some(false) {
             marks.remove(&key);
@@ -138,11 +152,17 @@ impl Marks {
         floor: Option<Floor>,
     ) {
         let mut marks = self.marks.lock().expect("no panic holds the marks");
+        let key = (watch, folder.to_owned());
+        let before = marks
+            .get(&key)
+            .filter(|mark| mark.validity == validity)
+            .map(|mark| mark.now);
         marks.insert(
-            (watch, folder.to_owned()),
+            key,
             Mark {
                 validity,
                 now,
+                lag: before,
                 scanning: floor,
             },
         );
@@ -178,6 +198,20 @@ mod tests {
             marks.floor(Watch::Changes, "INBOX", 1, false),
             Some(floor(10))
         );
+    }
+
+    #[test]
+    fn a_scan_starts_from_where_the_one_before_the_last_got() {
+        let marks = Marks::default();
+        marks.commit(Watch::Changes, "INBOX", 1, floor(10), None);
+        marks.commit(Watch::Changes, "INBOX", 1, floor(20), Some(floor(10)));
+        // What the last scan found is found again by the next (the check it
+        // was part of may have failed).
+        assert_eq!(
+            marks.floor(Watch::Changes, "INBOX", 1, true),
+            Some(floor(10))
+        );
+        marks.commit(Watch::Changes, "INBOX", 1, floor(30), Some(floor(10)));
         assert_eq!(
             marks.floor(Watch::Changes, "INBOX", 1, true),
             Some(floor(20))

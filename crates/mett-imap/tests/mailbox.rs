@@ -907,7 +907,13 @@ async fn mail_that_arrives_with_an_old_date_is_still_new() {
         1
     );
 
-    // Once seen, it isn't new again.
+    // The check that found it may have failed elsewhere and been thrown
+    // away, so the next finds it again; the one after, not.
+    let again = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(again.messages.len(), 1);
     let changed = store
         .changed_messages(&inbox, since, Page::first(10))
         .await
@@ -1108,7 +1114,17 @@ async fn sees_flags_another_client_changed_where_the_server_tracks_changes() {
     assert_eq!(unread.len(), 1);
     assert!(unread[0].0.as_str().contains(&format!(".{read}.")));
 
-    // Seen once, they are not changed again.
+    // The check may have failed elsewhere and been thrown away: the next
+    // finds them again. The one after that doesn't.
+    assert_eq!(
+        store
+            .changed_messages(&inbox, since, Page::first(10))
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
     assert!(
         store
             .changed_messages(&inbox, since, Page::first(10))
@@ -1339,8 +1355,14 @@ async fn what_comes_in_between_listing_a_folder_and_the_first_poll_is_new() {
         .changed_messages(&inbox, since, Page::first(10))
         .await
         .unwrap();
-    assert_eq!(changed.messages.len(), 1);
-    assert_eq!(changed.messages[0].subject, "copied in too");
+    let mut subjects: Vec<_> = changed
+        .messages
+        .iter()
+        .map(|m| m.subject.as_str())
+        .collect();
+    subjects.sort_unstable();
+    // The one the last check found is found again, in case that check failed.
+    assert_eq!(subjects, ["copied in", "copied in too"]);
 }
 
 #[tokio::test]
@@ -1552,4 +1574,29 @@ async fn new_unread_mail_is_reported_by_every_check_until_it_is_read() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn a_check_thrown_away_after_the_changes_were_read_loses_nothing() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("listed"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    store.list_messages(&inbox, Page::first(10)).await.unwrap();
+    deliver(&server, "INBOX", &simple("copied in"), &[]);
+    // The poll reads the changes, but another part of it fails: the app
+    // throws it all away, and asks again.
+    let lost = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(lost.messages.len(), 1);
+    drop(lost);
+    let asked_again = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(asked_again.messages[0].subject, "copied in");
 }
