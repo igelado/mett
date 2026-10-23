@@ -721,7 +721,9 @@ impl<S: MailStore> MailStore for CachedStore<S> {
     }
 
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
-        if self.caching() {
+        // A cursor that isn't the cache's (the server's, or a listing the
+        // cache began, resumed from the server) goes on there.
+        if self.caching() && page.cursor().is_none_or(is_cached) {
             match self.list_cached(folder, &page).await {
                 Err(e) if self.skips_cache(&e) => {}
                 listed => return listed,
@@ -744,7 +746,7 @@ impl<S: MailStore> MailStore for CachedStore<S> {
         since: DateTime<Utc>,
         page: Page,
     ) -> Result<MessagePage> {
-        if self.caching() {
+        if self.caching() && page.cursor().is_none_or(is_cached) {
             match self.changed_cached(folder, since, &page).await {
                 Err(e) if self.skips_cache(&e) => {}
                 listed => return listed,
