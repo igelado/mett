@@ -8,7 +8,7 @@ use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::transport::smtp::{self, AsyncSmtpTransport};
 use lettre::{Address as MailAddress, AsyncTransport, Tokio1Executor};
-use mett_core::{AccessToken, Address, Authenticator, Draft, Error, MailSender, Result};
+use mett_core::{AccessToken, Address, Authenticator, Draft, Error, Result};
 
 use crate::compose::{Threading, compose};
 
@@ -41,7 +41,8 @@ pub struct SmtpSettings {
     pub ca_certificates: Vec<Vec<u8>>,
     /// The sender's address, for messages that don't name another.
     pub from: Address,
-    /// How long to wait for the server.
+    /// How long to wait for the server at each step; a whole send is given
+    /// three times as long.
     pub timeout: Duration,
 }
 
@@ -122,14 +123,15 @@ impl<A: Authenticator> SmtpSender<A> {
         Self { settings, login }
     }
 
-    /// Sends `draft`, threaded as `threading` says. Returns the message
-    /// as the sender keeps it (see [`Composed::kept`](crate::Composed)),
-    /// and its `Message-ID:`.
-    pub async fn send_threaded(
-        &self,
-        draft: &Draft,
-        threading: &Threading,
-    ) -> Result<(String, Vec<u8>)> {
+    /// Sends `draft`, threaded as `threading` says. Returns the message's
+    /// `Message-ID:` and the message as the sender keeps it (see
+    /// [`Composed::kept`](crate::Composed)).
+    ///
+    /// This isn't a [`mett_core::MailSender`]: that port promises a copy in
+    /// the sent-items folder if the draft asks for one, which takes a
+    /// mailbox. The mailbox (IMAP) implements the port, and stores the
+    /// copy this returns.
+    pub async fn send(&self, draft: &Draft, threading: &Threading) -> Result<(String, Vec<u8>)> {
         let composed = compose(draft, &self.settings.from, threading)?;
         let envelope = Envelope::new(
             Some(address(&composed.sender)?),
@@ -211,20 +213,17 @@ impl<A: Authenticator> SmtpSender<A> {
                 transport = transport.authentication(vec![Mechanism::Xoauth2]);
             }
         }
-        transport
-            .build()
-            .send_raw(envelope, message)
-            .await
-            .map(drop)
-            .map_err(|e| failure(&e, &settings.host))
-    }
-}
-
-impl<A: Authenticator> MailSender for SmtpSender<A> {
-    async fn send(&self, draft: &Draft) -> Result<()> {
-        self.send_threaded(draft, &Threading::default())
-            .await
-            .map(drop)
+        // Lettre's timeout is for each step of the exchange, not for all of
+        // it: a server that answers slowly can't keep the send pending.
+        let transport = transport.build();
+        let sent = transport.send_raw(envelope, message);
+        match tokio::time::timeout(settings.timeout * 3, sent).await {
+            Ok(sent) => sent.map(drop).map_err(|e| failure(&e, &settings.host)),
+            Err(_) => Err(Error::Network(format!(
+                "{}: the server took too long",
+                settings.host
+            ))),
+        }
     }
 }
 
@@ -250,7 +249,8 @@ fn not_sent(e: Error) -> Error {
 ///
 /// A server's answer (4xx or 5xx) tells that the message wasn't taken:
 /// it is a [`Error::Backend`] or, for refused logins, an [`Error::Auth`].
-/// A failure to set up TLS comes before anything is sent. Anything else
+/// A failure to set up TLS, or of the client's own, comes before anything
+/// is sent. Anything else
 /// (a lost connection, a timeout) may have come after the server took the
 /// message, so it is an [`Error::Network`], which the user is told may have
 /// gone out.
@@ -263,7 +263,9 @@ fn failure(e: &smtp::Error, host: &str) -> Error {
             _ => Error::Backend(format!("{host}: {e}")),
         };
     }
-    if e.is_tls() {
+    // A failure of the client's own (the server has no STARTTLS or no login
+    // we can use) comes before anything is sent.
+    if e.is_tls() || e.is_client() {
         return Error::NotSent(format!("{host}: {e}"));
     }
     Error::Network(format!("{host}: {e}"))

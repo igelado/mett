@@ -5,9 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use mett_core::{
-    AccessToken, Address, Authenticator, Draft, Error, MailSender, OutgoingAttachment,
-};
+use mett_core::{AccessToken, Address, Authenticator, Draft, Error, OutgoingAttachment};
 use mett_smtp::{Login, NoTokens, Security, SmtpSender, SmtpSettings, Threading};
 use rcgen::{CertificateParams, KeyPair, SanType};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -214,7 +212,7 @@ fn draft() -> Draft {
 async fn sends_in_plain_text() {
     let server = server(false, Accept::Everything).await;
     let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), Login::None);
-    sender.send(&draft()).await.unwrap();
+    sender.send(&draft(), &Threading::default()).await.unwrap();
 
     let seen = server.seen.lock().unwrap();
     let seen = &seen[0];
@@ -244,7 +242,7 @@ async fn upgrades_with_starttls() {
         password: "hunter2".into(),
     };
     let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::StartTls), login);
-    sender.send(&draft()).await.unwrap();
+    sender.send(&draft(), &Threading::default()).await.unwrap();
 
     let seen = server.seen.lock().unwrap();
     assert!(seen[0].encrypted);
@@ -256,7 +254,7 @@ async fn upgrades_with_starttls() {
 async fn is_encrypted_from_the_start_with_tls() {
     let server = server(true, Accept::Everything).await;
     let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::Tls), Login::None);
-    sender.send(&draft()).await.unwrap();
+    sender.send(&draft(), &Threading::default()).await.unwrap();
     assert!(server.seen.lock().unwrap()[0].encrypted);
 }
 
@@ -266,7 +264,10 @@ async fn refuses_a_certificate_it_does_not_trust() {
     let mut settings = settings(&server, Security::Tls);
     settings.ca_certificates.clear();
     let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
-    let error = sender.send(&draft()).await.unwrap_err();
+    let error = sender
+        .send(&draft(), &Threading::default())
+        .await
+        .unwrap_err();
     assert!(!matches!(error, Error::Backend(_)), "{error}");
     assert!(server.seen.lock().unwrap().is_empty());
 }
@@ -278,7 +279,7 @@ async fn accepts_any_certificate_when_not_verifying() {
     settings.ca_certificates.clear();
     settings.verify = false;
     let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
-    sender.send(&draft()).await.unwrap();
+    sender.send(&draft(), &Threading::default()).await.unwrap();
     assert_eq!(server.seen.lock().unwrap().len(), 1);
 }
 
@@ -290,7 +291,10 @@ async fn a_wrong_password_is_an_authentication_error() {
         password: "wrong".into(),
     };
     let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::StartTls), login);
-    let error = sender.send(&draft()).await.unwrap_err();
+    let error = sender
+        .send(&draft(), &Threading::default())
+        .await
+        .unwrap_err();
     assert!(matches!(error, Error::Auth(_)), "{error}");
 }
 
@@ -329,7 +333,7 @@ async fn logs_in_with_an_oauth_token_and_asks_for_another_when_refused() {
         tokens,
     };
     let sender = SmtpSender::new(settings(&server, Security::StartTls), login);
-    sender.send(&draft()).await.unwrap();
+    sender.send(&draft(), &Threading::default()).await.unwrap();
 
     let seen = server.seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
@@ -351,7 +355,7 @@ async fn threads_a_reply_and_attaches_files() {
         in_reply_to: Some("<one@example.org>".into()),
         references: vec!["<zero@example.org>".into(), "<one@example.org>".into()],
     };
-    let (id, kept) = sender.send_threaded(&draft, &threading).await.unwrap();
+    let (id, kept) = sender.send(&draft, &threading).await.unwrap();
 
     let seen = server.seen.lock().unwrap();
     let data = &seen[0].data;
@@ -370,7 +374,10 @@ async fn threads_a_reply_and_attaches_files() {
 async fn a_message_without_recipients_is_not_sent() {
     let server = server(false, Accept::Everything).await;
     let sender = SmtpSender::<NoTokens>::new(settings(&server, Security::None), Login::None);
-    let error = sender.send(&Draft::default()).await.unwrap_err();
+    let error = sender
+        .send(&Draft::default(), &Threading::default())
+        .await
+        .unwrap_err();
     assert!(matches!(error, Error::NotSent(_)), "{error}");
 }
 
@@ -383,6 +390,31 @@ async fn an_unreachable_server_is_a_network_error() {
         SmtpSettings::new("127.0.0.1", Security::None, Address::new("me@example.com"));
     settings.port = port;
     let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
-    let error = sender.send(&draft()).await.unwrap_err();
+    let error = sender
+        .send(&draft(), &Threading::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Network(_)), "{error}");
+}
+
+#[tokio::test]
+async fn a_server_that_never_answers_is_given_up_on() {
+    // It takes the connection and says nothing.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _silent = tokio::spawn(async move {
+        let held = listener.accept().await;
+        std::future::pending::<()>().await;
+        drop(held);
+    });
+    let mut settings =
+        SmtpSettings::new("127.0.0.1", Security::None, Address::new("me@example.com"));
+    settings.port = port;
+    settings.timeout = std::time::Duration::from_millis(100);
+    let sender = SmtpSender::<NoTokens>::new(settings, Login::None);
+    let error = sender
+        .send(&draft(), &Threading::default())
+        .await
+        .unwrap_err();
     assert!(matches!(error, Error::Network(_)), "{error}");
 }

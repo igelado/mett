@@ -2,7 +2,7 @@
 //!
 //! This crate sends mail over SMTP, wrapping the [`lettre`] crate:
 //!
-//! - [`SmtpSender`] implements [`mett_core::MailSender`]. It connects in
+//! - [`SmtpSender`] sends a [`mett_core::Draft`]. It connects in
 //!   plain text, with STARTTLS or with TLS from the first byte
 //!   ([`Security`]), and logs in with a password or, through an
 //!   [`mett_core::Authenticator`], with an OAuth2 token (SASL XOAUTH2)
