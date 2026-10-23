@@ -1,6 +1,8 @@
 //! Flag bookkeeping: changing flags in the index at once, and tracking
 //! which changes the server has saved.
 
+use std::collections::HashMap;
+
 use super::*;
 
 impl App {
@@ -22,7 +24,7 @@ impl App {
         // listing shown may predate it.
         let in_flight = match &self.writing {
             Some((_, Write::Flags(id, sent)))
-                if *id == message_id && !self.mailbox_flags.contains_key(&message_id) =>
+                if *id == message_id && !self.flag_sync.mailbox.contains_key(&message_id) =>
             {
                 Some(*sent)
             }
@@ -44,35 +46,20 @@ impl App {
         summary.flags = flags;
         // What the mailbox has, as far as mett knows, while changes are
         // on their way.
-        self.mailbox_flags
+        self.flag_sync
+            .mailbox
             .entry(message_id.clone())
             .or_insert(before);
-        self.wanted_flags.insert(message_id.clone(), flags);
+        self.flag_sync.wanted.insert(message_id.clone(), flags);
         // Changing back what failed to change gives up on it.
-        if let Some((_, failed)) = self.save_failures.get_mut(&message_id) {
-            if failed
-                .read
-                .is_some_and(|read| update.read.is_some_and(|new| new != read))
-            {
-                failed.read = None;
-            }
-            if failed
-                .flagged
-                .is_some_and(|flagged| update.flagged.is_some_and(|new| new != flagged))
-            {
-                failed.flagged = None;
-            }
-            if *failed == FlagsUpdate::default() {
-                self.save_failures.remove(&message_id);
-            }
-        }
+        self.flag_sync.changed_back(&message_id, update);
         // A change still waiting its turn takes this one along.
         let queued = self.writes.iter_mut().find_map(|write| match write {
             Write::Flags(id, queued) if *id == message_id => Some(queued),
             _ => None,
         });
         if let Some(queued) = queued {
-            *queued = merged(*queued, update);
+            *queued = queued.merged(update);
             return Vec::new();
         }
         self.write(Write::Flags(message_id, update))
@@ -84,8 +71,8 @@ impl App {
     /// mett knows nothing more about.
     pub(super) fn flags_to_send(&self, message: &MessageId, update: FlagsUpdate) -> FlagsUpdate {
         match (
-            self.wanted_flags.get(message),
-            self.mailbox_flags.get(message),
+            self.flag_sync.wanted.get(message),
+            self.flag_sync.mailbox.get(message),
         ) {
             (Some(wanted), Some(mailbox)) => FlagsUpdate {
                 read: (wanted.read != mailbox.read).then_some(wanted.read),
@@ -111,38 +98,24 @@ impl App {
                 }
                 // Pages of a listing on their way may predate it.
                 if self.fetching_index() {
-                    let saved = self.saved_flags.get(&message).copied().unwrap_or_default();
-                    self.saved_flags
-                        .insert(message.clone(), merged(saved, update));
+                    let saved = self
+                        .flag_sync
+                        .saved
+                        .get(&message)
+                        .copied()
+                        .unwrap_or_default();
+                    self.flag_sync
+                        .saved
+                        .insert(message.clone(), saved.merged(update));
                 }
-                self.forget_saved(&message, update);
+                self.flag_sync.forget_saved(&message, update);
             }
             Err(e) => {
-                let failed = self
-                    .save_failures
-                    .get(&message)
-                    .map_or(update, |(_, before)| merged(*before, update));
-                self.save_failures.insert(message, (e.to_string(), failed));
+                self.flag_sync.fail(&message, e.to_string(), update);
                 self.report(e);
             }
         }
         Vec::new()
-    }
-
-    /// Forgets that saving what `update` has saved now failed before for
-    /// `message`.
-    pub(super) fn forget_saved(&mut self, message: &MessageId, update: FlagsUpdate) {
-        if let Some((_, failed)) = self.save_failures.get_mut(message) {
-            if update.read.is_some() {
-                failed.read = None;
-            }
-            if update.flagged.is_some() {
-                failed.flagged = None;
-            }
-            if *failed == FlagsUpdate::default() {
-                self.save_failures.remove(message);
-            }
-        }
     }
 
     /// Handles the outcome of a flag change.
@@ -157,7 +130,7 @@ impl App {
         }
         // Sent for a message mett has no flags for (its folder wasn't
         // open): only the fields it changed are known.
-        let Some(mut mailbox) = self.mailbox_flags.get(&message).copied() else {
+        let Some(mut mailbox) = self.flag_sync.mailbox.get(&message).copied() else {
             return self.on_unknown_flags_updated(message, update, result);
         };
         let saved = result.is_ok();
@@ -165,27 +138,20 @@ impl App {
             Ok(()) => {
                 update.apply(&mut mailbox);
                 // Whatever failed before of what was saved now is done.
-                self.forget_saved(&message, update);
+                self.flag_sync.forget_saved(&message, update);
             }
             Err(e) => {
                 // What the user has changed back meanwhile isn't wanted any
                 // more; the rest is kept with what failed before, to try
                 // again together.
-                let update = match self.wanted_flags.get(&message) {
+                let update = match self.flag_sync.wanted.get(&message) {
                     Some(wanted) => FlagsUpdate {
                         read: update.read.filter(|read| *read == wanted.read),
                         flagged: update.flagged.filter(|flagged| *flagged == wanted.flagged),
                     },
                     None => update,
                 };
-                let failed = self
-                    .save_failures
-                    .get(&message)
-                    .map_or(update, |(_, before)| merged(*before, update));
-                if failed != FlagsUpdate::default() {
-                    self.save_failures
-                        .insert(message.clone(), (e.to_string(), failed));
-                }
+                self.flag_sync.fail(&message, e.to_string(), update);
                 self.report(e);
             }
         }
@@ -198,9 +164,11 @@ impl App {
             // includes what just failed. Pages of the listing on its way
             // may predate what was saved.
             if saved && self.fetching_index() {
-                self.saved_flags.insert(message.clone(), whole(mailbox));
+                self.flag_sync
+                    .saved
+                    .insert(message.clone(), FlagsUpdate::whole(mailbox));
             }
-            self.mailbox_flags.insert(message, mailbox);
+            self.flag_sync.mailbox.insert(message, mailbox);
         } else {
             self.flags_settled(&message, mailbox, saved);
         }
@@ -217,15 +185,17 @@ impl App {
         mailbox: mett_core::Flags,
         saved: bool,
     ) {
-        self.mailbox_flags.remove(message);
-        self.wanted_flags.remove(message);
+        self.flag_sync.mailbox.remove(message);
+        self.flag_sync.wanted.remove(message);
         if let Some(summary) = self.summary_mut(message) {
             summary.flags = mailbox;
         }
         // Pages of the listing on its way may predate the save (or an
         // earlier one, which a failure since doesn't undo).
-        if self.fetching_index() && (saved || self.saved_flags.contains_key(message)) {
-            self.saved_flags.insert(message.clone(), whole(mailbox));
+        if self.fetching_index() && (saved || self.flag_sync.saved.contains_key(message)) {
+            self.flag_sync
+                .saved
+                .insert(message.clone(), FlagsUpdate::whole(mailbox));
         }
     }
 
@@ -234,27 +204,134 @@ impl App {
     /// folder was listed: the listing may predate them.
     pub(super) fn overlay_wanted_flags(&self, messages: &mut [MessageSummary]) {
         for message in messages {
-            if let Some(flags) = self.wanted_flags.get(&message.id) {
+            if let Some(flags) = self.flag_sync.wanted.get(&message.id) {
                 message.flags = *flags;
-            } else if let Some(saved) = self.saved_flags.get(&message.id) {
+            } else if let Some(saved) = self.flag_sync.saved.get(&message.id) {
                 saved.apply(&mut message.flags);
             }
         }
     }
 }
 
-/// All of `flags`, as an update.
-fn whole(flags: mett_core::Flags) -> FlagsUpdate {
-    FlagsUpdate {
-        read: Some(flags.read),
-        flagged: Some(flags.flagged),
+/// What the app does with [`FlagsUpdate`]s.
+pub(super) trait FlagsUpdateExt: Sized {
+    /// All of `flags`, as an update.
+    fn whole(flags: mett_core::Flags) -> Self;
+
+    /// `self` with what `later` changes too.
+    fn merged(self, later: Self) -> Self;
+
+    /// `self` without the fields that `saved` changes.
+    fn without(self, saved: Self) -> Self;
+
+    /// `self` without the fields that `later` changes to something else:
+    /// the user changed them back.
+    fn undone_by(self, later: Self) -> Self;
+
+    /// Whether it changes nothing.
+    fn is_empty(&self) -> bool;
+}
+
+impl FlagsUpdateExt for FlagsUpdate {
+    fn whole(flags: mett_core::Flags) -> Self {
+        Self {
+            read: Some(flags.read),
+            flagged: Some(flags.flagged),
+        }
+    }
+
+    fn merged(self, later: Self) -> Self {
+        Self {
+            read: later.read.or(self.read),
+            flagged: later.flagged.or(self.flagged),
+        }
+    }
+
+    fn without(self, saved: Self) -> Self {
+        Self {
+            read: self.read.filter(|_| saved.read.is_none()),
+            flagged: self.flagged.filter(|_| saved.flagged.is_none()),
+        }
+    }
+
+    fn undone_by(self, later: Self) -> Self {
+        Self {
+            read: self
+                .read
+                .filter(|read| later.read.is_none_or(|new| new == *read)),
+            flagged: self
+                .flagged
+                .filter(|flagged| later.flagged.is_none_or(|new| new == *flagged)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 
-/// `earlier` with what `later` changes too.
-fn merged(earlier: FlagsUpdate, later: FlagsUpdate) -> FlagsUpdate {
-    FlagsUpdate {
-        read: later.read.or(earlier.read),
-        flagged: later.flagged.or(earlier.flagged),
+/// How the flag changes the user made stand with the mailbox.
+#[derive(Debug, Default)]
+pub(super) struct FlagSync {
+    /// The mailbox's flags, as far as mett knows, for messages whose flag
+    /// changes are on their way, so a failure can be undone in the index.
+    pub(super) mailbox: HashMap<MessageId, mett_core::Flags>,
+    /// The flags the user last asked for, for messages whose updates are
+    /// on their way.
+    pub(super) wanted: HashMap<MessageId, mett_core::Flags>,
+    /// Flags saved while the folder was being listed, as far as known:
+    /// pages asked for before may still have the old ones. Forgotten once
+    /// the listing is done.
+    pub(super) saved: HashMap<MessageId, FlagsUpdate>,
+    /// Changes that failed to save, by message, kept apart from the status
+    /// line so that later messages can't hide them. A later successful save
+    /// of the same message clears its entry.
+    pub(super) failures: HashMap<MessageId, (String, FlagsUpdate)>,
+}
+
+impl FlagSync {
+    /// Forgets what is only known for the listing that is done, or that
+    /// another folder replaces. Changes on their way and failed ones stay:
+    /// they don't depend on the folder.
+    pub(super) fn forget_listing(&mut self) {
+        self.saved.clear();
+    }
+
+    /// Takes `update` out of what failed for `message`: it is saved now,
+    /// or the user changed it back. A failure with nothing left is gone.
+    fn clear_failed(
+        &mut self,
+        message: &MessageId,
+        clear: impl FnOnce(FlagsUpdate) -> FlagsUpdate,
+    ) {
+        if let Some((_, failed)) = self.failures.get_mut(message) {
+            *failed = clear(*failed);
+            if failed.is_empty() {
+                self.failures.remove(message);
+            }
+        }
+    }
+
+    /// Changing back what failed to change gives up on it.
+    pub(super) fn changed_back(&mut self, message: &MessageId, update: FlagsUpdate) {
+        self.clear_failed(message, |failed| failed.undone_by(update));
+    }
+
+    /// Forgets that saving what `update` has saved now failed before for
+    /// `message`.
+    pub(super) fn forget_saved(&mut self, message: &MessageId, update: FlagsUpdate) {
+        self.clear_failed(message, |failed| failed.without(update));
+    }
+
+    /// Notes that saving `update` failed with `error`, with what failed
+    /// before for `message` (if `update` isn't empty).
+    pub(super) fn fail(&mut self, message: &MessageId, error: String, update: FlagsUpdate) {
+        let failed = self
+            .failures
+            .get(message)
+            .map_or(update, |(_, before)| before.merged(update));
+        if !failed.is_empty() {
+            self.failures.insert(message.clone(), (error, failed));
+        }
     }
 }

@@ -189,7 +189,9 @@ sub-struct of `App` that owns its `Default` and a `reset()`, so that opening
 another folder resets it with one call and a new field can't be forgotten:
 `IndexState` (the messages and how they are threaded, limited and listed)
 and the folder's part of `Poll` (the check for new mail on its way, which
-sits with the timers and the watch that carry on across folders).
+sits with the timers and the watch that carry on across folders). `FlagSync`
+(flag changes on their way, saved or failed) forgets only what a listing
+knew; the rest doesn't depend on the folder.
 
 **Frontends.** The main loop is the same for the terminal and for
 `mett-gui`'s window: it reads crossterm events from a channel, and draws on

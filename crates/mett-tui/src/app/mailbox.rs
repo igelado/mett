@@ -498,10 +498,10 @@ impl App {
                     // The user changed them back meanwhile: what failed
                     // before isn't wanted any more either.
                     if update == FlagsUpdate::default() {
-                        if let Some(mailbox) = self.mailbox_flags.get(&message).copied() {
+                        if let Some(mailbox) = self.flag_sync.mailbox.get(&message).copied() {
                             self.flags_settled(&message, mailbox, false);
                         }
-                        self.save_failures.remove(&message);
+                        self.flag_sync.failures.remove(&message);
                         continue;
                     }
                     Write::Flags(message, update)
@@ -695,7 +695,7 @@ impl App {
         self.index.reset();
         self.retries.forget(RetryKind::Open);
         self.relist_on_return = false;
-        self.saved_flags.clear();
+        self.flag_sync.forget_listing();
         self.removed_while_listing.clear();
     }
 
@@ -737,7 +737,7 @@ impl App {
             }
         }
         for (old, new) in moved {
-            rekey(&mut self.save_failures, old, new);
+            rekey(&mut self.flag_sync.failures, old, new);
             // Moved away, it is no longer to be purged from here.
             self.transfer_failures
                 .remove(&(old.clone(), Transfer::Purge, None));
@@ -752,8 +752,8 @@ impl App {
                     self.transfer_failures.insert(key, failure);
                 }
             }
-            rekey(&mut self.mailbox_flags, old, new);
-            rekey(&mut self.wanted_flags, old, new);
+            rekey(&mut self.flag_sync.mailbox, old, new);
+            rekey(&mut self.flag_sync.wanted, old, new);
         }
     }
 
@@ -858,10 +858,10 @@ impl App {
             self.writes
                 .retain(|write| !matches!(write, Write::Flags(id, _) if done.contains(id)));
             for id in &done {
-                self.mailbox_flags.remove(id);
-                self.wanted_flags.remove(id);
+                self.flag_sync.mailbox.remove(id);
+                self.flag_sync.wanted.remove(id);
                 // Nothing left to save, or to retry (see below).
-                self.save_failures.remove(id);
+                self.flag_sync.failures.remove(id);
             }
         }
         // Moved into the open folder, the messages come back with new IDs

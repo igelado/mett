@@ -533,7 +533,7 @@ impl App {
     /// nothing is.
     pub(super) fn forget_index_changes(&mut self) {
         if !self.fetching_index() {
-            self.saved_flags.clear();
+            self.flag_sync.forget_listing();
             self.removed_while_listing.clear();
         }
     }

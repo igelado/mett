@@ -262,7 +262,8 @@ impl App {
     /// (Their failures are cleared once that succeeds.)
     pub(super) fn retry_saves(&mut self) -> Vec<Effect> {
         let mut unsaved: Vec<(MessageId, FlagsUpdate)> = self
-            .save_failures
+            .flag_sync
+            .failures
             .iter()
             .map(|(id, (_, update))| (id.clone(), *update))
             .collect();
@@ -272,7 +273,7 @@ impl App {
         // only its own.)
         let mut shown = HashMap::new();
         for summary in self.folder_messages() {
-            if self.save_failures.contains_key(&summary.id) {
+            if self.flag_sync.failures.contains_key(&summary.id) {
                 shown.entry(summary.id.clone()).or_insert(summary.flags);
             }
         }
@@ -282,7 +283,7 @@ impl App {
             .map(|(_, write)| write)
             .chain(&self.writes)
             .filter_map(|write| match write {
-                Write::Flags(id, _) if self.save_failures.contains_key(id) => Some(id.clone()),
+                Write::Flags(id, _) if self.flag_sync.failures.contains_key(id) => Some(id.clone()),
                 _ => None,
             })
             .collect();
@@ -297,7 +298,7 @@ impl App {
                     let mut flags = before;
                     update.apply(&mut flags);
                     if flags == before && !pending.contains(&message) {
-                        self.save_failures.remove(&message);
+                        self.flag_sync.failures.remove(&message);
                         return Vec::new();
                     }
                     self.update_flags(message, update)
