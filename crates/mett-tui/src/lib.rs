@@ -989,6 +989,12 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 let effects = slot.app.update(msg);
                 slot.absorb(effects);
                 stale = true;
+                // A `push <quit>` there quits mett, as it would in any
+                // account: it is the one shown, and the rest is asked.
+                if slots[at].app.quit {
+                    active = at;
+                    continue 'run;
+                }
             }
         }
         show_tabs(&mut slots, active, position);
@@ -2661,6 +2667,34 @@ mod tests {
                     .await
                     .expect("quits")
                     .unwrap();
+                assert!(ended.is_ok(), "{ended:?}");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_push_that_quits_in_an_account_not_shown_quits_mett() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let screen = Recording {
+                    drawn: Arc::default(),
+                };
+                let (_input, events) = mpsc::unbounded_channel();
+                let quit = keymap::Stroke::Key(keymap::Key::char('q'));
+                let accounts = Accounts {
+                    list: vec![
+                        demo_account("Work"),
+                        demo_account_pushing("Home", vec![quit]),
+                    ],
+                    position: app::TabPosition::Top,
+                };
+                let ended = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::task::spawn_local(run(screen, events, accounts)),
+                )
+                .await
+                .expect("quits")
+                .unwrap();
                 assert!(ended.is_ok(), "{ended:?}");
             })
             .await;
