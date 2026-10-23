@@ -41,14 +41,14 @@ pub fn compose(draft: &Draft, from: &Address, threading: &Threading) -> Result<C
         return Err(Error::NotSent("the message has no recipients".into()));
     }
     let from = draft.from.as_ref().unwrap_or(from);
-    // Lettre makes up the identifier, the same for both messages.
-    let first = build(draft, from, threading, false, None)?;
-    let message_id = first
+    // One message, so that its boundary and date are the same in both.
+    let kept = build(draft, from, threading, true)?;
+    let message_id = kept
         .headers()
         .get_raw("Message-ID")
         .map(str::to_owned)
         .ok_or_else(|| Error::NotSent("the message has no identifier".into()))?;
-    let kept = build(draft, from, threading, true, Some(&message_id))?;
+    let kept = kept.formatted();
     let recipients = draft
         .to
         .iter()
@@ -60,22 +60,41 @@ pub fn compose(draft: &Draft, from: &Address, threading: &Threading) -> Result<C
         message_id,
         sender: from.email.clone(),
         recipients,
-        sent: first.formatted(),
-        kept: kept.formatted(),
+        sent: without_bcc(&kept),
+        kept,
     })
 }
 
-/// The message, with `message_id` (made up if none is given).
-fn build(
-    draft: &Draft,
-    from: &Address,
-    threading: &Threading,
-    keep_bcc: bool,
-    message_id: Option<&str>,
-) -> Result<Message> {
-    let builder =
-        headers(draft, from, threading, keep_bcc)?.message_id(message_id.map(str::to_owned));
+/// The message, with its `Bcc:` if `keep_bcc`.
+fn build(draft: &Draft, from: &Address, threading: &Threading, keep_bcc: bool) -> Result<Message> {
+    let builder = headers(draft, from, threading, keep_bcc)?.message_id(None);
     finish(builder, draft)
+}
+
+/// `message` without its `Bcc:` header (and the lines it is folded on).
+fn without_bcc(message: &[u8]) -> Vec<u8> {
+    let end = message
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(message.len(), |at| at + 2);
+    let mut out = Vec::with_capacity(message.len());
+    let mut skipping = false;
+    for line in message[..end].split_inclusive(|b| *b == b'\n') {
+        if line.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
+            // A continuation goes with the header before it.
+            if skipping {
+                continue;
+            }
+        } else {
+            skipping = line.len() >= 4 && line[..4].eq_ignore_ascii_case(b"bcc:");
+            if skipping {
+                continue;
+            }
+        }
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(&message[end..]);
+    out
 }
 
 /// The message's headers.
@@ -219,5 +238,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, Error::NotSent(_)));
+    }
+
+    #[test]
+    fn the_copy_differs_from_what_is_sent_by_the_blind_copy_alone() {
+        let mut draft = draft();
+        draft.attachments = vec![mett_core::OutgoingAttachment {
+            name: "a.txt".into(),
+            content_type: "text/plain".into(),
+            data: b"a".to_vec(),
+        }];
+        // Enough blind copies for their header to be folded.
+        draft.bcc = (0..8)
+            .map(|n| Address::new(format!("someone-with-a-long-name-{n}@example.org")))
+            .collect();
+        let composed = compose(
+            &draft,
+            &Address::new("me@example.com"),
+            &Threading::default(),
+        )
+        .unwrap();
+        let kept = String::from_utf8(composed.kept).unwrap();
+        let sent = String::from_utf8(composed.sent).unwrap();
+        let (kept_headers, kept_body) = kept.split_once("\r\n\r\n").unwrap();
+        let (sent_headers, sent_body) = sent.split_once("\r\n\r\n").unwrap();
+        assert_eq!(kept_body, sent_body);
+        assert!(kept_headers.contains("Bcc: "));
+        assert!(!sent_headers.contains("Bcc") && !sent_headers.contains("someone-with"));
+        let mut without = Vec::new();
+        let mut in_bcc = false;
+        for line in kept_headers.split("\r\n") {
+            if !line.starts_with([' ', '\t']) {
+                in_bcc = line.starts_with("Bcc:");
+            }
+            if !in_bcc {
+                without.push(line);
+            }
+        }
+        assert_eq!(sent_headers.split("\r\n").collect::<Vec<_>>(), without);
     }
 }
