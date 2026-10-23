@@ -378,7 +378,8 @@ genuinely expected:
 ### 5.8 Rust idioms: newtypes, typestate and builders
 
 - **Newtypes:** `MessageId`, `FolderId`, `ConversationId` and similar types
-  prevent different kinds of identifiers being mixed up.
+  prevent different kinds of identifiers being mixed up. They share their
+  text (`Arc<str>`), so cloning an identifier, which is constant, copies nothing.
 - **Typestate:** an outgoing draft moves through `Draft<Editing>` to
   `Draft<Ready>`, and only `Draft<Ready>` can be passed to `Sender`.
 - **Builders:** construct the configuration and outgoing messages.

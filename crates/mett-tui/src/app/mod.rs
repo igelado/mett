@@ -465,7 +465,7 @@ pub struct App {
     /// (`false`) themselves. The others are open, or with `collapse_all`
     /// collapsed unless they hold unread mail (as mutt's
     /// `collapse_unread=no`).
-    chosen: HashMap<String, bool>,
+    chosen: HashMap<std::sync::Arc<str>, bool>,
     /// `Esc V` collapsed every thread, including those listed since.
     collapse_all: bool,
     /// Whether the limit showed each message it was applied to, kept

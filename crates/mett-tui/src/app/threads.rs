@@ -2,6 +2,7 @@
 //! and moving between them, as in mutt.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use mett_core::{MessageId, MessageSummary};
 
@@ -12,10 +13,10 @@ use crate::sort::{self, Method, Sort};
 /// What tells a thread apart, whichever message starts it: its
 /// conversation (which all its messages share), or for a message on its
 /// own, the message.
-fn thread_key(message: &MessageSummary, root: &MessageId) -> String {
+fn thread_key(message: &MessageSummary, root: &MessageId) -> Arc<str> {
     match &message.thread {
-        Some(thread) => format!("conversation {}", thread.conversation),
-        None => format!("message {root}"),
+        Some(thread) => format!("conversation {}", thread.conversation).into(),
+        None => format!("message {root}").into(),
     }
 }
 
@@ -53,7 +54,7 @@ pub struct Threaded {
     pub root: MessageId,
     /// What tells the thread apart, whichever message starts it: its
     /// conversation, or its only message.
-    pub key: String,
+    pub key: Arc<str>,
     /// For a collapsed thread's first message, how many messages are
     /// folded under it.
     pub folded: usize,
@@ -126,7 +127,7 @@ impl App {
         // The thread being taken in: its first message, its key, whether
         // it is collapsed, and how many messages are folded under it. A
         // thread's messages come together, its first message first.
-        let mut thread: Option<(MessageId, String, bool, usize)> = None;
+        let mut thread: Option<(MessageId, Arc<str>, bool, usize)> = None;
         for node in arranged.nodes {
             let message = slots[node.index].take().expect("each message once");
             if !threaded {
@@ -173,7 +174,7 @@ impl App {
     /// Says how many messages are folded under a thread [`Self::arrange`]
     /// took in, given as its first message, key, whether it is collapsed
     /// and that count.
-    fn fold_count(&mut self, thread: Option<(MessageId, String, bool, usize)>) {
+    fn fold_count(&mut self, thread: Option<(MessageId, Arc<str>, bool, usize)>) {
         if let Some((root, _, _, folded)) = thread
             && folded > 0
             && let Some(threaded) = self.threads.get_mut(&root)
@@ -300,7 +301,7 @@ impl App {
     }
 
     /// Collapses or opens the thread `key`, as the user chose.
-    fn set_collapsed(&mut self, key: String, collapsed: bool) {
+    fn set_collapsed(&mut self, key: Arc<str>, collapsed: bool) {
         self.chosen.insert(key, collapsed);
     }
 
@@ -323,7 +324,7 @@ impl App {
         let mut opened = false;
         for message in arrived.into_iter().filter(|m| !m.flags.read) {
             if let Some(thread) = &message.thread {
-                let key = format!("conversation {}", thread.conversation);
+                let key: Arc<str> = format!("conversation {}", thread.conversation).into();
                 let collapsed = self.chosen.get(&key).copied().unwrap_or(self.collapse_all);
                 if collapsed {
                     self.chosen.insert(key, false);
@@ -555,7 +556,7 @@ impl App {
                 let key = self
                     .threads
                     .get(root)
-                    .map_or_else(|| format!("message {root}"), |t| t.key.clone());
+                    .map_or_else(|| format!("message {root}").into(), |t| t.key.clone());
                 // As it shows now: collapsed if mail is folded into it;
                 // with none (yet), as chosen.
                 let collapsed = self.threads.get(root).is_some_and(|t| t.folded > 0)

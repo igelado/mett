@@ -216,11 +216,11 @@ fn collapsing_a_thread_with_nothing_to_fold_can_be_undone() {
     // A thread of one message (its replies not listed yet, say).
     let messages = vec![message("c0", 1, "c", &[0])];
     let mut app = opened(sorted("threads"), 24, messages, None).0;
-    let key = "conversation c".to_owned();
+    let key = "conversation c";
     act(&mut app, Action::CollapseThread);
-    assert_eq!(app.chosen.get(&key), Some(&true));
+    assert_eq!(app.chosen.get(key), Some(&true));
     act(&mut app, Action::CollapseThread);
-    assert_eq!(app.chosen.get(&key), Some(&false), "undone");
+    assert_eq!(app.chosen.get(key), Some(&false), "undone");
 }
 
 #[test]
