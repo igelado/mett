@@ -261,13 +261,30 @@ fn render_tabs(app: &App, frame: &mut Frame) -> Rect {
         }
     };
     let colors = &app.display.colors;
+    // Too many tabs for the line: those before the one shown go from the
+    // left until it fits.
+    let text = |at: usize, tab: &crate::app::Tab| {
+        let marker = if tab.new_mail { "*" } else { "" };
+        format!(" {} {}{marker} ", at + 1, tab.label)
+    };
+    let widths: Vec<usize> = tabs
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(at, tab)| text(at, tab).width())
+        .collect();
+    let mut first = 0;
+    while first < tabs.active
+        && widths[first..=tabs.active].iter().sum::<usize>() > usize::from(bar.width)
+    {
+        first += 1;
+    }
     let spans: Vec<Span> = tabs
         .tabs
         .iter()
         .enumerate()
+        .skip(first)
         .map(|(at, tab)| {
-            let marker = if tab.new_mail { "*" } else { "" };
-            let text = format!(" {} {}{marker} ", at + 1, tab.label);
             let style = if at == tabs.active {
                 colors.indicator
             } else if tab.new_mail {
@@ -279,7 +296,7 @@ fn render_tabs(app: &App, frame: &mut Frame) -> Rect {
             } else {
                 colors.status
             };
-            Span::styled(text, style)
+            Span::styled(text(at, tab), style)
         })
         .collect();
     frame.render_widget(Paragraph::new(Line::from(spans)).style(colors.status), bar);
@@ -1924,5 +1941,37 @@ mod tests {
     fn without_tabs_the_screen_is_the_apps_alone() {
         let app = App::new(WIDTH, HEIGHT).0;
         assert!(screen(&app)[0].starts_with("q:Quit"));
+    }
+
+    #[test]
+    fn the_tab_shown_stays_in_view_when_the_tabs_are_too_many_for_the_line() {
+        use crate::app::{Tab, Tabs};
+        let mut app = App::new(WIDTH, HEIGHT - 1).0;
+        let labels = [
+            "First account",
+            "Second account",
+            "Third account",
+            "Fourth account",
+        ];
+        app.tabs = Some(Tabs {
+            tabs: labels
+                .iter()
+                .map(|label| Tab {
+                    label: (*label).to_owned(),
+                    new_mail: false,
+                })
+                .collect(),
+            active: 3,
+            position: TabPosition::Top,
+        });
+        // 60 columns: the four need more than that.
+        let line = screen(&app)[0].clone();
+        assert!(line.contains("4 Fourth account"), "{line}");
+        assert!(!line.contains("1 First account"), "{line}");
+        // With the first shown, they start from it.
+        if let Some(tabs) = &mut app.tabs {
+            tabs.active = 0;
+        }
+        assert!(screen(&app)[0].starts_with(" 1 First account"));
     }
 }

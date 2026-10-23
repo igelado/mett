@@ -317,14 +317,14 @@ impl Config {
         else {
             return;
         };
-        // In a mettrc `\` is an escape: paths are written with `/`.
-        let written = file.display().to_string().replace('\\', "/");
         for account in &mut self.accounts {
             let config = &mut account.config;
             if config.was_set("alias_file") {
                 continue;
             }
-            let _ = config.run_line(&format!("set alias_file='{written}'"));
+            // Set as it is, not written in a mettrc line: a path may hold
+            // what a mettrc takes for quotes.
+            config.store("alias_file", Value::Str(file.display().to_string()));
             if file.exists() {
                 config.source(&file, 1);
             }
@@ -1913,7 +1913,7 @@ mod tests {
         config.share_aliases_with_accounts();
         assert!(config.errors.is_empty(), "{:?}", config.errors);
         let accounts = config.accounts();
-        let written = dir.join("aliases").display().to_string().replace('\\', "/");
+        let written = dir.join("aliases").display().to_string();
         assert_eq!(accounts[0].config.string("alias_file"), written);
         assert_eq!(accounts[0].config.aliases().len(), 1, "read");
         // One that names its own file keeps it.
