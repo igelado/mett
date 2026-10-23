@@ -112,7 +112,7 @@ pub(crate) fn summary(folder: &str, validity: u32, fetched: &Fetched) -> Result<
         received: sent.or(fetched.internal).unwrap_or(DateTime::UNIX_EPOCH),
         flags: fetched.flags,
         has_attachments: multipart_mixed,
-        draft: fetched.draft && sent.is_none(),
+        draft: fetched.draft,
         delivered: fetched.internal,
         modified: None,
         thread,

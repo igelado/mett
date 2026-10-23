@@ -1,6 +1,6 @@
 //! The mailbox, over one IMAP connection.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_imap::Session;
@@ -15,6 +15,8 @@ use mett_core::{
 };
 use mett_smtp::{SmtpSender, Threading};
 use tokio::sync::{Mutex, MutexGuard};
+
+use std::sync::Mutex as Blocking;
 use utf7_imap::{decode_utf7_imap, encode_utf7_imap};
 
 use crate::conn::{self, Conn, Credentials, LoginFailure, within};
@@ -83,6 +85,18 @@ pub struct ImapMailStore<A = NoTokens> {
     from: Address,
     smtp: Option<SmtpSender<A>>,
     live: Mutex<Option<Live>>,
+    /// Where the `UID`s of each folder had got to when it was last asked
+    /// about new mail, by what asked.
+    marks: Blocking<HashMap<(Watch, String), (u32, u32)>>,
+}
+
+/// What asks about new mail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Watch {
+    /// [`MailStore::changed_messages`].
+    Changes,
+    /// [`MailStore::recent_unread`].
+    Unread,
 }
 
 impl<A: Authenticator> ImapMailStore<A> {
@@ -95,6 +109,7 @@ impl<A: Authenticator> ImapMailStore<A> {
             from,
             smtp: None,
             live: Mutex::new(None),
+            marks: Blocking::default(),
         }
     }
 
@@ -103,6 +118,21 @@ impl<A: Authenticator> ImapMailStore<A> {
     pub fn with_smtp(mut self, smtp: SmtpSender<A>) -> Self {
         self.smtp = Some(smtp);
         self
+    }
+
+    /// The `UID` the folder's next message had when `watch` last asked, if
+    /// it was the same folder (`validity`); and notes `selected` for the next
+    /// time. Messages from there on are new, whatever their dates say: mail
+    /// copied or moved in keeps its old `INTERNALDATE`.
+    fn arrivals(&self, watch: Watch, folder: &str, selected: &Selected) -> Option<u32> {
+        let mut marks = self.marks.lock().expect("no panic holds the marks");
+        let before = marks.insert(
+            (watch, folder.to_owned()),
+            (selected.validity, selected.next),
+        );
+        before
+            .filter(|(validity, _)| *validity == selected.validity)
+            .map(|(_, next)| next)
     }
 
     /// The account: the user at the server.
@@ -277,25 +307,26 @@ fn set(uids: impl IntoIterator<Item = u32>) -> String {
         .join(",")
 }
 
-/// The role a folder has, by what the server says of it, or else by its
-/// name.
+/// The role a folder has, by what the server says of it (and then it is
+/// declared), or else by its name.
 fn role(
     name: &str,
     delimiter: Option<&str>,
     attributes: &[NameAttribute<'_>],
-) -> Option<WellKnownFolder> {
+) -> Option<(WellKnownFolder, bool)> {
     if name.eq_ignore_ascii_case("INBOX") {
-        return Some(WellKnownFolder::Inbox);
+        return Some((WellKnownFolder::Inbox, true));
     }
     for attribute in attributes {
-        match attribute {
-            NameAttribute::Sent => return Some(WellKnownFolder::SentItems),
-            NameAttribute::Drafts => return Some(WellKnownFolder::Drafts),
-            NameAttribute::Trash => return Some(WellKnownFolder::DeletedItems),
-            NameAttribute::Junk => return Some(WellKnownFolder::JunkEmail),
-            NameAttribute::Archive | NameAttribute::All => return Some(WellKnownFolder::Archive),
-            _ => {}
-        }
+        let declared = match attribute {
+            NameAttribute::Sent => WellKnownFolder::SentItems,
+            NameAttribute::Drafts => WellKnownFolder::Drafts,
+            NameAttribute::Trash => WellKnownFolder::DeletedItems,
+            NameAttribute::Junk => WellKnownFolder::JunkEmail,
+            NameAttribute::Archive | NameAttribute::All => WellKnownFolder::Archive,
+            _ => continue,
+        };
+        return Some((declared, true));
     }
     // Servers that say nothing of the kind use the usual names, at the top
     // or just below `INBOX` (where some keep every folder).
@@ -312,15 +343,18 @@ fn role(
     if !top {
         return None;
     }
-    Some(match last.as_str() {
-        "sent" | "sent items" | "sent messages" | "sent mail" => WellKnownFolder::SentItems,
-        "drafts" => WellKnownFolder::Drafts,
-        "trash" | "deleted items" | "deleted messages" | "bin" => WellKnownFolder::DeletedItems,
-        "junk" | "spam" | "junk email" | "junk e-mail" => WellKnownFolder::JunkEmail,
-        "archive" | "archives" => WellKnownFolder::Archive,
-        "outbox" => WellKnownFolder::Outbox,
-        _ => return None,
-    })
+    Some((
+        match last.as_str() {
+            "sent" | "sent items" | "sent messages" | "sent mail" => WellKnownFolder::SentItems,
+            "drafts" => WellKnownFolder::Drafts,
+            "trash" | "deleted items" | "deleted messages" | "bin" => WellKnownFolder::DeletedItems,
+            "junk" | "spam" | "junk email" | "junk e-mail" => WellKnownFolder::JunkEmail,
+            "archive" | "archives" => WellKnownFolder::Archive,
+            "outbox" => WellKnownFolder::Outbox,
+            _ => return None,
+        },
+        false,
+    ))
 }
 
 /// A folder from a listing, without counts.
@@ -329,12 +363,16 @@ struct Listed {
     delimiter: Option<String>,
     selectable: bool,
     role: Option<WellKnownFolder>,
+    /// Whether the server says so (`SPECIAL-USE`), rather than the name.
+    declared: bool,
 }
 
 fn listed(name: &Name) -> Listed {
     let decoded = decode_utf7_imap(name.name().to_owned());
+    let found = role(&decoded, name.delimiter(), name.attributes());
     Listed {
-        role: role(&decoded, name.delimiter(), name.attributes()),
+        role: found.map(|(role, _)| role),
+        declared: found.is_some_and(|(_, declared)| declared),
         selectable: !name.attributes().iter().any(|a| match a {
             NameAttribute::NoSelect => true,
             NameAttribute::Extension(x) => x.eq_ignore_ascii_case("\\NonExistent"),
@@ -358,7 +396,20 @@ async fn list(live: &mut Live, pattern: &str) -> Res<Vec<Listed>> {
         .await?
         .try_collect()
         .await?;
-    Ok(names.iter().map(listed).collect())
+    let mut all: Vec<Listed> = names.iter().map(listed).collect();
+    // A folder the server says has a role has it alone: another that only
+    // has the usual name for it is an ordinary folder.
+    let declared: HashSet<WellKnownFolder> = all
+        .iter()
+        .filter(|l| l.declared)
+        .filter_map(|l| l.role)
+        .collect();
+    for item in &mut all {
+        if !item.declared && item.role.is_some_and(|r| declared.contains(&r)) {
+            item.role = None;
+        }
+    }
+    Ok(all)
 }
 
 /// `listed` as a folder, with its counts from the server.
@@ -390,7 +441,10 @@ async fn folder_of(live: &mut Live, listed: &Listed, parent: Option<FolderId>) -
     })
 }
 
-async fn folders(live: &mut Live) -> Res<Vec<Folder>> {
+/// The folders of the mailbox, or, with `under`, those directly below the
+/// folder it holds (the top ones if it holds none): counting messages takes
+/// a request to the server for each.
+async fn folders(live: &mut Live, under: Option<Option<&FolderId>>) -> Res<Vec<Folder>> {
     let all = list(live, "*").await?;
     let names: HashSet<String> = all.iter().map(|l| l.name.clone()).collect();
     let mut out = Vec::with_capacity(all.len());
@@ -398,44 +452,50 @@ async fn folders(live: &mut Live) -> Res<Vec<Folder>> {
         let parent = parent_name(&item.name, item.delimiter.as_deref())
             .filter(|p| names.contains(*p))
             .map(FolderId::new);
+        if under.is_some_and(|under| under != parent.as_ref()) {
+            continue;
+        }
         out.push(folder_of(live, item, parent).await?);
     }
     Ok(out)
 }
 
 async fn folder(live: &mut Live, id: &FolderId) -> Res<Folder> {
-    let found = list(live, &wire(id.as_str()).replace('"', "\\\"")).await?;
-    let item = found
-        .into_iter()
+    // The whole listing, which says what roles the others have.
+    let all = list(live, "*").await?;
+    let item = all
+        .iter()
         .find(|l| l.name == id.as_str())
         .ok_or_else(|| Error::not_found("folder", id))?;
-    // Whether the parent is a folder of the listing: it is, if the server
-    // lists it.
-    let parent = match parent_name(&item.name, item.delimiter.as_deref()) {
-        Some(parent) => {
-            let up = list(live, &wire(parent).replace('"', "\\\"")).await?;
-            up.iter()
-                .any(|l| l.name == parent)
-                .then(|| FolderId::new(parent))
-        }
-        None => None,
-    };
-    folder_of(live, &item, parent).await
+    let parent = parent_name(&item.name, item.delimiter.as_deref())
+        .filter(|p| all.iter().any(|l| l.name == *p))
+        .map(FolderId::new);
+    folder_of(live, item, parent).await
 }
 
-/// Selects `name` and returns its `UIDVALIDITY`.
-async fn select(live: &mut Live, name: &str) -> Res<u32> {
+/// A folder that is selected.
+struct Selected {
+    /// Its `UIDVALIDITY`.
+    validity: u32,
+    /// The `UID` the next message to come in will have.
+    next: u32,
+}
+
+/// Selects `name`.
+async fn select(live: &mut Live, name: &str) -> Res<Selected> {
     let mailbox = live.session.select(wire(name)).await.map_err(|e| match e {
         async_imap::error::Error::No(_) => Fail::Core(Error::not_found("folder", name)),
         e => Fail::Imap(e),
     })?;
-    Ok(mailbox.uid_validity.unwrap_or(0))
+    Ok(Selected {
+        validity: mailbox.uid_validity.unwrap_or(0),
+        next: mailbox.uid_next.unwrap_or(0),
+    })
 }
 
 /// Selects the folder of `at`, as long as it is the one `at` was made in.
 async fn select_ref(live: &mut Live, at: &Ref) -> Res<()> {
-    let validity = select(live, &at.folder).await?;
-    if validity != at.validity {
+    if select(live, &at.folder).await?.validity != at.validity {
         return Err(Error::not_found("message", at.id()).into());
     }
     Ok(())
@@ -477,13 +537,18 @@ async fn search(live: &mut Live, query: &str) -> Res<Vec<u32>> {
     Ok(uids)
 }
 
-/// A page of the newest messages of `folder`, from `ids` (newest first).
-async fn page_of(live: &mut Live, folder: &str, ids: Vec<u32>, page: &Page) -> Res<MessagePage> {
-    let validity = select(live, folder).await?;
-    let all = if ids.is_empty() {
-        search(live, "ALL").await?
-    } else {
-        ids
+/// A page of the newest messages of `folder`: of all of them, or of `only`
+/// (newest first).
+async fn page_of(
+    live: &mut Live,
+    folder: &str,
+    only: Option<Vec<u32>>,
+    page: &Page,
+) -> Res<MessagePage> {
+    let validity = select(live, folder).await?.validity;
+    let all = match only {
+        Some(only) => only,
+        None => search(live, "ALL").await?,
     };
     let after = page.cursor().and_then(|c| c.as_str().parse::<u32>().ok());
     let rest: Vec<u32> = all
@@ -516,7 +581,14 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
         let mut g = self.lock().await?;
         let t = g.timeout;
-        let r = bounded(t, folders(g.live())).await;
+        let r = bounded(t, folders(g.live(), None)).await;
+        g.done(r)
+    }
+
+    async fn child_folders(&self, parent: Option<&FolderId>) -> Result<Vec<Folder>> {
+        let mut g = self.lock().await?;
+        let t = g.timeout;
+        let r = bounded(t, folders(g.live(), Some(parent))).await;
         g.done(r)
     }
 
@@ -536,24 +608,40 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let t = g.timeout;
         let r = bounded(t, async {
             let live = g.live();
-            let validity = select(live, folder.as_str()).await?;
+            let selected = select(live, folder.as_str()).await?;
+            let arrived = self.arrivals(Watch::Unread, folder.as_str(), &selected);
+            // IMAP dates what it took in by the day, so this asks for the
+            // days since and keeps what came in after `since`. Messages
+            // since the last time this asked are new, whatever their dates.
             let query = match since {
                 Some(since) => format!("UNSEEN SINCE {}", day(since)),
                 None => "UNSEEN".to_owned(),
             };
-            let uids = search(live, &query).await?;
-            let mut found = fetch(live, &uids, "(UID FLAGS INTERNALDATE)", false).await;
-            if let Err(Fail::Core(_)) = &found {
-                found = Ok(Vec::new());
-            }
-            let mut out: Vec<(MessageId, DateTime<Utc>)> = found?
+            let mut uids: BTreeSet<u32> = search(live, &query).await?.into_iter().collect();
+            let fresh: BTreeSet<u32> = match arrived {
+                Some(next) => search(live, &format!("UNSEEN UID {next}:*"))
+                    .await?
+                    .into_iter()
+                    .filter(|uid| *uid >= next)
+                    .collect(),
+                None => BTreeSet::new(),
+            };
+            uids.extend(&fresh);
+            let uids: Vec<u32> = uids.into_iter().collect();
+            let found = fetch(live, &uids, "(UID FLAGS INTERNALDATE)", false).await?;
+            let now = Utc::now();
+            let mut out: Vec<(MessageId, DateTime<Utc>)> = found
                 .into_iter()
                 .filter_map(|f| {
-                    let at = f.internal?;
-                    since.is_none_or(|s| at >= s).then(|| {
+                    let (at, new) = if fresh.contains(&f.uid) {
+                        (now, true)
+                    } else {
+                        (f.internal?, false)
+                    };
+                    (new || since.is_none_or(|s| at >= s)).then(|| {
                         let id = Ref {
                             folder: folder.as_str().to_owned(),
-                            validity,
+                            validity: selected.validity,
                             uid: f.uid,
                         }
                         .id();
@@ -592,7 +680,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
     async fn list_messages(&self, folder: &FolderId, page: Page) -> Result<MessagePage> {
         let mut g = self.lock().await?;
         let t = g.timeout;
-        let r = bounded(t, page_of(g.live(), folder.as_str(), Vec::new(), &page)).await;
+        let r = bounded(t, page_of(g.live(), folder.as_str(), None, &page)).await;
         g.done(r)
     }
 
@@ -606,14 +694,35 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let t = g.timeout;
         let r = bounded(t, async {
             let live = g.live();
-            select(live, folder.as_str()).await?;
+            let selected = select(live, folder.as_str()).await?;
+            let arrived = self.arrivals(Watch::Changes, folder.as_str(), &selected);
             // The server dates what it took in by the day, so this asks
-            // for the days since and keeps what came in after `since`.
-            let uids = search(live, &format!("SINCE {}", day(since))).await?;
-            let mut page = page_of(live, folder.as_str(), uids, &page).await?;
-            page.messages
-                .retain(|m| m.delivered.is_none_or(|at| at >= since));
-            Ok(page)
+            // for the days since and keeps what came in after `since`;
+            // and what came in since the last time this asked, whatever its
+            // date says.
+            let mut uids: BTreeSet<u32> = search(live, &format!("SINCE {}", day(since)))
+                .await?
+                .into_iter()
+                .collect();
+            let recent = fetch(
+                live,
+                &uids.iter().copied().collect::<Vec<_>>(),
+                "(UID FLAGS INTERNALDATE)",
+                false,
+            )
+            .await?;
+            uids.retain(|uid| {
+                recent
+                    .iter()
+                    .find(|f| f.uid == *uid)
+                    .is_none_or(|f| f.internal.is_none_or(|at| at >= since))
+            });
+            if let Some(next) = arrived {
+                let fresh = search(live, &format!("UID {next}:*")).await?;
+                uids.extend(fresh.into_iter().filter(|uid| *uid >= next));
+            }
+            let uids: Vec<u32> = uids.into_iter().rev().collect();
+            page_of(live, folder.as_str(), Some(uids), &page).await
         })
         .await;
         g.done(r)
@@ -661,15 +770,10 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let r = bounded(t, async {
             let live = g.live();
             select_ref(live, &at).await?;
-            for (flag, on) in [("\\Seen", update.read), ("\\Flagged", update.flagged)] {
-                let Some(on) = on else { continue };
-                let sign = if on { '+' } else { '-' };
-                let _: Vec<Fetch> = live
-                    .session
-                    .uid_store(at.uid.to_string(), format!("{sign}FLAGS.SILENT ({flag})"))
-                    .await?
-                    .try_collect()
-                    .await?;
+            for (name, on) in [("\\Seen", update.read), ("\\Flagged", update.flagged)] {
+                if let Some(on) = on {
+                    flag(live, &at, if on { '+' } else { '-' }, name).await?;
+                }
             }
             Ok(())
         })
@@ -692,7 +796,7 @@ impl<A: Authenticator> MailStore for ImapMailStore<A> {
         let r = bounded(t, async {
             let live = g.live();
             select_ref(live, &at).await?;
-            expunge(live, at.uid).await
+            expunge(live, &at).await
         })
         .await;
         g.done(r)
@@ -749,10 +853,10 @@ impl<A: Authenticator> ImapMailStore<A> {
             // Its `Message-ID:` finds it again where it goes: the server
             // gives it a new UID, and says which only to some clients.
             let header = fetch(live, &[at.uid], SUMMARY, false).await?;
-            let wanted = match header.first() {
-                Some(h) => parse::threading(&h.data)?.0,
-                None => None,
+            let Some(header) = header.first() else {
+                return Err(Error::not_found("message", id).into());
             };
+            let wanted = parse::threading(&header.data)?.0;
             let before = live
                 .session
                 .status(wire(to.as_str()), "(UIDNEXT)")
@@ -762,9 +866,14 @@ impl<A: Authenticator> ImapMailStore<A> {
             if moving && live.caps.moves {
                 live.session.uid_mv(&uids, wire(to.as_str())).await?;
             } else {
+                if moving {
+                    // Before the copy: a message that is copied and can't
+                    // be deleted is in two folders.
+                    expungeable(live, at.uid).await?;
+                }
                 live.session.uid_copy(&uids, wire(to.as_str())).await?;
                 if moving {
-                    expunge(live, at.uid).await?;
+                    expunge(live, &at).await?;
                 }
             }
             locate(live, to.as_str(), wanted.as_deref(), before).await
@@ -832,18 +941,45 @@ impl<A: Authenticator> ImapMailStore<A> {
     }
 }
 
-/// Deletes the message `uid` of the selected folder.
-async fn expunge(live: &mut Live, uid: u32) -> Res<()> {
-    let _: Vec<Fetch> = live
+/// Whether the message `uid` of the selected folder can be deleted without
+/// deleting others: without `UIDPLUS`, expunging takes every message marked
+/// deleted, so it is only safe if none other is.
+async fn expungeable(live: &mut Live, uid: u32) -> Res<()> {
+    if live.caps.uidplus {
+        return Ok(());
+    }
+    if search(live, "DELETED").await?.iter().any(|u| *u != uid) {
+        return Err(Error::Backend(
+            "the folder has other messages marked deleted, and this server can't delete just one (it has no UIDPLUS)".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Changes the flags of the message `at` in the selected folder: `sign` is
+/// `+` or `-`. A message that is no longer there is [`Error::NotFound`].
+async fn flag(live: &mut Live, at: &Ref, sign: char, flag: &str) -> Res<()> {
+    let changed: Vec<Fetch> = live
         .session
-        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .uid_store(at.uid.to_string(), format!("{sign}FLAGS ({flag})"))
         .await?
         .try_collect()
         .await?;
+    if changed.is_empty() {
+        return Err(Error::not_found("message", at.id()).into());
+    }
+    Ok(())
+}
+
+/// Deletes the message `at` from the selected folder.
+async fn expunge(live: &mut Live, at: &Ref) -> Res<()> {
+    expungeable(live, at.uid).await?;
+    flag(live, at, '+', "\\Deleted").await?;
     if live.caps.uidplus {
         let _: Vec<u32> = live
             .session
-            .uid_expunge(uid.to_string())
+            .uid_expunge(at.uid.to_string())
             .await?
             .try_collect()
             .await?;
@@ -862,7 +998,7 @@ async fn locate(
     wanted: Option<&str>,
     before: Option<u32>,
 ) -> Res<MessageId> {
-    let validity = select(live, folder).await?;
+    let validity = select(live, folder).await?.validity;
     let found = match wanted {
         Some(id) => {
             let query = format!("HEADER Message-ID \"{}\"", id.replace(['\\', '"'], ""));
@@ -928,17 +1064,22 @@ mod tests {
 
     #[test]
     fn roles_come_from_attributes_then_names() {
-        assert_eq!(role("inbox", Some("/"), &[]), Some(WellKnownFolder::Inbox));
+        let named = |role: Option<(WellKnownFolder, bool)>| role.map(|(r, _)| r);
+        assert_eq!(
+            role("inbox", Some("/"), &[]),
+            Some((WellKnownFolder::Inbox, true))
+        );
         assert_eq!(
             role("Mail/Out", Some("/"), &[NameAttribute::Sent]),
-            Some(WellKnownFolder::SentItems)
+            Some((WellKnownFolder::SentItems, true))
         );
+        // A name that looks right is only what it looks like.
         assert_eq!(
             role("Sent Items", Some("/"), &[]),
-            Some(WellKnownFolder::SentItems)
+            Some((WellKnownFolder::SentItems, false))
         );
         assert_eq!(
-            role("INBOX.Drafts", Some("."), &[]),
+            named(role("INBOX.Drafts", Some("."), &[])),
             Some(WellKnownFolder::Drafts)
         );
         // Deeper down, a name that looks right is only a name.

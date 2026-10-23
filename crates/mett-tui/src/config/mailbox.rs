@@ -1,18 +1,32 @@
-//! Mailbox paths: `msgraph://` URLs and mutt's shortcuts
+//! Mailbox paths: `msgraph://` and `imap://` URLs and mutt's shortcuts
 //! (`docs/CONFIG-OFFICE365.md` §3, `docs/MUTTRC.md` §5).
 
 use std::fmt;
 
 use mett_core::{AccountId, WellKnownFolder};
 
-/// A folder in an Office365 mailbox, from a `msgraph://<account>/<path>`
-/// URL.
+use super::server::{self, ServerUrl};
+
+/// A folder in a mailbox, from a `msgraph://<account>/<path>` URL
+/// (Office365) or an `imap://[user@]<host>/<path>` one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailboxUrl {
-    /// The account (user principal name).
+    /// The account: the user principal name of an Office365 mailbox, or
+    /// the user at the server of an IMAP one.
     pub account: AccountId,
     /// The folder below the mailbox root.
     pub folder: FolderPath,
+    /// Where the mailbox is.
+    pub server: Server,
+}
+
+/// Where a mailbox is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Server {
+    /// Office365, through Microsoft Graph or Exchange Web Services.
+    Office365,
+    /// An IMAP server.
+    Imap(ServerUrl),
 }
 
 /// Where a folder is in the mailbox.
@@ -45,12 +59,33 @@ impl fmt::Display for MailboxError {
 
 const SCHEME: &str = "msgraph://";
 
+/// The schemes of IMAP mailboxes.
+const IMAP: [&str; 2] = ["imap://", "imaps://"];
+
+/// Whether `text` starts like a mailbox URL.
+fn is_url(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with(SCHEME) || IMAP.iter().any(|s| lower.starts_with(s))
+}
+
+/// The account of the user at an IMAP server.
+fn imap_account(host: &str, user: &str) -> AccountId {
+    if user.contains('@') {
+        AccountId::new(user)
+    } else {
+        AccountId::new(format!("{user}@{host}"))
+    }
+}
+
 impl MailboxUrl {
-    /// Parses a `msgraph://` URL.
+    /// Parses a `msgraph://` or `imap://` URL.
     pub fn parse(url: &str) -> Result<Self, MailboxError> {
+        if IMAP.iter().any(|s| url.to_ascii_lowercase().starts_with(s)) {
+            return Self::parse_imap(url);
+        }
         let rest = url
             .strip_prefix(SCHEME)
-            .ok_or_else(|| MailboxError(format!("{url}: not a msgraph:// mailbox")))?;
+            .ok_or_else(|| MailboxError(format!("{url}: not a msgraph:// or imap:// mailbox")))?;
         let (account, path) = rest.split_once('/').unwrap_or((rest, ""));
         let valid_upn = account.split_once('@').is_some_and(|(user, domain)| {
             !user.is_empty() && !domain.is_empty() && !domain.contains('@')
@@ -60,43 +95,131 @@ impl MailboxUrl {
                 "{url}: expected msgraph://<user@domain>/<folder>"
             )));
         }
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let folder = match segments.split_first() {
-            None => FolderPath::Root,
-            Some((first, rest)) => match first.strip_prefix('@') {
-                Some(name) => {
-                    let which = name.parse::<WellKnownFolder>().map_err(|_| {
-                        MailboxError(format!("{url}: unknown well-known folder @{name}"))
-                    })?;
-                    // `@inbox/@focused` and `@inbox/@other` are the Focused
-                    // Inbox views; any other name is a real folder.
-                    if which == WellKnownFolder::Inbox
-                        && let Some(view @ (&"@focused" | &"@other")) = rest.first()
-                    {
-                        return Err(MailboxError(format!("{url}: {view} is not supported yet")));
-                    }
-                    FolderPath::WellKnown(which, rest.iter().map(|s| (*s).to_owned()).collect())
-                }
-                None => FolderPath::Named(segments.iter().map(|s| (*s).to_owned()).collect()),
-            },
-        };
+        let segments: Vec<String> = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
         Ok(Self {
             account: AccountId::new(account),
-            folder,
+            folder: folder_path_of(url, &segments)?,
+            server: Server::Office365,
         })
     }
+
+    fn parse_imap(url: &str) -> Result<Self, MailboxError> {
+        let server = ServerUrl::parse(url, "imap", "imaps").map_err(MailboxError)?;
+        let segments = server
+            .path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(server::decode)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(MailboxError)?;
+        let account = match &server.user {
+            Some(user) => imap_account(&server.host, user),
+            // Until `imap_user` says (see `with_user`).
+            None => AccountId::new(&server.host),
+        };
+        Ok(Self {
+            account,
+            folder: folder_path_of(url, &segments)?,
+            server: Server::Imap(server),
+        })
+    }
+
+    /// An IMAP mailbox whose URL names no user, as `user`'s (the
+    /// `imap_user`).
+    #[must_use]
+    pub fn with_user(mut self, user: &str) -> Self {
+        if let Server::Imap(server) = &mut self.server
+            && server.user.is_none()
+            && !user.is_empty()
+        {
+            self.account = imap_account(&server.host, user);
+            server.user = Some(user.to_owned());
+        }
+        self
+    }
+
+    /// Whether the mailbox is `account`'s: an IMAP URL that names no user
+    /// is of any user at its server.
+    pub fn is_of(&self, account: &AccountId) -> bool {
+        if self.account.as_str().eq_ignore_ascii_case(account.as_str()) {
+            return true;
+        }
+        match &self.server {
+            Server::Imap(server) if server.user.is_none() => account
+                .as_str()
+                .rsplit_once('@')
+                .is_some_and(|(_, host)| host.eq_ignore_ascii_case(&server.host)),
+            _ => false,
+        }
+    }
+}
+
+/// The folder that the segments of the path in `url` name.
+fn folder_path_of(url: &str, segments: &[String]) -> Result<FolderPath, MailboxError> {
+    Ok(match segments.split_first() {
+        None => FolderPath::Root,
+        Some((first, rest)) => match first.strip_prefix('@') {
+            Some(name) => {
+                let which = name.parse::<WellKnownFolder>().map_err(|_| {
+                    MailboxError(format!("{url}: unknown well-known folder @{name}"))
+                })?;
+                // `@inbox/@focused` and `@inbox/@other` are the Focused
+                // Inbox views; any other name is a real folder.
+                if which == WellKnownFolder::Inbox
+                    && let Some(view @ ("@focused" | "@other")) = rest.first().map(String::as_str)
+                {
+                    return Err(MailboxError(format!("{url}: {view} is not supported yet")));
+                }
+                FolderPath::WellKnown(which, rest.to_vec())
+            }
+            None => FolderPath::Named(segments.to_vec()),
+        },
+    })
 }
 
 impl fmt::Display for MailboxUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{SCHEME}{}/", self.account)?;
+        match &self.server {
+            Server::Office365 => write!(f, "{SCHEME}{}/", self.account)?,
+            Server::Imap(server) => {
+                f.write_str(if server.tls { "imaps://" } else { "imap://" })?;
+                if let Some(user) = &server.user {
+                    write!(f, "{}@", server::encode(user))?;
+                }
+                f.write_str(&server.host)?;
+                if let Some(port) = server.port {
+                    write!(f, ":{port}")?;
+                }
+                f.write_str("/")?;
+            }
+        }
+        let encoded = |name: &str| match self.server {
+            Server::Office365 => name.to_owned(),
+            Server::Imap(_) => name
+                .bytes()
+                .map(|b| match b {
+                    b'%' | b'/' | b' ' | b'#' | b'?' => format!("%{b:02X}"),
+                    _ => (b as char).to_string(),
+                })
+                .collect::<String>(),
+        };
         match &self.folder {
             FolderPath::Root => Ok(()),
             FolderPath::WellKnown(which, rest) => {
                 write!(f, "@{which}")?;
-                rest.iter().try_for_each(|s| write!(f, "/{s}"))
+                rest.iter().try_for_each(|s| write!(f, "/{}", encoded(s)))
             }
-            FolderPath::Named(names) => f.write_str(&names.join("/")),
+            FolderPath::Named(names) => f.write_str(
+                &names
+                    .iter()
+                    .map(|n| encoded(n))
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ),
         }
     }
 }
@@ -133,9 +256,9 @@ pub fn folder_path(
     account: &AccountId,
 ) -> Result<FolderPath, MailboxError> {
     let expanded = expand_shortcut(text.trim(), folder);
-    let url = if expanded.starts_with(SCHEME) {
+    let url = if is_url(&expanded) {
         let url = MailboxUrl::parse(&expanded)?;
-        if !url.account.as_str().eq_ignore_ascii_case(account.as_str()) {
+        if !url.is_of(account) {
             return Err(MailboxError(format!(
                 "{expanded}: mett can only use folders of {account}"
             )));
@@ -206,7 +329,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_urls() {
-        assert!(MailboxUrl::parse("imaps://outlook.office365.com/").is_err());
+        assert!(MailboxUrl::parse("pop3://mail.example.com/").is_err());
         assert!(MailboxUrl::parse("msgraph:///@inbox").is_err());
         for bad in [
             "msgraph://@/@inbox",
@@ -302,5 +425,85 @@ mod tests {
             path("=Archive"),
             Ok(FolderPath::Named(vec!["Archive".into()]))
         );
+    }
+
+    #[test]
+    fn parses_imap_mailboxes() {
+        let url = MailboxUrl::parse("imaps://me@mail.example.com:1993/INBOX/Work").unwrap();
+        assert_eq!(url.account, AccountId::new("me@mail.example.com"));
+        assert_eq!(
+            url.folder,
+            FolderPath::Named(vec!["INBOX".into(), "Work".into()])
+        );
+        let Server::Imap(server) = &url.server else {
+            panic!("not IMAP")
+        };
+        assert!(server.tls);
+        assert_eq!(server.port, Some(1993));
+
+        // A user that is an address is the account.
+        let url = MailboxUrl::parse("imap://me%40example.org@mail.example.com/@sentitems").unwrap();
+        assert_eq!(url.account, AccountId::new("me@example.org"));
+        assert_eq!(
+            url.folder,
+            FolderPath::WellKnown(WellKnownFolder::SentItems, vec![])
+        );
+        assert_eq!(
+            MailboxUrl::parse("imap://me@h/").unwrap().folder,
+            FolderPath::Root
+        );
+        assert!(MailboxUrl::parse("imap://me@h/@spam").is_err());
+    }
+
+    #[test]
+    fn an_imap_user_comes_from_imap_user_when_the_url_has_none() {
+        let url = MailboxUrl::parse("imaps://mail.example.com/INBOX").unwrap();
+        assert_eq!(url.account, AccountId::new("mail.example.com"));
+        let url = url.with_user("me");
+        assert_eq!(url.account, AccountId::new("me@mail.example.com"));
+        // A user in the URL stays.
+        let url = MailboxUrl::parse("imaps://you@mail.example.com/")
+            .unwrap()
+            .with_user("me");
+        assert_eq!(url.account, AccountId::new("you@mail.example.com"));
+        // An Office365 mailbox has no user to set.
+        let url = MailboxUrl::parse("msgraph://a@b.c/")
+            .unwrap()
+            .with_user("me");
+        assert_eq!(url.account, AccountId::new("a@b.c"));
+    }
+
+    #[test]
+    fn imap_urls_round_trip_without_the_password() {
+        for url in [
+            "imaps://me@mail.example.com/",
+            "imap://me@mail.example.com:143/INBOX/Work",
+            "imaps://mail.example.com/@inbox/Sub%2Ffolder",
+            "imaps://me%40example.org@mail.example.com/Sent",
+        ] {
+            assert_eq!(MailboxUrl::parse(url).unwrap().to_string(), url);
+        }
+        let url = MailboxUrl::parse("imaps://me:secret@mail.example.com/INBOX").unwrap();
+        assert_eq!(url.to_string(), "imaps://me@mail.example.com/INBOX");
+    }
+
+    #[test]
+    fn folders_of_an_imap_account_are_found_by_name() {
+        let account = AccountId::new("me@mail.example.com");
+        let folder = "imaps://me@mail.example.com/";
+        let path = |text| folder_path(text, folder, &account);
+        assert_eq!(path("=Sent"), Ok(FolderPath::Named(vec!["Sent".into()])));
+        assert_eq!(
+            path("=@sentitems"),
+            Ok(FolderPath::WellKnown(WellKnownFolder::SentItems, vec![]))
+        );
+        assert_eq!(
+            path("imaps://me@mail.example.com/INBOX/Work"),
+            Ok(FolderPath::Named(vec!["INBOX".into(), "Work".into()]))
+        );
+        // A URL without a user is of the user at that server.
+        assert!(path("imaps://mail.example.com/INBOX").is_ok());
+        assert!(path("imaps://other.example.com/INBOX").is_err());
+        assert!(path("imaps://you@mail.example.com/INBOX").is_err());
     }
 }

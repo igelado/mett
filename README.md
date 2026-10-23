@@ -128,6 +128,10 @@ To reach the account through Exchange Web Services instead of Microsoft
 Graph, `set use_ews`; see
 [mett-ews's README](https://github.com/igelado/mett/blob/main/crates/mett-ews/README.md).
 
+Any IMAP and SMTP server works too, plain or with STARTTLS or TLS, with a
+password: set `spoolfile` to an `imaps://` URL and `smtp_url`; see
+[MUTTRC.md §4.13](docs/MUTTRC.md).
+
 ## Documentation
 
 The packages install `CONFIG-OFFICE365.md` and `MUTTRC.md` in

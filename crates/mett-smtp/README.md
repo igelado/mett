@@ -6,8 +6,9 @@ crate (with rustls):
 - **`SmtpSender`** connects to an SMTP server and sends a `Draft`. It
   returns the copy to keep and leaves keeping it (and so `mett-core`'s
   `MailSender` port, which promises a copy in Sent) to the mailbox, IMAP. The
-  connection is `Security::None` (plain text), `Security::StartTls` (upgraded,
-  and refused if the server won't) or `Security::Tls` (TLS from the first
+  connection is `Security::None` (plain text), `Security::StartTlsIfOffered`
+  (upgraded if the server offers it), `Security::StartTls` (upgraded, and
+  refused if the server won't) or `Security::Tls` (TLS from the first
   byte, port 465). The login is a password (`Login::Password`: PLAIN or
   LOGIN) or an OAuth2 token from any `Authenticator` (`Login::OAuth`: SASL
   XOAUTH2; a token the server turns down is replaced once). The server's

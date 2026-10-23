@@ -20,6 +20,7 @@ mod expando;
 mod format;
 #[cfg(feature = "gui")]
 mod gui;
+mod imap;
 mod keymap;
 mod lineedit;
 mod pattern;

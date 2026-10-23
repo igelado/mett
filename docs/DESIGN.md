@@ -56,6 +56,7 @@ I/O and talks to the UI over channels.
 ├───────────────┬──────────────┬─────────────────┤
 │ mett-msgraph, │ mett-sqlite  │ mock (tests)    │
 │ mett-ews,     │              │                 │
+│ mett-imap,    │              │                 │
 │ mett-smtp     │              │                 │
 └───────────────┴──────────────┴─────────────────┘
 ```
@@ -72,6 +73,7 @@ a crate may only depend on crates below it in the diagram.
 | `mett-msgraph` | Microsoft Graph adapter: HTTP, OAuth2, paging, throttling, delta.  | `mett-core`                    |
 | `mett-ews`     | Exchange Web Services adapter: SOAP, paging, throttling.           | `mett-core`                    |
 | `mett-smtp`    | SMTP adapter (wraps `lettre`): sends mail, writes drafts as MIME.  | `mett-core`                    |
+| `mett-imap`    | IMAP adapter (wraps `async-imap`): mailbox access; sends via SMTP. | `mett-core`, `mett-smtp`       |
 | `mett-sqlite`  | Local cache and sync state, in SQLite.                             | `mett-core`                    |
 | `mett-tui`     | The binary: TUI, key bindings, configuration, worker wiring.       | `mett-core`, adapters          |
 
@@ -103,12 +105,24 @@ for an Exchange Online token. `mett-tui` picks the adapter at startup
 (`use_ews`); an enum of the two implements the ports by delegating, so the
 worker stays generic over a single type.
 
-`mett-smtp` implements `MailSender` over SMTP (plain, STARTTLS or TLS; a
-password or an OAuth2 token for the login), wrapping the `lettre` crate. It
-also writes a `Draft` as the MIME message (`compose`), which a mailbox that
-keeps its own Sent and Drafts folders (IMAP) stores. Replies are threaded
-by the `Message-ID:` and `References:` of the original, which the caller
-looks up and gives as `Threading`.
+`mett-smtp` sends a `Draft` over SMTP (plain, STARTTLS or TLS; a password or
+an OAuth2 token for the login), wrapping the `lettre` crate. It also writes
+the `Draft` as the MIME message (`compose`), which a mailbox that keeps its
+own Sent and Drafts folders (IMAP) stores. Replies are threaded by the
+`Message-ID:` and `References:` of the original, which the caller looks up
+and gives as `Threading`. It leaves the Sent copy to the mailbox, so it is
+not a `MailSender` itself.
+
+`mett-imap` implements `MailStore` against an IMAP server (wrapping
+`async-imap` and `mail-parser`, with TLS by rustls), and `MailSender` on top
+of an `SmtpSender`: it threads replies, carries the attachments of forwards
+and recalled drafts, and appends the copy to the Sent folder. Folders are
+named by their names on the server and messages by folder, `UIDVALIDITY` and
+`UID`, so a message that moves is a new one, as with Graph. IMAP can't say
+what changed in a folder as the Exchange APIs do (without the `QRESYNC`
+extension, which isn't used), so this adapter neither syncs nor watches
+folders, and mett doesn't cache its mailbox.
+`mett-tui` picks IMAP when the `spoolfile` is an `imap://` or `imaps://` URL.
 
 - **Pros:**
   - The core and UI can be tested without network access.

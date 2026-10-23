@@ -107,6 +107,21 @@ async fn lists_folders_with_their_roles_counts_and_nesting() {
 }
 
 #[tokio::test]
+async fn lists_the_folders_below_one() {
+    let (_server, store) = plain().await;
+    let top = store.child_folders(None).await.unwrap();
+    let names: Vec<_> = top.iter().map(|f| f.id.as_str()).collect();
+    assert!(names.contains(&"INBOX") && names.contains(&"Sent"));
+    assert!(!names.contains(&"INBOX/Work"));
+    let below = store
+        .child_folders(Some(&FolderId::new("INBOX")))
+        .await
+        .unwrap();
+    assert_eq!(below.len(), 1);
+    assert_eq!(below[0].name, "Work");
+}
+
+#[tokio::test]
 async fn finds_a_folder_by_role_and_by_id() {
     let (_server, store) = plain().await;
     let sent = store
@@ -686,4 +701,280 @@ async fn the_account_is_the_user_at_the_server() {
     let (_server, store) = plain().await;
     assert_eq!(store.account().as_str(), "me@127.0.0.1");
     assert_eq!(store.own_addresses().await.unwrap(), [ME]);
+}
+
+#[tokio::test]
+async fn a_saved_draft_is_listed_as_a_draft_so_it_can_be_recalled() {
+    let (_server, store) = plain().await;
+    let draft = Draft {
+        to: vec![Address::new("alice@example.org")],
+        subject: "Unfinished".into(),
+        ..Draft::default()
+    };
+    store.save_draft(&draft).await.unwrap();
+    let page = store
+        .list_messages(&FolderId::new("Drafts"), Page::first(10))
+        .await
+        .unwrap();
+    assert!(page.messages[0].draft);
+}
+
+#[tokio::test]
+async fn a_draft_without_recipients_can_be_postponed() {
+    let (server, store) = plain().await;
+    let draft = Draft {
+        subject: "Whom to?".into(),
+        body: "Notes\n".into(),
+        ..Draft::default()
+    };
+    store.save_draft(&draft).await.unwrap();
+    assert_eq!(
+        server.state.lock().unwrap().folder("Drafts").messages.len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn deletes_one_message_without_uidplus_only_if_no_other_is_marked() {
+    let (server, store) = plain().await;
+    server.state.lock().unwrap().no_uidplus = true;
+    let ours = deliver(&server, "INBOX", &simple("ours"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    // Another client marked a message deleted and hasn't expunged yet.
+    let theirs = deliver(&server, "INBOX", &simple("theirs"), &["\\Deleted"]);
+    let error = store.delete_message(&id).await.unwrap_err();
+    assert!(error.to_string().contains("UIDPLUS"), "{error}");
+    {
+        let mut state = server.state.lock().unwrap();
+        let kept: Vec<u32> = state
+            .folder("INBOX")
+            .messages
+            .iter()
+            .map(|m| m.uid)
+            .collect();
+        assert_eq!(kept, [ours, theirs]);
+        // Ours wasn't left marked.
+        assert!(
+            !state.folder("INBOX").messages[0]
+                .flags
+                .contains("\\Deleted")
+        );
+        // Without the other one, it is safe.
+        state.folder("INBOX").messages.retain(|m| m.uid == ours);
+    }
+    store.delete_message(&id).await.unwrap();
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .folder("INBOX")
+            .messages
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn moves_without_move_or_uidplus_by_copying_when_it_can_delete_safely() {
+    let (server, store) = plain().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.no_uidplus = true;
+        state.no_move = true;
+    }
+    deliver(&server, "INBOX", &simple("travelling"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    let moved = store
+        .move_message(&id, &FolderId::new("Archive"))
+        .await
+        .unwrap();
+    assert!(moved.as_str().ends_with(".Archive"));
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .folder("INBOX")
+            .messages
+            .is_empty()
+    );
+
+    // With another message marked, it doesn't copy at all.
+    deliver(&server, "INBOX", &simple("stays"), &[]);
+    deliver(&server, "INBOX", &simple("theirs"), &["\\Deleted"]);
+    let id = store
+        .list_messages(&inbox, Page::first(5))
+        .await
+        .unwrap()
+        .messages[1]
+        .id
+        .clone();
+    assert!(
+        store
+            .move_message(&id, &FolderId::new("Trash"))
+            .await
+            .is_err()
+    );
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .folder("Trash")
+            .messages
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn mail_that_arrives_with_an_old_date_is_still_new() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("old"), &[]);
+    let inbox = FolderId::new("INBOX");
+    // The user looked at the folder after everything in it.
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    assert!(
+        store
+            .changed_messages(&inbox, since, Page::first(10))
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+    assert!(
+        store
+            .recent_unread(&inbox, Some(since))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A message that was copied in keeps the date it was first delivered.
+    deliver(&server, "INBOX", &simple("copied in"), &[]);
+    let changed = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert_eq!(changed.messages.len(), 1);
+    assert_eq!(changed.messages[0].subject, "copied in");
+    assert_eq!(
+        store
+            .recent_unread(&inbox, Some(since))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Once seen, it isn't new again.
+    let changed = store
+        .changed_messages(&inbox, since, Page::first(10))
+        .await
+        .unwrap();
+    assert!(changed.messages.is_empty());
+    assert!(changed.next.is_none());
+}
+
+#[tokio::test]
+async fn nothing_changed_is_an_empty_page_not_the_whole_folder() {
+    let (server, store) = plain().await;
+    for n in 0..30 {
+        deliver(&server, "INBOX", &simple(&format!("old {n}")), &[]);
+    }
+    let since = chrono::DateTime::parse_from_rfc3339("2026-10-22T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let page = store
+        .changed_messages(&FolderId::new("INBOX"), since, Page::first(5))
+        .await
+        .unwrap();
+    assert!(page.messages.is_empty() && page.next.is_none());
+}
+
+#[tokio::test]
+async fn the_folder_the_server_calls_sent_wins_over_one_called_sent() {
+    let server = server(
+        Mode::Plain,
+        password(),
+        vec![
+            Folder::new("INBOX", &[]),
+            Folder::new("Sent", &[]),
+            Folder::new("Mail Out", &["\\Sent"]),
+        ],
+    )
+    .await;
+    let store = ImapMailStore::new(settings(&server, Security::None), login(), Address::new(ME));
+    let sent = store
+        .well_known_folder(WellKnownFolder::SentItems)
+        .await
+        .unwrap();
+    assert_eq!(sent.id.as_str(), "Mail Out");
+    let folders = store.list_folders().await.unwrap();
+    let ordinary = folders.iter().find(|f| f.id.as_str() == "Sent").unwrap();
+    assert_eq!(ordinary.well_known, None);
+    let by_id = store.folder(&FolderId::new("Sent")).await.unwrap();
+    assert_eq!(by_id.well_known, None);
+}
+
+#[tokio::test]
+async fn a_message_that_has_gone_is_not_found() {
+    let (server, store) = plain().await;
+    deliver(&server, "INBOX", &simple("going"), &[]);
+    let inbox = FolderId::new("INBOX");
+    let id = store
+        .list_messages(&inbox, Page::first(1))
+        .await
+        .unwrap()
+        .messages[0]
+        .id
+        .clone();
+    server
+        .state
+        .lock()
+        .unwrap()
+        .folder("INBOX")
+        .messages
+        .clear();
+    for result in [
+        store
+            .update_flags(&id, FlagsUpdate::read(true))
+            .await
+            .map(drop),
+        store.delete_message(&id).await,
+        store
+            .move_message(&id, &FolderId::new("Trash"))
+            .await
+            .map(drop),
+        store
+            .copy_message(&id, &FolderId::new("Trash"))
+            .await
+            .map(drop),
+    ] {
+        assert!(matches!(result, Err(Error::NotFound { .. })), "{result:?}");
+    }
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .folder("Trash")
+            .messages
+            .is_empty()
+    );
 }

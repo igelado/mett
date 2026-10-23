@@ -38,12 +38,11 @@ pub struct Composed {
 /// forward or a recalled draft takes from the message it comes from (less
 /// the draft's `drop_attachments`), which it can fetch and this can't.
 ///
-/// Fails with [`Error::NotSent`] if an address isn't one, or there is
-/// no recipient.
+/// A draft without recipients is written too (to keep it, not to send it:
+/// [`SmtpSender::send`](crate::SmtpSender::send) refuses it).
+///
+/// Fails with [`Error::NotSent`] if an address isn't one.
 pub fn compose(draft: &Draft, from: &Address, threading: &Threading) -> Result<Composed> {
-    if !draft.has_recipients() {
-        return Err(Error::NotSent("the message has no recipients".into()));
-    }
     let from = draft.from.as_ref().unwrap_or(from);
     // One message, so that its boundary and date are the same in both.
     let kept = build(draft, from, threading, true)?;
@@ -120,6 +119,17 @@ fn headers(
     }
     if keep_bcc {
         builder = builder.keep_bcc();
+    }
+    if !draft.has_recipients() {
+        // Lettre won't build a message that goes to no one, though it is
+        // only the envelope that says so: this one goes to its sender.
+        let me = from
+            .email
+            .parse::<lettre::Address>()
+            .map_err(|e| Error::NotSent(format!("{}: {e}", from.email)))?;
+        let envelope = lettre::address::Envelope::new(Some(me.clone()), vec![me])
+            .map_err(|e| Error::NotSent(e.to_string()))?;
+        builder = builder.envelope(envelope);
     }
     builder = builder.subject(draft.subject.clone());
     if let Some(id) = &threading.in_reply_to {
@@ -280,5 +290,22 @@ mod tests {
             }
         }
         assert_eq!(sent_headers.split("\r\n").collect::<Vec<_>>(), without);
+    }
+
+    #[test]
+    fn a_draft_without_recipients_is_written() {
+        let mut draft = draft();
+        draft.to.clear();
+        draft.bcc.clear();
+        let composed = compose(
+            &draft,
+            &Address::new("me@example.com"),
+            &Threading::default(),
+        )
+        .unwrap();
+        assert!(composed.recipients.is_empty());
+        let kept = String::from_utf8(composed.kept).unwrap();
+        assert!(kept.contains("Subject: =?utf-8?"));
+        assert!(!kept.contains("\r\nTo:"));
     }
 }

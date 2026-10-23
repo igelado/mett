@@ -59,6 +59,10 @@ pub struct State {
     pub logins: Vec<String>,
     /// Whether each connection was encrypted when it logged in.
     pub encrypted: Vec<bool>,
+    /// Leaves `UIDPLUS` out of what the server says it can do.
+    pub no_uidplus: bool,
+    /// Leaves `MOVE` out of it.
+    pub no_move: bool,
 }
 
 impl State {
@@ -254,8 +258,15 @@ impl Session {
                     } else {
                         ""
                     };
+                    let (uidplus, moves) = {
+                        let state = self.state.lock().unwrap();
+                        (
+                            if state.no_uidplus { "" } else { " UIDPLUS" },
+                            if state.no_move { "" } else { " MOVE" },
+                        )
+                    };
                     out.push_str(&format!(
-                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2 UIDPLUS MOVE\r\n"
+                        "* CAPABILITY IMAP4rev1{starttls} AUTH=XOAUTH2{uidplus}{moves}\r\n"
                     ));
                     ok(&mut out, "done");
                 } else if upper == "STARTTLS" {
@@ -420,6 +431,10 @@ impl Session {
                 folder.validity
             ));
         } else if upper == "EXPUNGE" || upper.starts_with("UID EXPUNGE ") {
+            if upper.starts_with("UID") && state.no_uidplus {
+                out.push_str(&format!("{tag} BAD not supported\r\n"));
+                return;
+            }
             let Some(name) = self.selected.clone() else {
                 out.push_str(&format!("{tag} BAD nothing selected\r\n"));
                 return;
@@ -447,6 +462,12 @@ impl Session {
             }
             out.push_str(&format!("{tag} OK done\r\n"));
         } else if let Some(args) = upper.strip_prefix("UID ") {
+            if (args.starts_with("EXPUNGE") && state.no_uidplus)
+                || (args.starts_with("MOVE") && state.no_move)
+            {
+                out.push_str(&format!("{tag} BAD not supported\r\n"));
+                return;
+            }
             self.uid(&mut state, tag, &rest[4..], args, out);
         } else {
             out.push_str(&format!("{tag} BAD unknown command\r\n"));
@@ -462,6 +483,7 @@ impl Session {
             let folder = state.folder(&name);
             let words: Vec<&str> = rest[7..].split_whitespace().collect();
             let _ = criteria;
+            let folder_uids: Vec<u32> = folder.messages.iter().map(|m| m.uid).collect();
             let mut found = Vec::new();
             for m in &folder.messages {
                 let mut keep = true;
@@ -470,6 +492,12 @@ impl Session {
                     match words[i].to_uppercase().as_str() {
                         "ALL" => {}
                         "UNSEEN" => keep &= !m.flags.contains("\\Seen"),
+                        "DELETED" => keep &= m.flags.contains("\\Deleted"),
+                        "UID" => {
+                            i += 1;
+                            let all: Vec<u32> = folder_uids.clone();
+                            keep &= uids(words[i], &all).contains(&m.uid);
+                        }
                         "SINCE" => {
                             // The day, which the server compares with the
                             // day it took the message in.
@@ -545,7 +573,8 @@ impl Session {
                 .split_whitespace()
                 .map(str::to_owned)
                 .collect();
-            for m in &mut folder.messages {
+            let silent = how.contains("SILENT");
+            for (n, m) in folder.messages.iter_mut().enumerate() {
                 if uids(set, &all).contains(&m.uid) {
                     for flag in &flags {
                         if how.starts_with('+') {
@@ -553,6 +582,14 @@ impl Session {
                         } else {
                             m.flags.remove(flag);
                         }
+                    }
+                    if !silent {
+                        let now = m.flags.iter().cloned().collect::<Vec<_>>().join(" ");
+                        out.push_str(&format!(
+                            "* {} FETCH (UID {} FLAGS ({now}))\r\n",
+                            n + 1,
+                            m.uid
+                        ));
                     }
                 }
             }

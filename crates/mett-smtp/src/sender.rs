@@ -121,6 +121,15 @@ pub struct SmtpSender<A = NoTokens> {
     login: Login<A>,
 }
 
+impl<A> fmt::Debug for SmtpSender<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SmtpSender")
+            .field("settings", &self.settings)
+            .field("login", &self.login)
+            .finish()
+    }
+}
+
 impl<A: Authenticator> SmtpSender<A> {
     /// A sender for the server `settings` describe, logging in as `login`.
     pub fn new(settings: SmtpSettings, login: Login<A>) -> Self {
@@ -136,6 +145,9 @@ impl<A: Authenticator> SmtpSender<A> {
     /// mailbox. The mailbox (IMAP) implements the port, and stores the
     /// copy this returns.
     pub async fn send(&self, draft: &Draft, threading: &Threading) -> Result<(String, Vec<u8>)> {
+        if !draft.has_recipients() {
+            return Err(Error::NotSent("the message has no recipients".into()));
+        }
         let composed = compose(draft, &self.settings.from, threading)?;
         let envelope = Envelope::new(
             Some(address(&composed.sender)?),

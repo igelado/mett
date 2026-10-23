@@ -95,15 +95,18 @@ These are the variables most relevant to mett. mutt has several hundred more.
 | | `delete` | quadoption | Whether to purge messages marked for deletion (on `$`, or when leaving the folder). |
 | | `resolve` | boolean | Move to the next message after marking one (`d`, `u`). |
 | | `copy` | quadoption | Whether to save a copy of outgoing mail in `record`. |
-| IMAP | `imap_user`, `imap_login`, `imap_pass` | string | Credentials. |
-| | `imap_authenticators` | string | Colon-separated methods, for example `oauthbearer:xoauth2`. |
-| | `imap_oauth_refresh_command` | string | Command that prints a fresh OAuth2 access token. |
+| IMAP | `imap_user`, `imap_pass` | string | Credentials (§4.13). mett doesn't know `imap_login`. |
+| | `imap_authenticators` | string | Colon-separated methods, for example `oauthbearer:xoauth2`. (Not supported yet: mett logs in with `LOGIN`.) |
+| | `imap_oauth_refresh_command` | string | Command that prints a fresh OAuth2 access token. (Not supported yet.) |
 | | `imap_check_subscribed` | boolean | Poll subscribed folders. |
-| SMTP | `smtp_url` | string | `smtp[s]://[user[:pass]@]host[:port]/` |
-| | `smtp_pass`, `smtp_authenticators` | string | Credentials and methods. |
-| | `smtp_oauth_refresh_command` | string | As for IMAP. |
-| | `sendmail` | path | Local MTA, used when `smtp_url` is unset. |
-| | `ssl_force_tls` | boolean | Require encrypted connections. |
+| SMTP | `smtp_url` | string | `smtp[s]://[user[:pass]@]host[:port]/` (§4.13). |
+| | `smtp_pass` | string | The password (§4.13). |
+| | `smtp_authenticators` | string | Methods. (Not supported yet: mett logs in with PLAIN or LOGIN.) |
+| | `smtp_oauth_refresh_command` | string | As for IMAP. (Not supported yet.) |
+| | `sendmail` | path | Local MTA, used when `smtp_url` is unset. (Not supported: with no `smtp_url`, mail can't be sent.) |
+| | `ssl_starttls`, `ssl_force_tls` | boolean | Upgrade a plain connection with STARTTLS if the server offers it (`yes`); fail if it doesn't (`ssl_force_tls`, `no`). |
+| | `ssl_verify_host` | boolean | Check the server's certificate and name (`yes`). |
+| | `ssl_ca_certificate_file` | path | More certificate authorities to trust, as PEM, besides the system's. |
 | Caching | `header_cache` | path | Header cache database. |
 | | `message_cachedir` | path | Body cache for IMAP and POP. |
 | Composing | `editor` | path | Compose editor. Falls back to `$VISUAL`, `$EDITOR`, then mett's built-in editor (§4.11), which `builtin` asks for. |
@@ -400,6 +403,57 @@ the editor it is built on: most of vim's motions and operators, and
 emacs's movement and deletion. In the terminal, its clipboard is its
 own: paste text from elsewhere through the terminal.
 
+### 4.13 IMAP and SMTP accounts
+
+mett reads and sends mail through any IMAP and SMTP server, besides
+Office365 (`msgraph://`). It uses IMAP when `spoolfile` is an `imap://` or
+`imaps://` URL:
+
+```muttrc
+set imap_user = "alice"
+set imap_pass = "`pass show mail/example`"   # or a literal password
+set folder    = "imaps://mail.example.com/"
+set spoolfile = "=INBOX"
+set record    = "=Sent"
+set postponed = "=Drafts"
+set trash     = "=Trash"
+
+set smtp_url  = "smtps://smtp.example.com"   # smtp://host:587 for STARTTLS
+set from      = "alice@example.com"
+set realname  = "Alice Example"
+```
+
+- **The URL** is `imap[s]://[user[:password]@]host[:port]/folder`. The user
+  and password may come from `imap_user` and `imap_pass` instead (escape
+  `@`, `:` and `/` in a URL as `%40`, `%3A` and `%2F`). The account is named
+  `user@host`, or the user if it is an address.
+- **Connections.** `imaps://` and `smtps://` are TLS from the first byte
+  (ports 993 and 465). `imap://` and `smtp://` (ports 143 and 587) upgrade with
+  STARTTLS if the server offers it (`ssl_starttls`, on by default), fail
+  without it if `ssl_force_tls` is set, and go on in plain text otherwise:
+  use `ssl_force_tls` unless the network is yours. The server's certificate
+  is checked against the system's authorities (and
+  `ssl_ca_certificate_file`) unless `ssl_verify_host` is off.
+- **SMTP.** `smtp_url` names the server and, if it needs one, a user (by
+  default `imap_user`). Its password is in the URL, or `smtp_pass`, or the
+  IMAP one if the user is the same. Without `smtp_url`, mail can't be sent.
+  mett saves the copy of what it sends (`copy`) in the folder the server
+  calls Sent, and postponed messages in Drafts, whatever `record` and
+  `postponed` say (as with Office365). Replies keep the original's
+  `Message-ID:` and `References:`.
+- **Folders** are named as on the server, below `folder`: `=INBOX/Work`
+  (with `/`, whatever the server's own separator is). `@inbox`, `@sentitems`,
+  `@drafts`, `@deleteditems`, `@junkemail` and `@archive` find a folder by what
+  the server says it is (the `\Sent`, `\Drafts`, `\Trash`, `\Junk` and `\Archive`
+  attributes), or by its usual name (`Sent`, `Drafts`, `Trash`, `Spam`,
+  `Archive`).
+- **Limits.** mett logs in with a password only (`LOGIN`; OAuth2 isn't
+  wired to the configuration yet). IMAP can't tell what changed in a folder,
+  so mett doesn't cache the mailbox and looks again every `mail_check`
+  seconds rather than being told when mail arrives. Threads are those of
+  `References:`. Meeting invitations aren't shown as such (their `text/calendar`
+  part is an attachment) and can't be answered.
+
 ## 5. Mailbox shortcuts
 
 Wherever a path is expected:
@@ -415,8 +469,8 @@ Wherever a path is expected:
 | `~` | Home directory. |
 | `@alias` | Default save folder for the alias's address. |
 
-Remote mailboxes are URLs: `imap[s]://[user@]host[:port]/path` and
-`pop[s]://…`.
+Remote mailboxes are URLs: `imap[s]://[user@]host[:port]/path` (§4.13) and
+`msgraph://account/path`. mett doesn't read POP.
 
 ## 6. Patterns
 
