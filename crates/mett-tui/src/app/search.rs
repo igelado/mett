@@ -1,6 +1,7 @@
 //! Searching (`/`, `n`) and limiting (`l`) the index with mutt's patterns,
 //! and searching the text in the pager.
 
+use super::StatusKind;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
@@ -142,7 +143,7 @@ impl App {
             // The message is still on its way: search it once it comes.
             if pager.message.is_none() {
                 pager.pending_search = Some(text.to_owned());
-                self.status = "Searching...".into();
+                self.status.say("Searching...", StatusKind::Searching);
                 return Vec::new();
             }
             let position = self.screens.len() - 1;
@@ -195,11 +196,10 @@ impl App {
         match found {
             Some(i) => {
                 // Replaces an earlier "Not found." too.
-                self.status = if i <= self.selected && !from_top {
-                    "Search wrapped to top.".into()
-                } else {
-                    String::new()
-                };
+                self.status.clear();
+                if i <= self.selected && !from_top {
+                    self.status.info("Search wrapped to top.");
+                }
                 let id = self
                     .search_match(&pattern, &folded, i)
                     .expect("found above");
@@ -215,7 +215,7 @@ impl App {
                 self.pending_search = Some((text.to_owned(), pattern));
                 self.search_from_top = from_top;
                 let effects = self.retry_listing();
-                self.status = "Searching...".into();
+                self.status.say("Searching...", StatusKind::Searching);
                 return effects;
             }
             None => self.fail("Not found."),
@@ -292,11 +292,10 @@ impl App {
         match found {
             Some((line, start, end, next)) => {
                 let wrapped = (line, start) < (from_line, from_offset);
-                self.status = if wrapped {
-                    "Search wrapped to top.".into()
-                } else {
-                    String::new()
-                };
+                self.status.clear();
+                if wrapped {
+                    self.status.info("Search wrapped to top.");
+                }
                 // Show the row with the match at the top, unless that would
                 // scroll past the end.
                 let row = match_row(pager, line, start);
@@ -384,7 +383,7 @@ impl App {
                 pattern,
             });
             if self.messages.is_empty() {
-                self.status = NO_MATCHES.into();
+                self.status.say(NO_MATCHES, StatusKind::NoMatches);
             }
         }
         self.arrange();
@@ -446,7 +445,7 @@ impl App {
             self.selected = 0;
         }
         // A later page had matches after all.
-        if limited && !self.messages.is_empty() && self.status == NO_MATCHES {
+        if limited && !self.messages.is_empty() && self.status.is(StatusKind::NoMatches) {
             self.status.clear();
         }
     }

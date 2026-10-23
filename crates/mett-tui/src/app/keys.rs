@@ -88,10 +88,12 @@ impl App {
         {
             let key = Key::from(event);
             if key == Key::ctrl('g') || key == Key::new(KeyCode::Esc) {
-                self.status = format!("Not waiting for {} any more.", path.display());
+                self.status
+                    .info(format!("Not waiting for {} any more.", path.display()));
                 self.file_wait = None;
             } else {
-                self.status = format!("Waiting for {} (^G gives up)...", path.display());
+                self.status
+                    .info(format!("Waiting for {} (^G gives up)...", path.display()));
             }
             return Vec::new();
         }
@@ -246,7 +248,7 @@ impl App {
     /// has been listed (which says it is loading meanwhile), unless that
     /// failed.
     pub fn notice(&mut self, notice: String) {
-        self.status.clone_from(&notice);
+        self.status.info(notice.clone());
         self.notice = Some(notice);
     }
 
@@ -290,9 +292,9 @@ impl App {
     pub(super) fn loaded(&mut self) {
         self.strokes.extend(std::mem::take(&mut self.after_load));
         if let Some(notice) = self.notice.take()
-            && self.error.as_deref() != Some(self.status.as_str())
+            && !self.status.is_error()
         {
-            self.status = notice;
+            self.status.info(notice);
             self.redraw = true;
         }
     }
@@ -430,7 +432,8 @@ impl App {
         push_problems.reverse();
         problems.extend(push_problems);
         if problems.is_empty() {
-            self.status = self.after_configured.take().unwrap_or_default();
+            let said = self.after_configured.take().unwrap_or_default();
+            self.status.info(said);
         } else {
             self.fail(problems.join("; "));
         }

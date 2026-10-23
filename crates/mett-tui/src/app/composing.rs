@@ -233,7 +233,7 @@ impl App {
         let id = summary.id.clone();
         let fetch = self.request(Request::FetchMessage(id.clone()));
         self.compose_fetch = Some((effect_id(&fetch), kind, id));
-        self.status = "Fetching message...".into();
+        self.status.info("Fetching message...");
         vec![fetch]
     }
 
@@ -663,7 +663,7 @@ impl App {
             Question::AbortUnmodified => return self.open_compose_menu(),
             Question::Postpone if answer => return self.deliver(Delivery::Postpone),
             Question::Postpone => {
-                self.status = "Mail not sent.".into();
+                self.status.info("Mail not sent.");
                 // Given up on: so is a draft a failed attempt left.
                 return match self.screens.pop() {
                     Some(Screen::Compose(compose)) if compose.left_draft => {
@@ -735,7 +735,7 @@ impl App {
     /// Gives up on the message being set up.
     fn abort(&mut self, why: &str) -> Vec<Effect> {
         self.composing = None;
-        self.status = why.into();
+        self.status.info(why);
         Vec::new()
     }
 
@@ -1031,7 +1031,7 @@ impl App {
         if let Some(Screen::Compose(compose)) = self.screens.last_mut() {
             compose.delivery = Some((effect_id(&effect), delivery));
         }
-        self.status = status.into();
+        self.status.info(status);
         vec![effect]
     }
 
@@ -1066,11 +1066,10 @@ impl App {
         match result {
             Ok(()) => {
                 self.screens.remove(position);
-                self.status = match delivery {
+                self.status.info(match delivery {
                     Some(Delivery::Postpone) => "Message postponed.",
                     _ => "Mail sent.",
-                }
-                .into();
+                });
                 if let Some(why) = &not_kept {
                     self.fail(format!("Mail sent, but no copy was kept: {why}"));
                 }

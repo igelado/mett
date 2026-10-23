@@ -950,8 +950,8 @@ impl App {
     fn announce(&mut self, text: &str) {
         // The account's tab says so too, until it is looked at.
         self.arrived = true;
-        if self.status.is_empty() || self.error.as_deref() != Some(self.status.as_str()) {
-            self.status = text.to_owned();
+        if !self.status.is_error() {
+            self.status.info(text);
         }
     }
 

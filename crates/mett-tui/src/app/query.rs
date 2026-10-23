@@ -433,7 +433,7 @@ impl App {
         if self.configuring > 0 {
             self.after_configured = Some(said);
         } else {
-            self.status = said;
+            self.status.info(said);
         }
         Vec::new()
     }

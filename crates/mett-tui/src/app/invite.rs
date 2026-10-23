@@ -194,7 +194,7 @@ impl App {
             request: Some(effect_id(&request)),
             ..answering
         });
-        self.status = "Sending answer...".into();
+        self.status.info("Sending answer...");
         vec![request]
     }
 
@@ -218,14 +218,14 @@ impl App {
         }
         // An answer for one occurrence leaves the series' as it was.
         let own = answering.invitation.answer_changes_reply(answering.scope);
-        self.status = if own {
+        self.status.info(if own {
             done(answering.rsvp).into()
         } else {
             format!(
                 "{} (this occurrence only).",
                 done(answering.rsvp).trim_end_matches('.')
             )
-        };
+        });
         // The message shows the new answer, if it is still open.
         let width = self.wrap_width();
         for screen in &mut self.screens {

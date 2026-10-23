@@ -1085,7 +1085,7 @@ fn mail_a_check_finds_before_it_is_listed_is_not_seen() {
 #[test]
 fn a_failure_hidden_by_another_message_is_said_later() {
     let (mut app, check) = app();
-    app.status = "Loading Inbox...".into();
+    app.status.info("Loading Inbox...");
     check_both(
         &mut app,
         check,

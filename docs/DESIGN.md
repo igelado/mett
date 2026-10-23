@@ -342,6 +342,11 @@ drawing it formats only the rows on screen. The app gives the menus the
 width the sidebar leaves (`App::width`), so that what they lay out
 (the pager's wrapping, say) fits beside it.
 
+The message line itself is `App::status`: a text and a `StatusKind` (error,
+loading, searching, ...). Code that reacts to a message (the view coloring an
+error, a loaded folder clearing its "Loading..."), asks for the kind, never
+compares words.
+
 Questions on the message line (`To:`, `Postpone this message?`) are not
 screens: they sit over the current screen, as `App::input`, and take keys
 as typed rather than through the key bindings. Writing a message is a
