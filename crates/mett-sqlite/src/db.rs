@@ -264,6 +264,12 @@ impl Db {
         })
     }
 
+    /// Sets how long a call waits for another connection's lock (five
+    /// seconds to begin with).
+    pub fn set_busy_timeout(&mut self, timeout: std::time::Duration) -> Result<(), Error> {
+        self.conn.busy_timeout(timeout).map_err(failed)
+    }
+
     /// Says whether bodies stay good (see the field).
     pub fn set_bodies_stay(&mut self, stay: bool) {
         self.bodies_stay = stay;

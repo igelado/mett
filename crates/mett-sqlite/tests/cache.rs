@@ -887,3 +887,50 @@ async fn a_busy_cache_is_not_a_broken_one() {
     drop((store, other));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// SQLite waits (up to its busy timeout) off the executor: a task that
+/// shares its thread keeps running meanwhile.
+#[tokio::test(flavor = "current_thread")]
+async fn a_busy_cache_does_not_block_the_executor() {
+    let dir = std::env::temp_dir().join(format!("mett-sqlite-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("cache.sqlite");
+    let cache = Cache::open(&path, &alice())
+        .unwrap()
+        .with_busy_timeout(Duration::from_millis(600))
+        .unwrap();
+    let store = CachedStore::new(mailbox(2), Some(cache));
+    // Another mett is writing to the cache: the first sync waits for it.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let ticker = {
+        let ticks = std::sync::Arc::clone(&ticks);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    };
+    let started = std::time::Instant::now();
+    assert_eq!(
+        listing(&store, 10).await,
+        ["m1", "m0"],
+        "from the server meanwhile"
+    );
+    let waited = started.elapsed();
+    ticker.abort();
+    assert!(
+        waited >= Duration::from_millis(500),
+        "the cache was waited for ({waited:?})"
+    );
+    let ticks = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        ticks >= 20,
+        "the executor ran other tasks while SQLite waited ({ticks} ticks in {waited:?})"
+    );
+    // Windows can't remove files that are open.
+    drop((store, other));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -31,6 +31,12 @@ of each folder listed, and each message read, in a database file: mutt's
   everything. A cache that is only busy (another mett is writing to it)
   isn't given up on: the server answers for ten seconds (SQLite already
   waited five), and then the cache serves again.
+- **Threads:** SQLite's calls block (waiting for another mett's lock, a
+  large sync batch), so `CachedStore` runs each on a blocking thread
+  (`spawn_blocking`) and awaits it: the executor, and the UI sharing it,
+  keep running. A call dropped meanwhile still runs to its end there, its
+  transaction finished (or rolled back) and the cache's state noted. The
+  `Db` itself needs no runtime.
 - **Storage:** a message's row keeps what is sorted, filtered or changed
   alone (dates, read, flagged) in columns, with indexes that page by date
   and by change (and one for unread mail), and the rest of its summary as
