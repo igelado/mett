@@ -83,12 +83,17 @@ impl App {
         !self.deleted.is_empty()
     }
 
-    /// Whether a message is being written: it isn't lost by quitting
-    /// another account.
+    /// Whether a message is being written (or is about to be: its recipients
+    /// are being asked, or its original is being fetched): it isn't lost by
+    /// quitting another account.
     pub fn is_composing(&self) -> bool {
-        self.screens
-            .iter()
-            .any(|screen| matches!(screen, crate::app::Screen::Compose(_)))
+        self.composing.is_some()
+            || self.compose_fetch.is_some()
+            || self.awaiting_addresses.is_some()
+            || self
+                .screens
+                .iter()
+                .any(|screen| matches!(screen, crate::app::Screen::Compose(_)))
     }
 
     /// The keys still to play (a macro, `push`), and how many have been

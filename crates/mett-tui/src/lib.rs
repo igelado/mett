@@ -888,10 +888,8 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
         // Quitting in any account quits mett, as it would in one alone: it
         // may be one that isn't shown (a `push <quit>`, or a purge that was
         // being done when the user went to another tab).
-        for (at, slot) in slots.iter_mut().enumerate() {
-            if std::mem::take(&mut slot.app.quit) {
-                done[at] = true;
-            }
+        for (at, slot) in slots.iter().enumerate() {
+            done[at] |= slot.app.quit;
         }
         if done.iter().any(|done| *done) {
             // What is unfinished in another account (messages marked deleted,
@@ -999,7 +997,11 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 });
             }
         }
-        if slots.iter().any(|slot| slot.app.quit) {
+        if slots
+            .iter()
+            .zip(&done)
+            .any(|(slot, done)| slot.app.quit && !done)
+        {
             continue 'run;
         }
         // The keys a `push` in an account's own file queued play there even
@@ -1012,7 +1014,7 @@ async fn run<S: mett_core::MailStore + mett_core::MailSender + 'static>(
                 stale = true;
                 // A `push <quit>` there quits mett, as it would in any
                 // account (see above).
-                if slots[at].app.quit {
+                if slots[at].app.quit && !done[at] {
                     continue 'run;
                 }
             }
